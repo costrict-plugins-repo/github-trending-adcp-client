@@ -1,0 +1,1182 @@
+// Generated Agent Classes
+// Auto-generated from AdCP tool definitions
+
+import type { AgentConfig } from '../types';
+import { ProtocolClient } from '../protocols';
+import { validateAgentUrl } from '../validation';
+import { getCircuitBreaker, unwrapProtocolResponse } from '../utils';
+import type { MutatingRequestInput } from '../utils/idempotency';
+import type {
+  GetProductsRequest,
+  GetProductsResponse,
+  ListProductsRequest,
+  ListProductsResponse,
+  ListProposalsRequest,
+  ListProposalsResponse,
+  ListCollectionsRequest,
+  ListCollectionsResponse,
+  RequestProposalsRequest,
+  RequestProposalsResponse,
+  RefineProposalsRequest,
+  RefineProposalsResponse,
+  DeclineProposalsRequest,
+  DeclineProposalsResponse,
+  BuyProductsRequest,
+  BuyProductsResponse,
+  AcceptProposalRequest,
+  AcceptProposalResponse,
+  ControlMediaBuyRequest,
+  ControlMediaBuyResponse,
+  ListCreativeFormatsRequest,
+  ListCreativeFormatsResponse,
+  CreateMediaBuyRequest,
+  CreateMediaBuyResponse,
+  UpdateMediaBuyRequest,
+  UpdateMediaBuyResponse,
+  GetMediaBuysRequest,
+  GetMediaBuysResponse,
+  GetMediaBuyDeliveryRequest,
+  GetMediaBuyDeliveryResponse,
+  GetReportingStatusRequest,
+  GetReportingStatusResponse,
+  SyncReportingStatusRequest,
+  SyncReportingStatusResponse,
+  SyncReportingReceiptsRequest,
+  SyncReportingReceiptsResponse,
+  ProvidePerformanceFeedbackRequest,
+  ProvidePerformanceFeedbackResponse,
+  SyncEventSourcesRequest,
+  SyncEventSourcesResponse,
+  LogEventRequest,
+  LogEventResponse,
+  SyncAudiencesRequest,
+  SyncAudiencesResponse,
+  SyncCatalogsRequest,
+  SyncCatalogsResponse,
+  BuildCreativeRequest,
+  BuildCreativeResponse,
+  PreviewCreativeRequest,
+  PreviewCreativeResponse,
+  ListTransformersRequest,
+  ListTransformersResponse,
+  GetCreativeDeliveryRequest,
+  GetCreativeDeliveryResponse,
+  ListCreativesRequest,
+  ListCreativesResponse,
+  SyncCreativesRequest,
+  SyncCreativesResponse,
+  ValidateInputRequest,
+  ValidateInputResponse,
+  GetSignalsRequest,
+  GetSignalsResponse,
+  ActivateSignalRequest,
+  ActivateSignalResponse,
+  CreatePropertyListRequest,
+  CreatePropertyListResponse,
+  UpdatePropertyListRequest,
+  UpdatePropertyListResponse,
+  GetPropertyListRequest,
+  GetPropertyListResponse,
+  ListPropertyListsRequest,
+  ListPropertyListsResponse,
+  DeletePropertyListRequest,
+  DeletePropertyListResponse,
+  CreateCollectionListRequest,
+  CreateCollectionListResponse,
+  UpdateCollectionListRequest,
+  UpdateCollectionListResponse,
+  GetCollectionListRequest,
+  GetCollectionListResponse,
+  ListCollectionListsRequest,
+  ListCollectionListsResponse,
+  DeleteCollectionListRequest,
+  DeleteCollectionListResponse,
+  ListContentStandardsRequest,
+  ListContentStandardsResponse,
+  GetContentStandardsRequest,
+  GetContentStandardsResponse,
+  CreateContentStandardsRequest,
+  CreateContentStandardsResponse,
+  UpdateContentStandardsRequest,
+  UpdateContentStandardsResponse,
+  CalibrateContentRequest,
+  CalibrateContentResponse,
+  ValidateContentDeliveryRequest,
+  ValidateContentDeliveryResponse,
+  GetMediaBuyArtifactsRequest,
+  GetMediaBuyArtifactsResponse,
+  GetCreativeFeaturesRequest,
+  GetCreativeFeaturesResponse,
+  SyncPlansRequest,
+  SyncPlansResponse,
+  ReportPlanOutcomeRequest,
+  ReportPlanOutcomeResponse,
+  ReportPlanAdjustmentRequest,
+  ReportPlanAdjustmentResponse,
+  GetPlanAuditLogsRequest,
+  GetPlanAuditLogsResponse,
+  CheckGovernanceRequest,
+  CheckGovernanceResponse,
+  SIGetOfferingRequest,
+  SIGetOfferingResponse,
+  SIInitiateSessionRequest,
+  SIInitiateSessionResponse,
+  SISendMessageRequest,
+  SISendMessageResponse,
+  SITerminateSessionRequest,
+  SITerminateSessionResponse,
+  GetAdCPCapabilitiesRequest,
+  GetAdCPCapabilitiesResponse,
+  GetTaskStatusRequest,
+  GetTaskStatusResponse,
+  ListTasksRequest,
+  ListTasksResponse,
+  SyncAgentNotificationConfigsRequest,
+  SyncAgentNotificationConfigsResponse,
+  SyncPrincipalRequest,
+  SyncPrincipalResponse,
+  GetPrincipalRequest,
+  GetPrincipalResponse,
+  ListAccountChangesRequest,
+  ListAccountChangesResponse,
+  ListAccountsRequest,
+  ListAccountsResponse,
+  SyncAccountsRequest,
+  SyncAccountsResponse,
+  SyncGovernanceRequest,
+  SyncGovernanceResponse,
+  ReportUsageRequest,
+  ReportUsageResponse,
+  GetAccountFinancialsRequest,
+  GetAccountFinancialsResponse,
+  ComplyTestControllerRequest,
+  ComplyTestControllerResponse
+} from '../types/tools.generated';
+
+/**
+ * Single agent operations with full type safety
+ *
+ * Returns raw AdCP responses matching schema exactly.
+ * No SDK wrapping - responses follow AdCP discriminated union patterns.
+ *
+ * @deprecated Use `SingleAgentClient` / `AgentClient` / `ADCPMultiAgentClient`
+ * from `@adcp/sdk` instead. The `Agent` class predates Stage 3's per-instance
+ * `adcpVersion` plumbing — it always emits the SDK-pinned `ADCP_MAJOR_VERSION`
+ * on the wire regardless of caller pin, which silently drifts from a buyer
+ * who pins a non-default version. The conversation-aware clients honor the
+ * per-instance pin end-to-end (validators, wire field, capability check).
+ */
+let _agentDeprecationWarned = false;
+
+export class Agent {
+  constructor(
+    private config: AgentConfig,
+    private client: any // Will be AdCPClient
+  ) {
+    if (!_agentDeprecationWarned) {
+      // Flag is set only after a successful emitWarning so a runtime that
+      // throws on the first call (monkey-patched test harness, polyfilled
+      // worker) still surfaces the deprecation on a later construction.
+      try {
+        process.emitWarning(
+          'Agent class is deprecated. Use SingleAgentClient / AgentClient / ADCPMultiAgentClient from @adcp/sdk; ' +
+            'Agent does not honor per-instance adcpVersion pins (always emits the SDK default major).',
+          'DeprecationWarning'
+        );
+        _agentDeprecationWarned = true;
+      } catch {
+        // emitWarning is best-effort observability; never fatal.
+      }
+    }
+  }
+
+  private async callTool<T>(toolName: string, params: any): Promise<T> {
+    const debugLogs: any[] = [];
+
+    try {
+      validateAgentUrl(this.config.agent_uri);
+
+      const circuitBreaker = getCircuitBreaker(this.config.id);
+      const protocolResponse = await circuitBreaker.call(async () => {
+        return await ProtocolClient.callTool(this.config, toolName, params, { debugLogs });
+      });
+
+      // Unwrap and validate protocol response using tool-specific Zod schema
+      const adcpResponse = unwrapProtocolResponse(protocolResponse, toolName, this.config.protocol);
+
+      return adcpResponse as T;
+    } catch (error) {
+      // Convert exceptions to AdCP error format
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      return {
+        errors: [{
+          code: 'client_error',
+          message: errorMessage
+        }]
+      } as T;
+    }
+  }
+
+  /**
+   * Official AdCP get_products tool schema
+   */
+  async getProducts(params: GetProductsRequest): Promise<GetProductsResponse> {
+    return this.callTool<GetProductsResponse>('get_products', params);
+  }
+
+  /**
+   * Official AdCP list_products tool schema
+   */
+  async listProducts(params: ListProductsRequest): Promise<ListProductsResponse> {
+    return this.callTool<ListProductsResponse>('list_products', params);
+  }
+
+  /**
+   * Official AdCP list_proposals tool schema
+   */
+  async listProposals(params: ListProposalsRequest): Promise<ListProposalsResponse> {
+    return this.callTool<ListProposalsResponse>('list_proposals', params);
+  }
+
+  /**
+   * Official AdCP list_collections tool schema
+   */
+  async listCollections(params: ListCollectionsRequest): Promise<ListCollectionsResponse> {
+    return this.callTool<ListCollectionsResponse>('list_collections', params);
+  }
+
+  /**
+   * Official AdCP request_proposals tool schema
+   */
+  async requestProposals(params: MutatingRequestInput<RequestProposalsRequest>): Promise<RequestProposalsResponse> {
+    return this.callTool<RequestProposalsResponse>('request_proposals', params);
+  }
+
+  /**
+   * Official AdCP refine_proposals tool schema
+   */
+  async refineProposals(params: MutatingRequestInput<RefineProposalsRequest>): Promise<RefineProposalsResponse> {
+    return this.callTool<RefineProposalsResponse>('refine_proposals', params);
+  }
+
+  /**
+   * Official AdCP decline_proposals tool schema
+   */
+  async declineProposals(params: MutatingRequestInput<DeclineProposalsRequest>): Promise<DeclineProposalsResponse> {
+    return this.callTool<DeclineProposalsResponse>('decline_proposals', params);
+  }
+
+  /**
+   * Official AdCP buy_products tool schema
+   */
+  async buyProducts(params: MutatingRequestInput<BuyProductsRequest>): Promise<BuyProductsResponse> {
+    return this.callTool<BuyProductsResponse>('buy_products', params);
+  }
+
+  /**
+   * Official AdCP accept_proposal tool schema
+   */
+  async acceptProposal(params: MutatingRequestInput<AcceptProposalRequest>): Promise<AcceptProposalResponse> {
+    return this.callTool<AcceptProposalResponse>('accept_proposal', params);
+  }
+
+  /**
+   * Official AdCP control_media_buy tool schema
+   */
+  async controlMediaBuy(params: MutatingRequestInput<ControlMediaBuyRequest>): Promise<ControlMediaBuyResponse> {
+    return this.callTool<ControlMediaBuyResponse>('control_media_buy', params);
+  }
+
+  /**
+   * Official AdCP list_creative_formats tool schema
+   */
+  async listCreativeFormats(params: ListCreativeFormatsRequest): Promise<ListCreativeFormatsResponse> {
+    return this.callTool<ListCreativeFormatsResponse>('list_creative_formats', params);
+  }
+
+  /**
+   * Official AdCP create_media_buy tool schema
+   */
+  async createMediaBuy(params: MutatingRequestInput<CreateMediaBuyRequest>): Promise<CreateMediaBuyResponse> {
+    return this.callTool<CreateMediaBuyResponse>('create_media_buy', params);
+  }
+
+  /**
+   * Official AdCP update_media_buy tool schema
+   */
+  async updateMediaBuy(params: MutatingRequestInput<UpdateMediaBuyRequest>): Promise<UpdateMediaBuyResponse> {
+    return this.callTool<UpdateMediaBuyResponse>('update_media_buy', params);
+  }
+
+  /**
+   * Official AdCP get_media_buys tool schema
+   */
+  async getMediaBuys(params: GetMediaBuysRequest): Promise<GetMediaBuysResponse> {
+    return this.callTool<GetMediaBuysResponse>('get_media_buys', params);
+  }
+
+  /**
+   * Official AdCP get_media_buy_delivery tool schema
+   */
+  async getMediaBuyDelivery(params: GetMediaBuyDeliveryRequest): Promise<GetMediaBuyDeliveryResponse> {
+    return this.callTool<GetMediaBuyDeliveryResponse>('get_media_buy_delivery', params);
+  }
+
+  /**
+   * Official AdCP get_reporting_status tool schema
+   */
+  async getReportingStatus(params: GetReportingStatusRequest): Promise<GetReportingStatusResponse> {
+    return this.callTool<GetReportingStatusResponse>('get_reporting_status', params);
+  }
+
+  /**
+   * Official AdCP sync_reporting_status tool schema
+   */
+  async syncReportingStatus(params: MutatingRequestInput<SyncReportingStatusRequest>): Promise<SyncReportingStatusResponse> {
+    return this.callTool<SyncReportingStatusResponse>('sync_reporting_status', params);
+  }
+
+  /**
+   * Official AdCP sync_reporting_receipts tool schema
+   */
+  async syncReportingReceipts(params: MutatingRequestInput<SyncReportingReceiptsRequest>): Promise<SyncReportingReceiptsResponse> {
+    return this.callTool<SyncReportingReceiptsResponse>('sync_reporting_receipts', params);
+  }
+
+  /**
+   * Official AdCP provide_performance_feedback tool schema
+   */
+  async providePerformanceFeedback(params: MutatingRequestInput<ProvidePerformanceFeedbackRequest>): Promise<ProvidePerformanceFeedbackResponse> {
+    return this.callTool<ProvidePerformanceFeedbackResponse>('provide_performance_feedback', params);
+  }
+
+  /**
+   * Official AdCP sync_event_sources tool schema
+   */
+  async syncEventSources(params: MutatingRequestInput<SyncEventSourcesRequest>): Promise<SyncEventSourcesResponse> {
+    return this.callTool<SyncEventSourcesResponse>('sync_event_sources', params);
+  }
+
+  /**
+   * Official AdCP log_event tool schema
+   */
+  async logEvent(params: MutatingRequestInput<LogEventRequest>): Promise<LogEventResponse> {
+    return this.callTool<LogEventResponse>('log_event', params);
+  }
+
+  /**
+   * Official AdCP sync_audiences tool schema
+   */
+  async syncAudiences(params: MutatingRequestInput<SyncAudiencesRequest>): Promise<SyncAudiencesResponse> {
+    return this.callTool<SyncAudiencesResponse>('sync_audiences', params);
+  }
+
+  /**
+   * Official AdCP sync_catalogs tool schema
+   */
+  async syncCatalogs(params: MutatingRequestInput<SyncCatalogsRequest>): Promise<SyncCatalogsResponse> {
+    return this.callTool<SyncCatalogsResponse>('sync_catalogs', params);
+  }
+
+  /**
+   * Official AdCP build_creative tool schema
+   */
+  async buildCreative(params: MutatingRequestInput<BuildCreativeRequest>): Promise<BuildCreativeResponse> {
+    return this.callTool<BuildCreativeResponse>('build_creative', params);
+  }
+
+  /**
+   * Official AdCP preview_creative tool schema
+   */
+  async previewCreative(params: PreviewCreativeRequest): Promise<PreviewCreativeResponse> {
+    return this.callTool<PreviewCreativeResponse>('preview_creative', params);
+  }
+
+  /**
+   * Official AdCP list_transformers tool schema
+   */
+  async listTransformers(params: ListTransformersRequest): Promise<ListTransformersResponse> {
+    return this.callTool<ListTransformersResponse>('list_transformers', params);
+  }
+
+  /**
+   * Official AdCP get_creative_delivery tool schema
+   */
+  async getCreativeDelivery(params: GetCreativeDeliveryRequest): Promise<GetCreativeDeliveryResponse> {
+    return this.callTool<GetCreativeDeliveryResponse>('get_creative_delivery', params);
+  }
+
+  /**
+   * Official AdCP list_creatives tool schema
+   */
+  async listCreatives(params: ListCreativesRequest): Promise<ListCreativesResponse> {
+    return this.callTool<ListCreativesResponse>('list_creatives', params);
+  }
+
+  /**
+   * Official AdCP sync_creatives tool schema
+   */
+  async syncCreatives(params: MutatingRequestInput<SyncCreativesRequest>): Promise<SyncCreativesResponse> {
+    return this.callTool<SyncCreativesResponse>('sync_creatives', params);
+  }
+
+  /**
+   * Official AdCP validate_input tool schema
+   */
+  async validateInput(params: ValidateInputRequest): Promise<ValidateInputResponse> {
+    return this.callTool<ValidateInputResponse>('validate_input', params);
+  }
+
+  /**
+   * Official AdCP get_signals tool schema
+   */
+  async getSignals(params: GetSignalsRequest): Promise<GetSignalsResponse> {
+    return this.callTool<GetSignalsResponse>('get_signals', params);
+  }
+
+  /**
+   * Official AdCP activate_signal tool schema
+   */
+  async activateSignal(params: MutatingRequestInput<ActivateSignalRequest>): Promise<ActivateSignalResponse> {
+    return this.callTool<ActivateSignalResponse>('activate_signal', params);
+  }
+
+  /**
+   * Official AdCP create_property_list tool schema
+   */
+  async createPropertyList(params: MutatingRequestInput<CreatePropertyListRequest>): Promise<CreatePropertyListResponse> {
+    return this.callTool<CreatePropertyListResponse>('create_property_list', params);
+  }
+
+  /**
+   * Official AdCP update_property_list tool schema
+   */
+  async updatePropertyList(params: MutatingRequestInput<UpdatePropertyListRequest>): Promise<UpdatePropertyListResponse> {
+    return this.callTool<UpdatePropertyListResponse>('update_property_list', params);
+  }
+
+  /**
+   * Official AdCP get_property_list tool schema
+   */
+  async getPropertyList(params: GetPropertyListRequest): Promise<GetPropertyListResponse> {
+    return this.callTool<GetPropertyListResponse>('get_property_list', params);
+  }
+
+  /**
+   * Official AdCP list_property_lists tool schema
+   */
+  async listPropertyLists(params: ListPropertyListsRequest): Promise<ListPropertyListsResponse> {
+    return this.callTool<ListPropertyListsResponse>('list_property_lists', params);
+  }
+
+  /**
+   * Official AdCP delete_property_list tool schema
+   */
+  async deletePropertyList(params: MutatingRequestInput<DeletePropertyListRequest>): Promise<DeletePropertyListResponse> {
+    return this.callTool<DeletePropertyListResponse>('delete_property_list', params);
+  }
+
+  /**
+   * Official AdCP create_collection_list tool schema
+   */
+  async createCollectionList(params: MutatingRequestInput<CreateCollectionListRequest>): Promise<CreateCollectionListResponse> {
+    return this.callTool<CreateCollectionListResponse>('create_collection_list', params);
+  }
+
+  /**
+   * Official AdCP update_collection_list tool schema
+   */
+  async updateCollectionList(params: MutatingRequestInput<UpdateCollectionListRequest>): Promise<UpdateCollectionListResponse> {
+    return this.callTool<UpdateCollectionListResponse>('update_collection_list', params);
+  }
+
+  /**
+   * Official AdCP get_collection_list tool schema
+   */
+  async getCollectionList(params: GetCollectionListRequest): Promise<GetCollectionListResponse> {
+    return this.callTool<GetCollectionListResponse>('get_collection_list', params);
+  }
+
+  /**
+   * Official AdCP list_collection_lists tool schema
+   */
+  async listCollectionLists(params: ListCollectionListsRequest): Promise<ListCollectionListsResponse> {
+    return this.callTool<ListCollectionListsResponse>('list_collection_lists', params);
+  }
+
+  /**
+   * Official AdCP delete_collection_list tool schema
+   */
+  async deleteCollectionList(params: MutatingRequestInput<DeleteCollectionListRequest>): Promise<DeleteCollectionListResponse> {
+    return this.callTool<DeleteCollectionListResponse>('delete_collection_list', params);
+  }
+
+  /**
+   * Official AdCP list_content_standards tool schema
+   */
+  async listContentStandards(params: ListContentStandardsRequest): Promise<ListContentStandardsResponse> {
+    return this.callTool<ListContentStandardsResponse>('list_content_standards', params);
+  }
+
+  /**
+   * Official AdCP get_content_standards tool schema
+   */
+  async getContentStandards(params: GetContentStandardsRequest): Promise<GetContentStandardsResponse> {
+    return this.callTool<GetContentStandardsResponse>('get_content_standards', params);
+  }
+
+  /**
+   * Official AdCP create_content_standards tool schema
+   */
+  async createContentStandards(params: MutatingRequestInput<CreateContentStandardsRequest>): Promise<CreateContentStandardsResponse> {
+    return this.callTool<CreateContentStandardsResponse>('create_content_standards', params);
+  }
+
+  /**
+   * Official AdCP update_content_standards tool schema
+   */
+  async updateContentStandards(params: MutatingRequestInput<UpdateContentStandardsRequest>): Promise<UpdateContentStandardsResponse> {
+    return this.callTool<UpdateContentStandardsResponse>('update_content_standards', params);
+  }
+
+  /**
+   * Official AdCP calibrate_content tool schema
+   */
+  async calibrateContent(params: MutatingRequestInput<CalibrateContentRequest>): Promise<CalibrateContentResponse> {
+    return this.callTool<CalibrateContentResponse>('calibrate_content', params);
+  }
+
+  /**
+   * Official AdCP validate_content_delivery tool schema
+   */
+  async validateContentDelivery(params: ValidateContentDeliveryRequest): Promise<ValidateContentDeliveryResponse> {
+    return this.callTool<ValidateContentDeliveryResponse>('validate_content_delivery', params);
+  }
+
+  /**
+   * Official AdCP get_media_buy_artifacts tool schema
+   */
+  async getMediaBuyArtifacts(params: GetMediaBuyArtifactsRequest): Promise<GetMediaBuyArtifactsResponse> {
+    return this.callTool<GetMediaBuyArtifactsResponse>('get_media_buy_artifacts', params);
+  }
+
+  /**
+   * Official AdCP get_creative_features tool schema
+   */
+  async getCreativeFeatures(params: GetCreativeFeaturesRequest): Promise<GetCreativeFeaturesResponse> {
+    return this.callTool<GetCreativeFeaturesResponse>('get_creative_features', params);
+  }
+
+  /**
+   * Official AdCP sync_plans tool schema
+   */
+  async syncPlans(params: MutatingRequestInput<SyncPlansRequest>): Promise<SyncPlansResponse> {
+    return this.callTool<SyncPlansResponse>('sync_plans', params);
+  }
+
+  /**
+   * Official AdCP report_plan_outcome tool schema
+   */
+  async reportPlanOutcome(params: MutatingRequestInput<ReportPlanOutcomeRequest>): Promise<ReportPlanOutcomeResponse> {
+    return this.callTool<ReportPlanOutcomeResponse>('report_plan_outcome', params);
+  }
+
+  /**
+   * Official AdCP report_plan_adjustment tool schema
+   */
+  async reportPlanAdjustment(params: MutatingRequestInput<ReportPlanAdjustmentRequest>): Promise<ReportPlanAdjustmentResponse> {
+    return this.callTool<ReportPlanAdjustmentResponse>('report_plan_adjustment', params);
+  }
+
+  /**
+   * Official AdCP get_plan_audit_logs tool schema
+   */
+  async getPlanAuditLogs(params: GetPlanAuditLogsRequest): Promise<GetPlanAuditLogsResponse> {
+    return this.callTool<GetPlanAuditLogsResponse>('get_plan_audit_logs', params);
+  }
+
+  /**
+   * Official AdCP check_governance tool schema
+   */
+  async checkGovernance(params: CheckGovernanceRequest): Promise<CheckGovernanceResponse> {
+    return this.callTool<CheckGovernanceResponse>('check_governance', params);
+  }
+
+  /**
+   * Official AdCP si_get_offering tool schema
+   */
+  async siGetOffering(params: SIGetOfferingRequest): Promise<SIGetOfferingResponse> {
+    return this.callTool<SIGetOfferingResponse>('si_get_offering', params);
+  }
+
+  /**
+   * Official AdCP si_initiate_session tool schema
+   */
+  async siInitiateSession(params: MutatingRequestInput<SIInitiateSessionRequest>): Promise<SIInitiateSessionResponse> {
+    return this.callTool<SIInitiateSessionResponse>('si_initiate_session', params);
+  }
+
+  /**
+   * Official AdCP si_send_message tool schema
+   */
+  async siSendMessage(params: MutatingRequestInput<SISendMessageRequest>): Promise<SISendMessageResponse> {
+    return this.callTool<SISendMessageResponse>('si_send_message', params);
+  }
+
+  /**
+   * Official AdCP si_terminate_session tool schema
+   */
+  async siTerminateSession(params: SITerminateSessionRequest): Promise<SITerminateSessionResponse> {
+    return this.callTool<SITerminateSessionResponse>('si_terminate_session', params);
+  }
+
+  /**
+   * Official AdCP get_adcp_capabilities tool schema
+   */
+  async getAdcpCapabilities(params: GetAdCPCapabilitiesRequest): Promise<GetAdCPCapabilitiesResponse> {
+    return this.callTool<GetAdCPCapabilitiesResponse>('get_adcp_capabilities', params);
+  }
+
+  /**
+   * Official AdCP get_task_status tool schema
+   */
+  async getTaskStatus(params: GetTaskStatusRequest): Promise<GetTaskStatusResponse> {
+    return this.callTool<GetTaskStatusResponse>('get_task_status', params);
+  }
+
+  /**
+   * Official AdCP list_tasks tool schema
+   */
+  async listTasks(params: ListTasksRequest): Promise<ListTasksResponse> {
+    return this.callTool<ListTasksResponse>('list_tasks', params);
+  }
+
+  /**
+   * Official AdCP sync_agent_notification_configs tool schema
+   */
+  async syncAgentNotificationConfigs(params: MutatingRequestInput<SyncAgentNotificationConfigsRequest>): Promise<SyncAgentNotificationConfigsResponse> {
+    return this.callTool<SyncAgentNotificationConfigsResponse>('sync_agent_notification_configs', params);
+  }
+
+  /**
+   * Official AdCP sync_principal tool schema
+   */
+  async syncPrincipal(params: MutatingRequestInput<SyncPrincipalRequest>): Promise<SyncPrincipalResponse> {
+    return this.callTool<SyncPrincipalResponse>('sync_principal', params);
+  }
+
+  /**
+   * Official AdCP get_principal tool schema
+   */
+  async getPrincipal(params: GetPrincipalRequest): Promise<GetPrincipalResponse> {
+    return this.callTool<GetPrincipalResponse>('get_principal', params);
+  }
+
+  /**
+   * Official AdCP list_account_changes tool schema
+   */
+  async listAccountChanges(params: ListAccountChangesRequest): Promise<ListAccountChangesResponse> {
+    return this.callTool<ListAccountChangesResponse>('list_account_changes', params);
+  }
+
+  /**
+   * Official AdCP list_accounts tool schema
+   */
+  async listAccounts(params: ListAccountsRequest): Promise<ListAccountsResponse> {
+    return this.callTool<ListAccountsResponse>('list_accounts', params);
+  }
+
+  /**
+   * Official AdCP sync_accounts tool schema
+   */
+  async syncAccounts(params: MutatingRequestInput<SyncAccountsRequest>): Promise<SyncAccountsResponse> {
+    return this.callTool<SyncAccountsResponse>('sync_accounts', params);
+  }
+
+  /**
+   * Official AdCP sync_governance tool schema
+   */
+  async syncGovernance(params: MutatingRequestInput<SyncGovernanceRequest>): Promise<SyncGovernanceResponse> {
+    return this.callTool<SyncGovernanceResponse>('sync_governance', params);
+  }
+
+  /**
+   * Official AdCP report_usage tool schema
+   */
+  async reportUsage(params: MutatingRequestInput<ReportUsageRequest>): Promise<ReportUsageResponse> {
+    return this.callTool<ReportUsageResponse>('report_usage', params);
+  }
+
+  /**
+   * Official AdCP get_account_financials tool schema
+   */
+  async getAccountFinancials(params: GetAccountFinancialsRequest): Promise<GetAccountFinancialsResponse> {
+    return this.callTool<GetAccountFinancialsResponse>('get_account_financials', params);
+  }
+
+  /**
+   * Official AdCP comply_test_controller tool schema
+   */
+  async complyTestController(params: ComplyTestControllerRequest): Promise<ComplyTestControllerResponse> {
+    return this.callTool<ComplyTestControllerResponse>('comply_test_controller', params);
+  }
+
+}
+
+/**
+ * Multi-agent operations with full type safety
+ */
+export class AgentCollection {
+  constructor(
+    private configs: AgentConfig[],
+    private client: any // Will be AdCPClient
+  ) {}
+
+  private async callToolOnAll<T>(toolName: string, params: any): Promise<T[]> {
+    const agents = this.configs.map(config => new Agent(config, this.client));
+    const promises = agents.map(agent => (agent as any).callTool(toolName, params));
+    return Promise.all(promises);
+  }
+
+  /**
+   * Official AdCP get_products tool schema (across multiple agents)
+   */
+  async getProducts(params: GetProductsRequest): Promise<GetProductsResponse[]> {
+    return this.callToolOnAll<GetProductsResponse>('get_products', params);
+  }
+
+  /**
+   * Official AdCP list_products tool schema (across multiple agents)
+   */
+  async listProducts(params: ListProductsRequest): Promise<ListProductsResponse[]> {
+    return this.callToolOnAll<ListProductsResponse>('list_products', params);
+  }
+
+  /**
+   * Official AdCP list_proposals tool schema (across multiple agents)
+   */
+  async listProposals(params: ListProposalsRequest): Promise<ListProposalsResponse[]> {
+    return this.callToolOnAll<ListProposalsResponse>('list_proposals', params);
+  }
+
+  /**
+   * Official AdCP list_collections tool schema (across multiple agents)
+   */
+  async listCollections(params: ListCollectionsRequest): Promise<ListCollectionsResponse[]> {
+    return this.callToolOnAll<ListCollectionsResponse>('list_collections', params);
+  }
+
+  /**
+   * Official AdCP request_proposals tool schema (across multiple agents)
+   */
+  async requestProposals(params: MutatingRequestInput<RequestProposalsRequest>): Promise<RequestProposalsResponse[]> {
+    return this.callToolOnAll<RequestProposalsResponse>('request_proposals', params);
+  }
+
+  /**
+   * Official AdCP refine_proposals tool schema (across multiple agents)
+   */
+  async refineProposals(params: MutatingRequestInput<RefineProposalsRequest>): Promise<RefineProposalsResponse[]> {
+    return this.callToolOnAll<RefineProposalsResponse>('refine_proposals', params);
+  }
+
+  /**
+   * Official AdCP decline_proposals tool schema (across multiple agents)
+   */
+  async declineProposals(params: MutatingRequestInput<DeclineProposalsRequest>): Promise<DeclineProposalsResponse[]> {
+    return this.callToolOnAll<DeclineProposalsResponse>('decline_proposals', params);
+  }
+
+  /**
+   * Official AdCP buy_products tool schema (across multiple agents)
+   */
+  async buyProducts(params: MutatingRequestInput<BuyProductsRequest>): Promise<BuyProductsResponse[]> {
+    return this.callToolOnAll<BuyProductsResponse>('buy_products', params);
+  }
+
+  /**
+   * Official AdCP accept_proposal tool schema (across multiple agents)
+   */
+  async acceptProposal(params: MutatingRequestInput<AcceptProposalRequest>): Promise<AcceptProposalResponse[]> {
+    return this.callToolOnAll<AcceptProposalResponse>('accept_proposal', params);
+  }
+
+  /**
+   * Official AdCP control_media_buy tool schema (across multiple agents)
+   */
+  async controlMediaBuy(params: MutatingRequestInput<ControlMediaBuyRequest>): Promise<ControlMediaBuyResponse[]> {
+    return this.callToolOnAll<ControlMediaBuyResponse>('control_media_buy', params);
+  }
+
+  /**
+   * Official AdCP list_creative_formats tool schema (across multiple agents)
+   */
+  async listCreativeFormats(params: ListCreativeFormatsRequest): Promise<ListCreativeFormatsResponse[]> {
+    return this.callToolOnAll<ListCreativeFormatsResponse>('list_creative_formats', params);
+  }
+
+  /**
+   * Official AdCP get_media_buys tool schema (across multiple agents)
+   */
+  async getMediaBuys(params: GetMediaBuysRequest): Promise<GetMediaBuysResponse[]> {
+    return this.callToolOnAll<GetMediaBuysResponse>('get_media_buys', params);
+  }
+
+  /**
+   * Official AdCP get_media_buy_delivery tool schema (across multiple agents)
+   */
+  async getMediaBuyDelivery(params: GetMediaBuyDeliveryRequest): Promise<GetMediaBuyDeliveryResponse[]> {
+    return this.callToolOnAll<GetMediaBuyDeliveryResponse>('get_media_buy_delivery', params);
+  }
+
+  /**
+   * Official AdCP get_reporting_status tool schema (across multiple agents)
+   */
+  async getReportingStatus(params: GetReportingStatusRequest): Promise<GetReportingStatusResponse[]> {
+    return this.callToolOnAll<GetReportingStatusResponse>('get_reporting_status', params);
+  }
+
+  /**
+   * Official AdCP sync_reporting_status tool schema (across multiple agents)
+   */
+  async syncReportingStatus(params: MutatingRequestInput<SyncReportingStatusRequest>): Promise<SyncReportingStatusResponse[]> {
+    return this.callToolOnAll<SyncReportingStatusResponse>('sync_reporting_status', params);
+  }
+
+  /**
+   * Official AdCP sync_reporting_receipts tool schema (across multiple agents)
+   */
+  async syncReportingReceipts(params: MutatingRequestInput<SyncReportingReceiptsRequest>): Promise<SyncReportingReceiptsResponse[]> {
+    return this.callToolOnAll<SyncReportingReceiptsResponse>('sync_reporting_receipts', params);
+  }
+
+  /**
+   * Official AdCP provide_performance_feedback tool schema (across multiple agents)
+   */
+  async providePerformanceFeedback(params: MutatingRequestInput<ProvidePerformanceFeedbackRequest>): Promise<ProvidePerformanceFeedbackResponse[]> {
+    return this.callToolOnAll<ProvidePerformanceFeedbackResponse>('provide_performance_feedback', params);
+  }
+
+  /**
+   * Official AdCP sync_event_sources tool schema (across multiple agents)
+   */
+  async syncEventSources(params: MutatingRequestInput<SyncEventSourcesRequest>): Promise<SyncEventSourcesResponse[]> {
+    return this.callToolOnAll<SyncEventSourcesResponse>('sync_event_sources', params);
+  }
+
+  /**
+   * Official AdCP log_event tool schema (across multiple agents)
+   */
+  async logEvent(params: MutatingRequestInput<LogEventRequest>): Promise<LogEventResponse[]> {
+    return this.callToolOnAll<LogEventResponse>('log_event', params);
+  }
+
+  /**
+   * Official AdCP sync_audiences tool schema (across multiple agents)
+   */
+  async syncAudiences(params: MutatingRequestInput<SyncAudiencesRequest>): Promise<SyncAudiencesResponse[]> {
+    return this.callToolOnAll<SyncAudiencesResponse>('sync_audiences', params);
+  }
+
+  /**
+   * Official AdCP sync_catalogs tool schema (across multiple agents)
+   */
+  async syncCatalogs(params: MutatingRequestInput<SyncCatalogsRequest>): Promise<SyncCatalogsResponse[]> {
+    return this.callToolOnAll<SyncCatalogsResponse>('sync_catalogs', params);
+  }
+
+  /**
+   * Official AdCP build_creative tool schema (across multiple agents)
+   */
+  async buildCreative(params: MutatingRequestInput<BuildCreativeRequest>): Promise<BuildCreativeResponse[]> {
+    return this.callToolOnAll<BuildCreativeResponse>('build_creative', params);
+  }
+
+  /**
+   * Official AdCP preview_creative tool schema (across multiple agents)
+   */
+  async previewCreative(params: PreviewCreativeRequest): Promise<PreviewCreativeResponse[]> {
+    return this.callToolOnAll<PreviewCreativeResponse>('preview_creative', params);
+  }
+
+  /**
+   * Official AdCP list_transformers tool schema (across multiple agents)
+   */
+  async listTransformers(params: ListTransformersRequest): Promise<ListTransformersResponse[]> {
+    return this.callToolOnAll<ListTransformersResponse>('list_transformers', params);
+  }
+
+  /**
+   * Official AdCP get_creative_delivery tool schema (across multiple agents)
+   */
+  async getCreativeDelivery(params: GetCreativeDeliveryRequest): Promise<GetCreativeDeliveryResponse[]> {
+    return this.callToolOnAll<GetCreativeDeliveryResponse>('get_creative_delivery', params);
+  }
+
+  /**
+   * Official AdCP list_creatives tool schema (across multiple agents)
+   */
+  async listCreatives(params: ListCreativesRequest): Promise<ListCreativesResponse[]> {
+    return this.callToolOnAll<ListCreativesResponse>('list_creatives', params);
+  }
+
+  /**
+   * Official AdCP sync_creatives tool schema (across multiple agents)
+   */
+  async syncCreatives(params: MutatingRequestInput<SyncCreativesRequest>): Promise<SyncCreativesResponse[]> {
+    return this.callToolOnAll<SyncCreativesResponse>('sync_creatives', params);
+  }
+
+  /**
+   * Official AdCP validate_input tool schema (across multiple agents)
+   */
+  async validateInput(params: ValidateInputRequest): Promise<ValidateInputResponse[]> {
+    return this.callToolOnAll<ValidateInputResponse>('validate_input', params);
+  }
+
+  /**
+   * Official AdCP get_signals tool schema (across multiple agents)
+   */
+  async getSignals(params: GetSignalsRequest): Promise<GetSignalsResponse[]> {
+    return this.callToolOnAll<GetSignalsResponse>('get_signals', params);
+  }
+
+  /**
+   * Official AdCP activate_signal tool schema (across multiple agents)
+   */
+  async activateSignal(params: MutatingRequestInput<ActivateSignalRequest>): Promise<ActivateSignalResponse[]> {
+    return this.callToolOnAll<ActivateSignalResponse>('activate_signal', params);
+  }
+
+  /**
+   * Official AdCP get_property_list tool schema (across multiple agents)
+   */
+  async getPropertyList(params: GetPropertyListRequest): Promise<GetPropertyListResponse[]> {
+    return this.callToolOnAll<GetPropertyListResponse>('get_property_list', params);
+  }
+
+  /**
+   * Official AdCP list_property_lists tool schema (across multiple agents)
+   */
+  async listPropertyLists(params: ListPropertyListsRequest): Promise<ListPropertyListsResponse[]> {
+    return this.callToolOnAll<ListPropertyListsResponse>('list_property_lists', params);
+  }
+
+  /**
+   * Official AdCP create_collection_list tool schema (across multiple agents)
+   */
+  async createCollectionList(params: MutatingRequestInput<CreateCollectionListRequest>): Promise<CreateCollectionListResponse[]> {
+    return this.callToolOnAll<CreateCollectionListResponse>('create_collection_list', params);
+  }
+
+  /**
+   * Official AdCP update_collection_list tool schema (across multiple agents)
+   */
+  async updateCollectionList(params: MutatingRequestInput<UpdateCollectionListRequest>): Promise<UpdateCollectionListResponse[]> {
+    return this.callToolOnAll<UpdateCollectionListResponse>('update_collection_list', params);
+  }
+
+  /**
+   * Official AdCP get_collection_list tool schema (across multiple agents)
+   */
+  async getCollectionList(params: GetCollectionListRequest): Promise<GetCollectionListResponse[]> {
+    return this.callToolOnAll<GetCollectionListResponse>('get_collection_list', params);
+  }
+
+  /**
+   * Official AdCP list_collection_lists tool schema (across multiple agents)
+   */
+  async listCollectionLists(params: ListCollectionListsRequest): Promise<ListCollectionListsResponse[]> {
+    return this.callToolOnAll<ListCollectionListsResponse>('list_collection_lists', params);
+  }
+
+  /**
+   * Official AdCP delete_collection_list tool schema (across multiple agents)
+   */
+  async deleteCollectionList(params: MutatingRequestInput<DeleteCollectionListRequest>): Promise<DeleteCollectionListResponse[]> {
+    return this.callToolOnAll<DeleteCollectionListResponse>('delete_collection_list', params);
+  }
+
+  /**
+   * Official AdCP list_content_standards tool schema (across multiple agents)
+   */
+  async listContentStandards(params: ListContentStandardsRequest): Promise<ListContentStandardsResponse[]> {
+    return this.callToolOnAll<ListContentStandardsResponse>('list_content_standards', params);
+  }
+
+  /**
+   * Official AdCP get_content_standards tool schema (across multiple agents)
+   */
+  async getContentStandards(params: GetContentStandardsRequest): Promise<GetContentStandardsResponse[]> {
+    return this.callToolOnAll<GetContentStandardsResponse>('get_content_standards', params);
+  }
+
+  /**
+   * Official AdCP calibrate_content tool schema (across multiple agents)
+   */
+  async calibrateContent(params: MutatingRequestInput<CalibrateContentRequest>): Promise<CalibrateContentResponse[]> {
+    return this.callToolOnAll<CalibrateContentResponse>('calibrate_content', params);
+  }
+
+  /**
+   * Official AdCP validate_content_delivery tool schema (across multiple agents)
+   */
+  async validateContentDelivery(params: ValidateContentDeliveryRequest): Promise<ValidateContentDeliveryResponse[]> {
+    return this.callToolOnAll<ValidateContentDeliveryResponse>('validate_content_delivery', params);
+  }
+
+  /**
+   * Official AdCP get_media_buy_artifacts tool schema (across multiple agents)
+   */
+  async getMediaBuyArtifacts(params: GetMediaBuyArtifactsRequest): Promise<GetMediaBuyArtifactsResponse[]> {
+    return this.callToolOnAll<GetMediaBuyArtifactsResponse>('get_media_buy_artifacts', params);
+  }
+
+  /**
+   * Official AdCP get_creative_features tool schema (across multiple agents)
+   */
+  async getCreativeFeatures(params: GetCreativeFeaturesRequest): Promise<GetCreativeFeaturesResponse[]> {
+    return this.callToolOnAll<GetCreativeFeaturesResponse>('get_creative_features', params);
+  }
+
+  /**
+   * Official AdCP sync_plans tool schema (across multiple agents)
+   */
+  async syncPlans(params: MutatingRequestInput<SyncPlansRequest>): Promise<SyncPlansResponse[]> {
+    return this.callToolOnAll<SyncPlansResponse>('sync_plans', params);
+  }
+
+  /**
+   * Official AdCP report_plan_outcome tool schema (across multiple agents)
+   */
+  async reportPlanOutcome(params: MutatingRequestInput<ReportPlanOutcomeRequest>): Promise<ReportPlanOutcomeResponse[]> {
+    return this.callToolOnAll<ReportPlanOutcomeResponse>('report_plan_outcome', params);
+  }
+
+  /**
+   * Official AdCP report_plan_adjustment tool schema (across multiple agents)
+   */
+  async reportPlanAdjustment(params: MutatingRequestInput<ReportPlanAdjustmentRequest>): Promise<ReportPlanAdjustmentResponse[]> {
+    return this.callToolOnAll<ReportPlanAdjustmentResponse>('report_plan_adjustment', params);
+  }
+
+  /**
+   * Official AdCP get_plan_audit_logs tool schema (across multiple agents)
+   */
+  async getPlanAuditLogs(params: GetPlanAuditLogsRequest): Promise<GetPlanAuditLogsResponse[]> {
+    return this.callToolOnAll<GetPlanAuditLogsResponse>('get_plan_audit_logs', params);
+  }
+
+  /**
+   * Official AdCP check_governance tool schema (across multiple agents)
+   */
+  async checkGovernance(params: CheckGovernanceRequest): Promise<CheckGovernanceResponse[]> {
+    return this.callToolOnAll<CheckGovernanceResponse>('check_governance', params);
+  }
+
+  /**
+   * Official AdCP si_get_offering tool schema (across multiple agents)
+   */
+  async siGetOffering(params: SIGetOfferingRequest): Promise<SIGetOfferingResponse[]> {
+    return this.callToolOnAll<SIGetOfferingResponse>('si_get_offering', params);
+  }
+
+  /**
+   * Official AdCP si_send_message tool schema (across multiple agents)
+   */
+  async siSendMessage(params: MutatingRequestInput<SISendMessageRequest>): Promise<SISendMessageResponse[]> {
+    return this.callToolOnAll<SISendMessageResponse>('si_send_message', params);
+  }
+
+  /**
+   * Official AdCP get_adcp_capabilities tool schema (across multiple agents)
+   */
+  async getAdcpCapabilities(params: GetAdCPCapabilitiesRequest): Promise<GetAdCPCapabilitiesResponse[]> {
+    return this.callToolOnAll<GetAdCPCapabilitiesResponse>('get_adcp_capabilities', params);
+  }
+
+  /**
+   * Official AdCP get_task_status tool schema (across multiple agents)
+   */
+  async getTaskStatus(params: GetTaskStatusRequest): Promise<GetTaskStatusResponse[]> {
+    return this.callToolOnAll<GetTaskStatusResponse>('get_task_status', params);
+  }
+
+  /**
+   * Official AdCP list_tasks tool schema (across multiple agents)
+   */
+  async listTasks(params: ListTasksRequest): Promise<ListTasksResponse[]> {
+    return this.callToolOnAll<ListTasksResponse>('list_tasks', params);
+  }
+
+  /**
+   * Official AdCP sync_agent_notification_configs tool schema (across multiple agents)
+   */
+  async syncAgentNotificationConfigs(params: MutatingRequestInput<SyncAgentNotificationConfigsRequest>): Promise<SyncAgentNotificationConfigsResponse[]> {
+    return this.callToolOnAll<SyncAgentNotificationConfigsResponse>('sync_agent_notification_configs', params);
+  }
+
+  /**
+   * Official AdCP sync_principal tool schema (across multiple agents)
+   */
+  async syncPrincipal(params: MutatingRequestInput<SyncPrincipalRequest>): Promise<SyncPrincipalResponse[]> {
+    return this.callToolOnAll<SyncPrincipalResponse>('sync_principal', params);
+  }
+
+  /**
+   * Official AdCP get_principal tool schema (across multiple agents)
+   */
+  async getPrincipal(params: GetPrincipalRequest): Promise<GetPrincipalResponse[]> {
+    return this.callToolOnAll<GetPrincipalResponse>('get_principal', params);
+  }
+
+  /**
+   * Official AdCP list_account_changes tool schema (across multiple agents)
+   */
+  async listAccountChanges(params: ListAccountChangesRequest): Promise<ListAccountChangesResponse[]> {
+    return this.callToolOnAll<ListAccountChangesResponse>('list_account_changes', params);
+  }
+
+  /**
+   * Official AdCP list_accounts tool schema (across multiple agents)
+   */
+  async listAccounts(params: ListAccountsRequest): Promise<ListAccountsResponse[]> {
+    return this.callToolOnAll<ListAccountsResponse>('list_accounts', params);
+  }
+
+  /**
+   * Official AdCP sync_accounts tool schema (across multiple agents)
+   */
+  async syncAccounts(params: MutatingRequestInput<SyncAccountsRequest>): Promise<SyncAccountsResponse[]> {
+    return this.callToolOnAll<SyncAccountsResponse>('sync_accounts', params);
+  }
+
+  /**
+   * Official AdCP sync_governance tool schema (across multiple agents)
+   */
+  async syncGovernance(params: MutatingRequestInput<SyncGovernanceRequest>): Promise<SyncGovernanceResponse[]> {
+    return this.callToolOnAll<SyncGovernanceResponse>('sync_governance', params);
+  }
+
+  /**
+   * Official AdCP report_usage tool schema (across multiple agents)
+   */
+  async reportUsage(params: MutatingRequestInput<ReportUsageRequest>): Promise<ReportUsageResponse[]> {
+    return this.callToolOnAll<ReportUsageResponse>('report_usage', params);
+  }
+
+  /**
+   * Official AdCP get_account_financials tool schema (across multiple agents)
+   */
+  async getAccountFinancials(params: GetAccountFinancialsRequest): Promise<GetAccountFinancialsResponse[]> {
+    return this.callToolOnAll<GetAccountFinancialsResponse>('get_account_financials', params);
+  }
+
+  /**
+   * Official AdCP comply_test_controller tool schema (across multiple agents)
+   */
+  async complyTestController(params: ComplyTestControllerRequest): Promise<ComplyTestControllerResponse[]> {
+    return this.callToolOnAll<ComplyTestControllerResponse>('comply_test_controller', params);
+  }
+
+}

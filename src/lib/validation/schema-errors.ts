@@ -1,0 +1,164 @@
+/**
+ * Convert schema validation failures into the AdCP L3 `VALIDATION_ERROR`
+ * envelope and the `ValidationError` thrown type.
+ */
+
+import { ValidationError } from '../errors';
+import { formatDiscriminator, type ValidationIssue } from './schema-validator';
+import { jsonPointerToJsonPathLite } from '../utils/pointer-utils';
+import { boundValidationIssues, validationDiagnosticsTruncated } from './diagnostic-limits';
+
+/**
+ * Build the `(schema: …; discriminator: …)` suffix for a single issue's
+ * prose message. Suppresses `schema:` when the issue's `schemaId` matches
+ * `rootSchemaId` (it would just restate the tool the adopter already
+ * knows), and `discriminator:` when no const-discriminator was resolved.
+ * Returns an empty string when both halves drop out so callers can compose
+ * conditionally.
+ */
+function buildIssueProseSuffix(issue: ValidationIssue, rootSchemaId: string | undefined): string {
+  const parts: string[] = [];
+  if (issue.schemaId && issue.schemaId !== rootSchemaId) parts.push(`schema: ${issue.schemaId}`);
+  const discriminator = formatDiscriminator(issue.discriminator);
+  if (discriminator) parts.push(`discriminator: ${discriminator}`);
+  if (issue.hint) parts.push(`hint: ${issue.hint}`);
+  return parts.length > 0 ? ` (${parts.join('; ')})` : '';
+}
+
+export interface ValidationErrorDetails {
+  /** Tool that was being validated. */
+  tool: string;
+  /** Which side of the exchange — request (outgoing) or response (incoming). */
+  side: 'request' | 'response';
+  /** Bounded failures, each with a JSON Pointer to the bad field. */
+  issues: ValidationIssue[];
+  issues_truncated?: boolean;
+}
+
+/**
+ * Build a `ValidationError` thrown by strict-mode client hooks. Keeps the
+ * existing constructor signature (`field, value, constraint`) but threads
+ * the full issue list through `details` so callers can inspect every
+ * pointer, not just the first.
+ */
+export function buildValidationError(
+  tool: string,
+  side: 'request' | 'response',
+  issues: ValidationIssue[]
+): ValidationError {
+  issues = boundValidationIssues(issues);
+  const first = issues[0];
+  const field = first?.pointer ?? '/';
+  const constraint = first
+    ? `${first.keyword}: ${first.message}${buildIssueProseSuffix(first, undefined)}`
+    : 'schema validation failed';
+  const err = new ValidationError(field, undefined, `${tool} ${side}: ${constraint}`);
+  err.details = {
+    tool,
+    side,
+    issues,
+    ...(validationDiagnosticsTruncated(issues) && { issues_truncated: true }),
+  } satisfies ValidationErrorDetails;
+  return err;
+}
+
+/**
+ * Shape of `adcp_error.details` inside a server-side `VALIDATION_ERROR`
+ * envelope. The issue list is ALSO promoted to the top level
+ * (`adcp_error.issues`) so operators see JSON Pointers on the first
+ * render; `details.issues` is kept as a spec-convention mirror for
+ * buyers that index into `details`. `schemaPath` is optional per-issue
+ * — the builder drops it by default in production so `oneOf` branch
+ * selection doesn't leak to buyers.
+ */
+export interface AdcpValidationErrorDetails {
+  tool: string;
+  side: 'request' | 'response';
+  issues: Array<Omit<ValidationIssue, 'schemaPath'> & { schemaPath?: string }>;
+  issues_truncated?: boolean;
+}
+
+/**
+ * Serialize issues for the server-side `adcpError('VALIDATION_ERROR', ...)` call.
+ *
+ * Issues appear at BOTH `adcp_error.issues` (top level, so operators
+ * and debuggers see them on first render) AND `adcp_error.details.issues`
+ * (the spec-convention location, so buyers that already index into
+ * `details` continue to work). Future buyers should prefer
+ * `adcp_error.issues`; the `details.issues` mirror is maintained for
+ * compatibility across the AdCP ecosystem until a spec decision settles
+ * where issues should canonically live.
+ *
+ * `exposeSchemaPath` controls whether each issue's AJV `schemaPath`
+ * (e.g. `#/oneOf/2/properties/status/enum`) crosses the wire. When
+ * false, schemaPath is stripped from the emitted `issues` (both
+ * copies) — buyers still get `pointer`, `message`, and `keyword`,
+ * which is enough to fix their payload, but the internal branch
+ * shape of the seller's handler isn't leaked. Defaults to the same
+ * policy as `exposeErrorDetails`: on in dev/test, off in production.
+ */
+export function buildAdcpValidationErrorPayload(
+  tool: string,
+  side: 'request' | 'response',
+  issues: ValidationIssue[],
+  options: { exposeSchemaPath?: boolean; rootSchemaId?: string } = {}
+): {
+  message: string;
+  field?: string;
+  issues: Array<Omit<ValidationIssue, 'schemaPath'> & { schemaPath?: string }>;
+  details: Record<string, unknown>;
+} {
+  issues = boundValidationIssues(issues);
+  const first = issues[0];
+  let message: string;
+  if (first != null) {
+    // Prose suffix mirrors `formatIssueLine` so adopters reading
+    // `adcp_error.message` directly see the rejecting schema $id and
+    // (when known) the union discriminator the payload was inferred to be
+    // targeting (issue #1283). `rootSchemaId` (passed by callers that
+    // know the validator's root, e.g. the server middleware threading
+    // through from `validateRequest`/`validateResponse`) suppresses the
+    // `schema:` half when the issue landed on the response root — typical
+    // for AdCP's bundled tree, where most issues do, and where the schema
+    // suffix would just restate the tool name.
+    message = `${tool} ${side} failed schema validation at ${first.pointer}: ${first.message}${buildIssueProseSuffix(first, options.rootSchemaId)}`;
+  } else {
+    message = `${tool} ${side} failed schema validation`;
+  }
+  // `exposeSchemaPath` gates `schemaPath` only. Not `variants`.
+  // Different sensitivity classes justify different defaults:
+  //   - `schemaPath` (e.g. `#/properties/account/oneOf/2`) encodes which
+  //     branch of the validator rejected first — an implementation
+  //     detail that can fingerprint the seller's handler ordering.
+  //   - `variants[]` summarizes the PUBLIC spec's union shape (each
+  //     variant's required / properties keys). The bundled AdCP
+  //     schemas are already npm-shipped with `@adcp/sdk` and
+  //     published at adcontextprotocol.org — a motivated buyer has
+  //     them offline anyway. Gating would only hurt naive LLM clients
+  //     in production, which is exactly the audience `variants[]` was
+  //     built for (#919).
+  // If a future AdCP version ever admits per-seller schema extensions
+  // into the validator (today's validator only loads canonical spec
+  // from `schemas/cache/<version>/`), revisit this — at that point
+  // `variants[]` could start to reflect seller-internal shapes and the
+  // gating argument would apply.
+  const emittedIssues = options.exposeSchemaPath ? issues : issues.map(({ schemaPath: _schemaPath, ...rest }) => rest);
+  const payload: {
+    message: string;
+    field?: string;
+    issues: Array<Omit<ValidationIssue, 'schemaPath'> & { schemaPath?: string }>;
+    details: Record<string, unknown>;
+  } = {
+    message,
+    issues: emittedIssues,
+    details: {
+      tool,
+      side,
+      issues: emittedIssues,
+      ...(validationDiagnosticsTruncated(issues) && { issues_truncated: true }),
+    } satisfies AdcpValidationErrorDetails as unknown as Record<string, unknown>,
+  };
+  const field = first && jsonPointerToJsonPathLite(first.pointer);
+  if (field !== undefined) payload.field = field;
+  return payload;
+}

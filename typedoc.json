@@ -1,0 +1,74 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/lib/index.ts"],
+  "out": "docs/api",
+  "name": "@adcp/sdk API Reference",
+  "navigationLinks": {
+    "Documentation": "https://docs.adcontextprotocol.org",
+    "GitHub": "https://github.com/adcontextprotocol/adcp-client",
+    "npm": "https://www.npmjs.com/package/@adcp/sdk"
+  },
+  "includeVersion": true,
+  "categorizeByGroup": true,
+  "githubPages": true,
+  "readme": "docs/API_README.md",
+  "excludePrivate": true,
+  "excludeProtected": true,
+  "excludeInternal": true,
+  "disableSources": false,
+  "searchInComments": true,
+  "hideGenerator": false,
+  "validation": {
+    "notExported": true,
+    "invalidLink": true,
+    "notDocumented": false
+  },
+  "blockTags": [
+    "@alpha",
+    "@beta",
+    "@deprecated",
+    "@example",
+    "@experimental",
+    "@hidden",
+    "@ignore",
+    "@internal",
+    "@param",
+    "@privateRemarks",
+    "@provenance",
+    "@public",
+    "@readonly",
+    "@remarks",
+    "@returns",
+    "@sealed",
+    "@see",
+    "@since",
+    "@throws",
+    "@virtual"
+  ],
+  "categoryOrder": [
+    "Client Classes",
+    "Agent Classes",
+    "Configuration",
+    "Request/Response Types",
+    "Core Types",
+    "Task & Conversation Types",
+    "Async & Event Types",
+    "Error Classes",
+    "Utilities",
+    "Discovery",
+    "*"
+  ],
+  "sort": ["source-order", "required-first"],
+  "visibilityFilters": {
+    "protected": false,
+    "private": false,
+    "inherited": true,
+    "external": false
+  },
+  "navigation": {
+    "includeCategories": true,
+    "includeGroups": true
+  },
+  "searchInComments": true,
+  "searchInDocuments": true
+}

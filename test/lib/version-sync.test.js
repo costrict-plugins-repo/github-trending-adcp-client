@@ -1,0 +1,53 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const { readFileSync } = require('node:fs');
+const path = require('node:path');
+
+const {
+  ADCP_VERSION,
+  COMPATIBLE_ADCP_VERSIONS,
+  LIBRARY_VERSION,
+  VERSION_INFO,
+  toReleasePrecisionVersion,
+} = require('../../dist/lib/version.js');
+
+test('exported SDK library version matches package.json', () => {
+  const pkg = JSON.parse(readFileSync(path.join(__dirname, '../../package.json'), 'utf8'));
+  assert.equal(LIBRARY_VERSION, pkg.version);
+  assert.equal(VERSION_INFO.library, pkg.version);
+});
+
+test('AdCP semver pins normalize to release-precision wire values', () => {
+  assert.equal(toReleasePrecisionVersion('3.1.0-beta.7'), '3.1-beta.7');
+  assert.equal(toReleasePrecisionVersion('3.2.0-beta.1'), '3.2-beta.1');
+  assert.equal(toReleasePrecisionVersion('3.1.0'), '3.1');
+  assert.equal(toReleasePrecisionVersion('3.1-beta.7'), '3.1-beta.7');
+});
+
+test('3.3 beta pin retains stable 3.2 aliases and advertises only its exact preview', () => {
+  assert.equal(ADCP_VERSION, '3.3.0-beta.0');
+  assert.equal(toReleasePrecisionVersion(ADCP_VERSION), '3.3-beta.0');
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.0.25'));
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.1.18'));
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.1.24'));
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.1.28'));
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.1.29'));
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.2.1'));
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.2.2'));
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.2.3'));
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.2.4'));
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.2.5'));
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.2.6'));
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.2.7'));
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.2'));
+  assert.ok(!COMPATIBLE_ADCP_VERSIONS.includes('3.2.0'));
+  assert.ok(!COMPATIBLE_ADCP_VERSIONS.includes('3.2.0-' + 'rc.7'));
+  assert.ok(!COMPATIBLE_ADCP_VERSIONS.includes('3.2-' + 'rc.7'));
+  assert.ok(!COMPATIBLE_ADCP_VERSIONS.includes('3.2-beta'));
+  assert.deepEqual(
+    COMPATIBLE_ADCP_VERSIONS.filter(version => /-(?:beta|rc)/.test(version)),
+    ['3.3.0-beta.0', '3.3-beta.0']
+  );
+  assert.ok(!COMPATIBLE_ADCP_VERSIONS.includes('3.3-beta'));
+  assert.ok(!COMPATIBLE_ADCP_VERSIONS.includes('3.3'));
+});

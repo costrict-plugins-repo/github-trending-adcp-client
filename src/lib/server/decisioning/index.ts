@@ -1,0 +1,571 @@
+/**
+ * DecisioningPlatform v1.0 — preview surface for the v6.0 architecture.
+ *
+ * Status: PREVIEW. Types only; not yet wired into the framework. Subject
+ * to change before 6.0 ships. Don't build production adapters against this
+ * yet — the framework still routes through the v5.x handler-style API.
+ *
+ * Design proposal: `.context/proposals/specialism-platform-interfaces-v3.md`
+ *
+ * @packageDocumentation
+ */
+
+// Adopter-facing structured-error primitive.
+//
+// `AdcpError` is the canonical throwable for structured rejection. Specialism
+// methods return plain `T` for success or `throw new AdcpError(...)` to project
+// to the wire `adcp_error` envelope.
+//
+// HITL is expressed in the type system via the dual-method shape on each
+// spec-HITL tool (`xxx` for sync, `xxxTask` for HITL). The framework owns
+// task lifecycle and dispatches the `*Task` method in the background.
+export { type AdcpStructuredError, type ErrorCode, AdcpError } from './async-outcome';
+export type {
+  ExternalTaskHandoffOptions,
+  ExternalTaskHandoffContext,
+  TaskHandoffOptions,
+  TaskHandoffProgress,
+  TaskHandoffContext,
+} from './async-outcome';
+export { withResponseSummary } from './response-summary';
+export type { ResponseWithSummary } from './response-summary';
+export type { ServerPayload } from '../../types/server-payload';
+
+// Typed `AdcpError` subclasses — adopter convenience for the highest-traffic
+// error codes. Each class encodes the canonical code/recovery/field shape.
+// LLM-generated platforms get autocomplete on the import; humans skim the
+// list to find the right class. See `errors-typed.ts`.
+export {
+  PackageNotFoundError,
+  MediaBuyNotFoundError,
+  ProductNotFoundError,
+  CreativeNotFoundError,
+  ProductUnavailableError,
+  CreativeRejectedError,
+  BudgetTooLowError,
+  BudgetExhaustedError,
+  IdempotencyConflictError,
+  InvalidRequestError,
+  InvalidStateError,
+  BackwardsTimeRangeError,
+  AuthMissingError,
+  AuthInvalidError,
+  AuthRequiredError,
+  PermissionDeniedError,
+  RateLimitedError,
+  ServiceUnavailableError,
+  UnsupportedFeatureError,
+  ComplianceUnsatisfiedError,
+  GovernanceDeniedError,
+  PolicyViolationError,
+} from './errors-typed';
+
+// Cursor pagination
+export type { CursorPage, CursorRequest } from './pagination';
+
+// Status-change event bus — adopter-facing primitive for spec-native
+// lifecycle channels (media_buy / creative / audience / signal / proposal /
+// plan / rights_grant / delivery_report). Module-level so adopters can
+// publish from webhook handlers, crons, in-process workers without holding
+// a server reference.
+export {
+  publishStatusChange,
+  setStatusChangeBus,
+  getStatusChangeBus,
+  createInMemoryStatusChangeBus,
+  type StatusChange,
+  type StatusChangeBus,
+  type StatusChangeResourceType,
+  type StatusChangeListener,
+  type PublishStatusChangeOpts,
+} from './status-changes';
+
+// Capabilities (single source of truth for get_adcp_capabilities)
+export type {
+  DecisioningCapabilities,
+  ComplianceTestingCapabilities,
+  CreativeAgentRef,
+  TargetingCapabilities,
+  TargetingPostalAreaSupport,
+  ReportingCapabilities,
+} from './capabilities';
+export { normalizePostalAreaSupport, normalizeTargetingCapabilities } from './capabilities';
+
+// Account model
+export type {
+  Account,
+  AccountResolutionMode,
+  CanonicalAccountResolutionMode,
+  AuthPrincipal,
+  AccountStore,
+  AccountFilter,
+  ListAccountsPayload,
+  ListAccountChangesPayload,
+  SyncAccountsPayload,
+  SyncAccountsSuccessPayload,
+  SyncAccountsRow,
+  SyncAccountsResultRow,
+  SyncGovernancePayload,
+  SyncGovernanceSuccessPayload,
+  SyncGovernanceRow,
+  ReportUsagePayload,
+  GetAccountFinancialsPayload,
+  GetAccountFinancialsSuccessPayload,
+  ListAccountsHandlerResult,
+  ListAccountChangesHandlerResult,
+  SyncAccountsHandlerResult,
+  SyncGovernanceHandlerResult,
+  ReportUsageHandlerResult,
+  GetAccountFinancialsHandlerResult,
+  AdcpAccountStatus,
+  ResolveContext,
+  AccountUpsertContext,
+  AccountSyncDiagnostic,
+  AccountToolContext,
+  ResolvedAuthInfo,
+} from './account';
+
+export {
+  AccountNotFoundError,
+  isAccountResolutionMode,
+  normalizeAccountResolution,
+  refAccountId,
+  refHasNaturalKey,
+} from './account';
+
+// Multi-tenant AccountStore builder. Bakes in the two-path resolution
+// (operator-routed + auth-derived) and the per-entry tenant-isolation gate
+// that adopters historically had to hand-write — and silently fail to
+// hand-write — on `accounts.upsert` / `accounts.syncGovernance`.
+export { createTenantStore, narrowAccountRef } from './tenant-store';
+export type { TenantStoreConfig } from './tenant-store';
+
+// Buyer-agent identity surface — Phase 1 of #1269. Durable commercial
+// relationship records keyed off the request credential. Factory-pattern
+// registry (signing-only / bearer-only / mixed) encodes the implementer
+// posture at construction; framework calls `BuyerAgentRegistry.resolve`
+// once per request before `accounts.resolve`. Phase 1 ships the shape and
+// resolution; framework-level billing-capability enforcement and the
+// AdCP-3.1 error-code emission land in Phase 2 (#1292).
+export type {
+  BuyerAgent,
+  BuyerAgentBillingMode,
+  BuyerAgentStatus,
+  BuyerAgentRegistry as BuyerAgentRegistryProtocol,
+  BuyerAgentResolveInput,
+  BuyerAgentCacheOptions,
+  CachedBuyerAgentRegistry,
+  AdcpCredential,
+  ResolveBuyerAgentByAgentUrl,
+  ResolveBuyerAgentByCredential,
+} from './buyer-agent';
+export { BuyerAgentRegistry } from './buyer-agent';
+
+// Native status mapping
+export type { StatusMappers, AdcpMediaBuyStatus, AdcpCreativeStatus, AdcpPlanStatus } from './status-mappers';
+export { identityStatusMappers } from './status-mappers';
+
+// Request context (state + resolve)
+export type {
+  RequestContext,
+  WorkflowStateReader,
+  ResourceResolver,
+  WorkflowObjectType,
+  WorkflowStep,
+  Proposal,
+  GovernanceContextJWS,
+} from './context';
+
+// Top-level platform + compile-time capability enforcement
+export type { DecisioningPlatform, RequiredPlatformsFor, RequiredCapabilitiesFor } from './platform';
+export type { ReliableReportingPlatform } from './specialisms/reporting';
+
+// Method-level composition (closes #1314) — wrap individual platform methods
+// with `before` / `after` hooks for short-circuit + enrichment patterns.
+export { composeMethod } from './compose';
+export type { ComposeHooks, ComposeShortCircuit } from './compose';
+
+// `accounts.resolve` security presets (closes #1339) — canonical post-resolve
+// guards that standardize the multi-tenant authorization pattern instead of
+// every adopter rolling their own.
+export { requireAccountMatch, requireAdvertiserMatch, requireOrgScope } from './resolve-presets';
+export type { ResolveAccountHooks, ResolveGuardOptions } from './resolve-presets';
+
+// Specialism interfaces (v1.0)
+export type {
+  CreativeBuilderPlatform,
+  LegacyBuildCreativeReturn,
+  LegacyBuildCreativePayload,
+  LegacyBuildCreativeMultiPayload,
+  BuildCreativeVariantPayload,
+  PreviewCreativePayload,
+  LegacyPreviewCreativePayload,
+  LegacyListCreativeFormatsPayload,
+  // Deprecated aliases — kept for one-release source compat. Both
+  // resolve to CreativeBuilderPlatform; see specialisms/creative.ts.
+  CreativeTemplatePlatform,
+  CreativeGenerativePlatform,
+  RefinementMessage,
+  SyncCreativesRow,
+} from './specialisms/creative';
+
+export type {
+  CreativeAdServerPlatform,
+  LegacyBuildCreativeReturn as CreativeAdServerLegacyBuildCreativeReturn,
+  LegacyBuildCreativePayload as CreativeAdServerLegacyBuildCreativePayload,
+  LegacyBuildCreativeMultiPayload as CreativeAdServerLegacyBuildCreativeMultiPayload,
+  BuildCreativeVariantPayload as CreativeAdServerBuildCreativeVariantPayload,
+  PreviewCreativePayload as CreativeAdServerPreviewCreativePayload,
+  LegacyPreviewCreativePayload as CreativeAdServerLegacyPreviewCreativePayload,
+  LegacyListCreativeFormatsPayload as CreativeAdServerLegacyListCreativeFormatsPayload,
+  ListCreativesPayload as CreativeAdServerListCreativesPayload,
+  GetCreativeDeliveryPayload,
+  GetCreativeDeliveryPayload as CreativeAdServerGetCreativeDeliveryPayload,
+  LegacyGetCreativeDeliveryPayload as CreativeAdServerLegacyGetCreativeDeliveryPayload,
+} from './specialisms/creative-ad-server';
+
+export type {
+  CampaignGovernancePlatform,
+  CheckGovernancePayload,
+  SyncPlansPayload,
+  ReportPlanOutcomePayload,
+  GetPlanAuditLogsPayload,
+} from './specialisms/campaign-governance';
+
+export type {
+  ContentStandardsPlatform,
+  LegacyListContentStandardsPayload,
+  LegacyGetContentStandardsPayload,
+  LegacyCreateContentStandardsPayload,
+  LegacyUpdateContentStandardsPayload,
+  LegacyCalibrateContentPayload,
+  LegacyValidateContentDeliveryPayload,
+  LegacyGetMediaBuyArtifactsPayload,
+  LegacyGetCreativeFeaturesPayload,
+} from './specialisms/content-standards';
+
+export type {
+  PropertyListsPlatform,
+  CollectionListsPlatform,
+  CreatePropertyListPayload,
+  UpdatePropertyListPayload,
+  GetPropertyListPayload,
+  ListPropertyListsPayload,
+  DeletePropertyListPayload,
+  CreateCollectionListPayload,
+  UpdateCollectionListPayload,
+  GetCollectionListPayload,
+  ListCollectionListsPayload,
+  DeleteCollectionListPayload,
+} from './specialisms/lists';
+
+export type {
+  SalesPlatform,
+  SalesCorePlatform,
+  SalesIngestionPlatform,
+  MediaBuyLifecyclePlatform,
+  MediaBuyLifecycleCorePlatform,
+  MediaBuyLifecycleProposalPlatform,
+  GetProductsPayload,
+  GetProductsProjectionInput,
+  LegacyGetProductsPayload,
+  GetProductsHandlerResult,
+  CreateMediaBuyPayload,
+  LegacyCreateMediaBuyPayload,
+  CreateMediaBuyHandlerResult,
+  UpdateMediaBuyPayload,
+  LegacyUpdateMediaBuyPayload,
+  UpdateMediaBuyHandlerResult,
+  GetMediaBuyDeliveryPayload,
+  LegacyGetMediaBuyDeliveryPayload,
+  GetMediaBuysPayload,
+  LegacyGetMediaBuysPayload,
+  ProvidePerformanceFeedbackPayload,
+  LegacyListCreativeFormatsPayload as SalesLegacyListCreativeFormatsPayload,
+  ListCreativesPayload,
+  LegacyListCreativesPayload,
+  SyncCreativesPayload,
+  SyncCreativesHandlerResult,
+  SyncCatalogsPayload,
+  LogEventPayload,
+  SyncEventSourcesPayload,
+  ListProductsPayload,
+  RequestProposalsPayload,
+  RefineProposalsPayload,
+  DeclineProposalsPayload,
+  BuyProductsPayload,
+  AcceptProposalPayload,
+  ControlMediaBuyPayload,
+} from './specialisms/sales';
+
+export type {
+  AudiencePlatform,
+  Audience,
+  SyncAudiencesPayload,
+  SyncAudiencesRow,
+  SyncAudiencesHandlerResult,
+  AudienceStatus,
+} from './specialisms/audiences';
+
+export type {
+  SignalsPlatform,
+  GetSignalsPayload,
+  GetSignalsHandlerResult,
+  ActivateSignalPayload,
+} from './specialisms/signals';
+
+export type {
+  SponsoredIntelligencePlatform,
+  SIGetOfferingPayload,
+  SIInitiateSessionPayload,
+  SISendMessagePayload,
+  SITerminateSessionPayload,
+} from './specialisms/sponsored-intelligence';
+
+export type {
+  BrandRightsPlatform,
+  GetBrandIdentityPayload,
+  LegacyGetRightsPayload,
+  LegacyAcquireRightsAcquiredPayload,
+  LegacyAcquireRightsPendingApprovalPayload,
+  LegacyAcquireRightsRejectedPayload,
+  LegacyAcquireRightsPayload,
+  LegacyUpdateRightsPayload,
+  CreativeApprovedPayload,
+  CreativeRejectedPayload,
+  CreativePendingReviewPayload,
+  CreativeApprovalPayload,
+} from './specialisms/brand-rights';
+
+// Brand-rights wire types — re-exported from `@adcp/sdk/server/decisioning`
+// because brand-rights is the only specialism whose wire types live in
+// `core.generated` (not `tools.generated`), and the public `@adcp/sdk/types`
+// barrel doesn't surface them. Adopters typing their own helper functions
+// import these from here, NOT from the deep `core.generated` path.
+export type {
+  GetBrandIdentityRequest,
+  GetBrandIdentitySuccess,
+  GetRightsRequest as LegacyGetRightsRequest,
+  GetRightsSuccess as LegacyGetRightsSuccess,
+  AcquireRightsRequest as LegacyAcquireRightsRequest,
+  AcquireRightsAcquired as LegacyAcquireRightsAcquired,
+  AcquireRightsPendingApproval as LegacyAcquireRightsPendingApproval,
+  AcquireRightsRejected as LegacyAcquireRightsRejected,
+  AcquireRightsError as LegacyAcquireRightsError,
+  RightUse,
+  RightType,
+  RightsConstraint,
+  RightsTerms,
+  RightsPricingOption,
+  GenerationCredential,
+} from '../../types/core.generated';
+
+// Runtime (v6.0 alpha) — preview surface for adopters spiking against the
+// new shape. Subject to change before 6.0 GA.
+export {
+  createAdcpServerFromPlatform,
+  getHydratedLegacyFormatIds,
+  getAllAdcpMigrations,
+  type CreateAdcpServerFromPlatformOptions,
+  type AccountOf,
+  type LegacyDecisioningHandlerGroups,
+  type RequiredOptsFor,
+  type DecisioningAdcpServer,
+  type DecisioningObservabilityHooks,
+} from './runtime/from-platform';
+export { PlatformConfigError, validatePlatform } from './runtime/validate-platform';
+export {
+  completeScopedTask,
+  createInMemoryTaskRegistry,
+  failScopedTask,
+  rejectScopedTask,
+  updateScopedTaskProgress,
+  type ScopedTaskRef,
+  type TaskMutationOutcome,
+  type TaskRegistry,
+  type TaskRegistryMutationResult,
+  type TaskRegistryScope,
+  type TaskRecord,
+  type TaskStatus,
+} from './runtime/task-registry';
+export {
+  createPostgresTaskRegistry,
+  getDecisioningTaskRegistryBootstrap,
+  getDecisioningTaskRegistryMigration,
+  getDecisioningTaskRegistryScopeV1Upgrade,
+  getDecisioningTaskRegistryStatusWidenV61Migration,
+  type CreatePostgresTaskRegistryOptions,
+  type DecisioningTaskRegistryScopeV1Upgrade,
+  type DecisioningTaskRegistryScopeV1UpgradeOptions,
+  type DecisioningTaskRegistryStatusWidenV61MigrationOptions,
+  type PgQueryable,
+  type PgTransactionClient,
+  type PgTransactionalPool,
+} from './runtime/postgres-task-registry';
+export {
+  completeScopedPushTask,
+  createPostgresTaskSettlementCoordinator,
+  failScopedPushTask,
+  rejectScopedPushTask,
+  TaskPushSettlementConfigurationError,
+  type PostgresTaskSettlementCoordinator,
+  type PostgresTaskSettlementCoordinatorOptions,
+  type TaskPushDeliveryState,
+  type TaskPushSettlementConfig,
+  type TaskPushSettlementOutcome,
+} from './runtime/postgres-task-settlement';
+export {
+  canonicalizeTaskSettlementIntent,
+  createPostgresTaskSettlementIntentQueue,
+  getTaskSettlementIntentMigration,
+  TASK_SETTLEMENT_INTENT_IDEMPOTENCY_HORIZON_MS,
+  TaskSettlementIntentConflictError,
+  type CreatePostgresTaskSettlementIntentQueueOptions,
+  type DurableTaskSettlementRef,
+  type PostgresTaskSettlementIntentQueue,
+  type PruneTaskSettlementIntentAcknowledgementsOptions,
+  type RecoverTaskSettlementIntentsOptions,
+  type TaskSettlementIntent,
+  type TaskSettlementIntentCheckpoint,
+  type TaskSettlementIntentRecoveryContext,
+  type TaskSettlementIntentRecoveryErrorContext,
+  type TaskSettlementIntentRecoveryMetrics,
+  type TaskSettlementIntentWriteOptions,
+} from './runtime/postgres-task-settlement-intents';
+export {
+  applyTaskSettlementIntent,
+  type ApplyTaskSettlementIntentOptions,
+} from './runtime/apply-task-settlement-intent';
+
+// Multi-tenant deployment helper — wraps createAdcpServerFromPlatform with
+// per-tenant config, health states (healthy/unverified/disabled), and JWKS
+// validation. Composes with the existing serve() host-routing surface.
+export {
+  createTenantRegistry,
+  createDefaultJwksValidator,
+  createSelfSignedTenantKey,
+  createNoopJwksValidator,
+  type TenantRegistry,
+  type TenantConfig,
+  type TenantSigningKey,
+  type TenantStatus,
+  type TenantHealth,
+  type TenantRegistryOptions,
+  type JwksValidator,
+  type JwksValidationResult,
+} from './tenant-registry';
+
+// Manifest helpers — typed accessors for creative_manifest.assets values.
+// Save adopters from writing the same null-check + discriminator-check
+// boilerplate per call.
+export { getAsset, getAssetSlot, requireAsset } from './manifest-helpers';
+export type { CreativeAssetsContainer } from './manifest-helpers';
+
+// List helpers — wrap row arrays + pagination into the heavier wire shapes
+// (today: list_creatives, which carries query_summary alongside the rows).
+export {
+  buildListCreativesResponse,
+  buildListCreativesResponseLegacy,
+  type BuildListCreativesResponseOpts,
+  type BuildListCreativesResponseLegacyOpts,
+} from './list-helpers';
+
+// Start-time helper — normalize the wire `start_time` union into a Date,
+// with platform-aware ASAP lead-time injection.
+export { resolveStartTime, type ResolveStartTimeOptions } from './start-time';
+
+// Admin Express router for ops visibility into the TenantRegistry.
+// Mount on a separate port/path with operator auth.
+export {
+  createTenantAdminRouter,
+  createTenantAdminHandlers,
+  mountTenantAdmin,
+  type TenantAdminHandlers,
+  type RouterLike,
+} from './admin-router';
+
+// Adopter helpers — batchPoll, validationError, upstreamError, RequestShape.
+// All opt-in convenience; nothing in the framework calls these internally.
+export { batchPoll, validationError, upstreamError } from './helpers';
+export type { RequestShape } from './helpers';
+
+// Platform identity helpers — fix TypeScript's contextual-typing gap when
+// building a DecisioningPlatform (or sub-interface) as an object literal.
+// Without these, `createAdcpServerFromPlatform({ sales: { syncEventSources:
+// async (req, ctx) => {...} } })` gives `req: unknown` because the generic
+// `P extends DecisioningPlatform<any,any>` is inferred, not declared.
+// Wrapping the sub-object with e.g. `defineSalesPlatform<MyMeta>({...})`
+// forces the concrete type annotation TypeScript needs. The helpers are
+// pure identity functions — zero runtime cost.
+export {
+  definePlatform,
+  defineSalesPlatform,
+  defineSalesCorePlatform,
+  defineSalesIngestionPlatform,
+  defineAudiencePlatform,
+  defineSignalsPlatform,
+  defineSponsoredIntelligencePlatform,
+  defineCreativeBuilderPlatform,
+  defineCreativeAdServerPlatform,
+  defineCampaignGovernancePlatform,
+  defineContentStandardsPlatform,
+  definePropertyListsPlatform,
+  defineCollectionListsPlatform,
+  defineBrandRightsPlatform,
+  definePlatformWithCompliance,
+} from './platform-helpers';
+
+// ProposalManager — primitives for the two-platform composition (port of
+// adcp-client-python PRs #504 + #550). Splits proposal assembly from
+// media-buy execution; either side can be mock-backed independently.
+// Framework dispatch wiring lands in a follow-up release.
+export type {
+  ProposalManager,
+  ProposalGetProductsPayload,
+  LegacyProposalGetProductsPayload,
+  ProposalCapabilities,
+  ProposalSalesSpecialism,
+  Recipe,
+  CapabilityOverlap,
+  FinalizeProposalRequest,
+  FinalizeProposalSuccess,
+  ProposalState,
+  ProposalRecord,
+  ProposalStore,
+  InMemoryProposalStoreOptions,
+  ProposalPgQueryable,
+  PostgresProposalStoreOptions,
+  ProposalStoreMigrationOptions,
+  MockProposalManagerOptions,
+} from './proposal';
+export {
+  validateProposalCapabilities,
+  InMemoryProposalStore,
+  PostgresProposalStore,
+  createPostgresProposalStore,
+  getProposalStoreMigration,
+  MockProposalManager,
+  enforceProposalExpiry,
+  validateCapabilityOverlap,
+  validateOverlapSubsetOfWire,
+  detectFinalizeAction,
+  setProposalLifecycleLogger,
+  maybeInterceptFinalize,
+  maybePersistDraftAfterGetProducts,
+  maybeReserveProposalForCreateMediaBuy,
+  finalizeProposalConsumption,
+  releaseProposalReservation,
+  maybeHydrateRecipesForMediaBuyId,
+} from './proposal';
+export type { FinalizeActionRef, ProposalLifecycleLogger, FinalizeInterceptResult, ReservedProposal } from './proposal';
+
+// Canonical assembly helpers — emit Product / PricingOption / package shapes
+// from intent-shaped input. Raw named-format product assembly is available
+// only through the explicit buildProductLegacy compatibility helper.
+export { buildProduct, buildProductLegacy, buildPricingOption, buildPackage } from './assembly-helpers';
+export type {
+  BuildProductInput,
+  BuildProductLegacyInput,
+  BuildPricingOptionInput,
+  BuildPackageInput,
+} from './assembly-helpers';

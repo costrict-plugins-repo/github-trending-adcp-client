@@ -1,0 +1,97 @@
+#!/usr/bin/env tsx
+/**
+ * Idempotent guard for the schema cache. Tests load schemas from
+ * `schemas/cache/{current,3.2.7,3.1.29,3.0.25}/` (gitignored, populated by
+ * `npm run sync-schemas:all`). Fresh clones, branch switches that wipe
+ * the cache, and `git clean -fdx` all leave a dev environment that
+ * silently fails test suites with "AdCP schema data for version '3.2'
+ * not found" — CI passes because it runs `sync-schemas:all` explicitly,
+ * but local dev hits a paper cut.
+ *
+ * This script runs as a `pretest` hook. It checks whether both caches
+ * exist and whether the primary cache matches any tracked PR-bundle
+ * provenance, then syncs only stale or missing caches. The fast path is
+ * filesystem reads; the sync fetches a tarball and takes ~5s, but only after
+ * a cache wipe or provenance change.
+ *
+ * No CI-time cost: CI's explicit `sync-schemas:all` populates both
+ * caches before tests run, so this guard is a no-op there.
+ */
+import { existsSync, lstatSync, readFileSync, rmSync, symlinkSync } from 'fs';
+import path from 'path';
+import { spawnSync } from 'child_process';
+import { cacheMatchesCodegenProvenance } from './sync-schemas';
+
+const REPO_ROOT = path.join(__dirname, '..');
+const CACHE_ROOT = path.join(REPO_ROOT, 'schemas/cache');
+const COMPLIANCE_CACHE_ROOT = path.join(REPO_ROOT, 'compliance/cache');
+const MAINTAINED_SCHEMA_VERSIONS = ['3.0.25', '3.1.29', '3.2.7'];
+
+function currentAdcpVersion(): string {
+  return readFileSync(path.join(REPO_ROOT, 'ADCP_VERSION'), 'utf8').trim();
+}
+
+function hasCurrentV3Cache(): boolean {
+  const current = currentAdcpVersion();
+  return (
+    existsSync(path.join(CACHE_ROOT, current)) &&
+    cacheMatchesCodegenProvenance(
+      path.join(REPO_ROOT, 'schemas/codegen-provenance.json'),
+      path.join(CACHE_ROOT, current, '_provenance.json')
+    )
+  );
+}
+
+function hasCurrentComplianceCache(): boolean {
+  return existsSync(path.join(COMPLIANCE_CACHE_ROOT, currentAdcpVersion()));
+}
+
+function pointLatestAtCurrent(cacheRoot: string, current: string): void {
+  if (!existsSync(path.join(cacheRoot, current))) return;
+  const latest = path.join(cacheRoot, 'latest');
+  if (existsSync(latest) || lstatSync(latest, { throwIfNoEntry: false })?.isSymbolicLink()) {
+    rmSync(latest, { recursive: true, force: true });
+  }
+  symlinkSync(current, latest);
+}
+
+const currentV3Ok = hasCurrentV3Cache();
+const currentComplianceOk = hasCurrentComplianceCache();
+const maintained = MAINTAINED_SCHEMA_VERSIONS.map(version => ({
+  version,
+  schemas: existsSync(path.join(CACHE_ROOT, version)),
+  compliance: existsSync(path.join(COMPLIANCE_CACHE_ROOT, version)),
+}));
+
+const current = currentAdcpVersion();
+if (currentV3Ok && currentComplianceOk && maintained.every(bundle => bundle.schemas && bundle.compliance)) {
+  pointLatestAtCurrent(CACHE_ROOT, current);
+  pointLatestAtCurrent(COMPLIANCE_CACHE_ROOT, current);
+  process.exit(0);
+}
+
+// Only sync what's missing — each sync fetches a tarball, so resyncing
+// a populated cache is ~3s of needless network call.
+const scripts: string[] = [];
+if (!currentV3Ok || !currentComplianceOk) scripts.push('sync-schemas');
+for (const bundle of maintained) {
+  if (!bundle.schemas || !bundle.compliance) scripts.push(`sync-schemas -- ${bundle.version}`);
+}
+
+console.log(`[schemas:ensure] Missing or provenance-stale schema cache; running: ${scripts.join(', ')}`);
+
+for (const script of scripts) {
+  const [name, ...args] = script.split(' ');
+  const result = spawnSync('npm', ['run', name!, ...args], {
+    cwd: REPO_ROOT,
+    stdio: 'inherit',
+  });
+  if (result.status !== 0) process.exit(result.status ?? 1);
+}
+
+// Support-cache syncs update the `latest`
+// symlink as a side effect. If the current cache was already present and only
+// support caches were missing, restore `latest` to the ADCP_VERSION pin so
+// subsequent generators do not accidentally read an older bundle.
+pointLatestAtCurrent(CACHE_ROOT, current);
+pointLatestAtCurrent(COMPLIANCE_CACHE_ROOT, current);

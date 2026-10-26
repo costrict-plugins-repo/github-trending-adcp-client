@@ -1,0 +1,774 @@
+// Core conversation types for ADCP client library
+// These types support the conversation and clarification pattern
+
+import type { ProductPropertyPolicyDiagnostic, ProductPropertyPolicyMode } from '../media-buy/property-policy';
+import type { DelegatedOperatorAuthorizationContext } from '../signing/agent-resolver/resolve-agent';
+
+/**
+ * Represents a single message in a conversation with an agent
+ */
+export interface Message {
+  /** Unique identifier for this message */
+  id: string;
+  /** Role of the message sender */
+  role: 'user' | 'agent' | 'system';
+  /** Message content - can be structured or text */
+  content: any;
+  /** Timestamp when message was created */
+  timestamp: string;
+  /** Optional metadata about the message */
+  metadata?: {
+    /** Tool/task name if this message is tool-related */
+    toolName?: string;
+    /** Message type (request, response, clarification, etc.) */
+    type?: string;
+    /** Additional context data */
+    [key: string]: any;
+  };
+}
+
+/**
+ * Request for input from the agent - sent when clarification is needed
+ */
+export interface InputRequest {
+  /** Human-readable question or prompt */
+  question: string;
+  /** Specific field being requested (if applicable) */
+  field?: string;
+  /** Expected type of response */
+  expectedType?: 'string' | 'number' | 'boolean' | 'object' | 'array';
+  /** Suggested values or options */
+  suggestions?: any[];
+  /** Whether this input is required */
+  required?: boolean;
+  /** Validation rules for the input */
+  validation?: {
+    min?: number;
+    max?: number;
+    pattern?: string;
+    enum?: any[];
+  };
+  /** Additional context about why this input is needed */
+  context?: string;
+}
+
+/**
+ * Different types of responses an input handler can provide
+ */
+export type InputHandlerResponse =
+  | any // Direct answer
+  | Promise<any> // Async answer
+  | {
+      defer: true;
+      /**
+       * Opaque bearer capability. Durable clients require a CSPRNG-generated
+       * UUIDv4 or 43-256 character URL-safe value. Prefer
+       * `context.deferToHuman()`, which mints a UUIDv4.
+       */
+      token: string;
+    } // Defer to human
+  | { abort: true; reason?: string } // Abort task
+  | never; // For control flow (abort() helper)
+
+/**
+ * Function signature for input handlers
+ */
+export type InputHandler = (context: ConversationContext) => InputHandlerResponse;
+
+/**
+ * Complete conversation context provided to input handlers
+ */
+export interface ConversationContext {
+  /** Full conversation history for this task */
+  messages: Message[];
+  /** Current input request from the agent */
+  inputRequest: InputRequest;
+  /** Unique task identifier */
+  taskId: string;
+  /** Agent configuration */
+  agent: {
+    id: string;
+    name: string;
+    protocol: 'mcp' | 'a2a';
+  };
+  /** Current clarification attempt number (1-based) */
+  attempt: number;
+  /** Maximum allowed clarification attempts */
+  maxAttempts: number;
+
+  /** Helper method to defer task to human */
+  deferToHuman(): Promise<{ defer: true; token: string }>;
+
+  /** Helper method to abort the task */
+  abort(reason?: string): never;
+
+  /** Get conversation summary for context */
+  getSummary(): string;
+
+  /** Check if a field was previously discussed */
+  wasFieldDiscussed(field: string): boolean;
+
+  /** Get previous response for a field */
+  getPreviousResponse(field: string): any;
+}
+
+/**
+ * Status of a task execution
+ */
+export type TaskStatus =
+  | 'pending'
+  | 'running'
+  | 'working'
+  | 'needs_input'
+  | 'input-required'
+  | 'auth-required'
+  | 'completed'
+  | 'failed'
+  | 'rejected'
+  | 'canceled'
+  | 'deferred'
+  | 'aborted'
+  | 'submitted'
+  | 'governance-denied';
+
+/**
+ * Predicate used by scoped webhook URL templates to decide which operations
+ * receive protocol-level webhook URLs.
+ */
+export type WebhookToolPredicate = (toolName: string) => boolean;
+
+/**
+ * Webhook URL template with macro substitution. A bare string preserves the
+ * legacy behavior: every operation receives a generated webhook URL. The
+ * object form scopes webhook URL generation to a tool allowlist or predicate.
+ */
+export type WebhookUrlTemplate =
+  | string
+  | {
+      template: string;
+      tools?: string[] | WebhookToolPredicate;
+    };
+
+/**
+ * Options for task execution
+ */
+export interface TaskOptions {
+  /**
+   * Caller-supplied operation correlation id. Defaults to a generated UUID.
+   * Persist it with metadata.serverTaskId to resume tracking after a restart.
+   * Use a globally unique opaque id per dispatch (UUID recommended), including
+   * across tenants sharing persistence or webhook receivers. Reuse it for tracking,
+   * not resubmission; retry dispatches use a new id and the same idempotency_key.
+   * Accepts 1–255 letters, digits, underscores, periods, colons, or hyphens.
+   * Dot-only IDs and the delivery_route: prefix are reserved.
+   */
+  operationId?: string;
+  /**
+   * Skip inline completion status handlers for this call and its continuations.
+   * Defaults to false. Independently delivered webhook handlers are unaffected.
+   */
+  skipStatusHandlers?: boolean;
+  /**
+   * Absolute wall-clock deadline for the entire SDK task call (ms), including
+   * discovery and capability/version preflight. Unlike `workingTimeout`, this
+   * deadline never resets on progress and aborts in-flight protocol work.
+   */
+  timeout?: number;
+  /**
+   * Caller-owned cancellation signal for the read path and in-flight protocol
+   * call. Aborting this signal cancels discovery probes (`getAgentInfo`,
+   * `getCapabilities`, feature/version preflight) and the tool request where
+   * the underlying official protocol client supports it.
+   */
+  signal?: AbortSignal;
+  /**
+   * INTERNAL — compatibility-coordinator wire release for this operation.
+   * Request/response validation remains pinned to the owning client.
+   *
+   * @internal
+   */
+  wireAdcpVersion?: string;
+  /**
+   * INTERNAL — AdCP release negotiated with the seller for this operation.
+   * Responses are validated against this release before being converted up
+   * to the client's release. Set by `SingleAgentClient`; not an adopter knob.
+   *
+   * @internal
+   */
+  negotiatedAdcpVersion?: string;
+  /**
+   * INTERNAL — compatibility-coordinator version-envelope mode for this operation.
+   *
+   * @internal
+   */
+  versionEnvelope?: import('../protocols').VersionEnvelopeMode;
+  /** Maximum clarification rounds before failing */
+  maxClarifications?: number;
+  /**
+   * A2A `contextId` that binds this call to a server-side conversation.
+   * When set, the client sends it on the A2A Message envelope so the server
+   * can route to the existing session instead of starting a new one.
+   * Retained automatically across calls on the same `AgentClient`.
+   */
+  contextId?: string;
+  /**
+   * A2A `taskId` of a non-terminal task to resume (HITL / approval flows).
+   * When set, the client sends it on the A2A Message envelope so the server
+   * continues the same task rather than opening a new one.
+   */
+  taskId?: string;
+  /** Enable debug logging for this task */
+  debug?: boolean;
+  /** Suppress automatic webhook URL generation for this call. */
+  disableWebhook?: boolean;
+  /**
+   * Opt a direct mutating A2A call into operation-routed pause recovery.
+   *
+   * `ownerScope` must identify the authenticated buyer principal and account
+   * in the host's authorization model. It is hashed together with the trusted
+   * seller binding and must be supplied again during recovery.
+   *
+   * Requires a `DeferredTaskStorage` implementation with the operation-route
+   * methods. The SDK returns a distinct, host-only recovery capability in
+   * `result.deferred.recovery` when the seller first pauses.
+   */
+  durableContinuationRecovery?: {
+    ownerScope: string;
+  };
+  /**
+   * Trusted local authorization tuple for a delegated, cross-origin seller.
+   * The SDK snapshots this before dispatch and persists it with any generated
+   * webhook registration. It is never inferred from or sent in task arguments.
+   *
+   * When present, this whole object takes precedence over the client-wide
+   * `webhookVerification.resolverOptions.requiredOperator*` fallback.
+   */
+  delegatedOperatorAuthorization?: DelegatedOperatorAuthorizationContext;
+  /** Additional metadata to include */
+  metadata?: Record<string, any>;
+  /**
+   * INTERNAL — compliance-test-only escape hatch.
+   *
+   * Suppresses the client's automatic `idempotency_key` generation on
+   * mutating requests. The sole caller is the storyboard runner, which
+   * needs to exercise servers' missing-key validation. Auto-injection
+   * is the retry-safety contract for every real buyer — bypassing it
+   * in production breaks at-most-once semantics on network retries.
+   *
+   * @internal Do not set in production buyer code.
+   */
+  skipIdempotencyAutoInject?: boolean;
+  /**
+   * INTERNAL — compliance-test-only escape hatch.
+   *
+   * Suppresses the client's `account`-required validation on
+   * `create_media_buy` requests. The sole caller is the storyboard runner,
+   * which needs to exercise servers' missing-account validation without the
+   * SDK throwing client-side before the wire call.
+   *
+   * @internal Do not set in production buyer code.
+   */
+  skipAccountValidation?: boolean;
+  /**
+   * INTERNAL — compliance-test-only escape hatch.
+   *
+   * Skips outgoing request-schema validation so storyboard vectors marked
+   * `negative_path: schema_invalid` reach the seller. Those vectors exist to
+   * grade the seller's validation response; rejecting them in the buyer SDK
+   * would replace seller evidence with a locally synthesized result.
+   *
+   * This does not disable request normalization, idempotency injection, or
+   * response validation.
+   *
+   * @internal Do not set in production buyer code.
+   */
+  skipRequestValidation?: boolean;
+  /**
+   * INTERNAL — storyboard governance approval binds the exact downstream
+   * arguments. Keep that request unchanged by buyer compatibility shims and
+   * seller-schema field stripping after check_governance has approved it.
+   * Local request-schema and account-required checks are also bypassed so
+   * a seller can grade the approved wire payload, including invalid vectors.
+   * Principal identity and version safety checks still run.
+   * Canonical creative methods reject this option because their projections
+   * can reshape requests; the storyboard runner uses their raw counterparts.
+   *
+   * @internal Do not set in production buyer code.
+   */
+  preserveGovernedPayload?: boolean;
+  /**
+   * Transport-level safeguards for this call. Use to lift or tighten
+   * `maxResponseBytes` per call when an agent legitimately publishes large
+   * catalogs (e.g., `list_creative_formats` on a generative seller) — the
+   * default is 4 MiB.
+   *
+   * This object **replaces** the client constructor's `transport` rather than
+   * merging into it. A per-call object that sets only `requestTimeoutMs`
+   * drops the constructor's `maxResponseBytes` back to the default; repeat
+   * every field you still want.
+   */
+  transport?: import('../protocols').TransportOptions;
+}
+
+/**
+ * Internal task state for tracking execution
+ */
+export interface TaskState {
+  /** Unique task identifier */
+  taskId: string;
+  /** Seller work handle, distinct from the local operation id. */
+  serverTaskId?: string;
+  /** Task name (tool name) */
+  taskName: string;
+  /**
+   * Original parameters while the SDK is actively dispatching or resolving
+   * input. Redacted after a task becomes working, submitted, or terminal so
+   * lifecycle inspection does not retain request assets or credentials.
+   */
+  params?: any;
+  /** Current status */
+  status: TaskStatus;
+  /** Message history */
+  messages: Message[];
+  /** Current input request (if waiting for input) */
+  pendingInput?: InputRequest;
+  /** Start time */
+  startTime: number;
+  /** Current attempt number */
+  attempt: number;
+  /** Maximum attempts allowed */
+  maxAttempts: number;
+  /** Task options */
+  options: TaskOptions;
+  /** Agent configuration */
+  agent: {
+    id: string;
+    name: string;
+    protocol: 'mcp' | 'a2a';
+  };
+  /** Seller wire generation selected for this task. */
+  serverVersion?: 'v2' | 'v3';
+  /** True when seller-version detection used the SDK's compatibility heuristic. */
+  serverVersionSynthetic?: boolean;
+  /** @internal Explicit discovery served release retained for refinement response validation. */
+  refinementServedVersion?: string;
+  /**
+   * Idempotency key for this task, when the tool is mutating. Tracked on
+   * state so internal retries reuse the same key (the whole point of the
+   * envelope — a re-generated key defeats retry safety).
+   */
+  idempotencyKey?: string;
+}
+
+/**
+ * Task tracking information from tasks/get endpoint (PR #78)
+ */
+export interface TaskInfo {
+  /** Task ID */
+  taskId: string;
+  /** Local operation id when observed through an SDK continuation or lifecycle event. */
+  operationId?: string;
+  /** Seller work handle when known. Existing taskId semantics are preserved. */
+  serverTaskId?: string;
+  /** Current status */
+  status: string;
+  /** Task type/name */
+  taskType: string;
+  /** Creation timestamp */
+  createdAt: number;
+  /** Last update timestamp */
+  updatedAt: number;
+  /** Task result (if completed) */
+  result?: any;
+  /** Error message (if failed) */
+  error?: string;
+  /** Human-readable message from agent (alternative to error field) */
+  message?: string;
+  /** Webhook URL (if applicable) */
+  webhookUrl?: string;
+}
+
+/**
+ * Continuation for a paused task. The closure resumes the same seller task
+ * in the current process; application-issued deferrals may additionally be
+ * persisted through TaskExecutor deferred storage.
+ */
+export interface DeferredContinuation<T> {
+  /** SDK continuation token; this is not the seller's task ID. */
+  token: string;
+  /** Question that triggered the deferral */
+  question?: string;
+  /** Resume the same seller task with user input or after refreshing auth. */
+  resume: (input: any) => Promise<TaskResult<T>>;
+  /**
+   * Stable operation route and host-only recovery capability. Present only
+   * when the call opted into durable operation-routed recovery. Persist this
+   * once; never expose `recoveryKey` to the seller or a human approver.
+   */
+  recovery?: {
+    operationId: string;
+    recoveryKey: string;
+  };
+}
+
+/** Authenticated owner input for direct pause route recovery. */
+export interface DirectPauseRecoveryRequest {
+  operationId: string;
+  recoveryKey: string;
+  ownerScope: string;
+}
+
+/** Persisted seller work to observe without submitting a new task. */
+export interface TrackTaskRequest extends Pick<TaskOptions, 'operationId' | 'transport' | 'signal'> {
+  /** Seller's AdCP task_id (TaskResult.metadata.serverTaskId). */
+  taskId: string;
+  /** Original tool name, used to verify the seller's task identity. */
+  taskType: string;
+  /** Actual A2A transport Task.id, if known. Distinct from the AdCP taskId. */
+  a2aTaskId?: string;
+  /** Request cancellation of seller work on polling abort. Requires a2aTaskId; defaults to false. */
+  cancelOnAbort?: boolean;
+}
+
+/** Polling handle for persisted seller work. */
+export interface TrackedTask<T = unknown> extends SubmittedContinuation<T> {
+  /** Stable runner operation id. Save this when the SDK generates it. */
+  operationId: string;
+}
+
+/**
+ * Continuation for submitted server tasks (server needs time).
+ *
+ * Returned in `TaskResult.submitted` when the seller signals an AdCP
+ * `submitted` arm (long-running work that won't complete inside the
+ * transport call). The buyer either polls via {@link waitForCompletion}
+ * / {@link track} or waits for the seller's webhook callback at
+ * {@link webhookUrl}.
+ */
+export interface SubmittedContinuation<T> {
+  /**
+   * Server-assigned task handle — the value the seller emitted in
+   * `response.task_id` (AdCP submitted-arm wire field) or surfaced via
+   * the A2A response Task. This is the identifier the seller knows; it
+   * is what the SDK passes to subsequent `tasks/get` polling calls.
+   *
+   * NOT the same as the SDK's runner-side correlation id (`TaskState.taskId`,
+   * a local UUID generated at request time and used internally for
+   * `activeTasks` map indexing and the `{operation_id}` webhook URL macro).
+   * The runner-side id never reaches the seller.
+   *
+   * If the seller violated the spec and didn't include a task handle on
+   * the submitted-arm response, this falls back to the runner-side
+   * correlation id — pollers won't be able to locate the work, but
+   * callers at least get a non-undefined value to log.
+   */
+  taskId: string;
+  /** Webhook URL where server will notify completion */
+  webhookUrl?: string;
+  /** Get current task status. Pass `transport` to override the executor-constructor cap for this poll. */
+  track: (transport?: import('../protocols').TransportOptions) => Promise<TaskInfo>;
+  /**
+   * Wait for completion with polling. Transport cap is fixed at task-submission time; use `track` for per-poll override.
+   * Pass `signal` to cancel the polling loop early (e.g. `AbortSignal.timeout(ms)`); the loop exits cleanly on abort
+   * rather than continuing to issue `tasks/get` requests after the caller has moved on. (adcp-client#1612)
+   * On abort with an A2A seller, a `tasks/cancel` is also dispatched as a protocol courtesy (A2A 0.3.0 §7.4)
+   * — fire-and-forget; the buyer does not wait for acknowledgment and the outcome does not affect the returned `TaskResult`.
+   */
+  waitForCompletion: (pollInterval?: number, signal?: AbortSignal) => Promise<TaskResult<T>>;
+}
+
+/**
+ * A single validation failure from an AdCP VALIDATION_ERROR response.
+ *
+ * `pointer` uses RFC 6901 JSON Pointer format (e.g. `/packages/0/targeting`),
+ * which differs from the top-level `AdcpErrorInfo.field` that uses JSONPath-lite
+ * (`packages[0].targeting`). For LLM self-correction: read `keyword` first —
+ * `'required'` means add the missing field, `'enum'` means pick a valid value,
+ * `'type'` means fix the value type.
+ */
+export interface AdcpValidationIssue {
+  /** RFC 6901 JSON Pointer to the offending field (e.g. `/packages/0/targeting`). */
+  pointer: string;
+  /** Human-readable reason this field was rejected. */
+  message: string;
+  /** JSON Schema keyword that caused rejection (e.g. `'required'`, `'type'`, `'enum'`). */
+  keyword: string;
+  /**
+   * Path inside the schema that rejected the payload. Sellers SHOULD NOT emit on
+   * production endpoints — it leaks oneOf branch selection and is a fingerprinting
+   * oracle for adversarial callers. May appear in dev/sandbox mode.
+   */
+  schemaPath?: string;
+}
+
+/**
+ * Structured AdCP error information extracted from a failed task response.
+ * Present on `TaskResult.adcpError` when the agent returns a recognized error.
+ */
+export interface AdcpErrorInfo {
+  /** AdCP error code (e.g., 'RATE_LIMITED', 'PRODUCT_NOT_FOUND') */
+  code: string;
+  /** Human-readable error message. **Sellers:** do not embed tokens, account IDs, or internal paths — this field is forwarded to `ComplianceResult.failures[].adcp_error` and is grader-visible beyond the request lifetime. */
+  message: string;
+  /** Recovery classification: retry, fix the request, or give up */
+  recovery?: 'transient' | 'correctable' | 'terminal';
+  /** Field that caused the error */
+  field?: string;
+  /** Suggested fix from the agent. Untrusted — sanitize before rendering in HTML. */
+  suggestion?: string;
+  /** Seconds to wait before retrying (transient errors). See also `retryAfterMs`. */
+  retry_after?: number;
+  /** Milliseconds to wait before retrying — convenience conversion of `retry_after * 1000`. */
+  retryAfterMs?: number;
+  /** Additional error details. Untrusted agent-controlled content — sanitize before rendering. **Sellers:** do not embed tokens, account IDs, or internal paths — this field is forwarded to `ComplianceResult.failures[].adcp_error` and is grader-visible beyond the request lifetime. */
+  details?: Record<string, unknown>;
+  /**
+   * Structured validation failures. Present on `VALIDATION_ERROR` when the seller
+   * identifies multiple offending fields. Each item's `pointer` is RFC 6901 format
+   * (e.g. `/packages/0/targeting`) — differs from the top-level `field` which uses
+   * JSONPath-lite. For LLM self-correction, read `keyword` first: `'required'` → add
+   * the field, `'enum'` → pick a valid value, `'type'` → fix the value type.
+   */
+  issues?: AdcpValidationIssue[];
+  /**
+   * Buyer-actionable classification of the failure. Present when the enclosing
+   * `code`/`message` is too coarse or carries producer-internal context that
+   * must not cross the buyer trust boundary. `code` reuses the standard error
+   * vocabulary; `message` is buyer-safe by spec — no vendor identifiers,
+   * ad-server type names, internal object names, internal IDs, or stack traces
+   * — so it may be rendered directly to a buyer UI. When present, the
+   * enclosing `recovery` classifies the buyer-actionable reason. See
+   * `core/error.json`'s `buyer_reason` field for the normative contract.
+   */
+  buyer_reason?: { code: string; message: string };
+  /** True when the SDK inferred this error from unstructured text (L1 compliance) */
+  synthetic?: boolean;
+}
+
+/**
+ * Task execution metadata, shared across all result variants.
+ */
+export interface TaskResultMetadata {
+  /**
+   * Client-minted correlation id for this specific request attempt. Used
+   * for internal tracking (activeTasks map, webhook URL macros, debug
+   * logs) and retried/refired across attempts — NOT the A2A task id the
+   * server is tracking. For the server-side id, use {@link serverTaskId}.
+   */
+  taskId: string;
+  /**
+   * Server-returned A2A `contextId` / AdCP `context_id` that binds this
+   * response to a server-side conversation. Present when the server surfaced
+   * one; `undefined` otherwise (e.g., fire-and-forget MCP completions).
+   *
+   * Buyers who persist conversation across process restarts should save this
+   * and seed it into `AgentClient.resetContext(id)` on rehydration.
+   */
+  contextId?: string;
+  /**
+   * AdCP work handle used by `tasks/get`. For A2A responses this may come
+   * from artifact `task_id` / `adcp_task_id` and is distinct from the A2A
+   * transport Task.id. Distinct from {@link taskId}, which is client-minted.
+   */
+  serverTaskId?: string;
+  /**
+   * Live A2A transport Task.id eligible for Message.taskId threading.
+   * Never populated from an AdCP artifact work handle.
+   */
+  a2aTaskId?: string;
+  taskName: string;
+  agent: { id: string; name: string; protocol: 'mcp' | 'a2a' };
+  /** Total execution time in milliseconds */
+  responseTimeMs: number;
+  /** ISO timestamp of completion */
+  timestamp: string;
+  /** Number of clarification rounds */
+  clarificationRounds: number;
+  /** Final status */
+  status: TaskStatus;
+  /** Input request details (for input-required status) */
+  inputRequest?: InputRequest;
+  /**
+   * Idempotency key used for this request, when the tool is mutating. Auto-
+   * generated by the SDK when the caller doesn't supply one. Surfaced for
+   * logging, correlation, and BYOK flows where the caller persists the key
+   * alongside the resource it creates.
+   */
+  idempotency_key?: string;
+  /**
+   * True when the response was a cached replay from the seller's idempotency
+   * store (i.e., an earlier request with the same key already succeeded).
+   *
+   * Callers with side effects on response — "campaign created!" notifications,
+   * LLM memory writes, downstream tool calls — MUST check this flag before
+   * acting, or retries will re-fire side effects.
+   */
+  replayed?: boolean;
+  /**
+   * Seller-served, release-precision AdCP version echoed on the response
+   * envelope. Present when the seller emits `adcp_version` (3.1+). Compare
+   * with the request's wire-normalized version, not a raw full-semver
+   * configuration pin, when detecting same-major downshift.
+   */
+  adcpVersion?: string;
+  /**
+   * Older AdCP release negotiated with the seller for this call. Present only
+   * when it differs from the client's release: the request was converted down
+   * to it and the response converted back up (see `debug_logs` for every
+   * field the conversion removed or moved).
+   */
+  negotiatedAdcpVersion?: string;
+  /** Seller wire generation used for this request after capability discovery. */
+  serverVersion?: 'v2' | 'v3';
+  /** True when {@link serverVersion} came from the SDK's synthetic fallback. */
+  serverVersionSynthetic?: boolean;
+  /**
+   * Buyer-side product property policy enforcement summary for `get_products`.
+   * Present when the client evaluates a configured product property policy or
+   * enforces the request's `property_list` reference against the response.
+   */
+  productPropertyPolicy?: {
+    mode: ProductPropertyPolicyMode;
+    ok: boolean;
+    accepted_count: number;
+    rejected_count: number;
+    flagged_count: number;
+    message?: string;
+    request_property_list?: {
+      list_id: string;
+      agent_url: string;
+      identifier_count?: number;
+      cache_valid_until?: string;
+      resolution_error?: string;
+    };
+    diagnostics: ProductPropertyPolicyDiagnostic[];
+  };
+  /**
+   * Buyer-side pricing-options enforcement summary for `get_products`. Present
+   * when the client drops one or more products that arrived without a usable
+   * `pricing_options[]` array (a required, non-empty field in AdCP 3.1).
+   */
+  productPricingPolicy?: {
+    ok: boolean;
+    accepted_count: number;
+    rejected_count: number;
+    rejected_products: Array<{ index: number; product_id?: string }>;
+  };
+}
+
+/** Fields shared across all TaskResult variants. */
+interface TaskResultBase<T = any> {
+  metadata: TaskResultMetadata;
+  /** Governance check result (present when governance is configured) */
+  governance?: import('./GovernanceTypes').GovernanceCheckResult;
+  /** Governance outcome (present after successful execution with governance) */
+  governanceOutcome?: import('./GovernanceTypes').GovernanceOutcome;
+  /** Error message when governance outcome reporting failed */
+  governanceOutcomeError?: string;
+  /** Full conversation history */
+  conversation?: Message[];
+  /** Debug logs (if debug enabled) */
+  debug_logs?: any[];
+  /**
+   * Exhaustive pattern match on the result's `status`. Prefer this method
+   * form — it autocompletes alongside the other `TaskResult` accessors.
+   *
+   * The free function {@link import('./match').match} is also exported for
+   * compositional use (e.g., point-free style or when the result type is
+   * not yet narrowed).
+   *
+   * Attached non-enumerably by the client when the result is returned
+   * from `executeTask`. Results constructed by hand (e.g., in test
+   * fixtures or custom middleware) will not have this method — use the
+   * free function, or call `attachMatch(result)` first.
+   */
+  match?: <R>(handlers: import('./match').MatchHandlers<T, R> | import('./match').PartialMatchHandlers<T, R>) => R;
+}
+
+/** Successful completion — `data` is always present. */
+export interface TaskResultCompleted<T> extends TaskResultBase<T> {
+  success: true;
+  status: 'completed';
+  data: T;
+  error?: undefined;
+  adcpError?: undefined;
+  errorInstance?: undefined;
+  correlationId?: undefined;
+  deferred?: undefined;
+  submitted?: undefined;
+}
+
+/** Task is still progressing (working, submitted, input-required, deferred). */
+export interface TaskResultIntermediate<T> extends TaskResultBase<T> {
+  success: true;
+  /**
+   * Task is progressing but not yet final. `'auth-required'` and
+   * `'input-required'` are paused states — the buyer must satisfy the paused
+   * condition (refresh auth / supply input). A live A2A pause handled during
+   * the initial exchange can expose a `deferred.resume()` closure bound to
+   * the seller's task/context. Pauses observed later through `tasks/get`,
+   * completed A2A artifacts, and MCP responses omit that closure: none has a
+   * standard safe post-return continuation. Polling alone won't advance a
+   * paused task.
+   */
+  status: 'working' | 'submitted' | 'input-required' | 'auth-required' | 'deferred';
+  data?: T;
+  error?: undefined;
+  adcpError?: undefined;
+  errorInstance?: undefined;
+  correlationId?: undefined;
+  /** Present only for a safely resumable live A2A pause or explicit client deferral. */
+  deferred?: DeferredContinuation<T>;
+  /** Submitted continuation (server needs time for processing) */
+  submitted?: SubmittedContinuation<T>;
+}
+
+/** Task failed — `error` is always present. */
+export interface TaskResultFailure<T> extends TaskResultBase<T> {
+  success: false;
+  status: 'failed' | 'governance-denied';
+  /** Response payload with structured error details (adcp_error, context, ext) */
+  data?: T;
+  /** Human-readable error message */
+  error: string;
+  /** Structured AdCP error (code, recovery, suggestion, retryAfterMs) */
+  adcpError?: AdcpErrorInfo;
+  /**
+   * Typed `ADCPError` subclass instance when the seller's error code has a
+   * dedicated class — currently `IdempotencyConflictError` and
+   * `IdempotencyExpiredError`. Lets callers write
+   * `if (result.errorInstance instanceof IdempotencyConflictError)` instead of
+   * switching on `adcpError.code` strings. Absent for codes without a typed
+   * mapping. Also preserves validated NeedsAuthorizationError metadata from
+   * MCP authentication challenges for interactive authorization flows.
+   */
+  errorInstance?: import('../errors').ADCPError;
+  /** Correlation ID from the error response context, for tracing across agents */
+  correlationId?: string;
+  deferred?: undefined;
+  submitted?: undefined;
+}
+
+/**
+ * Result of a task execution.
+ *
+ * Discriminated union on `success`:
+ * - `success: true` + `status: 'completed'` → `data` is `T`
+ * - `success: true` + intermediate status → task is progressing, `data` may be partial
+ * - `success: false` → `error` is always a string, `adcpError` has structured details
+ */
+export type TaskResult<T = any> = TaskResultCompleted<T> | TaskResultIntermediate<T> | TaskResultFailure<T>;
+
+/**
+ * Configuration for conversation management
+ */
+export interface ConversationConfig {
+  /** Maximum messages to keep in history */
+  maxHistorySize?: number;
+  /** Whether to persist conversations */
+  persistConversations?: boolean;
+  /** Resettable idle/progress timeout for protocol work in 'working' status. */
+  workingTimeout?: number;
+  /** Default max clarifications */
+  defaultMaxClarifications?: number;
+}

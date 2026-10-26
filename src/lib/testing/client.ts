@@ -1,0 +1,1491 @@
+import { hasUnsignedCapabilityBootstrap } from '../signing/protocol-methods';
+/**
+ * Test client utilities for AdCP Agent E2E Testing
+ */
+
+import { ADCPMultiAgentClient } from '../core/ADCPMultiAgentClient';
+import { getBestUnionErrors, type SchemaViolation } from '../utils/union-errors';
+import { getFormatAssets, usesDeprecatedAssetsField } from '../utils/format-assets';
+import { brandManifestToBrandReference } from '../types/compat';
+import type { Product } from '../types/core.generated';
+import type {
+  GetProductsResponse,
+  ListCreativeFormatsResponse,
+  Format,
+  GetSignalsResponse,
+  AccountReference,
+  BrandReference,
+} from '../types/tools.generated';
+import type { TestOptions, TestStepResult, AgentProfile, TaskResult, Logger } from './types';
+import { prepareResponseForSchemaValidation, TOOL_RESPONSE_SCHEMAS } from '../utils/response-schemas';
+import { injectLegacyEnvelopeStatus } from '../utils/envelope-status-compat';
+import { parseCapabilitiesResponse, looksLikeV3Capabilities } from '../utils/capabilities';
+import { classifyProbeUrl } from '../utils/probe-policy';
+import { SsrfRefusedError } from '../net/ssrf-fetch';
+import { ADCP_VERSION, toReleasePrecisionVersion } from '../version';
+import type { VersionEnvelopeMode } from '../protocols';
+import { normalizeTransportOptions } from '../protocols';
+import type { AgentRequestSigningConfig } from '../types/adcp';
+import { createHmac, hkdfSync, randomBytes } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { validateIncomingResponse } from '../validation/client-hooks';
+import { withServedValidationVersion } from '../validation/schema-loader';
+import { extractVersionUnsupportedDetails } from '../utils/error-extraction';
+import { buildAgentSigningContext } from '../signing/client';
+import type { VerifierCapability } from '../signing/types';
+import { bindAgentStorage } from '../auth/oauth/storage-registry';
+import type { OAuthConfigStorage } from '../auth/oauth/types';
+import { isTerminalAdcpError, ResponseSchemaValidationError } from '../utils/response-unwrapper';
+import { redactDiscoveryEvidence } from './discovery-evidence';
+import { redactCredentialPatterns } from '../utils/redact-credential-patterns';
+import {
+  NeedsAuthorizationError,
+  hasValidatedMcpAuthorizationRequirements,
+} from '../auth/oauth/authorization-required';
+import type { DebugLogEntry } from '../types/adcp';
+
+const TEST_CLIENT_VERSION_OPTIONS = Symbol('adcp.testClientVersionOptions');
+const TEST_CLIENT_SCOPE_SALT = randomBytes(32);
+
+interface TestClientScope {
+  clients: TestClient[];
+  profiles: WeakMap<
+    TestClient,
+    Map<
+      string,
+      {
+        promise: ReturnType<typeof discoverAgentProfile>;
+        signal?: AbortSignal;
+        failed?: boolean;
+        pass?: object;
+      }
+    >
+  >;
+  profileScopes: WeakMap<TestClient, WeakMap<AgentProfile, { scopeKey: string; schemaAdcpVersion?: string }>>;
+  authRejectedProfiles: WeakSet<AgentProfile>;
+  active: boolean;
+}
+
+const testClientScope = new AsyncLocalStorage<TestClientScope>();
+
+/** @internal Own client and discovery reuse for exactly one comply() invocation. */
+export async function withTestClientScope<T>(fn: () => Promise<T>): Promise<T> {
+  const scope: TestClientScope = {
+    clients: [],
+    profiles: new WeakMap(),
+    profileScopes: new WeakMap(),
+    authRejectedProfiles: new WeakSet(),
+    active: true,
+  };
+  return testClientScope.run(scope, async () => {
+    try {
+      return await fn();
+    } finally {
+      scope.active = false;
+      scope.clients.length = 0;
+    }
+  });
+}
+
+/** @internal Storyboards join the enclosing comply() connection lifetime. */
+export function hasTestClientScope(): boolean {
+  return testClientScope.getStore()?.active === true;
+}
+
+interface TestClientVersionOptions {
+  agentUrl: string;
+  protocol: 'mcp' | 'a2a';
+  adcpVersion: string;
+  wireAdcpVersion?: string;
+  versionEnvelope: VersionEnvelopeMode;
+  strictResponseSchemaValidation: boolean;
+  authMode?: string;
+  requestScopeMode?: string;
+  requestSigningMode?: string;
+  oauthStorage?: OAuthConfigStorage;
+  fetchFn?: typeof fetch;
+  allowPrivateIp?: boolean;
+  maxResponseBytes?: number;
+  requestTimeoutMs?: number;
+  legacyCompatEnabled?: boolean;
+  connectionPartition?: string;
+  connectionReuse?: 'process';
+}
+
+/**
+ * Extract a principal identifier from TestOptions auth.
+ * For bearer auth this is the token; for basic auth this is the username;
+ * for oauth this is the access_token.
+ */
+export function resolveAuthPrincipal(options: TestOptions): string | undefined {
+  if (!options.auth) return undefined;
+  switch (options.auth.type) {
+    case 'basic':
+      return options.auth.username;
+    case 'oauth':
+      return options.auth.tokens.access_token;
+    case 'bearer':
+      return options.auth.token;
+  }
+}
+
+const DEFAULT_BRAND_REF: BrandReference = { domain: 'test.example' };
+
+/**
+ * Resolve the brand reference to use for a test call.
+ * Prefers the new brand field, falls back to converting a legacy brand_manifest.
+ *
+ * The runner enforces a storyboard-run-scoped brand invariant on every
+ * outgoing request, so a missing brand yields a stable default that stays
+ * consistent across create/get/update/delete within a single run.
+ */
+export function resolveBrand(options: TestOptions): BrandReference {
+  return (
+    options.brand ||
+    (options.brand_manifest && brandManifestToBrandReference(options.brand_manifest)) ||
+    DEFAULT_BRAND_REF
+  );
+}
+
+/**
+ * Resolve the account reference to use for a test call.
+ * Uses the brand+operator form of AccountReference.
+ */
+export function resolveAccount(options: TestOptions): AccountReference {
+  const brand = resolveBrand(options);
+  return {
+    brand,
+    operator: brand.domain,
+    sandbox: options.sandbox,
+  };
+}
+
+// Default console-based logger
+const defaultLogger: Logger = {
+  info: (ctx, msg) => console.log(`[INFO] ${msg}`, JSON.stringify(ctx, null, 2)),
+  error: (ctx, msg) => console.error(`[ERROR] ${msg}`, JSON.stringify(ctx, null, 2)),
+  warn: (ctx, msg) => console.warn(`[WARN] ${msg}`, JSON.stringify(ctx, null, 2)),
+  debug: () => {}, // Silent by default
+};
+
+// Allow custom logger injection
+let logger: Logger = defaultLogger;
+
+/**
+ * Set a custom logger for the agent tester
+ */
+export function setAgentTesterLogger(customLogger: Logger): void {
+  logger = customLogger;
+}
+
+/**
+ * Get current logger instance
+ */
+export function getLogger(): Logger {
+  return logger;
+}
+
+/**
+ * Create a test client for an agent
+ */
+export function createTestClient(agentUrl: string, protocol: 'mcp' | 'a2a' = 'mcp', options: TestOptions = {}) {
+  options = withTestKitAuthDefaults(options);
+  const transport = normalizeTransportOptions(options.transport);
+
+  // adcp-client#1618: SSRF policy gate at client construction. Once the
+  // TestClient exists, every transport call inherits its agent URI; guarding
+  // once here covers the entire client lifecycle, including downstream
+  // `discoverAgentProfile` fetches (`getAgentInfo`, `getAdcpCapabilities`).
+  // Throws synchronously — `SsrfRefusedError` is the documented refusal
+  // type and operators see a clear hostname-only message (no resolved IP
+  // in the user-visible text; see `probe-policy.ts` rationale).
+  const policy = classifyProbeUrl(agentUrl);
+  if (!policy.allowed) {
+    // `classifyProbeUrl` already returned `{ allowed: true }` for any URL
+    // that fails `new URL(...)`, so reaching the !allowed branch implies the
+    // URL parses cleanly. Reparse only to extract the bare hostname for the
+    // SsrfRefusedError meta.
+    const hostname = new URL(agentUrl).hostname.replace(/^\[|\]$/g, '');
+    throw new SsrfRefusedError(
+      policy.code === 'always_blocked' ? 'always_blocked_address' : 'private_address',
+      policy.reason,
+      { url: agentUrl, hostname }
+    );
+  }
+
+  const headers: Record<string, string> = {};
+
+  if (options.test_session_id) {
+    headers['X-Test-Session-ID'] = options.test_session_id;
+  }
+
+  // Build agent config with auth_token if provided
+  const agentConfig: {
+    id: string;
+    name: string;
+    agent_uri: string;
+    protocol: 'mcp' | 'a2a';
+    auth_token?: string;
+    oauth_tokens?: import('../types/adcp').AgentOAuthTokens;
+    oauth_client?: import('../types/adcp').AgentOAuthClient;
+    oauth_client_credentials?: import('../types/adcp').AgentOAuthClientCredentials;
+    request_signing?: AgentRequestSigningConfig;
+    headers?: Record<string, string>;
+  } = {
+    id: 'test',
+    name: 'E2E Test Client',
+    agent_uri: agentUrl,
+    protocol,
+  };
+
+  // Caller-supplied tenant/routing headers carry through to every transport
+  // request. Merged before auth so auth still wins on Authorization conflicts
+  // (the basic-auth branch below intentionally overwrites this).
+  if (options.headers && Object.keys(options.headers).length > 0) {
+    agentConfig.headers = normalizeTestClientHeaders(options.headers);
+    // Preserve the SDK's object-merge precedence for standard headers while
+    // combining case variants of tenant and routing headers before transport.
+    for (const name of ['Authorization', 'User-Agent', 'Content-Type']) {
+      const lower = name.toLowerCase();
+      const value = agentConfig.headers[lower];
+      if (value !== undefined) {
+        delete agentConfig.headers[lower];
+        agentConfig.headers[name] = value;
+      }
+    }
+  }
+
+  // Add auth to agent config - the library will use it automatically
+  if (options.auth) {
+    if (options.auth.type === 'basic') {
+      // basic: encode credentials here; library sends the Authorization header as-is
+      const encoded = Buffer.from(`${options.auth.username}:${options.auth.password}`).toString('base64');
+      if (agentConfig.headers) delete agentConfig.headers.authorization;
+      agentConfig.headers = { ...agentConfig.headers, Authorization: `Basic ${encoded}` };
+    } else if (options.auth.type === 'oauth') {
+      // oauth: attach tokens + client registration; ProtocolClient detects
+      // oauth_tokens and routes through the refresh-capable MCP OAuth path.
+      agentConfig.oauth_tokens = options.auth.tokens;
+      if (options.auth.client) agentConfig.oauth_client = options.auth.client;
+      if (options.auth.storage) bindAgentStorage(agentConfig, options.auth.storage);
+    } else if (options.auth.type === 'oauth_client_credentials') {
+      // oauth_client_credentials: attach credentials + optional cached tokens.
+      // ProtocolClient pre-refreshes via secret re-exchange before each call
+      // and sends the resulting access_token as a plain bearer.
+      agentConfig.oauth_client_credentials = options.auth.credentials;
+      if (options.auth.tokens) agentConfig.oauth_tokens = options.auth.tokens;
+    } else {
+      // bearer: raw token stored; library prepends 'Bearer ' internally via createMCPAuthHeaders
+      agentConfig.auth_token = options.auth.token;
+    }
+  }
+
+  if (options.functional_request_signing) {
+    agentConfig.request_signing = options.functional_request_signing;
+  }
+
+  const scope = testClientScope.getStore();
+  const multiClient = new ADCPMultiAgentClient([agentConfig], {
+    headers,
+    validation: {
+      responses: options.strictResponseSchemaValidation === false ? 'warn' : 'strict',
+      logSchemaViolations: false,
+    },
+    ...(options.adcpVersion !== undefined && { adcpVersion: options.adcpVersion }),
+    ...(options.wireAdcpVersion !== undefined && { wireAdcpVersion: options.wireAdcpVersion }),
+    ...(options.versionEnvelope !== undefined && { versionEnvelope: options.versionEnvelope }),
+    ...(options.userAgent && { userAgent: options.userAgent }),
+    ...(transport && { transport }),
+    ...(scope?.active && {
+      _reuseConfiguredDiscovery: () => scope.active && testClientScope.getStore() === scope,
+    }),
+  });
+
+  const client = multiClient.agent('test');
+  const authMode = authReuseMode(options);
+  const requestScopeMode = requestScopeReuseMode(options);
+  const requestSigningMode = requestSigningReuseMode(options.functional_request_signing);
+  Object.defineProperty(client, TEST_CLIENT_VERSION_OPTIONS, {
+    value: {
+      agentUrl,
+      protocol,
+      adcpVersion: multiClient.getAdcpVersion(),
+      ...(options.wireAdcpVersion !== undefined && { wireAdcpVersion: options.wireAdcpVersion }),
+      versionEnvelope: options.versionEnvelope ?? 'auto',
+      strictResponseSchemaValidation: options.strictResponseSchemaValidation !== false,
+      ...(authMode !== undefined && { authMode }),
+      ...(requestScopeMode !== undefined && { requestScopeMode }),
+      ...(requestSigningMode !== undefined && { requestSigningMode }),
+      ...(options.auth?.type === 'oauth' && options.auth.storage && { oauthStorage: options.auth.storage }),
+      connectionPartition: transport?.connectionPartition,
+      connectionReuse: transport?.connectionReuse,
+      ...(transport?.trustedFetchFn && { fetchFn: transport.trustedFetchFn }),
+      ...(transport?.allowPrivateIp !== undefined && { allowPrivateIp: transport.allowPrivateIp }),
+      ...(transport?.maxResponseBytes !== undefined && {
+        maxResponseBytes: transport.maxResponseBytes,
+      }),
+      ...(transport?.requestTimeoutMs !== undefined && {
+        requestTimeoutMs: transport.requestTimeoutMs,
+      }),
+      ...(transport?.legacyCompat?.enabled !== undefined && {
+        legacyCompatEnabled: transport.legacyCompat.enabled,
+      }),
+    } satisfies TestClientVersionOptions,
+    enumerable: false,
+  });
+  if (hasTestClientScope()) testClientScope.getStore()!.clients.push(client);
+  return client;
+}
+
+export type TestClient = ReturnType<typeof createTestClient>;
+export interface TestClientResolution {
+  client: TestClient;
+  reusedShared: boolean;
+}
+
+/**
+ * Return a shared client from options (set by comply()) or create a fresh one.
+ * When comply() runs, it creates a single client and passes it via options._client
+ * so scenarios reuse the same MCP connection instead of opening 36+ connections.
+ */
+export function getOrCreateClient(agentUrl: string, options: TestOptions): TestClient {
+  return getOrCreateClientResolution(agentUrl, options).client;
+}
+
+export function getOrCreateClientResolution(agentUrl: string, options: TestOptions): TestClientResolution {
+  const shared = options._client as TestClient | undefined;
+  if (shared && isExecutableTestClient(shared) && testClientMatchesVersionOptions(shared, agentUrl, options)) {
+    return { client: shared, reusedShared: true };
+  }
+  const pooled = testClientScope
+    .getStore()
+    ?.clients.find(client => testClientMatchesVersionOptions(client, agentUrl, options));
+  if (pooled) return { client: pooled, reusedShared: true };
+  return { client: createTestClient(agentUrl, options.protocol || 'mcp', options), reusedShared: false };
+}
+
+function isExecutableTestClient(client: unknown): client is TestClient {
+  if (client == null || typeof client !== 'object') return false;
+  const candidate = client as Record<string, unknown>;
+  if (typeof candidate['executeTask'] === 'function' || typeof candidate['resetContext'] === 'function') return true;
+  return Object.entries(candidate).some(([key, value]) => key !== 'getAgentInfo' && typeof value === 'function');
+}
+
+function testClientMatchesVersionOptions(client: TestClient, agentUrl: string, options: TestOptions): boolean {
+  const effectiveOptions = withTestKitAuthDefaults(options);
+  const expectedTransport = normalizeTransportOptions(effectiveOptions.transport);
+  const meta = (client as unknown as { [TEST_CLIENT_VERSION_OPTIONS]?: TestClientVersionOptions })[
+    TEST_CLIENT_VERSION_OPTIONS
+  ];
+  const expectedAuthMode = authReuseMode(effectiveOptions);
+  const expectedRequestScopeMode = requestScopeReuseMode(effectiveOptions);
+  const expectedRequestSigningMode = requestSigningReuseMode(effectiveOptions.functional_request_signing);
+  const expectedOAuthStorage = effectiveOptions.auth?.type === 'oauth' ? effectiveOptions.auth.storage : undefined;
+  if (!meta) {
+    return (
+      expectedOAuthStorage === undefined &&
+      expectedRequestSigningMode === undefined &&
+      effectiveOptions.adcpVersion === undefined &&
+      effectiveOptions.versionEnvelope === undefined &&
+      effectiveOptions.transport === undefined
+    );
+  }
+  const expectedAdcpVersion = effectiveOptions.adcpVersion ?? ADCP_VERSION;
+  const expectedWireAdcpVersion = effectiveOptions.wireAdcpVersion;
+  const expectedVersionEnvelope = effectiveOptions.versionEnvelope ?? 'auto';
+  return (
+    meta.agentUrl === agentUrl &&
+    meta.protocol === (effectiveOptions.protocol ?? 'mcp') &&
+    meta.adcpVersion === expectedAdcpVersion &&
+    meta.wireAdcpVersion === expectedWireAdcpVersion &&
+    meta.versionEnvelope === expectedVersionEnvelope &&
+    meta.strictResponseSchemaValidation === (effectiveOptions.strictResponseSchemaValidation !== false) &&
+    meta.authMode === expectedAuthMode &&
+    meta.requestScopeMode === expectedRequestScopeMode &&
+    meta.requestSigningMode === expectedRequestSigningMode &&
+    meta.oauthStorage === expectedOAuthStorage &&
+    meta.connectionPartition === expectedTransport?.connectionPartition &&
+    meta.connectionReuse === expectedTransport?.connectionReuse &&
+    meta.fetchFn === expectedTransport?.trustedFetchFn &&
+    meta.allowPrivateIp === expectedTransport?.allowPrivateIp &&
+    meta.maxResponseBytes === expectedTransport?.maxResponseBytes &&
+    meta.requestTimeoutMs === expectedTransport?.requestTimeoutMs &&
+    meta.legacyCompatEnabled === expectedTransport?.legacyCompat?.enabled
+  );
+}
+
+function withTestKitAuthDefaults(options: TestOptions): TestOptions {
+  if (options.auth) return options;
+  const apiKey = options.test_kit?.auth?.api_key;
+  if (typeof apiKey === 'string' && apiKey.length > 0) {
+    return { ...options, auth: { type: 'bearer', token: apiKey } };
+  }
+
+  const basic = options.test_kit?.auth?.basic;
+  if (!basic) return options;
+  if (
+    typeof basic.username === 'string' &&
+    basic.username.length > 0 &&
+    typeof basic.password === 'string' &&
+    basic.password.length > 0
+  ) {
+    return { ...options, auth: { type: 'basic', username: basic.username, password: basic.password } };
+  }
+  if (typeof basic.credentials === 'string') {
+    const splitAt = basic.credentials.indexOf(':');
+    if (splitAt > 0) {
+      return {
+        ...options,
+        auth: {
+          type: 'basic',
+          username: basic.credentials.slice(0, splitAt),
+          password: basic.credentials.slice(splitAt + 1),
+        },
+      };
+    }
+  }
+  return options;
+}
+
+function authReuseMode(options: TestOptions): string | undefined {
+  return options.auth?.type;
+}
+
+function normalizeTestClientHeaders(headers: Record<string, string>): Record<string, string> {
+  const normalized: Record<string, string> = {};
+  new Headers(headers).forEach((value, name) => {
+    normalized[name] = value;
+  });
+  return normalized;
+}
+
+function requestScopeReuseMode(options: TestOptions): string | undefined {
+  const headers = options.headers
+    ? Object.fromEntries(
+        Object.entries(normalizeTestClientHeaders(options.headers)).sort(([a], [b]) => a.localeCompare(b))
+      )
+    : undefined;
+  if (!options.auth && !headers && !options.test_session_id && !options.userAgent) return undefined;
+  // Runtime adapters can contain callbacks, secrets or cycles. Their object
+  // identity is checked separately; retain the existing credential scope.
+  const auth = options.auth?.type === 'oauth' ? { ...options.auth, storage: undefined } : options.auth;
+  return testClientScopeDisambiguator(
+    JSON.stringify({
+      auth,
+      headers,
+      testSessionId: options.test_session_id,
+      userAgent: options.userAgent,
+    })
+  );
+}
+
+function testClientScopeDisambiguator(value: string): string {
+  return Buffer.from(hkdfSync('sha256', value, TEST_CLIENT_SCOPE_SALT, 'adcp-test-client-cache', 8)).toString('hex');
+}
+
+function requestSigningReuseMode(config: AgentRequestSigningConfig | undefined): string | undefined {
+  if (!config) return undefined;
+  const kind = config.kind === 'provider' ? 'provider' : 'inline';
+  const identity =
+    config.kind === 'provider'
+      ? {
+          algorithm: config.provider.algorithm,
+          keyid: config.provider.keyid,
+          adcpUse: config.provider.adcpUse,
+          fingerprint: config.provider.fingerprint,
+          publicKey: config.public_key,
+        }
+      : { algorithm: config.alg, keyid: config.kid, privateKey: config.private_key };
+  const fingerprint = createHmac('sha256', '')
+    .update(
+      JSON.stringify({
+        identity,
+        profile: config.profile ?? 'rfc9421',
+        agentUrl: config.agent_url,
+        jwksUri: config.jwks_uri,
+        signSupported: config.sign_supported === true,
+        alwaysSign: config.always_sign ?? [],
+        alwaysSignProtocolMethods: config.always_sign_protocol_methods ?? [],
+        unsignedCapabilityBootstrap: hasUnsignedCapabilityBootstrap(config),
+      })
+    )
+    .digest('hex')
+    .slice(0, 16);
+  return `${kind}:${fingerprint}`;
+}
+
+/**
+ * Return a pre-discovered profile from options (set by comply()) or discover fresh.
+ */
+export async function getOrDiscoverProfile(
+  client: TestClient,
+  options: TestOptions,
+  schemaAdcpVersion?: string
+): ReturnType<typeof discoverAgentProfile> {
+  const scope = testClientScope.getStore();
+  const profileBinding = options._profile ? scope?.profileScopes.get(client)?.get(options._profile) : undefined;
+  schemaAdcpVersion ??= profileBinding?.schemaAdcpVersion ?? options.adcpVersion;
+  options.signal?.throwIfAborted();
+  const scopeKey = scope?.active ? client.getCapabilityEvidenceScope().scopeKey : undefined;
+  if (
+    options._profile &&
+    (!scope?.active ||
+      scope.authRejectedProfiles.has(options._profile) ||
+      (!options._profile.capabilities_probe_error &&
+        !options._profile.capabilities_schema_issues?.length &&
+        options._client === client &&
+        profileBinding?.scopeKey === scopeKey))
+  ) {
+    seedTestClientSigningCapability(client, options._profile, schemaAdcpVersion);
+    return {
+      profile: options._profile,
+      step: { step: 'Discover agent capabilities', passed: true, duration_ms: 0 },
+    };
+  }
+  if (!scope?.active) return discoverAgentProfile(client, options.signal, schemaAdcpVersion);
+  const key = `${scopeKey}:${schemaAdcpVersion ?? client.getAdcpVersion()}`;
+  let profiles = scope.profiles.get(client);
+  if (!profiles) {
+    profiles = new Map();
+    scope.profiles.set(client, profiles);
+  }
+  let discovery = profiles.get(key);
+  if (discovery?.failed && discovery.pass !== options._discoveryPass) {
+    profiles.delete(key);
+    discovery = undefined;
+  }
+  if (!discovery) {
+    const evict = () => {
+      if (profiles!.get(key) === discovery) profiles!.delete(key);
+    };
+    const promise = discoverAgentProfile(client, options.signal, schemaAdcpVersion).then(
+      result => {
+        if (options.signal?.aborted) {
+          evict();
+        } else if (!result.step.passed || describeProfileDiscoveryFailure(result.profile)) {
+          if (options._discoveryPass && discovery) discovery.failed = true;
+          else evict();
+        }
+        return result;
+      },
+      error => {
+        evict();
+        throw error;
+      }
+    );
+    discovery = { promise, signal: options.signal, pass: options._discoveryPass };
+    profiles.set(key, discovery);
+  }
+  try {
+    const result = await raceWithSignal(discovery.promise, options.signal);
+    if (!discovery.signal?.aborted || options.signal?.aborted) return result;
+  } catch (error) {
+    if (!discovery.signal?.aborted || options.signal?.aborted) throw error;
+  }
+  // A surviving waiter owns a new probe after the first caller cancelled its
+  // physical request. Its own signal still governs both waiting and dispatch.
+  if (profiles.get(key) === discovery) profiles.delete(key);
+  return getOrDiscoverProfile(client, options, schemaAdcpVersion);
+}
+
+/** @internal Preserve the empty auth-diagnostic profile when a storyboard loads test-kit credentials. */
+export function seedAuthRejectedTestClientProfile(
+  client: TestClient,
+  profile: AgentProfile,
+  adcpVersion: string
+): void {
+  const scope = testClientScope.getStore();
+  if (scope?.active && profile.tools.length === 0 && profile.raw_capabilities === undefined) {
+    scope.authRejectedProfiles.add(profile);
+  }
+  seedTestClientSigningCapability(client, profile, adcpVersion);
+}
+
+/**
+ * Reuse the already-observed capability advertisement for signing decisions.
+ * This avoids a second discovery call whose failure could otherwise downgrade
+ * a functional compliance dispatch to unsigned.
+ */
+export function seedTestClientSigningCapability(client: TestClient, profile: AgentProfile, adcpVersion?: string): void {
+  const scope = testClientScope.getStore();
+  if (scope?.active) {
+    let profiles = scope.profileScopes.get(client);
+    if (!profiles) {
+      profiles = new WeakMap();
+      scope.profileScopes.set(client, profiles);
+    }
+    profiles.set(profile, { scopeKey: client.getCapabilityEvidenceScope().scopeKey, schemaAdcpVersion: adcpVersion });
+  }
+  if (describeProfileDiscoveryFailure(profile)) return;
+  const raw = profile.raw_capabilities;
+  if (!raw || typeof raw !== 'object') return;
+  const clientAccess = client as unknown as {
+    getAgent?: TestClient['getAgent'];
+    getAdcpVersion?: TestClient['getAdcpVersion'];
+  };
+  if (typeof clientAccess.getAgent !== 'function') return;
+  const agent = clientAccess.getAgent.call(client);
+  const meta = (client as unknown as { [TEST_CLIENT_VERSION_OPTIONS]?: TestClientVersionOptions })[
+    TEST_CLIENT_VERSION_OPTIONS
+  ];
+  const effectiveVersion =
+    meta?.wireAdcpVersion ??
+    meta?.adcpVersion ??
+    (typeof clientAccess.getAdcpVersion === 'function' ? clientAccess.getAdcpVersion.call(client) : undefined) ??
+    adcpVersion;
+  const signingContext = buildAgentSigningContext(agent, {
+    adcpVersion: effectiveVersion,
+    connectionPartition: meta?.connectionPartition,
+  });
+  if (!signingContext) return;
+  signingContext.cache.set(signingContext.capabilityCacheKey, {
+    requestSigning: (raw as { request_signing?: VerifierCapability }).request_signing,
+    adcpVersion: profile.adcp_major_versions?.[0],
+    fetchedAt: Math.floor(Date.now() / 1000),
+  });
+}
+
+/**
+ * Run a single test step with timing
+ */
+/**
+ * Race a promise against an AbortSignal. Adopted by `discoverAgentProfile`
+ * so the comply pipeline's timeout actually bounds discovery wall-clock —
+ * the underlying transport's `getAgentInfo()` doesn't accept a signal
+ * (public API), so we resolve the wrapper promise on abort and let the
+ * orphaned in-flight request finish on its own. (adcp-client#1612)
+ *
+ * Throws the signal's reason on abort.
+ *
+ * **SECURITY (security-reviewer follow-up on #1612):** the orphaned
+ * promise's `.then` handlers below stay attached until the underlying
+ * transport call settles. The resolved value `v` carries an authenticated
+ * agent response — `getAgentInfo()` and `getAdcpCapabilities()` round-trip
+ * through the bearer-token transport, so the promise body holds the wire
+ * response in memory until GC'd. **Do not log `v` from inside this
+ * resolver** (or any future `console.error` / telemetry hook on the
+ * orphaned path) — the buyer has already moved on past the abort, and
+ * logging here would leak agent-side data after the caller stopped
+ * trusting it. The early `resolve(v)` is intentionally a no-op on the
+ * already-rejected race-promise; `v` becomes unreferenced and GC-eligible
+ * the moment this `.then` returns.
+ */
+function raceWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    return Promise.reject(signal.reason ?? new Error('aborted'));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new Error('aborted'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      v => {
+        signal.removeEventListener('abort', onAbort);
+        // INTENTIONAL: no-op on an already-rejected race-promise. Do NOT
+        // log `v` here — see security note in the JSDoc above.
+        resolve(v);
+      },
+      e => {
+        signal.removeEventListener('abort', onAbort);
+        // INTENTIONAL: no-op on an already-rejected race-promise. Do NOT
+        // log `e` here either — `Error.message` from a transport rejection
+        // can carry an echoed response body, see security note above.
+        reject(e);
+      }
+    );
+  });
+}
+
+/**
+ * Result of {@link runStep}. The optional `caughtError` carries the raw
+ * thrown value (typed `unknown`, narrow via `instanceof` at the call site)
+ * so callers can pattern-match on typed exceptions like
+ * `ResponseSchemaValidationError` without losing the freeform string
+ * representation on `step.error`. Pre-existing callers that only consume
+ * `result` and `step` are unaffected.
+ *
+ * Spec: adcp-client#1709 (storyboard runner attributes Zod rejects to
+ * the canonical `response_schema` validation entry by detecting the typed
+ * error here).
+ */
+export interface RunStepOutcome<T> {
+  result?: T;
+  step: TestStepResult;
+  caughtError?: unknown;
+}
+
+export async function runStep<T>(
+  stepName: string,
+  taskName: string | undefined,
+  fn: () => Promise<T>
+): Promise<RunStepOutcome<T>> {
+  const start = Date.now();
+  try {
+    const result = await fn();
+    const duration = Date.now() - start;
+    return {
+      result,
+      step: {
+        step: stepName,
+        task: taskName,
+        passed: true,
+        duration_ms: duration,
+      },
+    };
+  } catch (error) {
+    const duration = Date.now() - start;
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    return {
+      step: {
+        step: stepName,
+        task: taskName,
+        passed: false,
+        duration_ms: duration,
+        error: errorMessage,
+      },
+      caughtError: error,
+    };
+  }
+}
+
+/**
+ * The `adcp_version` value a test client's requests carry on the wire.
+ *
+ * Bundle identifiers (`"3.2.1"`, `"3.2.0-rc.7"`) are internal: they key schema
+ * and compliance caches. The envelope builder collapses them to release
+ * precision (`"3.2"`, `"3.2-rc.7"`) before emit, so any diagnostic that names
+ * "what we requested" must apply the same collapse or it reports a value that
+ * was never sent. Returns `undefined` for `major-only` / `none` envelope
+ * modes, which send no release string.
+ *
+ * @internal Exported for unit tests.
+ */
+export function testClientWireAdcpVersion(client: unknown, fallbackVersion?: string): string | undefined {
+  const meta = (client as { [TEST_CLIENT_VERSION_OPTIONS]?: TestClientVersionOptions } | undefined)?.[
+    TEST_CLIENT_VERSION_OPTIONS
+  ];
+  if (meta && meta.versionEnvelope !== 'auto') return undefined;
+  const getAdcpVersion = (client as { getAdcpVersion?: () => string } | undefined)?.getAdcpVersion;
+  const pinned =
+    meta?.wireAdcpVersion ??
+    meta?.adcpVersion ??
+    (typeof getAdcpVersion === 'function' ? getAdcpVersion.call(client) : undefined) ??
+    fallbackVersion;
+  return pinned === undefined ? undefined : toReleasePrecisionVersion(pinned);
+}
+
+/** @internal Exported for unit tests. */
+export function describeVersionUnsupported(result: unknown, requestedVersion: string | undefined): string | undefined {
+  if (!result || typeof result !== 'object') return undefined;
+  const record = result as Record<string, unknown>;
+  const dataRecord =
+    record.data && typeof record.data === 'object' && !Array.isArray(record.data)
+      ? (record.data as Record<string, unknown>)
+      : undefined;
+  const dataError =
+    dataRecord?.adcp_error && typeof dataRecord.adcp_error === 'object' ? dataRecord.adcp_error : undefined;
+  const adcpError = record.adcpError ?? record.adcp_error ?? dataError;
+  if (!adcpError || typeof adcpError !== 'object') return undefined;
+  const adcpErrorRecord = adcpError as Record<string, unknown>;
+  if (adcpErrorRecord.code !== 'VERSION_UNSUPPORTED') return undefined;
+
+  const details = extractVersionUnsupportedDetails(adcpErrorRecord) ?? extractVersionUnsupportedDetails(record.data);
+  // Prefer the seller's echo of what it received. `claimed_version` is the
+  // key adcp (Python) sellers use; only a string can be a release pin.
+  const detailRecord =
+    adcpErrorRecord.details && typeof adcpErrorRecord.details === 'object'
+      ? (adcpErrorRecord.details as Record<string, unknown>)
+      : undefined;
+  const claimed = typeof detailRecord?.claimed_version === 'string' ? detailRecord.claimed_version : undefined;
+  // `requestedVersion` is a fallback for sellers that don't echo; callers pass
+  // the wire value, but collapse defensively so a bundle id (`"3.2.1"`) can
+  // never be reported as the requested release.
+  const fallback = requestedVersion === undefined ? undefined : toReleasePrecisionVersion(requestedVersion);
+  const requested = details?.requested_version ?? claimed ?? fallback;
+  const supported = details?.supported_versions;
+  const requestedText = requested ? `requested ${JSON.stringify(requested)}` : 'requested version is unsupported';
+  const supportedText = supported?.length
+    ? `; seller supports ${supported.map(version => JSON.stringify(version)).join(', ')}`
+    : '; seller did not report supported_versions';
+  return `VERSION_UNSUPPORTED: ${requestedText}${supportedText}`;
+}
+
+/** @internal Native storyboard gates require successful capability evidence. */
+export async function getOrDiscoverStoryboardProfile(
+  client: TestClient,
+  options: TestOptions,
+  schemaAdcpVersion?: string
+): ReturnType<typeof discoverAgentProfile> {
+  const result = await getOrDiscoverProfile(client, options, schemaAdcpVersion);
+  const failure = describeProfileDiscoveryFailure(
+    result.profile,
+    options._requireValidCapabilityEvidence === true,
+    options._allowCapabilityDiagnostic === true
+  );
+  return failure ? { ...result, step: failure } : result;
+}
+
+/** @internal A failed probe is not evidence that an optional capability is absent. */
+export function describeProfileDiscoveryFailure(
+  profile: AgentProfile,
+  requireValidSchema = true,
+  allowCapabilityDiagnostic = false
+): TestStepResult | undefined {
+  if (testClientScope.getStore()?.authRejectedProfiles.has(profile)) return undefined;
+  const raw = profile.raw_capabilities;
+  if (
+    allowCapabilityDiagnostic &&
+    profile.tools.includes('get_adcp_capabilities') &&
+    profile.capabilities_failure?.task === 'get_adcp_capabilities' &&
+    !profile.capabilities_probe_error?.startsWith('VERSION_UNSUPPORTED:')
+  )
+    return undefined;
+  const schemaOnly = !profile.capabilities_probe_error && Boolean(profile.capabilities_schema_issues?.length);
+  const error =
+    profile.capabilities_probe_error ??
+    ((!schemaOnly || requireValidSchema) && profile.capabilities_failure?.passed === false
+      ? (profile.capabilities_failure.error ?? 'Capability discovery failed')
+      : undefined) ??
+    (requireValidSchema && profile.capabilities_schema_issues?.length
+      ? `get_adcp_capabilities response schema validation failed: ${profile.capabilities_schema_issues.map(issue => `${issue.pointer || '/'} ${issue.message}`).join('; ')}`
+      : undefined) ??
+    (raw !== undefined && (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+      ? 'Supplied profile.raw_capabilities must be an object'
+      : undefined) ??
+    (isTerminalAdcpError(raw, 'get_adcp_capabilities')
+      ? 'Supplied capability evidence contains an AdCP error'
+      : undefined);
+  if (!error) return undefined;
+  return {
+    ...(redactDiscoveryEvidence(profile.capabilities_failure) as TestStepResult | undefined),
+    step: 'Discover agent capabilities',
+    task: profile.capabilities_failure?.task ?? 'get_adcp_capabilities',
+    passed: false,
+    duration_ms: profile.capabilities_failure?.duration_ms ?? 0,
+    error: (redactCredentialPatterns(error, false) as string).slice(0, 4096),
+  };
+}
+
+/**
+ * Discover agent profile - what capabilities does this agent have?
+ *
+ * When the agent exposes `get_adcp_capabilities`, its response populates
+ * `supported_protocols` + `specialisms` on the profile so the compliance
+ * runner can select domain and specialism bundles.
+ *
+ * Pass `signal` for hard external cancellation. `comply()` deliberately does
+ * not pass its soft `timeout_ms` storyboard-start budget here; that budget
+ * stops new storyboards after discovery instead of aborting an active run.
+ */
+export async function discoverAgentProfile(
+  client: TestClient,
+  signal?: AbortSignal,
+  /** Compliance/schema line selected by the caller. Defaults to the client pin. */
+  schemaAdcpVersion?: string
+): Promise<{ profile: AgentProfile; step: TestStepResult; caughtError?: unknown; evidence?: TestStepResult }> {
+  const scopeKey = hasTestClientScope() ? client.getCapabilityEvidenceScope().scopeKey : undefined;
+  const {
+    result: agentInfo,
+    step,
+    caughtError: infoError,
+  } = await runStep('Discover agent capabilities', 'getAgentInfo', () =>
+    raceWithSignal(client.getAgentInfo({ signal }), signal)
+  );
+
+  let caughtError = infoError;
+  const profile: AgentProfile = {
+    name: agentInfo?.name || 'Unknown',
+    tools: agentInfo?.tools?.map((t: { name: string }) => t.name) || [],
+  };
+
+  if (agentInfo) {
+    step.details = `Agent: ${profile.name}, Tools: ${profile.tools.length}`;
+    step.response_preview = JSON.stringify(
+      {
+        name: profile.name,
+        tools: profile.tools,
+      },
+      null,
+      2
+    );
+  }
+
+  if (step.passed && profile.tools.includes('get_adcp_capabilities')) {
+    const probeStart = Date.now();
+    step.request = {
+      transport: client.getAgent?.().protocol === 'a2a' ? 'a2a' : 'mcp',
+      operation: 'get_adcp_capabilities',
+      payload: {},
+    };
+    try {
+      const caps = (await raceWithSignal(
+        client.getAdcpCapabilities({}, undefined, { signal }),
+        signal
+      )) as TaskResult & {
+        debug_logs?: DebugLogEntry[];
+        adcpError?: TestStepResult['adcp_error'];
+        errorInstance?: unknown;
+      };
+      if (caps.errorInstance instanceof NeedsAuthorizationError) caughtError = caps.errorInstance;
+      const observed = caps.debug_logs
+        ?.slice()
+        .reverse()
+        .find(
+          log =>
+            typeof log.message === 'string' &&
+            (log.message.startsWith('MCP: Tool get_adcp_capabilities response received') ||
+              log.message.startsWith('A2A: Response received')) &&
+            log.response !== undefined
+        )?.response;
+      if (observed !== undefined)
+        step.response_record = {
+          transport: step.request.transport,
+          payload: redactDiscoveryEvidence(observed),
+          duration_ms: Date.now() - probeStart,
+        };
+      const adcpError = caps.adcpError ?? caps.adcp_error;
+      if (adcpError) step.adcp_error = redactDiscoveryEvidence(adcpError) as NonNullable<TestStepResult['adcp_error']>;
+      const versionUnsupported = describeVersionUnsupported(caps, testClientWireAdcpVersion(client, schemaAdcpVersion));
+      if (versionUnsupported) {
+        // Some transports return AdCP error envelopes as successful tool data.
+        // Detect the protocol error before validating/parsing it as a
+        // capabilities success response, or best-effort parsing will produce
+        // a synthetic v2 profile from the error object.
+        profile.capabilities_probe_error = versionUnsupported;
+        step.passed = false;
+        step.error = versionUnsupported;
+      } else if (
+        isTerminalAdcpError(caps.data, 'get_adcp_capabilities') ||
+        (!caps?.success && !looksLikeV3Capabilities(caps.data))
+      ) {
+        profile.capabilities_probe_error = caps.error ?? adcpError?.message ?? 'get_adcp_capabilities was rejected';
+      } else if (caps?.data) {
+        profile.raw_capabilities = caps.data;
+        // Validate against the release the seller served (its echoed
+        // `adcp_version`), not the pin. A 3.0 pin negotiates major-only, so
+        // the seller serves its highest 3.x release (versioning spec,
+        // "Server echoes"). The echo is used when it is same-major, listed in
+        // the response's `supported_versions` and has a schema root, even
+        // with an external root active for the pin; otherwise the pin.
+        const validation = withServedValidationVersion(
+          caps.data,
+          schemaAdcpVersion ?? client.getAdcpVersion(),
+          validationVersion =>
+            validateIncomingResponse('get_adcp_capabilities', caps.data, 'strict', undefined, validationVersion)
+        );
+        if (!validation.valid) {
+          profile.capabilities_schema_issues = validation.issues.map(issue => ({
+            pointer: issue.pointer,
+            message: issue.message,
+          }));
+        }
+
+        // Even a schema-invalid response can contain enough trustworthy
+        // discriminators to select the storyboards the seller claimed. Keep
+        // parsing best-effort so the preflight notice augments downstream
+        // failures instead of suppressing them.
+        if (looksLikeV3Capabilities(caps.data)) {
+          const parsed = parseCapabilitiesResponse(caps.data);
+          profile.adcp_version = parsed.version;
+          profile.adcp_major_versions = parsed.majorVersions;
+          if (parsed.supportedVersions !== undefined) profile.adcp_supported_versions = parsed.supportedVersions;
+          if (parsed.buildVersion !== undefined) profile.adcp_build_version = parsed.buildVersion;
+          profile.supported_protocols = parsed.protocols;
+          profile.supports_governance = parsed.protocols.includes('governance');
+          profile.supports_si = parsed.protocols.includes('sponsored_intelligence');
+          const specialisms = (caps.data as { specialisms?: unknown }).specialisms;
+          if (Array.isArray(specialisms)) {
+            profile.specialisms = specialisms.filter((s): s is string => typeof s === 'string');
+          }
+          const libVersion = (caps.data as Record<string, unknown>).library_version;
+          if (typeof libVersion === 'string') profile.library_version = libVersion;
+        }
+      }
+      if (
+        !versionUnsupported &&
+        (!caps?.success || !caps?.data) &&
+        !profile.capabilities_schema_issues?.length &&
+        !profile.capabilities_probe_error
+      ) {
+        profile.capabilities_probe_error = caps?.error || 'get_adcp_capabilities returned no data';
+      }
+    } catch (err) {
+      // Agent advertises the tool but the call failed. Don't silently downgrade —
+      // record the failure so the compliance report shows why only universal ran.
+      caughtError = err;
+      profile.capabilities_probe_error = (err as Error)?.message || String(err);
+      if (err instanceof ResponseSchemaValidationError) {
+        step.response_record = { transport: step.request.transport, payload: redactDiscoveryEvidence(err.data) };
+      }
+    } finally {
+      step.duration_ms += Date.now() - probeStart;
+    }
+  }
+
+  if (
+    caughtError instanceof NeedsAuthorizationError &&
+    typeof client.getAgent === 'function' &&
+    hasValidatedMcpAuthorizationRequirements(caughtError.requirements, client.getAgent().agent_uri)
+  ) {
+    step.authorization_required = redactDiscoveryEvidence(caughtError.requirements) as typeof caughtError.requirements;
+  }
+  const failure = describeProfileDiscoveryFailure(profile);
+  if (!step.passed || failure) {
+    const evidence = { ...step, ...(failure ?? {}), passed: false, duration_ms: step.duration_ms };
+    evidence.error = (redactCredentialPatterns(evidence.error ?? 'Agent discovery failed', false) as string).slice(
+      0,
+      4096
+    );
+    profile.capabilities_failure = evidence;
+  }
+  if (!step.passed) step.error = redactCredentialPatterns(step.error ?? 'Agent discovery failed', false) as string;
+  if (
+    !failure &&
+    step.passed &&
+    (scopeKey === undefined || scopeKey === client.getCapabilityEvidenceScope().scopeKey)
+  ) {
+    seedTestClientSigningCapability(client, profile, schemaAdcpVersion);
+  }
+  // Preparation can terminate on applicability immediately after discovery,
+  // so retain its actual exchange separately from the compact rollup step.
+  const evidence = step.passed && !failure ? { ...step } : undefined;
+  if (step.passed && !failure) {
+    delete step.request;
+    delete step.response_record;
+    delete step.adcp_error;
+  }
+  return { profile, step, ...(caughtError !== undefined && { caughtError }), ...(evidence && { evidence }) };
+}
+
+/**
+ * Discover what channels, pricing models, formats the agent supports
+ * by calling get_products and analyzing the response
+ */
+export async function discoverAgentCapabilities(
+  client: TestClient,
+  profile: AgentProfile,
+  options: TestOptions
+): Promise<{ capabilities: Partial<AgentProfile>; steps: TestStepResult[] }> {
+  const steps: TestStepResult[] = [];
+  const capabilities: Partial<AgentProfile> = {};
+
+  if (!profile.tools.includes('get_products')) {
+    return { capabilities, steps };
+  }
+
+  const brief = options.brief || 'Show me all available advertising products across all channels';
+  const getProductsParams: Record<string, unknown> = {
+    buying_mode: 'brief',
+    brief,
+    brand: resolveBrand(options),
+  };
+  const { result, step } = await runStep<TaskResult>(
+    'Discover products for capability analysis',
+    'get_products',
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- bypasses strict request typing
+    async () => client.getProducts(getProductsParams as any) as Promise<TaskResult>
+  );
+
+  if (result?.success && result?.data) {
+    const responseData = result.data as GetProductsResponse;
+    const products: Product[] = responseData.products ?? [];
+
+    // Extract unique channels
+    const channels = new Set<string>();
+    const pricingModels = new Set<string>();
+    const formatIds = new Set<string>();
+    const deliveryTypes = new Set<string>();
+
+    for (const product of products) {
+      // Channels from product
+      if (product.channels) {
+        for (const ch of product.channels) {
+          channels.add(ch);
+        }
+      }
+      // Delivery type
+      if (product.delivery_type) {
+        deliveryTypes.add(product.delivery_type);
+      }
+      // Pricing models
+      if (product.pricing_options) {
+        for (const po of product.pricing_options) {
+          if (po.pricing_model) pricingModels.add(po.pricing_model);
+        }
+      }
+      // Format IDs
+      if (product.format_ids) {
+        for (const fid of product.format_ids) {
+          const id = typeof fid === 'string' ? fid : fid.id;
+          if (id) formatIds.add(id);
+        }
+      }
+    }
+
+    capabilities.channels = Array.from(channels);
+    capabilities.pricing_models = Array.from(pricingModels);
+    capabilities.format_ids = Array.from(formatIds);
+    capabilities.delivery_types = Array.from(deliveryTypes);
+
+    step.details = `Found ${products.length} products across ${channels.size} channel(s), ${pricingModels.size} pricing model(s)`;
+    step.response_preview = JSON.stringify(
+      {
+        products_count: products.length,
+        channels: capabilities.channels,
+        pricing_models: capabilities.pricing_models,
+        delivery_types: capabilities.delivery_types,
+        format_count: capabilities.format_ids?.length,
+      },
+      null,
+      2
+    );
+    step.observation_data = { products_count: products.length, channels: capabilities.channels };
+  } else if (result && !result.success) {
+    step.passed = false;
+    step.error = result.error || 'get_products failed';
+  }
+
+  steps.push(step);
+  return { capabilities, steps };
+}
+
+/**
+ * Discover creative formats from a creative agent
+ */
+export async function discoverCreativeFormats(
+  client: TestClient,
+  profile: AgentProfile
+): Promise<{ formats: AgentProfile['supported_formats']; step: TestStepResult }> {
+  const formats: AgentProfile['supported_formats'] = [];
+
+  if (!profile.tools.includes('list_creative_formats')) {
+    return {
+      formats,
+      step: {
+        step: 'Discover creative formats',
+        passed: false,
+        duration_ms: 0,
+        error: 'Agent does not support list_creative_formats',
+      },
+    };
+  }
+
+  const { result, step } = await runStep<TaskResult>(
+    'Discover creative formats',
+    'list_creative_formats',
+    async () => client.listCreativeFormatsLegacy({}) as Promise<TaskResult>
+  );
+
+  if (result?.success && result?.data) {
+    const responseData = result.data as ListCreativeFormatsResponse;
+    const rawFormats: Format[] = responseData.formats ?? [];
+    const deprecatedFormats: string[] = [];
+
+    for (const format of rawFormats) {
+      const formatInfo: NonNullable<AgentProfile['supported_formats']>[0] = {
+        format_id: format.format_id,
+        name: format.name,
+        required_assets: [],
+        optional_assets: [],
+      };
+
+      // Check for deprecated assets_required usage
+      if (usesDeprecatedAssetsField(format as unknown as Parameters<typeof usesDeprecatedAssetsField>[0])) {
+        const displayId = typeof formatInfo.format_id === 'object' ? formatInfo.format_id.id : formatInfo.format_id;
+        deprecatedFormats.push(displayId);
+      }
+
+      // Extract asset requirements from format spec using format-assets utilities
+      // This handles both v2.6 `assets` and deprecated `assets_required` fields
+      const formatAssets = getFormatAssets(format as unknown as Parameters<typeof getFormatAssets>[0]);
+      for (const asset of formatAssets) {
+        const assetId = asset.item_type === 'individual' ? asset.asset_id : asset.asset_group_id;
+
+        if (asset.required) {
+          formatInfo.required_assets?.push(assetId);
+        } else {
+          formatInfo.optional_assets?.push(assetId);
+        }
+      }
+
+      formats.push(formatInfo);
+    }
+
+    step.details = `Found ${formats.length} format(s)`;
+    step.response_preview = JSON.stringify(
+      {
+        format_count: formats.length,
+        sample_formats: formats.slice(0, 3).map(f => ({
+          id: f.format_id,
+          name: f.name,
+          required_assets: f.required_assets?.length || 0,
+        })),
+      },
+      null,
+      2
+    );
+
+    // Add deprecation warnings if any formats use assets_required
+    if (deprecatedFormats.length > 0) {
+      step.warnings = [
+        `⚠️ DEPRECATION: ${deprecatedFormats.length} format(s) use 'assets_required' field which is deprecated and will be removed in a future version. Please migrate to the 'assets' field instead. (adcp-client 3.6.0+)`,
+      ];
+      logger.warn(
+        { deprecated_formats: deprecatedFormats },
+        `Agent uses deprecated 'assets_required' field in ${deprecatedFormats.length} format(s). Migrate to 'assets' field.`
+      );
+    }
+  } else if (result && !result.success) {
+    step.passed = false;
+    step.error = result.error || 'list_creative_formats failed';
+  }
+
+  return { formats, step };
+}
+
+/**
+ * Discover signals from a signals agent
+ */
+export async function discoverSignals(
+  client: TestClient,
+  profile: AgentProfile,
+  options: TestOptions
+): Promise<{
+  signals: AgentProfile['supported_signals'];
+  rawSignals: GetSignalsResponse['signals'];
+  step: TestStepResult;
+  schemaStep?: TestStepResult;
+}> {
+  const signals: AgentProfile['supported_signals'] = [];
+  let rawSignals: GetSignalsResponse['signals'] = [];
+
+  if (!profile.tools.includes('get_signals')) {
+    return {
+      signals,
+      rawSignals,
+      step: {
+        step: 'Discover signals',
+        passed: false,
+        duration_ms: 0,
+        error: 'Agent does not support get_signals',
+      },
+    };
+  }
+
+  const { result, step } = await runStep<TaskResult>(
+    'Discover available signals',
+    'get_signals',
+    async () =>
+      client.getSignals({
+        signal_spec: options.brief || 'Show me all available audience signals and segments',
+      }) as Promise<TaskResult>
+  );
+
+  let schemaStep: TestStepResult | undefined;
+
+  if (result?.success && result?.data) {
+    schemaStep = validateResponseSchema('get_signals', result.data);
+    const responseData = result.data as GetSignalsResponse;
+    rawSignals = responseData.signals ?? [];
+
+    for (const signal of rawSignals) {
+      const signalData = signal as {
+        signal_agent_segment_id?: unknown;
+        signal_ref?: unknown;
+        name?: unknown;
+        signal_type?: unknown;
+        type?: unknown;
+      };
+      let signalId: string | undefined;
+      if (typeof signalData.signal_agent_segment_id === 'string') {
+        signalId = signalData.signal_agent_segment_id;
+      } else if (typeof signalData.signal_ref === 'string') {
+        signalId = signalData.signal_ref;
+      } else if (signalData.signal_ref != null) {
+        // Summary-only convenience for the test report; rawSignals above
+        // preserves the seller's canonical signal_ref object.
+        signalId = JSON.stringify(signalData.signal_ref);
+      }
+      if (!signalId) continue;
+      signals.push({
+        signal_id: signalId,
+        name: typeof signalData.name === 'string' ? signalData.name : undefined,
+        type:
+          typeof signalData.signal_type === 'string'
+            ? signalData.signal_type
+            : typeof signalData.type === 'string'
+              ? signalData.type
+              : undefined,
+      });
+    }
+
+    step.details = `Found ${signals.length} signal(s)`;
+    step.response_preview = JSON.stringify(
+      {
+        signal_count: signals.length,
+        signal_types: [...new Set(signals.map(s => s.type).filter(Boolean))],
+        sample_signals: signals.slice(0, 5).map(s => ({
+          id: s.signal_id,
+          name: s.name,
+          type: s.type,
+        })),
+      },
+      null,
+      2
+    );
+  } else if (result && !result.success) {
+    step.passed = false;
+    step.error = result.error || 'get_signals failed';
+  }
+
+  return { signals, rawSignals, step, schemaStep };
+}
+
+/**
+ * Validate response data against the AdCP Zod schema for a tool.
+ * Returns a TestStepResult indicating pass/fail with details on schema violations.
+ *
+ * For union schemas (success | error responses), Zod's top-level error is the
+ * unhelpful "(root): Invalid input". This function detects that case and
+ * reports per-variant errors instead, picking the variant with the fewest
+ * issues (the closest match) so the developer sees actionable field names.
+ *
+ * Violations are split into two categories so remediation guidance differs
+ * appropriately (set the field vs. fix the value):
+ *  - `required` — a required field is absent from the response. Zod emits
+ *    `invalid_type` with `received: 'undefined'` for this case; we re-tag
+ *    it as `required` and report it as a missing field.
+ *  - constraint keyword (`minimum`, `maximum`, `enum`, `format`, …) — the
+ *    field is present but violates a JSON Schema keyword constraint.
+ */
+export function validateResponseSchema(toolName: string, data: unknown, responseAdcpVersion?: string): TestStepResult {
+  const schema = TOOL_RESPONSE_SCHEMAS[toolName];
+  if (!schema) {
+    return {
+      step: `Schema validation: ${toolName}`,
+      passed: true,
+      duration_ms: 0,
+      details: `No response schema available for ${toolName}`,
+      warnings: [`No Zod schema registered for "${toolName}" — validation skipped`],
+    };
+  }
+
+  // 3.0.x back-compat: synthesize envelope `status` for legacy peers so
+  // strict 3.1 validators don't reject otherwise-conformant 3.0 wire
+  // responses. See `utils/envelope-status-compat.ts`.
+  const compatData =
+    data && typeof data === 'object' && !Array.isArray(data)
+      ? injectLegacyEnvelopeStatus(data as Record<string, unknown>, { toolName, adcpVersion: responseAdcpVersion })
+      : data;
+  const result = schema.safeParse(prepareResponseForSchemaValidation(toolName, compatData, responseAdcpVersion));
+  if (result.success) {
+    return {
+      step: `Schema validation: ${toolName}`,
+      passed: true,
+      duration_ms: 0,
+      details: `Response matches ${toolName} schema`,
+    };
+  }
+
+  let violations: SchemaViolation[] = result.error.issues.map(i => {
+    const path = i.path.length > 0 ? i.path.join('.') : '(root)';
+    return { path, message: i.message, code: i.code };
+  });
+
+  // Union schemas produce "(root): Invalid input" when no variant matches.
+  // Try each variant individually and report the closest match's errors.
+  const first = violations[0];
+  const isUnionError = violations.length === 1 && first && first.path === '(root)' && first.code === 'invalid_union';
+
+  if (isUnionError) {
+    const betterErrors = getBestUnionErrors(schema, data);
+    if (betterErrors && betterErrors.length > 0) {
+      violations = betterErrors;
+    }
+  }
+
+  const classified = violations.map(classifyViolation);
+  const missing = classified.filter(v => v.kind === 'missing');
+  const constraint = classified.filter(v => v.kind === 'constraint');
+
+  const parts: string[] = [];
+  if (missing.length > 0) {
+    parts.push(`Response missing required fields: ${missing.map(v => v.json_pointer).join(', ')}`);
+  }
+  if (constraint.length > 0) {
+    parts.push(
+      `Response constraint violations: ${constraint
+        .map(v => `${v.json_pointer} (${v.keyword}): ${v.message}`)
+        .join('; ')}`
+    );
+  }
+
+  return {
+    step: `Schema validation: ${toolName}`,
+    passed: false,
+    duration_ms: 0,
+    error: parts.join(' | '),
+    response_preview: JSON.stringify({ violations: classified }, null, 2),
+  };
+}
+
+/**
+ * Classify a Zod-flavored schema violation as either a missing required field
+ * or a constraint violation (with the failed JSON Schema keyword). Adds a
+ * JSON Pointer (`/foo/0/bar`) so downstream tooling can locate the field
+ * without re-parsing dot paths.
+ */
+function classifyViolation(v: SchemaViolation): {
+  kind: 'missing' | 'constraint';
+  json_pointer: string;
+  keyword: string;
+  message: string;
+  code: SchemaViolation['code'];
+} {
+  const segments = v.path === '(root)' ? [] : v.path.split('.');
+  const json_pointer = '/' + segments.map(s => s.replace(/~/g, '~0').replace(/\//g, '~1')).join('/');
+
+  // Zod emits `invalid_type` with `received: 'undefined'` for missing required
+  // fields. The `code` alone is ambiguous (`invalid_type` also covers wrong-
+  // type-but-present), so we sniff the message for the canonical Zod wording.
+  const isMissing = v.code === 'invalid_type' && /received `?undefined`?/i.test(v.message);
+  if (isMissing) {
+    return { kind: 'missing', json_pointer, keyword: 'required', message: v.message, code: v.code };
+  }
+
+  return {
+    kind: 'constraint',
+    json_pointer,
+    keyword: zodCodeToKeyword(v.code),
+    message: v.message,
+    code: v.code,
+  };
+}
+
+/**
+ * Map a Zod error code to the equivalent JSON Schema keyword so downstream
+ * tooling (and humans reading the report) see the standard vocabulary
+ * (`minimum`, `enum`, `format`, …) instead of Zod-specific names.
+ */
+function zodCodeToKeyword(code: SchemaViolation['code']): string {
+  switch (code) {
+    case 'invalid_type':
+      return 'type';
+    case 'invalid_value':
+      return 'enum';
+    case 'too_small':
+      return 'minimum';
+    case 'too_big':
+      return 'maximum';
+    case 'invalid_format':
+      return 'format';
+    case 'unrecognized_keys':
+      return 'additionalProperties';
+    case 'invalid_union':
+      return 'oneOf';
+    case 'not_multiple_of':
+      return 'multipleOf';
+    default:
+      return code;
+  }
+}

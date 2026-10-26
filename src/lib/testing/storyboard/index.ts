@@ -1,0 +1,338 @@
+/**
+ * Storyboard-driven testing for AdCP agents.
+ *
+ * Storyboards are YAML-defined workflows that map directly to
+ * SingleAgentClient methods, enabling step-by-step agent testing.
+ * The canonical storyboard set lives in the AdCP compliance tarball
+ * and is pulled into `compliance/cache/{version}/` via `npm run sync-schemas`.
+ */
+
+// Side-effect import: registers the default cross-step assertions that
+// upstream storyboards reference by id (idempotency.conflict_no_payload_leak,
+// context.no_secret_echo, governance.denial_blocks_mutation). Without this
+// registration here, any `runStoryboard` call against a storyboard declaring
+// `invariants: [...]` would throw at start on unresolved ids. Consumers who
+// want to replace the defaults can `clearAssertionRegistry()` first.
+import { registerDefaultInvariants } from './default-invariants';
+
+registerDefaultInvariants();
+
+// Types
+export type {
+  A2ATaskEnvelope,
+  AgentEntry,
+  Storyboard,
+  StoryboardFixtureResolution,
+  FixtureResolutionStrategy,
+  FixtureMatchOperator,
+  FixtureMatchClause,
+  FixtureResolutionDeclaration,
+  ProductFixtureResolutionDeclaration,
+  PricingOptionFixtureResolutionDeclaration,
+  FixtureResolutionStatus,
+  FixtureResolutionRecord,
+  FixtureResolutionAttempt,
+  FixtureResolutionEvidence,
+  FixtureResolutionCoverageGap,
+  StoryboardInvariants,
+  StoryboardInvariantsObject,
+  StepInvariantsObject,
+  StoryboardPhase,
+  StoryboardStep,
+  RateLimitTripSpec,
+  StoryboardValidation,
+  StoryboardValidationCheck,
+  WebhookFilterSpec,
+  WebhookRetryTriggerSpec,
+  WebhookAssertionErrorCode,
+  ContextOutput,
+  ContextInput,
+  ContextProvenanceEntry,
+  ContextValueRejectedHint,
+  ShapeDriftHint,
+  MissingRequiredFieldHint,
+  FormatMismatchHint,
+  MonotonicViolationHint,
+  ImpairmentCoherenceHint,
+  ImpairmentCoherenceNotApplicableHint,
+  StoryboardContext,
+  StoryboardRunOptions,
+  PrepareStoryboardFixturesOptions,
+  TrustedMatchContextProviderEndpoint,
+  TrustedMatchContextRegistrationContext,
+  TrustedMatchContextRouterRunnerOptions,
+  TrustedMatchPublisherAuthOperation,
+  TrustedMatchPublisherCredentialState,
+  TrustedMatchPublisherAuthTls,
+  TrustedMatchPublisherAuthProbeConfiguration,
+  TrustedMatchPublisherAuthRunner,
+  ValidationResult,
+  StoryboardStepPreview,
+  StoryboardStepResult,
+  StoryboardStepHint,
+  StoryboardStepHintBase,
+  StoryboardPhaseResult,
+  StoryboardResult,
+  AssertionResult,
+  StrictValidationSummary,
+  StrictValidationVerdict,
+  UpstreamTrafficPayloadMatch,
+  RunnerNotice,
+  NoticeCode,
+  NoticeSeverity,
+} from './types';
+export { WEBHOOK_IDEMPOTENCY_KEY_PATTERN } from './types';
+// Report consumers key on `StoryboardStepResult.task`; the MCP session auth
+// probe is runner-native, so its task name ships as a constant rather than a
+// magic string operators have to copy (adcp-client#2940).
+export { MCP_SESSION_PROBE_TASK } from './types';
+
+// Cross-step assertion registry (adcontextprotocol/adcp#2639)
+export {
+  registerAssertion,
+  getAssertion,
+  listAssertions,
+  listDefaultAssertions,
+  clearAssertionRegistry,
+  resolveAssertions,
+} from './assertions';
+export type { AssertionSpec, AssertionContext, RegisterAssertionOptions } from './assertions';
+
+// Webhook receiver (outbound-webhook conformance testing per adcontextprotocol/adcp#2431)
+export { createWebhookReceiver } from './webhook-receiver';
+export type {
+  CapturedWebhook,
+  CapturedWebhookChallenge,
+  CreateWebhookReceiverOptions,
+  RetryReplayPolicy,
+  WebhookFilter,
+  WebhookReceiver,
+  WebhookWaitResult,
+} from './webhook-receiver';
+
+// Runner-variable substitution (`{{runner.*}}` / `{{prior_step.*.operation_id}}`)
+export { createRunnerVariables } from './context';
+export type { RunnerVariables } from './context';
+
+// Webhook-assertion pseudo-tasks
+export { WEBHOOK_ASSERTION_TASKS } from './webhook-assertions';
+
+// Runner
+export {
+  prepareStoryboardFixtures,
+  runStoryboard,
+  runStoryboardStep,
+  applyAdcpVersionRunOptions,
+  applyStoryboardVersionOptions,
+  getFirstStepPreview,
+  summarizeStrictValidation,
+  listStrictOnlyFailures,
+  resolveCapabilityPath,
+  evaluateCapabilityPredicate,
+  describeStoryboardCapabilityGates,
+  buildDiscoveryFailedResult,
+} from './runner';
+
+// Parser (single-file load for spec evolution / targeted testing)
+export { parseStoryboard, loadStoryboardFile, normalizeValidationOnlyTasks, VALIDATION_ONLY_TASK } from './loader';
+
+// AdCP 3.2 fixture-handle resolution
+export {
+  applyFixtureBindingsToRequest,
+  buildFixtureResolutionSpecs,
+  FixtureBindingRegistry,
+  matchesFixtureRequirements,
+  matchFixtureRequirementsWithWitness,
+  normalizeFixtureContextOutputs,
+  normalizeFixtureMatchExpression,
+  validateFixtureResolutionDeclarations,
+} from './fixture-resolution';
+export type { FixtureContextOutput } from './types';
+
+// Domain-qualified collection identity: one normalizer shared by the
+// fixture predicate, the derived witness captures and the set validator.
+export {
+  COLLECTION_DIAGNOSTIC_LIMIT,
+  COLLECTION_PAIR_LIMIT,
+  COLLECTION_TARGETING_MODES,
+  COLLECTION_WITNESS_KINDS,
+  compareCollectionPairs,
+  diffCollectionPairSets,
+  evaluateCollectionSelection,
+  formatCollectionPair,
+  normalizeCollectionSelectionSelector,
+  normalizeCollectionSelectors,
+  productSatisfiesCollectionSelection,
+  readCollectionWitness,
+  summarizeCollectionPairs,
+} from './collection-selection';
+export type {
+  ResolvedCollectionSelectionSelector,
+  CollectionNormalizationCode,
+  CollectionNormalizationFailure,
+  CollectionNormalizationResult,
+  CrossPublisherCollectionRelation,
+  CollectionPair,
+  CollectionSelectionEvaluation,
+  CollectionSelectionSelector,
+  CollectionSelectionWitness,
+  CollectionSelectorObject,
+  CollectionWitnessKind,
+  CollectionWitnessReadResult,
+  NormalizedCollectionSelectors,
+} from './collection-selection';
+
+// Protected fixture-capture namespace. The write capability itself is
+// runner-owned and intentionally NOT exported: a capability a caller can
+// construct is not a capability.
+export { isProtectedContextKey, PROTECTED_CONTEXT_PREFIX, ProtectedContextViolation } from './protected-context';
+export type { ProtectedContextViolationCode } from './protected-context';
+
+// Reusable fixture preparation shared by the full and standalone runners.
+export {
+  isTrustedPreparedFixtures,
+  PREPARED_FIXTURES_CONTRACT_VERSION,
+  PreparedStoryboardFixtures,
+  withPreparedFixtures,
+} from './prepared-fixtures';
+export type {
+  PreparedFixtureBinding,
+  PreparedFixtureSelection,
+  PreparedFixturesAuthorizer,
+  PreparedFixturesDecision,
+  PreparedFixturesDisposition,
+  PreparedFixturesLookup,
+  PreparedFixturesPreparationLookup,
+  PreparedFixturesPreparationAuthorizer,
+  PreparedFixturesRefusal,
+  PreparedFixturesRefusalCode,
+  PreparedFixturesReference,
+  PreparedSchemaArtifact,
+} from './prepared-fixtures';
+
+// Compliance cache: capability-driven resolution
+export {
+  getComplianceCacheDir,
+  getExternalSchemaRootForCompliance,
+  loadComplianceIndex,
+  listBundles,
+  loadBundleStoryboards,
+  listAllComplianceStoryboards,
+  getComplianceStoryboardById,
+  findBundleById,
+  resolveBundleOrStoryboard,
+  resolveStoryboardsForCapabilities,
+  isComplianceVersionSupported,
+  loadSpecialismDetail,
+  listSpecialisms,
+  CapabilityResolutionError,
+  PROTOCOL_TO_PATH,
+  UNBASELINED_SUPPORTED_PROTOCOLS,
+} from './compliance';
+export type {
+  AgentCapabilities,
+  BundleKind,
+  BundleRef,
+  CapabilityResolutionCode,
+  ComplianceIndex,
+  ComplianceIndexProtocol,
+  ComplianceIndexSpecialism,
+  NotApplicableStoryboard,
+  ResolveOptions,
+  ResolvedBundle,
+  ResolvedStoryboards,
+  SpecialismDetail,
+} from './compliance';
+
+// Task mapping
+export { TASK_TO_METHOD, executeStoryboardTask } from './task-map';
+
+// Storyboard-only creative asset directives
+export { expandCreativeAssetDirectives, findUnresolvedCreativeAssetDirectives } from './creative-assets';
+
+// Path utilities
+export { parsePath, resolvePath, setPath } from './path';
+
+// Context
+export {
+  CONTEXT_EXTRACTORS,
+  extractContext,
+  extractContextWithProvenance,
+  injectContext,
+  applyContextOutputs,
+  applyContextOutputsWithProvenance,
+  applyContextInputs,
+} from './context';
+export type { ContextWriteResult } from './context';
+
+// Rejection-hint detection (issue #870)
+export { detectContextRejectionHints } from './rejection-hints';
+
+// Request builder
+export { buildRequest, hasRequestBuilder } from './request-builder';
+
+// Validations
+export { runValidations } from './validations';
+export {
+  gradeOAuthMetadataGraph,
+  gradeOAuthMetadataGraphVector,
+  loadOAuthMetadataGraphVectors,
+  buildAuthorizationServerMetadataUrl,
+  buildProtectedResourceMetadataUrl,
+  normalizeOAuthResourceForComparison,
+  redactOAuthUrlForOutput,
+} from './oauth-metadata-graph';
+export type {
+  GradeOAuthMetadataGraphOptions,
+  OAuthMetadataFetchResponse,
+  OAuthMetadataFetchTransport,
+  OAuthMetadataGraphErrorCode,
+  OAuthMetadataGraphFinding,
+  OAuthMetadataGraphGrade,
+  OAuthMetadataGraphObservation,
+  OAuthMetadataGraphVector,
+  OAuthMetadataGraphVectorCorpus,
+} from './oauth-metadata-graph';
+export {
+  RateLimitTripObserver,
+  RATE_LIMIT_TRIP_CONTRACT,
+  RATE_LIMIT_TRIP_DEFAULT_REPLAY_MAX_WAIT_SECONDS,
+  RATE_LIMIT_TRIP_MAX_ATTEMPTS_MAX,
+  RATE_LIMIT_TRIP_MAX_ATTEMPTS_MIN,
+  extractTaskAdcpError,
+  validateRateLimitTripSpec,
+  type RateLimitTripFailureCode,
+  type RateLimitTripClient,
+  type RateLimitTripObservation,
+  type RateLimitTripObserverOptions,
+  type RateLimitTripResponseSnapshot,
+  type RateLimitTripStructuredResult,
+  type RateLimitTripTaskOptions,
+} from './rate-limit-trip';
+
+// `./junit` is deliberately NOT re-exported. The CLI requires it
+// directly from `dist/lib/testing/storyboard/junit.js` and the function
+// is marked `@internal` (stripped from the generated `.d.ts`). Add a
+// re-export here only if/when we promote it to a public API surface.
+
+// Test-kit schema validation
+export { validateTestKit, TestKitValidationError, PROBE_TASK_ALLOWLIST } from './test-kit';
+
+// Sandbox entities
+export type { SandboxBrand, SandboxAgent, SandboxEntities, BrandJson } from './sandbox-entities';
+export { BrandJsonSchema, AdagentsJsonSchema } from '../../types/wellknown-schemas.generated';
+export type { AdagentsJson } from '../../types/wellknown-schemas.generated';
+export {
+  getSandboxEntities,
+  getSandboxBrands,
+  getSandboxBrand,
+  isSandboxDomain,
+  clearSandboxCache,
+} from './sandbox-entities';
+
+export { resolveCreativeBuildProbe, validateCreativeBuildProbeSpec } from './creative-build-probe';
+export type {
+  CreativeBuildProbeSpec,
+  CreativeBuildProbeInputFixture,
+  CreativeBuildProbeResolution,
+} from './creative-build-probe';

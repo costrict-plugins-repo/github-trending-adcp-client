@@ -1,0 +1,89 @@
+---
+name: build-signals-agent
+description: Use when building an AdCP signals agent — a marketplace data provider, identity provider, CDP, or any system that serves audience or contextual signals to buyers.
+---
+
+# Build a Signals Agent
+
+A signals agent serves audience and contextual targeting segments to buyer agents. The fastest path to a passing agent is to **fork the worked adapter** and replace its `// SWAP:` markers with calls to your backend.
+
+## Pick your fork target
+
+| Specialism           | Archetype                                                                       | Fork this                                                                                            | Mock upstream                             | Storyboard           |
+| -------------------- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------- | -------------------- |
+| `signal-marketplace` | Multi-provider data marketplace (Oracle Data Cloud, LiveRamp, third-party data) | [`hello_signals_adapter_marketplace.ts`](../../examples/hello_signals_adapter_marketplace.ts)        | `npx adcp mock-server signal-marketplace` | `signal_marketplace` |
+| `signal-owned`       | First-party / single-provider data (CDP, identity provider, contextual)         | Same — fork the marketplace adapter and apply the [single-provider deltas below](#specialism-deltas) | Same                                      | `signal_owned`       |
+
+Both specialisms share the same tool surface (`get_signals`, `activate_signal`, `list_accounts`); the difference is whether you serve segments from multiple `data_provider_domain` values or one.
+
+For exact response shapes, error codes, and optional fields, [`docs/llms.txt`](../../docs/llms.txt) is the canonical reference. The fork target stays in sync with the spec because PR #1394's three-gate contract fails CI when it drifts. See [SHAPE-GOTCHAS.md](../SHAPE-GOTCHAS.md) — particularly [§1](../SHAPE-GOTCHAS.md#1-activationkey-oneof--keyvalue-are-top-level-not-nested) (flat `activation_key.key/value`), [§2](../SHAPE-GOTCHAS.md#2-signal_ids-is-signal_id-provenance-objects-not-string) (`signal_ids` is `SignalID[]`, not `string[]`), and [§7](../SHAPE-GOTCHAS.md#7-signal_type-marketplace-vs-owned-vs-custom) (`marketplace` / `owned` / `custom` decision).
+
+## When to use this skill
+
+- User wants to serve audience segments, identity data, or contextual targeting to buyers
+- User mentions `get_signals`, `activate_signal`, or the AdCP signals protocol
+- User describes themselves as a CDP, DMP, identity provider, or data marketplace
+
+**Not this skill:**
+
+- Selling ad inventory → `skills/build-seller-agent/`
+- Audience push (sync to a walled garden) → that's the `audience-sync` track in `skills/build-seller-agent/`
+
+## Cross-cutting rules
+
+Every signals agent hits the cross-cutting rules in [`../cross-cutting.md`](../cross-cutting.md). The high-traffic ones for signals (deep-linked to the rule):
+
+- [`idempotency_key`](../cross-cutting.md#idempotency_key-is-required-on-every-mutating-call) on `activate_signal`
+- [Authentication](../cross-cutting.md#authentication-is-mandatory) — `serve({ authenticate })` baseline
+- [Resolve-then-authorize](../cross-cutting.md#resolve-then-authorize--uniform-errors-for-not-found--not-yours) — byte-equivalent errors on `signal_agent_segment_id` lookups across tenants
+- [Webhooks](../cross-cutting.md#webhooks-stable-operation_id-across-retries) — for async platform-activation completions, use `signal_activation.${signal_agent_segment_id}.${platform}` as the stable `operation_id`
+
+Two signals-specific notes on top of those:
+
+### Async platform activation
+
+Platform activations (`type: 'platform'`) take minutes-to-hours to propagate to the DSP. Return `is_live: false` with `estimated_activation_duration_minutes` on first call; the buyer polls `activate_signal` again until `is_live: true`. **Commit `activation_key` up front** so the buyer can trust it across the poll window. Agent activations (`type: 'agent'`) are instant — return `is_live: true` immediately.
+
+`forceDeploymentStatus` in your `TestControllerStore` flips pending deployments to live for deterministic compliance tests.
+
+### Provenance — `data_provider_domain` must resolve
+
+Buyers fetch `https://{domain}/adagents.json` out-of-band to verify the provider. Use real domains even in demos, not `example.com`. For marketplace adopters, seed ≥2 different `data_provider_domain` values so the multi-provider nature is visible to the storyboard.
+
+## Specialism deltas
+
+### `signal-marketplace` (the baseline fork target)
+
+Multi-provider directory: `signals[].data_provider_domain` varies across cohorts. Platform-activation polling pattern is fully exercised. The marketplace governance sub-scenario in the storyboard exercises consent flows across providers; if you can't model multi-provider consent yet, surface `INVALID_REQUEST` rather than silently fall through. Use `signal_type: 'marketplace'` only when `data_provider_domain` resolves to a real `adagents.json`.
+
+### `signal-owned` (single-provider)
+
+Forking the marketplace adapter for a `signal-owned` agent? Apply these deltas — leaning on stable symbol names rather than line numbers (the adapter evolves; greppable identifiers don't):
+
+- **Replace the multi-provider seed.** The adapter ships an `UpstreamCohort` array seeded with multiple `data_provider_domain` / `data_provider_id` / `data_provider_name` triples. Replace with your single-provider catalog: every cohort gets the same `data_provider_domain` (your domain) and `data_provider_name` (your brand).
+- **Strip marketplace-discovery filters in `getSignals`** that filter `signals[]` by `(data_provider_domain, data_provider_id)` pairs — single-provider adopters either return everything or filter on signal id alone.
+- **Set `signal_type: 'owned'`** (not `'marketplace'`) in the `toAdcpSignal` projection. See [SHAPE-GOTCHAS §7](../SHAPE-GOTCHAS.md#7-signal_type-marketplace-vs-owned-vs-custom) for the decision table — `owned` is the default for first-party data agents.
+- **Drop the marketplace governance sub-scenario** from your storyboard run if you don't model multi-provider consent flows. The `signal_owned` storyboard is simpler.
+- **`value_type` drives targeting semantics** for owned segments: `binary` (in/out), `categorical` (with `allowed_values: [...]`), `numeric` (with `min`, `max`, optional `units`).
+
+**Keep**: the `accounts` / `createTenantStore` block (single-tenant adapters pass one tenant entry), `agentRegistry`, the `signals` `SignalsPlatform` block (`getSignals`, `activateSignal`, `listAccounts`), platform-vs-agent activation polling logic, `forceDeploymentStatus` for compliance-test determinism.
+
+## Validate locally
+
+```bash
+# Run the fork-matrix gate
+npm run compliance:fork-matrix -- --test-name-pattern="hello-signals-adapter-marketplace"
+
+# Or validate your forked agent directly against its storyboard
+adcp storyboard run http://127.0.0.1:3001/mcp signal_marketplace \
+  --bearer "$ADCP_AUTH_TOKEN" --include-bundles --json
+```
+
+The fork-matrix gate is the three-gate contract from [`docs/guides/EXAMPLE-TEST-CONTRACT.md`](../../docs/guides/EXAMPLE-TEST-CONTRACT.md): tsc strict / storyboard zero-failures / upstream façade.
+
+For deeper validation: [`docs/guides/VALIDATE-YOUR-AGENT.md`](../../docs/guides/VALIDATE-YOUR-AGENT.md).
+
+## Migration notes
+
+- 6.6 → 6.7: [`docs/migration-6.6-to-6.7.md`](../../docs/migration-6.6-to-6.7.md)
+- 4.x → 5.x: [`docs/migration-4.x-to-5.x.md`](../../docs/migration-4.x-to-5.x.md)

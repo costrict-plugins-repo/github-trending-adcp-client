@@ -1,0 +1,100 @@
+/**
+ * PropertyListsPlatform + CollectionListsPlatform — list-publishing
+ * specialisms (v6.0).
+ *
+ * Two distinct specialisms with parallel CRUD shapes:
+ *
+ *   - **`property-lists`** — agent publishes/maintains authorized property
+ *     lists (which sellers can sell what for which advertisers; buyer-side
+ *     authorization graphs). Sellers FETCH and validate against these.
+ *   - **`collection-lists`** — agent publishes/maintains authorized
+ *     collection lists (program/show-level brand safety via IMDb /
+ *     Gracenote / EIDR ids). Sellers FETCH and apply for inventory
+ *     filtering.
+ *
+ * Both have CRUD on the same shape — create, update, get, list, delete —
+ * just on different list types. Could fold into one interface if your
+ * adopter implements both; today they're separated to match the spec
+ * specialism-per-list-type shape.
+ *
+ * Shape: standard CRUD + token-issuance semantics. `create_*` returns a
+ * one-time fetch token sellers store in their secret manager; `delete_*`
+ * revokes the token. Tokens are scoped per-seller for revocation.
+ *
+ * For standalone list-token reads, use registerPropertyListTool from @adcp/sdk/server.
+ *
+ * @public
+ */
+
+import type { Account } from '../account';
+import type { RequestContext } from '../context';
+import type { ServerPayload } from '../../../types/server-payload';
+import type {
+  CreatePropertyListRequest,
+  CreatePropertyListResponse,
+  UpdatePropertyListRequest,
+  UpdatePropertyListResponse,
+  GetPropertyListRequest,
+  GetPropertyListResponse,
+  ListPropertyListsRequest,
+  ListPropertyListsResponse,
+  DeletePropertyListRequest,
+  DeletePropertyListResponse,
+  CreateCollectionListRequest,
+  CreateCollectionListResponse,
+  UpdateCollectionListRequest,
+  UpdateCollectionListResponse,
+  GetCollectionListRequest,
+  GetCollectionListResponse,
+  ListCollectionListsRequest,
+  ListCollectionListsResponse,
+  DeleteCollectionListRequest,
+  DeleteCollectionListResponse,
+} from '../../../types/tools.generated';
+
+type Ctx<TCtxMeta> = RequestContext<Account<TCtxMeta>>;
+
+export type CreatePropertyListPayload = ServerPayload<CreatePropertyListResponse>;
+export type UpdatePropertyListPayload = ServerPayload<UpdatePropertyListResponse>;
+export type GetPropertyListPayload = ServerPayload<GetPropertyListResponse>;
+export type ListPropertyListsPayload = ServerPayload<ListPropertyListsResponse>;
+export type DeletePropertyListPayload = ServerPayload<DeletePropertyListResponse>;
+export type CreateCollectionListPayload = ServerPayload<CreateCollectionListResponse>;
+export type UpdateCollectionListPayload = ServerPayload<UpdateCollectionListResponse>;
+export type GetCollectionListPayload = ServerPayload<GetCollectionListResponse>;
+export type ListCollectionListsPayload = ServerPayload<ListCollectionListsResponse>;
+export type DeleteCollectionListPayload = ServerPayload<DeleteCollectionListResponse>;
+
+export interface PropertyListsPlatform<TCtxMeta = Record<string, unknown>> {
+  /**
+   * Create a property list. Returns an `auth_token` the buyer stores in
+   * their secret manager. Token is scoped to this list_id; MUST NOT be
+   * reused across lists.
+   */
+  createPropertyList(req: CreatePropertyListRequest, ctx: Ctx<TCtxMeta>): Promise<CreatePropertyListPayload>;
+
+  /** Patch an existing property list. */
+  updatePropertyList(req: UpdatePropertyListRequest, ctx: Ctx<TCtxMeta>): Promise<UpdatePropertyListPayload>;
+
+  /** Read a property list by id. Sellers call this with the auth_token. */
+  getPropertyList(req: GetPropertyListRequest, ctx: Ctx<TCtxMeta>): Promise<GetPropertyListPayload>;
+
+  /** Discover property lists the caller is authorized to read. */
+  listPropertyLists(req: ListPropertyListsRequest, ctx: Ctx<TCtxMeta>): Promise<ListPropertyListsPayload>;
+
+  /**
+   * Delete a property list. MUST revoke the auth_token immediately and
+   * signal cache invalidation to sellers (reduced cache_valid_until or
+   * a list-changed webhook). Compromise-driven revocation MUST also
+   * trigger this path.
+   */
+  deletePropertyList(req: DeletePropertyListRequest, ctx: Ctx<TCtxMeta>): Promise<DeletePropertyListPayload>;
+}
+
+export interface CollectionListsPlatform<TCtxMeta = Record<string, unknown>> {
+  createCollectionList(req: CreateCollectionListRequest, ctx: Ctx<TCtxMeta>): Promise<CreateCollectionListPayload>;
+  updateCollectionList(req: UpdateCollectionListRequest, ctx: Ctx<TCtxMeta>): Promise<UpdateCollectionListPayload>;
+  getCollectionList(req: GetCollectionListRequest, ctx: Ctx<TCtxMeta>): Promise<GetCollectionListPayload>;
+  listCollectionLists(req: ListCollectionListsRequest, ctx: Ctx<TCtxMeta>): Promise<ListCollectionListsPayload>;
+  deleteCollectionList(req: DeleteCollectionListRequest, ctx: Ctx<TCtxMeta>): Promise<DeleteCollectionListPayload>;
+}

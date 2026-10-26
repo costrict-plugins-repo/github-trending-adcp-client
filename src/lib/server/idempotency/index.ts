@@ -1,0 +1,16 @@
+export { createIdempotencyStore, hashPayload, probeIdempotencyStore, IdempotencyClaimOwnershipError } from './store';
+export type {
+  IdempotencyStore,
+  IdempotencyStoreConfig,
+  IdempotencyBackend,
+  IdempotencyCacheEntry,
+  IdempotencyCheckResult,
+} from './store';
+export { memoryBackend } from './backends/memory';
+export type { MemoryBackendOptions } from './backends/memory';
+export { pgBackend, getIdempotencyMigration, IDEMPOTENCY_MIGRATION, cleanupExpiredIdempotency } from './backends/pg';
+export type { PgBackendOptions } from './backends/pg';
+export { redisBackend } from './backends/redis';
+export type { RedisBackendOptions, RedisBackendClient, RedisLikeClient } from './backends/redis';
+export { createLazyBackend } from './backends/lazy';
+export type { LazyBackendFactory, LazyBackendOptions } from './backends/lazy';

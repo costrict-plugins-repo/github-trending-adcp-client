@@ -1,0 +1,405 @@
+import { type LookupAddress, type LookupOptions } from 'dns';
+import { lookup as dnsLookup } from 'dns/promises';
+import { Agent, fetch as undiciFetch } from 'undici';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { isAlwaysBlocked, isPrivateIp } from '../probes';
+import type { SignedHttpRequest } from './builder';
+
+const DEFAULT_TIMEOUT_MS = 10_000;
+const MAX_BODY_BYTES = 64 * 1024;
+
+function combineAbortSignals(first: AbortSignal, second: AbortSignal): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const sources = [first, second];
+  const listeners = new Map<AbortSignal, () => void>();
+  const dispose = () => {
+    for (const [signal, listener] of listeners) signal.removeEventListener('abort', listener);
+    listeners.clear();
+  };
+  for (const signal of sources) {
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+      break;
+    }
+    const listener = () => controller.abort(signal.reason);
+    listeners.set(signal, listener);
+    signal.addEventListener('abort', listener, { once: true });
+  }
+  if (controller.signal.aborted) dispose();
+  else controller.signal.addEventListener('abort', dispose, { once: true });
+  return { signal: controller.signal, dispose };
+}
+
+export interface ProbeOptions {
+  /** Allow http:// and private-IP destinations. Default false. */
+  allowPrivateIp?: boolean;
+  /** Per-call timeout override (ms). */
+  timeoutMs?: number;
+  /**
+   * MCP session ID to attach as `Mcp-Session-Id` on every outgoing request,
+   * injected after signing. `Mcp-Session-Id` is not a covered component per
+   * RFC 9421, so the signature remains valid even when the header is appended
+   * post-signing. Required by streamable-HTTP servers that mandate session
+   * state from a prior `initialize` handshake. Omit (or pass `undefined`) for
+   * stateless servers; pass `''` to explicitly skip injection when you know the
+   * server is session-less.
+   */
+  mcpSessionId?: string;
+  /** Negotiated MCP version to attach after signing. */
+  mcpProtocolVersion?: string;
+  /** Caller cancellation signal, composed with the per-probe timeout. */
+  signal?: AbortSignal;
+}
+
+export interface ProbeResult {
+  url: string;
+  status: number;
+  headers: Record<string, string>;
+  /** Error code extracted from `WWW-Authenticate: Signature error="<code>"`. */
+  wwwAuthenticateErrorCode?: string;
+  /** Truncated response body (first 64 KiB, JSON-parsed if applicable). */
+  body: unknown;
+  /** Network-level error; non-undefined means the request didn't complete. */
+  error?: string;
+  duration_ms: number;
+}
+
+/**
+ * Attach an MCP session header after request signing has completed.
+ *
+ * Keeping this operation separate from the request builder makes the ordering
+ * explicit: neither `Signature-Input` nor `Signature` is recomputed, so the
+ * session identifier can never enter the covered-component set.
+ */
+export function attachMcpSessionHeader(
+  signedHeaders: Record<string, string>,
+  mcpSessionId: string | undefined,
+  mcpProtocolVersion?: string
+): Record<string, string> {
+  if (!mcpSessionId && !mcpProtocolVersion) return signedHeaders;
+  return {
+    ...signedHeaders,
+    ...(mcpSessionId ? { 'Mcp-Session-Id': mcpSessionId } : {}),
+    ...(mcpProtocolVersion ? { 'MCP-Protocol-Version': mcpProtocolVersion } : {}),
+  };
+}
+
+/**
+ * Send a signed HTTP request to an AdCP agent and capture the response fields
+ * needed for conformance grading (status, WWW-Authenticate error code, body).
+ *
+ * Reuses the SSRF guards from the address classifiers — scheme check,
+ * `isAlwaysBlocked`, `isPrivateIp` — then pins the outbound connection to the
+ * pre-validated address via an undici dispatcher, defeating DNS rebinding.
+ * Bodies are capped at 64 KiB and parsed as JSON when content-type matches;
+ * otherwise returned as text. `redirect: 'manual'` is enforced so an agent
+ * that 301s can't smuggle the grader elsewhere.
+ */
+export async function probeSignedRequest(signed: SignedHttpRequest, options: ProbeOptions = {}): Promise<ProbeResult> {
+  const start = Date.now();
+  const timeout = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const result: ProbeResult = { url: signed.url, status: 0, headers: {}, body: null, duration_ms: 0 };
+
+  let parsed: URL;
+  try {
+    parsed = new URL(signed.url);
+  } catch {
+    result.error = `Invalid URL: ${signed.url}`;
+    result.duration_ms = Date.now() - start;
+    return result;
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    result.error = `Refusing to probe URL with unsupported scheme: ${parsed.protocol}`;
+    result.duration_ms = Date.now() - start;
+    return result;
+  }
+  if (parsed.protocol !== 'https:' && !options.allowPrivateIp) {
+    result.error = `Refusing to probe non-HTTPS URL: ${signed.url}`;
+    result.duration_ms = Date.now() - start;
+    return result;
+  }
+
+  // Strip URL brackets from IPv6 literals (`[::1]` → `::1`) before DNS lookup
+  // and address classification. `URL.hostname` wraps IPv6 in brackets; both
+  // `dns.lookup` and the address classifiers need the bare form.
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
+
+  let addresses: { address: string; family: number }[];
+  try {
+    addresses = await dnsLookup(hostname, { all: true });
+  } catch (err) {
+    result.error = `DNS lookup failed for ${hostname}: ${err instanceof Error ? err.message : String(err)}`;
+    result.duration_ms = Date.now() - start;
+    return result;
+  }
+  if (addresses.length === 0) {
+    result.error = `DNS returned no addresses for ${hostname}`;
+    result.duration_ms = Date.now() - start;
+    return result;
+  }
+  for (const a of addresses) {
+    if (isAlwaysBlocked(a.address)) {
+      result.error = `Refusing to probe always-blocked address ${a.address} for ${hostname}`;
+      result.duration_ms = Date.now() - start;
+      return result;
+    }
+  }
+  if (!options.allowPrivateIp) {
+    for (const a of addresses) {
+      if (isPrivateIp(a.address)) {
+        result.error = `Refusing to probe private/loopback address ${a.address} for ${hostname}`;
+        result.duration_ms = Date.now() - start;
+        return result;
+      }
+    }
+  }
+  const pinned = addresses[0]!;
+  const pinnedFamily = pinned.family === 6 ? 6 : 4;
+  // undici calls lookup with { all: true } for HTTPS targets on Node 22+, which
+  // expects the array form of the callback. Handle both shapes so the pin works
+  // across Node versions.
+  const dispatcher = new Agent({
+    connect: {
+      lookup: (
+        _h: string,
+        opts: LookupOptions | undefined,
+        cb: (err: NodeJS.ErrnoException | null, address: string | LookupAddress[], family?: number) => void
+      ) => {
+        if (opts?.all) {
+          cb(null, [{ address: pinned.address, family: pinnedFamily }]);
+        } else {
+          cb(null, pinned.address, pinnedFamily);
+        }
+      },
+    },
+  });
+
+  // Attach Mcp-Session-Id after the signed headers so the header is not a
+  // covered component — the signature over the signed body/headers is already
+  // computed, and the session ID is orthogonal to the signature's integrity.
+  const outHeaders = attachMcpSessionHeader(signed.headers, options.mcpSessionId, options.mcpProtocolVersion);
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeout);
+  const combinedSignal = options.signal ? combineAbortSignals(options.signal, ac.signal) : undefined;
+  const signal = combinedSignal?.signal ?? ac.signal;
+  try {
+    const res = await undiciFetch(signed.url, {
+      method: signed.method,
+      redirect: 'manual',
+      signal,
+      headers: outHeaders,
+      body: signed.body,
+      dispatcher,
+    });
+    result.status = res.status;
+    const headers: Record<string, string> = {};
+    res.headers.forEach((v, k) => {
+      headers[k.toLowerCase()] = v;
+    });
+    result.headers = headers;
+
+    const wwwAuth = headers['www-authenticate'];
+    if (wwwAuth) {
+      result.wwwAuthenticateErrorCode = extractSignatureErrorCode(wwwAuth);
+    }
+
+    const reader = res.body?.getReader();
+    if (reader) {
+      const chunks: Uint8Array[] = [];
+      let bytes = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > MAX_BODY_BYTES) {
+          await reader.cancel();
+          result.error = `Response body exceeded ${MAX_BODY_BYTES} bytes`;
+          return result;
+        }
+        chunks.push(value);
+      }
+      const buf = Buffer.concat(chunks.map(c => Buffer.from(c.buffer, c.byteOffset, c.byteLength)));
+      const contentType = headers['content-type'] ?? '';
+      if (contentType.includes('application/json')) {
+        try {
+          result.body = JSON.parse(buf.toString('utf8'));
+        } catch {
+          result.body = buf.toString('utf8');
+        }
+      } else {
+        result.body = buf.toString('utf8');
+      }
+    }
+    return result;
+  } catch (err) {
+    result.error = err instanceof Error ? err.message : String(err);
+    return result;
+  } finally {
+    clearTimeout(timer);
+    combinedSignal?.dispose();
+    result.duration_ms = Date.now() - start;
+    await dispatcher.close().catch(() => {});
+  }
+}
+
+/**
+ * Perform the MCP Streamable HTTP `initialize` handshake and return the
+ * `Mcp-Session-Id` header value from the response. Call this once before
+ * dispatching signed conformance vectors so that each subsequent
+ * `tools/call` probe can carry the session ID without disturbing the
+ * covered-component set — `Mcp-Session-Id` is not a covered component per
+ * RFC 9421, so appending it after signing leaves signatures intact.
+ *
+ * Returns `{ sessionId: undefined }` when the server responds without a
+ * session header (stateless server, or one that does not require sessions).
+ * Returns `{ sessionId: undefined, error: '...' }` on network failure —
+ * callers that auto-initialize should propagate or surface this as a
+ * grading pre-condition failure rather than running all vectors session-less
+ * and watching them cascade to 400.
+ */
+export async function initializeMcpSession(
+  mcpUrl: string,
+  options: ProbeOptions = {},
+  /**
+   * Extra headers for the initialize handshake only — typically the agent's
+   * `authorization`. The handshake authenticates like any ordinary MCP client
+   * request; the signed vectors that follow stay bearer-less by design (the
+   * signature is their authentication), so this never leaks into vector
+   * requests.
+   */
+  extraHeaders: Record<string, string> = {}
+): Promise<{ sessionId: string | undefined; protocolVersion?: string; error?: string }> {
+  // The grader needs raw, post-signing control over subsequent tools/call
+  // requests, but session establishment must still follow the official MCP
+  // lifecycle. Adapt the hardened, DNS-pinned probe into the fetch surface
+  // accepted by the official SDK transport.
+  const lifecycleFetch: typeof fetch = async (input, init) => {
+    const request = new Request(input, init);
+    // Streamable HTTP's listening GET is optional. The signing grader never
+    // consumes server-initiated messages, so tell the official transport that
+    // this client does not open that stream. Buffering an SSE response through
+    // probeSignedRequest would otherwise hold one authenticated connection per
+    // vector until timeout.
+    if (request.method === 'GET') {
+      return new Response(null, { status: 405 });
+    }
+    const headers: Record<string, string> = {};
+    request.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
+    const body = request.method === 'GET' || request.method === 'HEAD' ? undefined : await request.clone().text();
+    const combinedSignal = options.signal ? combineAbortSignals(options.signal, request.signal) : undefined;
+    let result: ProbeResult;
+    try {
+      result = await probeSignedRequest(
+        {
+          method: request.method,
+          url: request.url,
+          headers,
+          ...(body !== undefined ? { body } : {}),
+        },
+        {
+          ...options,
+          signal: combinedSignal?.signal ?? request.signal,
+        }
+      );
+    } finally {
+      combinedSignal?.dispose();
+    }
+    if (result.error) throw new Error(result.error);
+
+    const responseBody =
+      result.status === 204 || result.status === 205 || result.body === null
+        ? null
+        : typeof result.body === 'string'
+          ? result.body
+          : JSON.stringify(result.body);
+    return new Response(responseBody, { status: result.status, headers: result.headers });
+  };
+
+  const transport = new StreamableHTTPClientTransport(new URL(mcpUrl), {
+    requestInit: {
+      headers: extraHeaders,
+      redirect: 'manual',
+    },
+    fetch: lifecycleFetch,
+  });
+  const client = new Client({ name: 'adcp-signing-grader', version: '1.0.0' });
+  try {
+    await client.connect(transport);
+    return {
+      sessionId: transport.sessionId,
+      protocolVersion: transport.protocolVersion,
+    };
+  } catch (err) {
+    return {
+      sessionId: undefined,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
+/**
+ * Extract `error="<code>"` from a `WWW-Authenticate: Signature ...` header.
+ * Returns undefined when the header isn't a Signature challenge, the param
+ * is absent, or the extracted value isn't a well-formed spec error code
+ * (a token in `[a-z0-9_]+`). Sanitizing at source keeps downstream
+ * diagnostics / LLM-consumption paths safe from smuggled content in
+ * attacker-controlled header values.
+ */
+export function extractSignatureErrorCode(headerValue: string): string | undefined {
+  // `WWW-Authenticate` may carry multiple challenges concatenated with commas.
+  // We only grade Signature challenges; ignore Basic/Bearer/etc.
+  const challenges = splitChallenges(headerValue);
+  for (const challenge of challenges) {
+    if (!/^Signature\b/i.test(challenge)) continue;
+    const m = /\berror\s*=\s*"([^"]*)"/.exec(challenge);
+    if (!m) continue;
+    const value = m[1];
+    // Spec error codes are `request_signature_*` — all lowercase-alnum +
+    // underscore. Reject anything else so quotes/newlines/HTML/LLM-poisoning
+    // content can't flow into diagnostic strings or rendered reports.
+    if (value && /^[a-z0-9_]+$/.test(value)) return value;
+    return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Split a `WWW-Authenticate` header into per-challenge chunks. RFC 7235 §4.1
+ * lets multiple challenges coexist separated by commas, and challenge params
+ * are `k="v"` where `v` can contain commas. Track quote state so an
+ * adversarial `error="foo, Bar baz"` doesn't spuriously split mid-value.
+ */
+function splitChallenges(headerValue: string): string[] {
+  const parts: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < headerValue.length; i++) {
+    const ch = headerValue[i]!;
+    if (ch === '"' && headerValue[i - 1] !== '\\') {
+      inQuotes = !inQuotes;
+      current += ch;
+      continue;
+    }
+    if (!inQuotes && ch === ',') {
+      // Look ahead for a scheme-like token (`<name><whitespace>`) — only
+      // then treat this comma as a challenge boundary; otherwise it's a
+      // param-list separator inside the current challenge.
+      const rest = headerValue.slice(i + 1);
+      if (/^\s*[A-Za-z][A-Za-z0-9-]*\s+/.test(rest)) {
+        parts.push(current.trim());
+        current = '';
+        continue;
+      }
+    }
+    current += ch;
+  }
+  if (current.trim().length > 0) parts.push(current.trim());
+  return parts.filter(p => p.length > 0);
+}

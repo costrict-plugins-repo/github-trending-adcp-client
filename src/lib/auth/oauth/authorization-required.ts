@@ -1,0 +1,541 @@
+/**
+ * Zero-config OAuth discovery + actionable authorization errors.
+ *
+ * When a library consumer calls an OAuth-gated MCP agent without saved
+ * credentials, they get a `NeedsAuthorizationError` containing everything
+ * needed to either run an interactive flow or present a clear prompt — no
+ * re-probing required.
+ *
+ * Design note: this module only *discovers* — it never opens a browser or
+ * writes state. Interactive flow handling stays in the caller (CLI or a
+ * bespoke `OAuthFlowHandler`) so library behavior is predictable.
+ */
+import { ssrfSafeFetch, decodeBodyAsJsonOrText } from '../../net';
+import { AuthenticationRequiredError, type OAuthMetadataInfo } from '../../errors';
+import { throwIfAborted } from '../../protocols/abort';
+import { parseWWWAuthenticate, type WWWAuthenticateChallenge } from './diagnostics';
+import { buildProtectedResourceMetadataUrl, normalizeOAuthResourceForComparison } from './resource-url';
+
+/**
+ * Maximum length of an individual server-supplied string we copy into the
+ * `AuthorizationRequirements` payload. Anything longer is truncated with a
+ * `…` suffix so hostile agents can't smuggle megabyte error-descriptions
+ * into operator-facing prompts and logs.
+ */
+const MAX_DISPLAY_STRING = 256;
+
+/**
+ * Maximum number of scope strings we copy into `scopesSupported`. RFC 8414
+ * allows an unbounded array; hostile servers have sent thousands.
+ */
+const MAX_SCOPES = 64;
+
+/**
+ * Maximum number of auth-params we preserve under `challenge.params`. Bounds
+ * memory pressure from hostile servers that pack the `WWW-Authenticate`
+ * header with unknown auth-params.
+ */
+const MAX_CHALLENGE_PARAMS = 32;
+
+/**
+ * Strip ASCII control characters (excluding TAB) from a server-supplied
+ * string that may be shown to a human. Defeats terminal-hijack tricks like
+ * `\x1b]0;pwned\x07` (rewrites terminal title), `\r` (overwrites prompt),
+ * and `\x1b[2J` (clears screen). Also truncates over-long values.
+ */
+function sanitizeDisplay(value: string): string {
+  const stripped = value.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+  if (stripped.length <= MAX_DISPLAY_STRING) return stripped;
+  return `${stripped.slice(0, MAX_DISPLAY_STRING - 1)}…`;
+}
+
+/**
+ * Sanitize the parsed `WWW-Authenticate` challenge before embedding it in a
+ * `NeedsAuthorizationError`. Consumers that render `requirements.challenge`
+ * to a terminal should never see control characters. Caps `params` count to
+ * bound hostile servers.
+ *
+ * The `scheme` is already lowercased + token-constrained by the parser.
+ * Param keys are also token-constrained so they're safe; only values need
+ * sanitizing.
+ */
+function sanitizeChallenge(c: WWWAuthenticateChallenge): WWWAuthenticateChallenge {
+  const params: Record<string, string> = {};
+  for (const [k, v] of Object.entries(c.params)) {
+    if (Object.keys(params).length >= MAX_CHALLENGE_PARAMS) break;
+    params[k] = sanitizeDisplay(v);
+  }
+  return {
+    scheme: c.scheme,
+    ...(c.realm !== undefined ? { realm: sanitizeDisplay(c.realm) } : {}),
+    ...(c.error !== undefined ? { error: sanitizeDisplay(c.error) } : {}),
+    ...(c.error_description !== undefined ? { error_description: sanitizeDisplay(c.error_description) } : {}),
+    ...(c.scope !== undefined ? { scope: sanitizeDisplay(c.scope) } : {}),
+    ...(c.resource_metadata !== undefined ? { resource_metadata: sanitizeDisplay(c.resource_metadata) } : {}),
+    params,
+  };
+}
+
+/**
+ * Structured result from a Bearer challenge and its available discovery
+ * metadata. Records may be partial; use
+ * {@link hasValidatedMcpAuthorizationRequirements} before treating one as
+ * proof that an MCP endpoint requires OAuth.
+ */
+export interface AuthorizationRequirements {
+  /** The agent URL we probed. */
+  agentUrl: string;
+  /** Resource URL the agent advertises in its `WWW-Authenticate` / PRM (RFC 9728). */
+  resource?: string;
+  /** URL of the protected-resource-metadata document (from `WWW-Authenticate: resource_metadata=…`). */
+  resourceMetadataUrl?: string;
+  /** First `authorization_servers[0]` from the protected-resource metadata. */
+  authorizationServer?: string;
+  /**
+   * All `authorization_servers` advertised by the PRM, in declaration order.
+   * The walker only probes `[0]` (PRM preference order — see RFC 9728 §3.3);
+   * the full list is exposed so callers can surface multi-issuer deployments
+   * in diagnostics. A length > 1 is uncommon and worth flagging to the
+   * operator — typically a federation partner or a staged migration.
+   */
+  authorizationServers?: string[];
+  /** `authorization_endpoint` from the authorization-server metadata (RFC 8414). */
+  authorizationEndpoint?: string;
+  /** `token_endpoint` from the authorization-server metadata. */
+  tokenEndpoint?: string;
+  /** `registration_endpoint` if the AS supports RFC 7591 dynamic client registration. */
+  registrationEndpoint?: string;
+  /** Scopes advertised by the AS (RFC 8414 `scopes_supported`). */
+  scopesSupported?: string[];
+  /**
+   * `grant_types_supported` advertised by the AS (RFC 8414). `undefined` when
+   * the AS didn't publish the field — per RFC 8414 that defaults to
+   * `["authorization_code", "implicit"]`. Clients should treat absence as
+   * "unknown, try your grant and see," not as proof the grant is unsupported.
+   */
+  grantTypesSupported?: string[];
+  /** True when the AS metadata came from the OIDC fallback URL rather than RFC 8414. */
+  metadataSource?: 'rfc-8414' | 'openid-configuration';
+  /** Scope hinted in the `WWW-Authenticate` challenge's `scope` auth-param. */
+  challengeScope?: string;
+  /** Raw parsed challenge the agent returned on the 401. */
+  challenge: WWWAuthenticateChallenge;
+}
+
+/**
+ * Error raised when an agent returns a 401 and we do not have credentials
+ * to satisfy it. Carries everything needed to run an interactive OAuth flow
+ * or show the operator an actionable prompt.
+ *
+ * Extends {@link AuthenticationRequiredError} so existing callers that catch
+ * `AuthenticationRequiredError` automatically receive the richer variant —
+ * they can downcast with `instanceof NeedsAuthorizationError` when they
+ * want walked discovery metadata.
+ *
+ * Note on `code` vs `subCode`:
+ *   The parent class declares `readonly code = 'AUTHENTICATION_REQUIRED'` as
+ *   a class field that re-initializes on every construction, so a child-side
+ *   override attempt is silently overwritten under `useDefineForClassFields`.
+ *   The narrow discriminator is exposed as `subCode` — prefer
+ *   `instanceof NeedsAuthorizationError` for type-narrowing and use `subCode`
+ *   only for structured-log keying.
+ *
+ * Note on validation and `hasOAuth`:
+ *   The inherited getter returns `true` only when both `authorization_endpoint`
+ *   and `token_endpoint` were walked successfully. A partially-walked
+ *   requirements record still yields `hasOAuth === false`. Callers should
+ *   construct this error only after
+ *   {@link hasValidatedMcpAuthorizationRequirements} succeeds.
+ */
+export class NeedsAuthorizationError extends AuthenticationRequiredError {
+  /** Narrow discriminator for consumers that already know about this class. */
+  readonly subCode = 'needs_authorization' as const;
+  readonly requirements: AuthorizationRequirements;
+
+  constructor(requirements: AuthorizationRequirements, message?: string) {
+    super(requirements.agentUrl, synthesizeOAuthMetadata(requirements), message ?? defaultMessage(requirements));
+    this.name = 'NeedsAuthorizationError';
+    this.requirements = requirements;
+    // Extend the parent's `details` payload so structured-logging consumers
+    // that read `err.details` (via `extractErrorInfo` or equivalent) see the
+    // full walked chain, not just the synthesized one-hop oauthMetadata.
+    this.details = { ...(this.details as object | undefined), requirements };
+  }
+}
+
+/**
+ * Build an {@link OAuthMetadataInfo} for the base-class constructor so that
+ * legacy callers still see a non-empty `oauthMetadata` + working
+ * `hasOAuth`/`authorizationUrl` getters on the error. When discovery didn't
+ * yield enough info, return undefined and let the base class degrade
+ * gracefully.
+ */
+function synthesizeOAuthMetadata(req: AuthorizationRequirements): OAuthMetadataInfo | undefined {
+  if (!req.authorizationEndpoint || !req.tokenEndpoint) return undefined;
+  return {
+    authorization_endpoint: req.authorizationEndpoint,
+    token_endpoint: req.tokenEndpoint,
+    ...(req.registrationEndpoint ? { registration_endpoint: req.registrationEndpoint } : {}),
+    ...(req.authorizationServer ? { issuer: req.authorizationServer } : {}),
+  };
+}
+
+function defaultMessage(req: AuthorizationRequirements): string {
+  const parts = [`Agent ${sanitizeDisplay(req.agentUrl)} requires OAuth authorization.`];
+  if (req.authorizationServer) {
+    parts.push(`Authorization server: ${req.authorizationServer}.`);
+  }
+  if (req.challenge.error_description) {
+    parts.push(`Server said: ${sanitizeDisplay(req.challenge.error_description)}.`);
+  }
+  parts.push('Provide an OAuthFlowHandler or run an interactive flow to complete authorization.');
+  return parts.join(' ');
+}
+
+/**
+ * Options for {@link discoverAuthorizationRequirements}.
+ */
+export interface DiscoverAuthorizationOptions {
+  /** Allow http:// and private-IP probe targets. Default false. */
+  allowPrivateIp?: boolean;
+  /** Override per-probe HTTP timeout (ms). Default inherits from ssrfSafeFetch (10s). */
+  timeoutMs?: number;
+  /** Scoped fetch implementation for the agent, PRM, and AS metadata probes. */
+  fetchFn?: typeof fetch;
+  /** Caller cancellation, including the absolute task deadline. */
+  signal?: AbortSignal;
+  /**
+   * If provided, use this `WWW-Authenticate` header verbatim instead of
+   * re-probing the agent. Use this when you already have a 401 response in
+   * hand and want to avoid a second round-trip.
+   */
+  wwwAuthenticate?: string;
+}
+
+/**
+ * Walk the OAuth discovery chain starting from an agent URL. Returns an
+ * `AuthorizationRequirements` diagnostic record for a Bearer challenge (even
+ * when later metadata is absent), or `null` when the probe is not a Bearer
+ * 401. Use {@link hasValidatedMcpAuthorizationRequirements} before promoting
+ * the record to an interactive OAuth requirement.
+ *
+ * Strategy:
+ *   1. POST `tools/list` to the agent with no `Authorization` header.
+ *   2. If 401 + `WWW-Authenticate: Bearer`: parse the challenge.
+ *   3. Resolve `resource_metadata=…`, or the RFC 9728 well-known fallback,
+ *      then GET it and read
+ *      `resource` + `authorization_servers`.
+ *   4. For the first `authorization_servers[0]`: GET `/.well-known/oauth-authorization-server`
+ *      and read `authorization_endpoint`, `token_endpoint`, `registration_endpoint`,
+ *      `scopes_supported`.
+ *   5. Return a structured record.
+ *
+ * Anything missing from the chain surfaces as `undefined` on the result —
+ * callers can still present a partial picture without re-probing.
+ */
+export async function discoverAuthorizationRequirements(
+  agentUrl: string,
+  options: DiscoverAuthorizationOptions = {}
+): Promise<AuthorizationRequirements | null> {
+  // `allowPrivateIp` authorizes the agent probe. Chain hops (PRM, AS
+  // metadata) inherit that trust ONLY when they share the agent's origin —
+  // a compromised agent that advertises a private-IP authorization server
+  // on a different origin would otherwise pivot a discovery walk into the
+  // host's internal network.
+  const allowPrivateIpOnAgent = options.allowPrivateIp ?? false;
+  const agentOrigin = originOf(agentUrl);
+  const allowPrivateIpForHop = (url: string): boolean =>
+    allowPrivateIpOnAgent && agentOrigin !== undefined && originOf(url) === agentOrigin;
+
+  let challengeHeader = options.wwwAuthenticate;
+  if (!challengeHeader) {
+    const probe = await probeAgent401(
+      agentUrl,
+      allowPrivateIpOnAgent,
+      options.timeoutMs,
+      options.fetchFn,
+      options.signal
+    );
+    if (probe.status !== 401) {
+      // 200, 403, 5xx, or network error — not an OAuth 401 we can act on.
+      return null;
+    }
+    challengeHeader = probe.wwwAuthenticate;
+  }
+
+  const challenge = parseWWWAuthenticate(challengeHeader ?? null);
+  if (!challenge || challenge.scheme !== 'bearer') {
+    // A 401 without a Bearer challenge isn't our kind of problem — let it propagate.
+    return null;
+  }
+
+  const requirements: AuthorizationRequirements = {
+    agentUrl,
+    challengeScope: challenge.scope ? sanitizeDisplay(challenge.scope) : undefined,
+    challenge: sanitizeChallenge(challenge),
+  };
+
+  let resourceMetadataUrl = challenge.resource_metadata;
+  if (!resourceMetadataUrl) {
+    try {
+      resourceMetadataUrl = buildProtectedResourceMetadataUrl(agentUrl);
+    } catch {
+      resourceMetadataUrl = undefined;
+    }
+  }
+  if (resourceMetadataUrl) requirements.resourceMetadataUrl = sanitizeDisplay(resourceMetadataUrl);
+
+  // Walk protected-resource metadata (RFC 9728 §3). Private-IP targets are
+  // only allowed when the hop's origin matches the agent's.
+  if (resourceMetadataUrl && isSafeHttpUrl(resourceMetadataUrl)) {
+    const prm = await fetchJson(
+      resourceMetadataUrl,
+      allowPrivateIpForHop(resourceMetadataUrl),
+      options.timeoutMs,
+      options.fetchFn,
+      options.signal
+    );
+    if (prm && typeof prm === 'object') {
+      const resource = (prm as { resource?: unknown }).resource;
+      const servers = (prm as { authorization_servers?: unknown }).authorization_servers;
+      if (typeof resource === 'string') requirements.resource = sanitizeDisplay(resource);
+      if (Array.isArray(servers)) {
+        const validServers = servers
+          .filter((s: unknown): s is string => typeof s === 'string' && isSafeHttpUrl(s))
+          .map(sanitizeDisplay);
+        if (validServers.length > 0) {
+          requirements.authorizationServers = validServers;
+          requirements.authorizationServer = validServers[0];
+        }
+      }
+    }
+  }
+
+  // Walk authorization-server metadata using the first issuer. RFC 8414 §3
+  // first, then OIDC Discovery 1.0 fallback for AS deployments (Keycloak in
+  // OIDC mode, Ping, ADFS) that only publish at
+  // `{issuer}/.well-known/openid-configuration`.
+  if (requirements.authorizationServer) {
+    const asUrl = buildAuthorizationServerMetadataUrl(requirements.authorizationServer);
+    let md: Record<string, unknown> | undefined;
+    let source: 'rfc-8414' | 'openid-configuration' | undefined;
+    if (asUrl) {
+      const res = await fetchJson(
+        asUrl,
+        allowPrivateIpForHop(asUrl),
+        options.timeoutMs,
+        options.fetchFn,
+        options.signal
+      );
+      if (res && typeof res === 'object') {
+        md = res as Record<string, unknown>;
+        source = 'rfc-8414';
+      }
+    }
+    if (!md) {
+      const oidcUrl = buildOidcDiscoveryUrl(requirements.authorizationServer);
+      if (oidcUrl) {
+        const res = await fetchJson(
+          oidcUrl,
+          allowPrivateIpForHop(oidcUrl),
+          options.timeoutMs,
+          options.fetchFn,
+          options.signal
+        );
+        if (res && typeof res === 'object') {
+          md = res as Record<string, unknown>;
+          source = 'openid-configuration';
+        }
+      }
+    }
+    if (md) {
+      requirements.metadataSource = source;
+      if (typeof md.authorization_endpoint === 'string') {
+        requirements.authorizationEndpoint = sanitizeDisplay(md.authorization_endpoint);
+      }
+      if (typeof md.token_endpoint === 'string') {
+        requirements.tokenEndpoint = sanitizeDisplay(md.token_endpoint);
+      }
+      if (typeof md.registration_endpoint === 'string') {
+        requirements.registrationEndpoint = sanitizeDisplay(md.registration_endpoint);
+      }
+      if (Array.isArray(md.scopes_supported)) {
+        const scopes = md.scopes_supported
+          .filter((s: unknown): s is string => typeof s === 'string')
+          .slice(0, MAX_SCOPES)
+          .map(sanitizeDisplay);
+        if (scopes.length > 0) requirements.scopesSupported = scopes;
+      }
+      if (Array.isArray(md.grant_types_supported)) {
+        const grants = md.grant_types_supported
+          .filter((g: unknown): g is string => typeof g === 'string')
+          .slice(0, 32)
+          .map(sanitizeDisplay);
+        if (grants.length > 0) requirements.grantTypesSupported = grants;
+      }
+    }
+  }
+
+  return requirements;
+}
+
+/**
+ * Whether a discovery record proves the MCP endpoint is OAuth protected.
+ *
+ * `discoverAuthorizationRequirements` intentionally returns partial records
+ * for diagnostics. Those records are not sufficient evidence for an
+ * interactive OAuth prompt: the MCP authorization profile requires protected
+ * resource metadata whose `resource` exactly identifies the endpoint and
+ * which names at least one authorization server.
+ */
+export function hasValidatedMcpAuthorizationRequirements(
+  requirements: AuthorizationRequirements,
+  agentUrl: string
+): boolean {
+  return (
+    normalizeOAuthResourceForComparison(requirements.resource ?? '') ===
+      normalizeOAuthResourceForComparison(agentUrl) &&
+    Array.isArray(requirements.authorizationServers) &&
+    requirements.authorizationServers.length > 0
+  );
+}
+
+/**
+ * Probe the agent for the parsed `WWW-Authenticate` challenge on a 401.
+ *
+ * Where `discoverAuthorizationRequirements` walks the full RFC 9728 → 8414
+ * chain for Bearer/OAuth challenges, this helper is the catch-all: it works
+ * for ANY scheme (Basic, Digest, Bearer-without-PRM, …) and returns the
+ * structured challenge so callers can surface scheme-specific remediation
+ * (e.g. "use `--auth-scheme basic`" when the gateway speaks RFC 7617).
+ *
+ * Returns `null` when the agent isn't responding with a 401, or when the
+ * response carries no parseable `WWW-Authenticate`. Reuses `probeAgent401`
+ * so the SSRF gate and timeout policy stay consistent with the OAuth path.
+ */
+export async function probeAuthChallenge(
+  agentUrl: string,
+  options: { allowPrivateIp?: boolean; timeoutMs?: number; fetchFn?: typeof fetch; signal?: AbortSignal } = {}
+): Promise<WWWAuthenticateChallenge | null> {
+  const probe = await probeAgent401(
+    agentUrl,
+    options.allowPrivateIp ?? false,
+    options.timeoutMs,
+    options.fetchFn,
+    options.signal
+  );
+  if (probe.status !== 401) return null;
+  return parseWWWAuthenticate(probe.wwwAuthenticate ?? null);
+}
+
+/**
+ * Fire a single unauthenticated `tools/list` at the agent and return the
+ * status + `WWW-Authenticate` header. Used when the caller hasn't provided
+ * a cached 401 response.
+ */
+async function probeAgent401(
+  agentUrl: string,
+  allowPrivateIp: boolean,
+  timeoutMs?: number,
+  fetchFn?: typeof fetch,
+  signal?: AbortSignal
+): Promise<{ status: number; wwwAuthenticate?: string }> {
+  const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+  try {
+    const res = await ssrfSafeFetch(agentUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json',
+      },
+      body,
+      allowPrivateIp,
+      signal,
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...(fetchFn ? { trustedFetchFn: fetchFn } : {}),
+    });
+    return { status: res.status, wwwAuthenticate: res.headers['www-authenticate'] };
+  } catch {
+    throwIfAborted(signal);
+    return { status: 0 };
+  }
+}
+
+/**
+ * Check a URL is an absolute `http:`/`https:` URL before we hand it to
+ * `ssrfSafeFetch`. Defeats `javascript:`, `file:`, `data:`, etc. the agent
+ * might echo back in PRM or AS metadata. `ssrfSafeFetch` refuses non-HTTP
+ * schemes too, but failing fast here gives a cleaner discovery flow and
+ * avoids surfacing scheme errors as mysterious discovery misses.
+ */
+function originOf(value: string): string | undefined {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+function isSafeHttpUrl(value: string): boolean {
+  try {
+    const u = new URL(value);
+    return u.protocol === 'https:' || u.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Build the authorization-server metadata URL for an issuer per RFC 8414 §3.
+ *
+ * For issuer `https://as.example.com/tenant1`, metadata lives at
+ * `https://as.example.com/.well-known/oauth-authorization-server/tenant1`
+ * (well-known prefix inserted BEFORE the issuer path, not after). This
+ * matches how the MCP SDK and most authorization servers advertise metadata.
+ */
+function buildAuthorizationServerMetadataUrl(issuer: string): string | undefined {
+  if (!isSafeHttpUrl(issuer)) return undefined;
+  const u = new URL(issuer);
+  const pathname = u.pathname.endsWith('/') ? u.pathname.slice(0, -1) : u.pathname;
+  return `${u.origin}/.well-known/oauth-authorization-server${pathname}`;
+}
+
+/**
+ * OpenID Connect Discovery 1.0 fallback URL. Some authorization servers
+ * (Keycloak in OIDC mode, Ping, ADFS) only publish metadata at
+ * `{issuer}/.well-known/openid-configuration` — path *suffixed*, not
+ * prefixed. The OIDC discovery doc carries `token_endpoint`,
+ * `authorization_endpoint`, and `grant_types_supported` with the same
+ * semantics as RFC 8414, so it's a safe read-through when the RFC 8414
+ * probe misses.
+ */
+function buildOidcDiscoveryUrl(issuer: string): string | undefined {
+  if (!isSafeHttpUrl(issuer)) return undefined;
+  const u = new URL(issuer);
+  const base = u.pathname.endsWith('/') ? `${u.origin}${u.pathname.slice(0, -1)}` : `${u.origin}${u.pathname}`;
+  return `${base}/.well-known/openid-configuration`;
+}
+
+async function fetchJson(
+  url: string,
+  allowPrivateIp: boolean,
+  timeoutMs?: number,
+  fetchFn?: typeof fetch,
+  signal?: AbortSignal
+): Promise<unknown> {
+  try {
+    const res = await ssrfSafeFetch(url, {
+      method: 'GET',
+      headers: { accept: 'application/json' },
+      allowPrivateIp,
+      signal,
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...(fetchFn ? { trustedFetchFn: fetchFn } : {}),
+    });
+    if (res.status !== 200) return undefined;
+    return decodeBodyAsJsonOrText(res.body, res.headers['content-type']);
+  } catch {
+    throwIfAborted(signal);
+    return undefined;
+  }
+}

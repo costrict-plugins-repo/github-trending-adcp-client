@@ -1,0 +1,112 @@
+export type ContentDigestPolicy = 'required' | 'forbidden' | 'either';
+
+export interface VerifierCapability {
+  profiles?: ('adcp/request-signing/v1' | 'web-bot-auth')[];
+  wba_draft_revision?: string;
+  supported: boolean;
+  covers_content_digest: ContentDigestPolicy;
+  required_for: string[];
+  /**
+   * Shadow-mode bridge between `supported_for` and `required_for`: the seller
+   * verifies signatures when present and logs failures but does NOT reject
+   * unsigned requests. Counterparties SHOULD sign ops in this list so sellers
+   * can surface failure rates before flipping to `required_for`. Precedence:
+   * `required_for` > `warn_for` > `supported_for`.
+   */
+  warn_for?: string[];
+  supported_for?: string[];
+  /**
+   * JSON-RPC protocol methods (for example `tasks/cancel`) that require
+   * request signatures. Kept separate from `required_for`, whose namespace is
+   * AdCP tool names such as `create_media_buy`.
+   */
+  protocol_methods_required_for?: string[];
+  /** Protocol methods verified in shadow mode, using exact wire-name matching. */
+  protocol_methods_warn_for?: string[];
+  /** Protocol methods to sign when the buyer enables `sign_supported`. */
+  protocol_methods_supported_for?: string[];
+}
+
+export interface AdcpJsonWebKey {
+  kid: string;
+  kty: string;
+  crv?: string;
+  alg?: string;
+  use?: string;
+  key_ops?: string[];
+  adcp_use?: string;
+  /** Public-key X coordinate (Ed25519) or x-coordinate (EC P-256). */
+  x?: string;
+  /** Public-key Y coordinate (EC P-256 only). */
+  y?: string;
+  /**
+   * Private scalar (RFC 7518 §6.2.2.1 / §6.1.2). Present only when the JWK
+   * represents a private key — never published at `jwks_uri`. Test vectors
+   * ship this under `_private_d_for_test_only` in their `keys.json`; runtime
+   * signers load it into `d`.
+   */
+  d?: string;
+  [extra: string]: unknown;
+}
+
+export interface RevocationSnapshot {
+  issuer: string;
+  updated: string;
+  next_update: string;
+  revoked_kids: string[];
+  revoked_jtis: string[];
+  revocation_details?: Record<string, import('../identity-3.3/types').RevocationDetail>;
+}
+
+/**
+ * Narrow "successfully verified" shape. Middleware sets `req.verifiedSigner`
+ * to a value of this type only after a real signature was validated — the
+ * absence of `req.verifiedSigner` is the signal that the request went through
+ * the verifier as unsigned (and the operation didn't require signing).
+ *
+ * `keyid` is always non-empty. Pre-3.x releases returned a `keyid: ''`
+ * sentinel on the unsigned path; consumers MUST now branch on
+ * `req.verifiedSigner === undefined` instead.
+ */
+export interface VerifiedSigner {
+  keyid: string;
+  agent_url?: string;
+  /** Exact operator record selected during verified agent discovery. */
+  operatorRecord?: { url: string; document: unknown };
+  verified_at: number;
+}
+
+/**
+ * Discriminated union returned by `verifyRequestSignature`.
+ *
+ * - `{ status: 'verified', ... }` — a signature was present and passed all
+ *   pipeline steps. Shape extends {@link VerifiedSigner}.
+ * - `{ status: 'unsigned' }` — no signature headers were present, and the
+ *   operation was not in `capability.required_for` (or no operation was
+ *   supplied). The request may still be accepted by the server's own auth
+ *   path; the verifier just has no signer to attest to.
+ *
+ * A caller that needs to distinguish "unsigned but acceptable" from
+ * "verified" should branch on `.status`. Most middleware consumers should
+ * instead rely on `req.verifiedSigner` being populated — that reads cleanly
+ * as "did a real signature check succeed."
+ */
+export type VerifyResult = ({ status: 'verified' } & VerifiedSigner) | { status: 'unsigned'; verified_at: number };
+
+export const REQUEST_SIGNING_TAG = 'adcp/request-signing/v1';
+export const RESPONSE_SIGNING_TAG = 'adcp/response-signing/v1';
+export const ALLOWED_ALGS = new Set(['ed25519', 'ecdsa-p256-sha256']);
+/**
+ * Wire-format algorithm identifier — the string that appears in
+ * `Signature-Input`'s `alg` parameter. Same vocabulary as `ALLOWED_ALGS`.
+ */
+export type AdcpSignAlg = 'ed25519' | 'ecdsa-p256-sha256';
+export const MAX_SIGNATURE_WINDOW_SECONDS = 300;
+export const CLOCK_SKEW_TOLERANCE_SECONDS = 60;
+export const MANDATORY_COMPONENTS: ReadonlyArray<string> = ['@method', '@target-uri', '@authority'];
+export const RESPONSE_MANDATORY_COMPONENTS: ReadonlyArray<string> = [
+  '@status',
+  '@method;req',
+  '@authority;req',
+  '@target-uri;req',
+];

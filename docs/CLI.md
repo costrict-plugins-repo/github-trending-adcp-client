@@ -1,0 +1,690 @@
+# AdCP CLI Tool
+
+A simple command-line utility for calling AdCP agents directly without writing code. Features protocol auto-detection and agent alias management for quick access.
+
+## Scaffold and diagnose a seller
+
+Requires Node.js `^20.19.0 || >=22.12.0`.
+
+```bash
+npx --package '@adcp/sdk@^14.0.0-0' adcp init seller \
+  --specialism sales-non-guaranteed --backend postgres --dir my-seller
+cd my-seller
+npm install
+cp .env.example .env
+# Edit .env with real credentials, catalog, database URL, and a unique deployment namespace.
+npm run migrate
+npm run doctor
+```
+
+The scaffold starts with the compact AdCP 3.2 lifecycle and real catalog input
+(`PRODUCT_CATALOG_JSON`); it never creates fallback inventory. `adcp doctor`
+checks the project contract, required secrets, SDK-major drift, database
+connectivity, canonical catalog shape, and the required task/idempotency/context
+tables. The generated `.gitignore` excludes `.env`, dependencies, and build
+output. A memory scaffold reports development-only conditions as warnings
+without failing `doctor`.
+
+The `webhooks` manifest field enables diagnostics only; it does not wire push
+delivery. First construct `createPostgresWebhookRuntime`, apply its migrations,
+pass `runtime.serverConfig` as the server's `webhooks` option, and schedule
+bounded `runtime.recoverOnce()` calls. Then set `webhooks: true` in
+`adcp.project.json` so doctor requires the delivery and outbox tables. For
+custom tables, declare `webhookTables: { "deliveries": "...", "outbox": "..." }`
+with the same distinct names passed to the runtime. See the
+[production durability checklist](./guides/PRODUCTION-DURABILITY.md).
+
+Use `--json` in CI.
+Pass `--agent <alias-or-url>` to run official-client capability discovery and
+compare the agent's advertised schema line with this SDK.
+
+## Installation
+
+### Global Installation (Recommended for CLI usage)
+
+```bash
+npm install -g '@adcp/sdk@^14.0.0-0'
+```
+
+After global installation, the `adcp` command will be available system-wide.
+
+### Local Installation
+
+```bash
+npm install '@adcp/sdk@^14.0.0-0'
+```
+
+Then use via npx:
+
+```bash
+npx adcp [arguments...]
+```
+
+The untagged `@adcp/sdk` install remains the maintained SDK 13 line until SDK
+14 reaches GA; it does not include the new `init seller` and `doctor` workflow.
+
+## Quick Start
+
+### Save an Agent for Easy Access
+
+```bash
+# Save agent with alias
+adcp --save-auth test https://test-agent.adcontextprotocol.org
+# Prompts for protocol (optional) and auth token (optional)
+
+# Now use the alias
+adcp test get_products '{"brief":"coffee brands"}'
+```
+
+### Direct URL Usage (No Setup Required)
+
+Protocol auto-detection - no need to specify `mcp` or `a2a`:
+
+```bash
+# List available tools
+adcp https://test-agent.adcontextprotocol.org
+
+# Call a tool
+adcp https://agent.example.com get_products '{"brief":"coffee brands"}'
+```
+
+## Usage
+
+```
+adcp <alias|url> [tool-name] [payload] [options]
+```
+
+### Arguments
+
+- **alias|url**: Saved agent alias (e.g., `test`) or full URL to agent endpoint
+- **tool-name**: Name of the AdCP tool/task to call (omit to list available tools)
+- **payload**: JSON payload for the tool (default: `{}`)
+  - Inline JSON: `'{"brief":"text"}'`
+  - File path: `@payload.json`
+  - Stdin: `-`
+
+### Options
+
+- `--protocol PROTO`: Force protocol: `mcp` or `a2a` (default: auto-detect)
+- `--auth TOKEN`: Authentication token for the agent
+- `--wait`: Wait for async/webhook responses (requires ngrok or --local)
+- `--local`: Use local webhook without ngrok (for local agents only)
+- `--timeout MS`: Webhook timeout in milliseconds (default: 300000 = 5min)
+- `--help, -h`: Show help message
+- `--json`: Output raw JSON response (default: pretty print)
+- `--debug`: Show debug information
+
+### Agent Management Commands
+
+- `--save-auth <alias> [url] [protocol]`: Save agent configuration
+- `--list-agents`: List all saved agents
+- `--remove-agent <alias>`: Remove saved agent configuration
+- `--show-config`: Show config file location
+
+## Examples
+
+### Agent Alias Workflow
+
+```bash
+# Save agents
+adcp --save-auth test https://test-agent.adcontextprotocol.org
+adcp --save-auth prod https://prod-agent.example.com
+
+# List saved agents
+adcp --list-agents
+
+# Use aliases
+adcp test
+adcp test get_products '{"brief":"coffee brands"}'
+adcp prod create_media_buy @payload.json
+```
+
+### List Available Tools/Skills
+
+Discover what an agent can do (no tool name = list tools):
+
+```bash
+# Auto-detect protocol
+adcp https://test-agent.adcontextprotocol.org
+adcp test
+
+# Explicit protocol (if needed)
+adcp mcp https://agent.example.com/mcp
+adcp a2a https://agent.example.com
+```
+
+Example output:
+```
+🔍 Auto-detecting protocol...
+✓ Detected protocol: MCP
+
+📋 Agent Information
+
+Name: CLI Agent
+Protocol: MCP
+URL: https://agent.example.com/mcp
+
+Available Tools (14):
+
+1. get_products
+   Get available products matching the brief
+
+2. create_media_buy
+   Create a media buy with the specified parameters
+
+3. list_creative_formats
+   List all available creative formats
+...
+```
+
+### Basic Product Discovery
+
+```bash
+# With alias (auto-detect)
+adcp test get_products '{"brief":"coffee subscription service"}'
+
+# With URL (auto-detect)
+adcp https://agent.example.com get_products '{"brief":"coffee brands"}'
+
+# Force specific protocol
+adcp https://agent.example.com get_products '{"brief":"coffee brands"}' --protocol mcp
+adcp test list_authorized_properties --protocol a2a
+```
+
+### Authentication Methods
+
+```bash
+# 1. Saved in agent config (recommended)
+adcp --save-auth prod https://prod-agent.com
+# Prompts for token securely
+
+adcp prod get_products '{"brief":"..."}'
+
+# 2. Explicit flag (overrides saved config)
+adcp test get_products '{"brief":"..."}' --auth your_token_here
+
+# 3. Environment variable (fallback)
+export ADCP_AUTH_TOKEN=your_token
+adcp https://agent.example.com get_products '{"brief":"..."}'
+
+# 4. HTTP Basic (gateway-fronted agents — Apigee, Kong, AWS API GW)
+adcp --save-auth gw https://gw.example.com/mcp --auth 'USER:PASS' --auth-scheme basic
+# See docs/guides/BASIC-AUTH.md for the gateway pattern, the auth_token-
+# suppression invariant, and a copyable wire-trace verification test.
+```
+
+### From File
+
+Create a payload file:
+
+```json
+{
+  "brief": "Eco-friendly products for millennials",
+  "brand_manifest": {"promoted_offering": "Sustainable consumer goods"},
+  "budget": 50000
+}
+```
+
+Then call:
+
+```bash
+# With alias
+adcp test get_products @payload.json
+
+# With URL
+adcp https://agent.example.com get_products @payload.json
+```
+
+### From Stdin
+
+```bash
+echo '{"brief":"travel packages"}' | adcp test get_products -
+```
+
+### Create Media Buy
+
+```bash
+adcp mcp https://agent.example.com/mcp create_media_buy '{
+  "brief": "Summer campaign",
+  "packages": [
+    {
+      "format_ids": [{"agent_url": "https://creative.example.com", "id": "banner_300x250"}],
+      "impressions": 100000
+    }
+  ]
+}' --auth $TOKEN
+```
+
+### With Debug Output
+
+```bash
+adcp mcp https://agent.example.com/mcp get_products '{"brief":"test"}' --debug
+```
+
+Output includes:
+- Configuration details
+- Request/response timing
+- Full error stack traces
+
+### JSON Output (for scripting)
+
+```bash
+# Get raw JSON for parsing
+adcp mcp https://agent.example.com/mcp get_products '{"brief":"test"}' --json > output.json
+
+# Use with jq
+adcp mcp https://agent.example.com/mcp get_products '{"brief":"test"}' --json | jq '.products[0].name'
+```
+
+## Compliance and Merchandising Assessments
+
+The CLI includes two higher-level evaluation flows on top of the existing scenario runner.
+
+### `adcp storyboard run`
+
+Runs all applicable capability tracks against an agent and reports the full picture instead of stopping at the first failure.
+
+> **Note:** `adcp comply` still works as a deprecated alias for `adcp storyboard run` but will be removed in v5.
+
+```bash
+# Run all applicable tracks
+adcp storyboard run myagent
+
+# Target a specific bundle or storyboard
+adcp storyboard run myagent --storyboards creative-template
+
+# Limit to a subset of tracks
+adcp storyboard run myagent --tracks core,products,media_buy
+
+# Pin the compliance cache/spec line used for storyboard resolution
+adcp storyboard run myagent --compliance-version 3.0.12
+
+# Recommended for CI: --json for machine-readable output + --strict-flags
+# so stale flags fail the build instead of passing advisory warnings.
+adcp storyboard run https://agent.example.com/mcp --auth "$ADCP_AUTH_TOKEN" --json --strict-flags
+```
+
+Available tracks:
+
+- `core`
+- `products`
+- `media_buy`
+- `creative`
+- `reporting`
+- `governance`
+- `signals`
+- `si`
+- `audiences`
+
+Useful flags:
+
+- `--storyboards ID,...`: Run specific storyboard or bundle IDs instead of capability-driven selection
+- `--tracks core,products,...`: Restrict the run to specific tracks
+- `--compliance-version VERSION`: Select a packaged compliance cache/spec line, for example `3.1.29` or `3.2.5`; use the same flag with `storyboard list`, `show`, and `step` when reproducing a pinned run
+- `--compliance-dir PATH`: Use a specific compliance cache directory, mainly for local protocol/cache development
+- `--brief TEXT`: Override the default sample discovery brief
+- `--dry-run`: Preview steps without executing
+- `--json`: Emit machine-readable output for automation
+- `--strict-flags`: Exit non-zero if any removed flag (e.g. `--platform-type`, removed in 5.1) is passed — recommended for CI
+- `--oauth`: Complete the browser OAuth flow inline when the saved alias has no valid tokens (MCP only — requires a saved alias)
+
+The versioned compliance summary reports actual storyboard-wide assertion failures in
+`failures`, with a command to rerun the whole storyboard. A false storyboard verdict
+without a failed step or assertion appears separately in `incomplete_storyboards`
+and as `STORYBOARD-INCOMPLETE` in text output. CI consumers that require complete
+coverage should inspect `overall_status`, `completeness`, and
+`incomplete_storyboards` as well as `failures`; partial coverage can exit zero.
+
+Discovery-only runs do not count as lifecycle observations. A lifecycle task that
+runs without observable state still leaves its lifecycle coverage partial. An
+optional-only storyboard passes only when a passing optional phase executes real
+coverage and no prerequisite fails; skipping every step does not earn a pass.
+
+Persistent notification assertions observe the URL from a successful subscriber
+registration. Positive `expect_webhook` payload selectors may use `filter.body`
+or flat selectors; conflicting values are rejected. Negative `expect_no_webhook`
+payload selectors require `filter.body`. Each ordinary positive assertion needs
+a fresh delivery or logical notification; explicit delivery-count and retry
+assertions can inspect the full delivery history. The flat account-change
+`change_id: '*'` selector means presence, while a nested `filter.body.change_id`
+matches its value exactly.
+
+> **Removed in 5.1:** `--platform-type` / `--list-platform-types` / `--storyboards` options. Agent selection is now driven by `get_adcp_capabilities` (`supported_protocols` + `specialisms`). Use `--storyboards` above to target a specific bundle.
+
+### OAuth-protected agents
+
+Storyboard runs reuse OAuth tokens saved under an alias (see `~/.adcp/agents.json`). Two supported flows:
+
+```bash
+# 1. Save tokens once, then run any number of storyboard assessments
+adcp --save-auth spotify-agent https://agents.scope3.com/spotify --oauth
+adcp storyboard run spotify-agent
+
+# 2. Save the alias without auth, then let the storyboard command drive the flow
+adcp --save-auth spotify-agent https://agents.scope3.com/spotify --no-auth
+adcp storyboard run spotify-agent --oauth
+```
+
+The first time `storyboard run` sees `--oauth` on an alias without valid tokens, it opens a browser, completes the PKCE flow, and persists the tokens to the alias. Subsequent runs reuse the cached tokens (auto-refreshing via the stored `refresh_token`). Static `--auth TOKEN` tokens are unaffected and still work the same way.
+
+**CI / headless environments.** The browser flow requires a local machine. For CI, save tokens once locally (`adcp --save-auth <alias> <url> --oauth`), copy `~/.adcp/agents.json` into the CI runner's home directory (or mount it as a secret), and run `adcp storyboard run <alias>` without `--oauth` — the stored `refresh_token` auto-refreshes on 401. Passing `--oauth` with a raw URL under `--json` exits with `{ "error": "oauth_requires_alias" }` and code 2 so pipelines fail fast instead of hanging on a browser prompt that will never arrive.
+
+## Environment Variables
+
+### ADCP_AUTH_TOKEN
+
+Set a default authentication token:
+
+```bash
+export ADCP_AUTH_TOKEN="your_token_here"
+adcp mcp https://agent.example.com/mcp get_products '{"brief":"test"}'
+```
+
+The `--auth` flag overrides this environment variable.
+
+### ADCP_DEBUG
+
+Enable debug mode by default:
+
+```bash
+export ADCP_DEBUG=true
+adcp mcp https://agent.example.com/mcp get_products '{"brief":"test"}'
+```
+
+## Async/Webhook Support with ngrok
+
+The CLI can automatically handle async agent responses using ngrok to create temporary webhook endpoints.
+
+### Setup
+
+First, install ngrok:
+
+```bash
+# Mac
+brew install ngrok
+
+# Windows
+choco install ngrok
+
+# Linux
+# Download from https://ngrok.com/download
+```
+
+### Usage
+
+#### With Remote Agents (ngrok)
+
+Use the `--wait` flag to wait for async responses from remote agents:
+
+```bash
+adcp mcp https://agent.example.com/mcp create_media_buy @payload.json --auth $TOKEN --wait
+```
+
+**What happens:**
+1. CLI starts a local webhook server
+2. ngrok creates a public tunnel to your local server
+3. CLI calls the agent with the ngrok webhook URL
+4. If the agent returns `submitted` or `working` status, CLI waits for webhook
+5. Agent sends response to webhook when ready
+6. CLI displays the final response and cleans up
+
+#### With Local Agents (no ngrok)
+
+Use `--wait --local` for local development without ngrok:
+
+```bash
+adcp mcp http://localhost:3000/mcp create_media_buy @payload.json --wait --local
+```
+
+**Perfect for:**
+- Testing with local agent servers
+- Development without internet
+- No ngrok account needed
+- Faster setup (no tunnel creation)
+
+**Example output:**
+```
+🌐 Webhook endpoint ready
+   URL: https://abc123.ngrok.io
+   Timeout: 300s
+
+📤 Task submitted, waiting for async response...
+⏳ Waiting for async response...
+✅ Response received after 45.2s
+
+✅ ASYNC RESPONSE RECEIVED
+
+Response:
+{
+  "status": "approved",
+  "media_buy_id": "mb_12345",
+  ...
+}
+```
+
+### Options
+
+- `--wait`: Enable webhook waiting (requires ngrok or `--local`)
+- `--local`: Use local webhook without ngrok (for local agents only)
+- `--timeout MS`: Set webhook timeout in milliseconds (default: 300000 = 5 minutes)
+- `--debug`: Show detailed webhook setup and progress
+
+### Example: Async Media Buy Creation
+
+**Remote agent with ngrok:**
+```bash
+# Create payload file
+cat > media-buy.json <<EOF
+{
+  "brief": "Summer campaign",
+  "packages": [{
+    "format_ids": [{"agent_url": "...", "id": "banner_300x250"}],
+    "impressions": 100000
+  }]
+}
+EOF
+
+# Submit and wait for approval
+adcp mcp https://agent.example.com/mcp create_media_buy @media-buy.json \
+  --auth $TOKEN \
+  --wait \
+  --timeout 600000
+```
+
+**Local agent without ngrok:**
+```bash
+# Start your local agent first
+# cd my-agent && npm start
+
+# Then submit request
+adcp mcp http://localhost:3000/mcp create_media_buy @media-buy.json \
+  --wait \
+  --local \
+  --timeout 600000
+```
+
+### Troubleshooting
+
+**"ngrok not found":**
+- Make sure ngrok is installed and in your PATH
+- Run `which ngrok` to verify installation
+
+**"Webhook timeout":**
+- Agent took longer than timeout to respond
+- Increase timeout with `--timeout 600000` (10 minutes)
+- Check agent status independently
+
+**ngrok connection issues:**
+- Check your internet connection
+- Free ngrok accounts have rate limits
+- Consider upgrading to ngrok paid plan for production use
+
+## Exit Codes
+
+- `0`: Success
+- `1`: General error (network issues, invalid JSON, etc.)
+- `2`: Invalid arguments (wrong protocol, missing required args)
+- `3`: Agent error (task failed, authentication failed, webhook timeout)
+
+## Scripting with the CLI
+
+### Bash Script Example
+
+```bash
+#!/bin/bash
+
+AGENT_URL="https://agent.example.com/mcp"
+AUTH_TOKEN="your_token"
+
+# Discover products
+products=$(adcp mcp "$AGENT_URL" get_products '{
+  "brief": "Summer fashion campaign",
+  "promoted_offering": "Sustainable clothing"
+}' --auth "$AUTH_TOKEN" --json)
+
+# Check if successful
+if [ $? -eq 0 ]; then
+  echo "Found products:"
+  echo "$products" | jq '.products[] | .name'
+else
+  echo "Failed to get products"
+  exit 1
+fi
+```
+
+### Node.js Script Example
+
+```javascript
+import { execSync } from 'child_process';
+
+try {
+  const result = execSync(
+    `adcp mcp https://agent.example.com/mcp get_products '{"brief":"test"}' --json`,
+    { encoding: 'utf-8' }
+  );
+
+  const data = JSON.parse(result);
+  console.log('Products:', data.products);
+} catch (error) {
+  console.error('CLI failed:', error.message);
+}
+```
+
+## Available AdCP Tools/Tasks
+
+Common AdCP tools you can call:
+
+- `get_products` - Discover advertising products
+- `list_creative_formats` - List available creative formats
+- `create_media_buy` - Create a new media buy
+- `update_media_buy` - Update an existing media buy
+- `sync_creatives` - Sync creative assets
+- `list_creatives` - List creative assets
+- `get_media_buy_delivery` - Get delivery information
+- `list_authorized_properties` - List authorized properties
+- `provide_performance_feedback` - Provide campaign feedback
+- `get_signals` - Get audience signals
+- `activate_signal` - Activate audience signals
+
+## Troubleshooting
+
+### "Cannot find module" Error
+
+Make sure the library is built:
+
+```bash
+npm run build:lib
+```
+
+### Authentication Failures
+
+Check that:
+1. Your token is valid and not expired
+2. The agent URL is correct
+3. The agent supports the protocol you specified
+
+### Invalid JSON Payload
+
+Ensure your JSON is properly escaped:
+
+```bash
+# Good - single quotes around JSON
+adcp mcp https://agent.example.com/mcp get_products '{"brief":"test"}'
+
+# Bad - unescaped quotes
+adcp mcp https://agent.example.com/mcp get_products {"brief":"test"}
+```
+
+Or use a file:
+
+```bash
+adcp mcp https://agent.example.com/mcp get_products @payload.json
+```
+
+## Advanced Usage
+
+### Piping Multiple Commands
+
+```bash
+# Discover products, extract first product ID, create media buy
+product_id=$(adcp mcp https://agent.example.com/mcp get_products '{"brief":"test"}' --json | jq -r '.products[0].id')
+
+adcp mcp https://agent.example.com/mcp create_media_buy "{
+  \"product_id\": \"$product_id\",
+  \"impressions\": 100000
+}" --auth $TOKEN
+```
+
+### Error Handling in Scripts
+
+```bash
+if ! adcp mcp https://agent.example.com/mcp get_products '{"brief":"test"}' 2>/dev/null; then
+  echo "First agent failed, trying backup..."
+  adcp a2a https://backup-agent.example.com get_products '{"brief":"test"}'
+fi
+```
+
+## Comparison with Library Usage
+
+### CLI
+
+```bash
+adcp mcp https://agent.example.com/mcp get_products '{"brief":"coffee"}' --auth $TOKEN
+```
+
+### Library (TypeScript)
+
+```typescript
+import { AdCPClient } from '@adcp/sdk';
+
+const client = new AdCPClient({
+  id: 'agent',
+  name: 'Agent',
+  agent_uri: 'https://agent.example.com/mcp',
+  protocol: 'mcp',
+  auth_token_env: process.env.TOKEN
+});
+
+const result = await client.getProducts({
+  brief: 'coffee'
+});
+```
+
+The CLI is perfect for:
+- Quick testing and exploration
+- Shell scripts and automation
+- CI/CD pipelines
+- One-off API calls
+
+The library is better for:
+- Complex multi-agent workflows
+- Conversation management
+- Input handlers and clarifications
+- Production applications
+
+## Getting Help
+
+- CLI Help: `adcp --help`
+- Library Docs: https://github.com/adcontextprotocol/adcp-client
+- Issues: https://github.com/adcontextprotocol/adcp-client/issues
+- Email: maintainers@adcontextprotocol.org

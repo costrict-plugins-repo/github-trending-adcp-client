@@ -1,0 +1,504 @@
+/**
+ * Simple ADCP-compliant response parser
+ * Implements ADCP spec PR #77 for standardized status field
+ */
+
+import type { InputRequest } from './ConversationTypes';
+import { getLatestA2ADataPartFromTask } from '../utils/a2a-artifacts';
+import {
+  ADCP_STATUS,
+  type ADCPStatus,
+  TASK_ENVELOPE_FIELDS,
+  extractAdcpStatusFromA2aTaskResult,
+  extractAdcpTaskStatusFromPayload,
+  isAdcpStatus,
+} from './task-status';
+
+export { ADCP_STATUS, type ADCPStatus } from './task-status';
+
+const NESTED_TASK_ENVELOPE_FIELDS: ReadonlySet<string> = new Set([...TASK_ENVELOPE_FIELDS, 'taskId', 'adcp_error']);
+
+/**
+ * Max length for a server-issued session id (`contextId` / `taskId`) we
+ * will retain on the client. Well above any sane UUID, opaque token, or
+ * ADK-style hierarchical id — exceeding it signals a misbehaving seller,
+ * not a legitimate identifier.
+ */
+const SESSION_ID_MAX_LENGTH = 256;
+
+/**
+ * Printable ASCII only (0x20–0x7E). Rejects control characters (CR, LF,
+ * NUL, ANSI sequences) that would be retained verbatim on future sends
+ * and echoed into debug logs — a log-injection vector if those logs reach
+ * third-party observability stacks. This is stricter than the A2A spec,
+ * which treats the id as opaque, but matches every id format we've seen
+ * in the wild (UUIDs, KSUIDs, ADK `app/user/session` triples, etc.).
+ */
+const SESSION_ID_PATTERN = /^[\x20-\x7E]+$/;
+
+function isSafeSessionId(v: unknown): v is string {
+  if (typeof v !== 'string') return false;
+  if (v.length === 0 || v.length > SESSION_ID_MAX_LENGTH) return false;
+  return SESSION_ID_PATTERN.test(v);
+}
+
+/**
+ * Extract the AdCP task handle from an A2A wrapped Task result. The
+ * handle lives on artifact metadata (`adcp_task_id` per adcp-client#899,
+ * with `serverTaskId` accepted as a compatibility alias).
+ * Walk artifacts backward so trailing text-only artifacts with metadata still
+ * work when the DataPart does not carry a task id. If both metadata and the
+ * typed DataPart carry task ids and they disagree, prefer the DataPart.
+ */
+function extractAdcpTaskIdFromA2aTaskResult(result: any): string | undefined {
+  if (result == null || typeof result !== 'object' || Array.isArray(result)) return undefined;
+  if (result.kind !== 'task') return undefined;
+
+  const latestDataPart = getLatestA2ADataPartFromTask(result);
+  const taskIdFromDataPart = firstSafeSessionId(latestDataPart?.data?.task_id, latestDataPart?.data?.taskId);
+
+  const resolveMetadataTaskId = (taskId: string | undefined): string | undefined => {
+    if (!taskId) return undefined;
+    return taskIdFromDataPart && taskIdFromDataPart !== taskId ? taskIdFromDataPart : taskId;
+  };
+
+  const artifacts = result.artifacts;
+  if (Array.isArray(artifacts)) {
+    for (let i = artifacts.length - 1; i >= 0; i -= 1) {
+      const artifact = artifacts[i];
+      if (artifact == null || typeof artifact !== 'object' || Array.isArray(artifact)) continue;
+      const metadata = (artifact as { metadata?: unknown }).metadata;
+      if (metadata == null || typeof metadata !== 'object' || Array.isArray(metadata)) continue;
+      const m = metadata as Record<string, unknown>;
+      const taskId = resolveMetadataTaskId(firstSafeSessionId(m.adcp_task_id, m.serverTaskId));
+      if (taskId) return taskId;
+    }
+  }
+
+  if (taskIdFromDataPart) return taskIdFromDataPart;
+
+  const resultMetadata = result.metadata;
+  if (resultMetadata != null && typeof resultMetadata === 'object' && !Array.isArray(resultMetadata)) {
+    const m = resultMetadata as Record<string, unknown>;
+    const taskId = resolveMetadataTaskId(firstSafeSessionId(m.adcp_task_id, m.serverTaskId));
+    if (taskId) return taskId;
+  }
+
+  return undefined;
+}
+
+/** Return the first argument that passes {@link isSafeSessionId}, else `undefined`. */
+function firstSafeSessionId(...candidates: unknown[]): string | undefined {
+  for (const c of candidates) {
+    if (isSafeSessionId(c)) return c;
+  }
+  return undefined;
+}
+
+function getAdcpVersionFromPayload(payload: unknown): string | undefined {
+  if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
+  const record = payload as Record<string, unknown>;
+  if (typeof record.adcp_version === 'string') return record.adcp_version;
+
+  const nested = record.response;
+  if (nested != null && typeof nested === 'object' && !Array.isArray(nested)) {
+    const envelope = nested as Record<string, unknown>;
+    const status = typeof envelope.status === 'string' ? envelope.status : undefined;
+    const isAdcpStatus = status !== undefined && (Object.values(ADCP_STATUS) as string[]).includes(status);
+    const hasOnlyEnvelopeFields = Object.keys(envelope).every(key => NESTED_TASK_ENVELOPE_FIELDS.has(key));
+    const looksLikeEnvelope =
+      typeof envelope.task_id === 'string' ||
+      typeof envelope.taskId === 'string' ||
+      Array.isArray(envelope.errors) ||
+      (envelope.adcp_error != null && typeof envelope.adcp_error === 'object') ||
+      (isAdcpStatus && hasOnlyEnvelopeFields);
+
+    if (looksLikeEnvelope && typeof envelope.adcp_version === 'string') {
+      return envelope.adcp_version;
+    }
+  }
+
+  return undefined;
+}
+
+function getLatestDataPartFromParts(parts: unknown): Record<string, unknown> | undefined {
+  if (!Array.isArray(parts)) return undefined;
+  for (let i = parts.length - 1; i >= 0; i -= 1) {
+    const part = parts[i];
+    if (part == null || typeof part !== 'object' || Array.isArray(part)) continue;
+    const record = part as Record<string, unknown>;
+    if (record.kind !== 'data') continue;
+    const data = record.data;
+    if (data == null || typeof data !== 'object' || Array.isArray(data)) continue;
+    return data as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+function getA2AResultAdcpVersion(result: unknown): string | undefined {
+  if (result == null || typeof result !== 'object' || Array.isArray(result)) return undefined;
+
+  const taskData = getLatestA2ADataPartFromTask(result)?.data;
+  const taskVersion = getAdcpVersionFromPayload(taskData);
+  if (taskVersion) return taskVersion;
+
+  const resultRecord = result as Record<string, unknown>;
+  const messageData = getLatestDataPartFromParts(resultRecord.parts);
+  const messageVersion = getAdcpVersionFromPayload(messageData);
+  if (messageVersion) return messageVersion;
+
+  return getAdcpVersionFromPayload(result);
+}
+
+function getMcpTextContentAdcpVersion(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+  for (const item of content) {
+    if (item == null || typeof item !== 'object' || Array.isArray(item)) continue;
+    const text = (item as { type?: unknown; text?: unknown }).text;
+    if ((item as { type?: unknown }).type !== 'text' || typeof text !== 'string') continue;
+    try {
+      const parsed = JSON.parse(text);
+      const version = getAdcpVersionFromPayload(parsed);
+      if (version) return version;
+    } catch {
+      // Non-JSON text chunks are advisory copy, not AdCP envelopes.
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Simple parser that follows ADCP spec exactly
+ */
+export class ProtocolResponseParser {
+  /**
+   * Check if response indicates input is needed per ADCP spec
+   */
+  isInputRequest(response: any): boolean {
+    // ADCP spec: check A2A JSON-RPC wrapped status first
+    if (
+      response?.result?.status?.state === ADCP_STATUS.INPUT_REQUIRED ||
+      response?.result?.status?.state === ADCP_STATUS.AUTH_REQUIRED
+    ) {
+      return true;
+    }
+
+    // ADCP spec: check top-level status field
+    if (response?.status === ADCP_STATUS.INPUT_REQUIRED || response?.status === ADCP_STATUS.AUTH_REQUIRED) {
+      return true;
+    }
+
+    // Legacy fallback for backward compatibility
+    return (
+      response?.type === 'input_request' ||
+      response?.question !== undefined ||
+      response?.input_required === true ||
+      response?.needs_clarification === true
+    );
+  }
+
+  /**
+   * Parse input request from response
+   */
+  parseInputRequest(response: any): InputRequest {
+    const statusMessageData = getLatestDataPartFromParts(response?.result?.status?.message?.parts);
+    const artifactData = getLatestA2ADataPartFromTask(response?.result)?.data;
+    const source = statusMessageData ?? artifactData ?? response?.structuredContent ?? response;
+    const question = source.message || source.question || source.prompt || 'Please provide input';
+    const field = source.field || source.parameter;
+    const suggestions = source.options || source.choices || source.suggestions;
+
+    return {
+      question,
+      field,
+      expectedType: this.parseExpectedType(source.expected_type || source.type),
+      suggestions,
+      required: source.required !== false,
+      validation: source.validation,
+      context: source.context || source.description,
+    };
+  }
+
+  /**
+   * Get ADCP status from response
+   */
+  getStatus(response: any): ADCPStatus | null {
+    // A live A2A pause is the continuation authority. Artifacts may contain
+    // earlier partial AdCP statuses (for example `submitted`) and must not
+    // mask the Task's current input/auth-required state.
+    const a2aTaskState = response?.result?.kind === 'task' ? response.result.status?.state : undefined;
+    if (a2aTaskState === ADCP_STATUS.INPUT_REQUIRED || a2aTaskState === ADCP_STATUS.AUTH_REQUIRED) {
+      return a2aTaskState;
+    }
+
+    // For A2A wrapped Task responses (`result.kind === 'task'`), the
+    // transport-layer `result.status.state` reflects the HTTP-call
+    // lifecycle (always `'completed'` for AdCP submitted arms per
+    // adcp-client#899), NOT the AdCP work lifecycle. Prefer the AdCP
+    // status surfaced on the artifact's DataPart when it's set —
+    // that's the layer the buyer cares about for polling decisions.
+    // See adcp-client#973 for the regression class this catches.
+    const adcpStatusFromArtifact = extractAdcpStatusFromA2aTaskResult(response?.result);
+    if (adcpStatusFromArtifact) return adcpStatusFromArtifact;
+
+    // Check A2A JSON-RPC wrapped status (result.status.state) — used
+    // when the artifact didn't surface an AdCP status (non-AdCP A2A
+    // responses, or sync-completed responses where transport state is
+    // authoritative).
+    if (isAdcpStatus(response?.result?.status?.state)) {
+      return response.result.status.state as ADCPStatus;
+    }
+
+    // Raw/in-process MCP wrappers may have a wrapper-level status plus the
+    // actual AdCP task envelope under `data`. The nested task status wins
+    // over the wrapper when it is a real task envelope; domain-status
+    // collisions still fall through because `extractAdcpTaskStatusFromPayload`
+    // rejects domain payloads with non-envelope fields.
+    const hasOfficialPayload =
+      response?.structuredContent !== undefined || response?.content !== undefined || response?.result !== undefined;
+    const data = hasOfficialPayload ? undefined : response?.data;
+    const dataTaskStatus =
+      data != null && typeof data === 'object' && !Array.isArray(data)
+        ? extractAdcpTaskStatusFromPayload(data)
+        : undefined;
+    if (dataTaskStatus) return dataTaskStatus;
+
+    // Check top-level status first (A2A and direct responses)
+    if (isAdcpStatus(response?.status)) {
+      return response.status as ADCPStatus;
+    }
+
+    // Check MCP structuredContent.status.
+    // Exclusive task-lifecycle statuses (submitted/working/input-required/
+    // auth-required) never appear in domain enums and are trusted unconditionally.
+    // Shared literals (completed/canceled/failed/rejected) collide with AdCP v3
+    // domain status enums like MediaBuyStatus, so we only treat them as task
+    // status when the envelope has no keys outside the task-envelope allowlist.
+    // Otherwise we fall through to the structuredContent fallback below, so Zod
+    // validators parse the domain payload. See issue #646.
+    const sc = response?.structuredContent;
+    if (sc?.status && isAdcpStatus(sc.status)) {
+      const taskStatus = extractAdcpTaskStatusFromPayload(sc);
+      if (taskStatus) return taskStatus;
+      // Domain payload present alongside a shared-literal status — fall through.
+    }
+
+    // Check for MCP error responses
+    if (response?.isError === true) {
+      return ADCP_STATUS.FAILED;
+    }
+
+    // If response has structuredContent or content, assume it's completed
+    if (response?.structuredContent || (response?.content && !response?.isError)) {
+      return ADCP_STATUS.COMPLETED;
+    }
+
+    return null;
+  }
+
+  /**
+   * Extract the `replayed` field from a protocol response envelope.
+   *
+   * Returns `true` if the seller set `replayed: true` on the envelope,
+   * `false` if explicitly set to `false`, `undefined` if not present. Callers
+   * with side effects on response (notifications, LLM memory writes, downstream
+   * tool calls) MUST treat `undefined` as `false` — the spec says fresh
+   * executions MAY omit the field.
+   */
+  getReplayed(response: any): boolean | undefined {
+    if (response == null) return undefined;
+
+    // A2A JSON-RPC wrapped
+    if (response.result && typeof response.result.replayed === 'boolean') {
+      return response.result.replayed;
+    }
+
+    // MCP structuredContent
+    if (response.structuredContent && typeof response.structuredContent.replayed === 'boolean') {
+      return response.structuredContent.replayed;
+    }
+
+    // Top-level envelope (A2A direct, REST)
+    if (typeof response.replayed === 'boolean') {
+      return response.replayed;
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Extract the seller-served AdCP release echo from the response envelope.
+   *
+   * This is the response-side `adcp_version` value, not necessarily the
+   * caller's configured pin. Multi-version sellers can downshift within the
+   * same major; callers that care should compare this value to their request's
+   * release-precision wire version (for example, `wireVersion.normalize(pin)`),
+   * not to a raw full-semver configuration value.
+   */
+  getAdcpVersion(response: any): string | undefined {
+    if (response == null) return undefined;
+
+    // A2A wrapped Task/Message responses carry AdCP payloads in DataParts.
+    const a2aVersion = getA2AResultAdcpVersion(response.result);
+    if (a2aVersion) return a2aVersion;
+
+    // MCP structuredContent.
+    if (typeof response.structuredContent?.adcp_version === 'string') {
+      return response.structuredContent.adcp_version;
+    }
+
+    // MCP text content fallback.
+    const textContentVersion = getMcpTextContentAdcpVersion(response.content);
+    if (textContentVersion) return textContentVersion;
+
+    // Legacy tasks/get wrapper.
+    const taskVersion = getAdcpVersionFromPayload(response.task);
+    if (taskVersion) return taskVersion;
+
+    // Flat AdCP envelope.
+    if (typeof response.adcp_version === 'string') {
+      return response.adcp_version;
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Extract the A2A `contextId` / AdCP `context_id` that binds the response
+   * to a server-side conversation. Buyers retain this across calls on the
+   * same AgentClient so the server can route subsequent sends to the same
+   * session. Returns `undefined` when the server did not surface one (e.g.,
+   * MCP completed responses that don't need conversation continuity).
+   *
+   * Values that fail {@link isSafeSessionId} (overlong, control characters,
+   * non-string) are rejected and return `undefined` — retention falls back
+   * to the previously retained id. The server is the authoritative issuer
+   * but a compromised or buggy seller shouldn't be able to exhaust buyer
+   * memory or inject control sequences into buyer debug logs.
+   */
+  getContextId(response: any): string | undefined {
+    if (response == null) return undefined;
+
+    // A2A sendMessage returns either a Task (has `contextId`) or a Message
+    // (may have `contextId`). With the A2AClient SDK these arrive unwrapped
+    // on `response.result`; some transports surface them directly on the
+    // response envelope, so check both.
+    if (response.result) {
+      const fromResult = firstSafeSessionId(response.result.contextId, response.result.context_id);
+      if (fromResult) return fromResult;
+    }
+    const fromEnvelope = firstSafeSessionId(response.contextId);
+    if (fromEnvelope) return fromEnvelope;
+
+    // MCP structuredContent / top-level AdCP envelope.
+    const sc = response.structuredContent;
+    if (sc) {
+      const fromSc = firstSafeSessionId(sc.context_id);
+      if (fromSc) return fromSc;
+    }
+    return firstSafeSessionId(response.context_id);
+  }
+
+  /**
+   * Extract the AdCP work handle used by tasks/get. For official A2A results,
+   * this never falls back to the transport Task.id / Message.taskId.
+   *
+   * Same sanitization rules as {@link getContextId}: malformed ids return
+   * `undefined`.
+   */
+  getTaskId(response: any): string | undefined {
+    if (response == null) return undefined;
+
+    if (response.result) {
+      // A2A wrapped Task with AdCP payload — `artifact.metadata.adcp_task_id`
+      // is the AdCP work handle (what the buyer polls with via AdCP
+      // `tasks/get`). The transport-layer `result.id` is the A2A
+      // Task.id (always pinned to one HTTP call per adcp-client#899's
+      // two-lifecycle contract); using it as a polling key would
+      // address the wrong thing. See adcp-client#973.
+      if (response.result.kind === 'task') {
+        return extractAdcpTaskIdFromA2aTaskResult(response.result);
+      }
+      if (response.result.kind === 'message') {
+        const messageData = getLatestDataPartFromParts(response.result.parts);
+        const fromMessageData = firstSafeSessionId(messageData?.task_id);
+        if (fromMessageData) return fromMessageData;
+        const metadata = response.result.metadata;
+        if (metadata != null && typeof metadata === 'object' && !Array.isArray(metadata)) {
+          const record = metadata as Record<string, unknown>;
+          return firstSafeSessionId(record.adcp_task_id, record.serverTaskId);
+        }
+        return undefined;
+      }
+      const fromResult = firstSafeSessionId(response.result.taskId, response.result.task_id);
+      if (fromResult) return fromResult;
+    }
+    const fromEnvelope = firstSafeSessionId(response.taskId);
+    if (fromEnvelope) return fromEnvelope;
+
+    const sc = response.structuredContent;
+    if (sc) {
+      const fromSc = firstSafeSessionId(sc.task_id);
+      if (fromSc) return fromSc;
+    }
+    const fromFlat = firstSafeSessionId(response.task_id);
+    if (fromFlat) return fromFlat;
+
+    const hasOfficialPayload =
+      response.structuredContent !== undefined || response.content !== undefined || response.result !== undefined;
+    const data = hasOfficialPayload ? undefined : response.data;
+    if (data != null && typeof data === 'object' && !Array.isArray(data)) {
+      const fromData = firstSafeSessionId(data.task_id, data.taskId);
+      if (fromData) return fromData;
+    }
+    return undefined;
+  }
+
+  /**
+   * Return the A2A transport Task.id that may receive a continuation message.
+   * This is deliberately separate from {@link getTaskId}, which returns the
+   * AdCP work handle used by tasks/get. Only a live A2A task paused for input
+   * can be resumed; artifact-level AdCP pauses on a completed transport task
+   * are display-only.
+   */
+  getA2AContinuationTaskId(response: any): string | undefined {
+    const result = response?.result;
+    if (result == null || typeof result !== 'object' || Array.isArray(result) || result.kind !== 'task') {
+      return undefined;
+    }
+    const state = result.status?.state;
+    if (state !== ADCP_STATUS.INPUT_REQUIRED && state !== ADCP_STATUS.AUTH_REQUIRED) return undefined;
+    return firstSafeSessionId(result.id);
+  }
+
+  /** Return a live, non-terminal A2A transport Task.id for session threading. */
+  getA2APendingTaskId(response: any): string | undefined {
+    const result = response?.result;
+    if (result == null || typeof result !== 'object' || Array.isArray(result) || result.kind !== 'task') {
+      return undefined;
+    }
+    const state = result.status?.state;
+    if (
+      state !== ADCP_STATUS.SUBMITTED &&
+      state !== ADCP_STATUS.WORKING &&
+      state !== ADCP_STATUS.INPUT_REQUIRED &&
+      state !== ADCP_STATUS.AUTH_REQUIRED
+    ) {
+      return undefined;
+    }
+    return firstSafeSessionId(result.id);
+  }
+
+  private parseExpectedType(rawType: unknown): 'string' | 'number' | 'boolean' | 'object' | 'array' | undefined {
+    if (typeof rawType === 'string') {
+      const allowedTypes: string[] = ['string', 'number', 'boolean', 'object', 'array'];
+      return allowedTypes.includes(rawType)
+        ? (rawType as 'string' | 'number' | 'boolean' | 'object' | 'array')
+        : undefined;
+    }
+    return undefined;
+  }
+}
+
+// Export singleton instance
+export const responseParser = new ProtocolResponseParser();

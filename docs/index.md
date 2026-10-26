@@ -1,0 +1,85 @@
+# ADCP Client Documentation
+
+Welcome to the official documentation for `@adcp/sdk`, the TypeScript/JavaScript client library for the Ad Context Protocol.
+
+> **First-time AdCP implementer?** The protocol-level orientation — [The AdCP stack](https://docs.adcontextprotocol.org/docs/building/sdk-stack) (L0–L4 layered reference + SDK coverage matrix), [Where to start](https://docs.adcontextprotocol.org/docs/building/where-to-start), [Migrate from a hand-rolled agent](https://docs.adcontextprotocol.org/docs/building/migrate-from-hand-rolled), and [Version Adaptation](https://docs.adcontextprotocol.org/docs/building/version-adaptation) — lives on the protocol docs site (language-agnostic). The pages below are `@adcp/sdk`-specific (TypeScript/JavaScript).
+
+## Quick Navigation
+
+### 🤖 For AI Agents
+
+- [`docs/llms.txt`](./llms.txt) — full protocol spec in one file (tools, types, error codes, examples)
+- [`skills/call-adcp-agent/SKILL.md`](../skills/call-adcp-agent/SKILL.md) — wire contract, async flow, error recovery (buyer side)
+
+### 🛠 Building a Server-Side Agent
+
+- [Build an Agent](./guides/BUILD-AN-AGENT.md) — `createAdcpServerFromPlatform` + `definePlatform` family
+- [Validate Your Agent](./guides/VALIDATE-YOUR-AGENT.md) — five-command checklist + storyboard runner
+- [Account Resolution](./guides/account-resolution.md) — `'explicit'` vs `'implicit'` vs `'derived'` mode selection
+- [ctx_metadata Safety](./guides/CTX-METADATA-SAFETY.md) — don't store secrets there
+- [Preview Asset Durability](./guides/PREVIEW-ASSET-DURABILITY.md) — durable MCPUI preview URLs for generated creative assets
+- [Signing Guide](./guides/SIGNING-GUIDE.md) — RFC 9421 request signing + JWKS
+- [Reporting reconciliation](./guides/REPORTING-RECONCILIATION.md) — stable ledger reads, destination verification, and consumer receipts
+- [Reliable Reporting operations](./guides/REPORTING-OPERATIONS.md) — production deployment, SLOs, recovery, and incident response
+- [Principal lifecycle](./guides/PRINCIPAL-LIFECYCLE.md) — guarded buyer configuration, destination readiness, and declaration negotiation
+- [Reporting source executor](./guides/REPORTING-SOURCE-EXECUTOR.md) — seller adapter contract, manifest evidence, and conformance
+- [Seller reporting ledger](./guides/REPORTING-LEDGER.md) — obligation planning, leased production, and status reads
+- [Reporting ledger cutover](./guides/REPORTING-LEDGER-CUTOVER.md) — move from your own ledger tables to the SDK ledger at a period boundary
+- [Python/TypeScript Reliable Reporting parity](./development/RELIABLE-REPORTING-PARITY.md) — cross-SDK release gates and implementation map
+- [Conformance](./guides/CONFORMANCE.md) — property-based fuzzing against bundled JSON schemas
+- Worked reference adapters: `examples/hello_*` family (pick by specialism)
+
+### 📈 Migration Guides
+
+- [8.0 → 8.1](./migration-8.0-to-8.1.md) — AdCP 3.1.0-beta.5 tightening, webhook verification, `TaskStatus` ambiguity
+- [7.11 → 8.0](./migration-7.11-to-8.0.md) — 8.x beta migration notes
+- [6.6 → 6.7](./migration-6.6-to-6.7.md) — fifteen adopter recipes; two breaking (`'implicit'` refusal, `SalesPlatform` split)
+- [5.x → 6.x](./migration-5.x-to-6.x.md) — `createAdcpServerFromPlatform` framework shape
+- [4.x → 5.x](./migration-4.x-to-5.x.md) — `TaskResult` discriminated union + `createAdcpServer`
+- [BuyerAgentRegistry](./migration-buyer-agent-registry.md) — durable buyer-agent identity (deep-dive)
+
+### 🚀 Buyer-Side Getting Started
+
+- [Installation & Setup](./getting-started.md)
+- [Basic Usage](./getting-started.md#basic-usage)
+- [Authentication](./getting-started.md#authentication)
+- [Buyer Input Handler Patterns](./guides/HANDLER-PATTERNS-GUIDE.md)
+
+### 📖 Core Concepts
+
+- [Async Execution Model](./guides/ASYNC-DEVELOPER-GUIDE.md)
+- [Type Summary](./TYPE-SUMMARY.md) — curated type signatures (avoid the `*.generated.ts` files)
+
+### 🔧 API Reference
+
+- [AdCPClient](./api/classes/AdCPClient.html)
+- [ADCPMultiAgentClient](./api/classes/ADCPMultiAgentClient.html)
+- [Type Definitions](./api/modules.html)
+- [Full API Documentation](./api/index.html)
+
+### 💡 Guides & Examples
+
+- [Real-World Examples](./guides/REAL-WORLD-EXAMPLES.md)
+- [Async Patterns](./guides/ASYNC-DEVELOPER-GUIDE.md) / [Migration](./guides/ASYNC-MIGRATION-GUIDE.md) / [Troubleshooting](./guides/ASYNC-TROUBLESHOOTING-GUIDE.md)
+- [Testing Strategy](./guides/TESTING-STRATEGY.md) / [Multi-Instance Testing](./guides/MULTI-INSTANCE-TESTING.md)
+- [Recipes](./recipes/) — inbound webhook verification, `composeMethod` testing patterns, etc.
+
+### 📦 Resources
+
+- [npm Package](https://www.npmjs.com/package/@adcp/sdk)
+- [GitHub Repository](https://github.com/adcontextprotocol/adcp-client)
+- [AdCP Specification](https://adcontextprotocol.org)
+
+## Features at a Glance
+
+✅ **Unified Protocol Support** — single API for both MCP and A2A protocols
+✅ **Async Execution** — handle long-running tasks with webhooks and deferrals
+✅ **Type Safety** — full TypeScript support with comprehensive type definitions
+✅ **Production Ready** — circuit breakers, retries, robust error handling
+✅ **Compile-time enforcement** — `RequiredPlatformsFor<S>` catches missing specialism methods at typecheck
+
+## Need Help?
+
+- 📋 [Troubleshooting Guide](./guides/ASYNC-TROUBLESHOOTING-GUIDE.md)
+- 🐛 [Report an Issue](https://github.com/adcontextprotocol/adcp-client/issues)
+- 💬 [Discussions](https://github.com/adcontextprotocol/adcp-client/discussions)

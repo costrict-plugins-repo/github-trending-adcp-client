@@ -1,0 +1,13821 @@
+/**
+ * Storyboard execution engine.
+ *
+ * Two entry points:
+ * - runStoryboard(): run all phases/steps sequentially
+ * - runStoryboardStep(): run a single step (stateless, LLM-friendly)
+ */
+
+import { createHash, createHmac } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import { ACCOUNT_FREE_DISCOVERY_TASKS } from './account-policy';
+import { prepareCreativeBuildProbe } from './creative-build-probe';
+import {
+  createTestClient,
+  getOrCreateClientResolution,
+  getOrDiscoverStoryboardProfile,
+  describeProfileDiscoveryFailure,
+  hasTestClientScope,
+  runStep,
+  type TestClient,
+} from '../client';
+import {
+  closeScopedConnections,
+  prepareProtocolToolCall,
+  withMCPConnectionScope,
+  type VersionEnvelopeMode,
+} from '../../protocols';
+import { getCapturesFromError, withRawResponseCapture, type RawHttpCapture } from '../../protocols/rawResponseCapture';
+import { defaultStoryboardResponseProjection, executeStoryboardTask } from './task-map';
+import { applyFunctionalRequestSigning } from './request-signing/functional-dispatch';
+import {
+  extractContextWithProvenance,
+  injectContext,
+  applyContextOutputsWithProvenance,
+  applyContextInputs,
+  forwardAliasCache,
+  createRunnerVariables,
+  type RunnerVariables,
+} from './context';
+import {
+  applyProtectedContextPatch,
+  createProtectedContextWriter,
+  forwardProtectedContext,
+  isProtectedContextKey,
+  ProtectedContextViolation,
+  registerProtectedContext,
+  type ProtectedContextSinks,
+  type ProtectedContextWriter,
+} from './protected-context';
+import {
+  buildPreparedBinding,
+  createPreparedStoryboardFixtures,
+  preparedBindingRegistryFor,
+  PreparedStoryboardFixtures,
+  resolvePreparedFixtures,
+  isTrustedPreparedFixtures,
+  assertNoPreparationAuthorizer,
+  type PreparedFixtureBinding,
+  type PreparedFixturesPreparationAuthorizer,
+  type PreparedFixturesDisposition,
+  type PreparedFixturesRefusal,
+} from './prepared-fixtures';
+import { detectContextRejectionHints } from './rejection-hints';
+import { detectShapeDriftHints } from './shape-drift-hints';
+import { detectStrictValidationHints } from './strict-validation-hints';
+import {
+  runValidations,
+  decorateValidationResult,
+  isExternalResponseSchemaAuthoritative,
+  validationFailsStep,
+  RUNNER_CAPABILITY_VERSION,
+  type ValidationContext,
+  type CrossResponseSet,
+  type UpstreamTrafficValidationContext,
+  type UpstreamTrafficQueryResult,
+} from './validations';
+import { PARALLEL_DISPATCH_CONTRACT, runParallelDispatches, validateParallelDispatchSpec } from './parallel-dispatch';
+import { resolvePath, resolvePortableIdentifierPathAll, toJsonPointer, validatePortableIdentifierPath } from './path';
+import {
+  RATE_LIMIT_TRIP_CONTRACT,
+  RateLimitTripObserver,
+  validateRateLimitTripSpec,
+  type RateLimitTripObservation,
+} from './rate-limit-trip';
+import { redactSecrets } from '../../utils/redact-secrets';
+import {
+  rememberPropertyListCredentials,
+  verifyPropertyListReference,
+  withPropertyListCredentialRedaction,
+} from './property-list-reference';
+import { ResponseSchemaValidationError } from '../../utils/response-unwrapper';
+import { PreparedFixturesDeniedError } from '../../errors';
+import { injectLegacyEnvelopeStatus, normalizeLegacyMediaBuyStatusForReturn } from '../../utils/envelope-status-compat';
+import { queryUpstreamTraffic, type UpstreamTrafficSuccess } from '../test-controller';
+import { IDENTIFIER_DIGEST_LIMIT } from '../../upstream-recorder/constants';
+import { enrichRequest, hasRequestEnricher } from './request-builder';
+import {
+  BUILD_ASSETS_FROM_FORMAT_DIRECTIVE,
+  expandCreativeAssetDirectivesWithDiagnostics,
+  findUnresolvedCreativeAssetDirectives,
+  type CreativeAssetExpansionFailure,
+} from './creative-assets';
+import { resolveAccount, resolveBrand } from '../client';
+import { requestUsesIdempotency, generateIdempotencyKey } from '../../utils/idempotency';
+import { isAdcpVersionAtLeast } from '../../utils/adcp-version-config';
+import {
+  getSchemaDefaultByPath,
+  getSchemaValidatorByRef,
+  resolveBundleKey,
+  schemaAllowsTopLevelField,
+  withExternalSchemaRoot,
+  withServedReleaseSchemaRoots,
+} from '../../validation/schema-loader';
+import { ADCP_VERSION, parseAdcpMajorVersion } from '../../version';
+import {
+  PROBE_TASKS,
+  probeProtectedResourceMetadata,
+  probeOauthAuthServerMetadata,
+  fetchProbe,
+  rawMcpProbe,
+  rawMcpSessionProbe,
+  generateRandomInvalidApiKey,
+  generateRandomInvalidJwt,
+  type McpSessionProbeControl,
+  type McpSessionStage,
+} from './probes';
+import { readBrandJsonUrl } from '../../signing/agent-resolver/capabilities-types';
+import { selectAgentByUrl } from '../../signing/agent-resolver/select-agent';
+import {
+  PROBE_TASK_ALLOWLIST,
+  PROBE_TASK_ALLOWLIST_SUMMARY,
+  resolveDeclaredTestKit,
+  validateTestKit,
+} from './test-kit';
+import { MUTATING_TASKS } from '../../utils/idempotency';
+import { TOOL_REQUEST_SCHEMAS } from '../../utils/tool-request-schemas';
+import {
+  ACCOUNT_TOOLS,
+  BRAND_RIGHTS_TOOLS,
+  CREATIVE_TOOLS,
+  EVENT_TRACKING_TOOLS,
+  GOVERNANCE_TOOLS,
+  MEDIA_BUY_TOOLS,
+  PROTOCOL_TOOLS,
+  SIGNALS_TOOLS,
+} from '../../utils/capabilities';
+import { normalizeValidationOnlyTasks, validateStoryboardShape, VALIDATION_ONLY_TASK } from './loader';
+import { evaluatePhaseCondition, phaseConditionUsesContext } from './phase-condition';
+import { trustedStoryboardComplianceRoot } from './provenance';
+import { applyNativeA2AComplianceTransportOptions } from './native-a2a-compliance';
+import { probeRequestSigningVector } from './request-signing/probe-dispatch';
+import { REQUEST_SIGNING_PROBE_TASK } from './request-signing/synthesize';
+import { createWebhookReceiver, type WebhookReceiver, type WebhookWaitResult } from './webhook-receiver';
+import { WEBHOOK_ASSERTION_TASKS, armWebhookAssertions, executeWebhookAssertionStep } from './webhook-assertions';
+import {
+  runControllerSeeding,
+  type ControllerSeedingResult,
+  type PreparedFixtureCaptures,
+  type SeedCall,
+} from './seeding';
+import { callControllerRaw } from '../test-controller';
+import { applyFixtureBindingsToRequest, type FixtureBindingRegistry } from './fixture-resolution';
+import { getComplianceCacheDir } from './compliance';
+import { signWebhook, type RequestLike } from '../../signing/client';
+import { replayTrustedMatchContextVector } from './trusted-match-context-replay';
+import {
+  TRUSTED_MATCH_PUBLISHER_AUTH_TASKS,
+  prepareTrustedMatchPublisherAuthProbes,
+  probeTrustedMatchPublisherAuth,
+  type PreparedTrustedMatchPublisherAuthProbes,
+  type TrustedMatchPublisherAuthTask,
+} from './trusted-match-publisher-auth';
+import {
+  gradeOAuthMetadataGraph,
+  redactOAuthUrlForOutput,
+  redactOAuthUrlsInText,
+  type OAuthMetadataGraphGrade,
+} from './oauth-metadata-graph';
+import {
+  verifyAcceptancePolicyDiscoveryStep,
+  type AcceptancePolicyDiscoveryRunState,
+} from './acceptance-policy-discovery';
+
+const PREPARED_TRUSTED_MATCH_PUBLISHER_AUTH = Symbol('preparedTrustedMatchPublisherAuth');
+type InternalStoryboardRunOptions = StoryboardRunOptions & {
+  [PREPARED_TRUSTED_MATCH_PUBLISHER_AUTH]?: PreparedTrustedMatchPublisherAuthProbes;
+};
+
+function getPreparedTrustedMatchPublisherAuth(
+  options: StoryboardRunOptions
+): PreparedTrustedMatchPublisherAuthProbes | undefined {
+  return (options as InternalStoryboardRunOptions)[PREPARED_TRUSTED_MATCH_PUBLISHER_AUTH];
+}
+
+function withPreparedTrustedMatchPublisherAuth(
+  options: StoryboardRunOptions,
+  prepared: PreparedTrustedMatchPublisherAuthProbes
+): StoryboardRunOptions {
+  return { ...options, [PREPARED_TRUSTED_MATCH_PUBLISHER_AUTH]: prepared } as InternalStoryboardRunOptions;
+}
+
+/**
+ * Pre-computed controller-seeding outcome passed into `executeStoryboardPass`.
+ * Populated by `runMultiPass` so seeding fires once at the run level instead
+ * of once per pass (which would inflate `failed_count`/`skipped_count` when
+ * the aggregator sums per-pass counts). `attach: true` on the first pass so
+ * the synthetic `__controller_seeding__` phase appears in `phaseResults`
+ * exactly once; subsequent passes inherit `allPassed` for cascade-skip
+ * semantics but don't double-attach.
+ */
+interface PreSeededInput {
+  result: ControllerSeedingResult | null;
+  attach: boolean;
+}
+import type {
+  A2ATaskEnvelope,
+  AgentEntry,
+  AssertionResult,
+  BranchSetSpec,
+  ContextProvenanceEntry,
+  FixtureResolutionCoverageGap,
+  FixtureResolutionRecord,
+  HttpProbeResult,
+  RunnerDetailedSkipReason,
+  RunnerExtractionRecord,
+  RunnerRequestRecord,
+  RunnerResponseRecord,
+  RunnerSelectionResult,
+  RequirementName,
+  RunnerSkipReason,
+  RunnerNotice,
+  RequiresCapabilityPredicate,
+  ResponseNotApplicableGate,
+  StepAuthDirective,
+  Storyboard,
+  StoryboardStep,
+  StoryboardPhase,
+  StoryboardContext,
+  StoryboardRunOptions,
+  PrepareStoryboardFixturesOptions,
+  StoryboardResult,
+  StoryboardPassResult,
+  StoryboardPhaseResult,
+  StoryboardStepResult,
+  StoryboardStepHint,
+  StoryboardStepPreview,
+  StoryboardValidation,
+  StrictValidationSummary,
+  SchemaValidationError,
+  ValidationResult,
+  RunnerTransport,
+} from './types';
+import {
+  buildRoutingContext,
+  DiscoveryFailure,
+  resolveAgentForStep,
+  routedAgentOptions,
+  hasAnyRequiredTool,
+  normalizeAgentToolNames,
+  resolveTaskName,
+  RoutingError,
+  type AgentRoutingContext,
+} from './agent-routing';
+import { DETAILED_SKIP_TO_CANONICAL, KNOWN_REQUIREMENTS, MCP_SESSION_PROBE_TASK } from './types';
+import type { AgentProfile, TaskResult, TestStepResult } from '../types';
+import {
+  type AssertionContext,
+  type AssertionSpec,
+  resolveAssertions,
+  stepDisablesAssertion,
+  validateStepInvariants,
+} from './assertions';
+
+// ────────────────────────────────────────────────────────────
+// Runner-output contract helpers
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Commit a patch through the protected funnel, converting a namespace
+ * violation into a `protected_context_violation` validation instead of an
+ * exception.
+ *
+ * The guide promises that "a runtime violation becomes a failed
+ * `protected_context_violation` validation on the step that attempted it",
+ * and four of the runner's funnel call sites were letting the throw escape
+ * `runStoryboard` instead. Each of those four is unreachable today — the
+ * keys involved are load-rejected or constrained to a lowercase prefix —
+ * but the funnel's non-key refusal arms (an unfreezable value, a
+ * non-extensible target) apply to ANY key, so the asymmetry was real even
+ * where the trigger was not.
+ *
+ * Returns the validation to record, or `undefined` when the patch
+ * committed. Non-`ProtectedContextViolation` errors still throw: those are
+ * programming errors, not graded outcomes.
+ */
+function tryProtectedContextPatch(
+  context: StoryboardContext,
+  patch: Parameters<typeof applyProtectedContextPatch>[1],
+  options: Parameters<typeof applyProtectedContextPatch>[2]
+): ValidationResult | undefined {
+  try {
+    applyProtectedContextPatch(context, patch, options);
+    return undefined;
+  } catch (error) {
+    if (!(error instanceof ProtectedContextViolation)) throw error;
+    return {
+      check: 'protected_context_violation',
+      passed: false,
+      description: 'Reserved fixture-preparation context keys are immutable for the rest of the run',
+      error: error.message,
+      json_pointer: null,
+      expected: 'no write, delete or metadata change to the __adcp_fixture_ namespace',
+      actual: error.keys.join(', '),
+      // required_on_failure, and null outside `response_schema`. Omitting
+      // the keys is not the same as recording null — a consumer cannot
+      // tell "no schema applies" from "the runner forgot".
+      schema_id: null,
+      schema_url: null,
+    };
+  }
+}
+
+const SKIP_DETAILS: Record<RunnerSkipReason, string> = {
+  not_applicable: 'Not applicable: agent did not declare the protocol or specialism this storyboard targets.',
+  no_phases: 'Storyboard has no executable phases (placeholder).',
+  prerequisite_failed: 'Skipped: a prerequisite step or contract did not pass.',
+  missing_tool: 'Skipped: agent did not advertise the required tool.',
+  missing_test_controller:
+    'Skipped: deterministic_testing phase requires comply_test_controller, which the agent did not advertise.',
+  fixture_unsatisfied:
+    'Skipped: every enabled strategy for a declared fixture handle was exhausted without finding or creating a qualifying entity.',
+  fixture_unavailable: 'Skipped: the runner test kit cannot synthesize a valid input for the seller-declared contract.',
+  unsatisfied_contract: 'Skipped: test-kit contract is out of scope for this grading run.',
+  requirement_unmet:
+    'Skipped: a requires: tag named a runtime requirement that is not available on this run (see RunnerSkipResult.requirement).',
+  peer_branch_taken: 'Skipped: a peer branch in the same any_of branch set already contributed the aggregation flag.',
+  peer_substituted: 'Skipped: a same-phase peer step established equivalent state via `provides_state_for`.',
+};
+
+const CONTROLLER_SEEDING_FAILED_DETAIL =
+  'Skipped: pre-flight comply_test_controller seeding failed; the agent was not populated with the storyboard fixtures the remaining phases depend on.';
+
+const FIXTURE_SEED_UNSUPPORTED_DETAIL =
+  'Skipped: pre-flight comply_test_controller seeding requires a seed_* scenario this agent does not implement (`fixture_seed_unsupported`).';
+
+const OAUTH_NOT_ADVERTISED_DETAIL =
+  'Skipped: agent does not advertise OAuth — /.well-known/oauth-protected-resource returned 404 (RFC 9728 §3). API-key path must carry auth_mechanism_verified for this storyboard to pass.';
+
+export function applyStoryboardVersionOptions(
+  storyboard: Storyboard,
+  options: StoryboardRunOptions
+): StoryboardRunOptions {
+  const versioned = applyAdcpVersionRunOptions(storyboard.adcp_version, options);
+  const mayInheritStoryboardDir = options.adcpVersion === undefined || options.adcpVersion === storyboard.adcp_version;
+  const complianceDir =
+    versioned.complianceDir ?? (mayInheritStoryboardDir ? trustedStoryboardComplianceRoot(storyboard) : undefined);
+  return complianceDir && versioned.complianceDir !== complianceDir ? { ...versioned, complianceDir } : versioned;
+}
+
+function applyReusableProfileOptions(options: StoryboardRunOptions): StoryboardRunOptions {
+  const profile = options.profile ?? options._profile;
+  if (!profile) return options;
+  if (
+    options.agents === undefined &&
+    options.profile !== undefined &&
+    (typeof profile !== 'object' ||
+      !Array.isArray(profile.tools) ||
+      profile.tools.some(
+        tool =>
+          typeof tool !== 'string' &&
+          !(tool && typeof tool === 'object' && typeof (tool as { name?: unknown }).name === 'string')
+      ))
+  ) {
+    throw new Error('Storyboard profile must contain an array of tool names.');
+  }
+  const profileTools = options.agents === undefined ? (normalizeAgentToolNames(profile.tools) ?? []) : undefined;
+
+  return {
+    ...options,
+    _profile: profile,
+    ...(options.agentTools === undefined && profileTools !== undefined ? { agentTools: profileTools } : {}),
+  };
+}
+
+export function applyAdcpVersionRunOptions(
+  defaultAdcpVersion: string | undefined,
+  options: StoryboardRunOptions
+): StoryboardRunOptions {
+  const adcpVersion = options.adcpVersion ?? defaultAdcpVersion;
+  if (adcpVersion === undefined) return options;
+
+  const versionEnvelope = options.versionEnvelope ?? storyboardVersionEnvelopeMode(adcpVersion);
+
+  if (options.adcpVersion === adcpVersion && options.versionEnvelope === versionEnvelope) {
+    return options;
+  }
+  return { ...options, adcpVersion, versionEnvelope };
+}
+
+function getRunSchemaRoot(options: StoryboardRunOptions): { adcpVersion: string; schemaRoot: string } | undefined {
+  if (!options.schemaRoot) return undefined;
+  const adcpVersion = options.adcpVersion ?? options._serverAdcpVersion;
+  if (!adcpVersion) {
+    throw new Error(
+      'schemaRoot requires an AdCP version. Pass adcpVersion, or run a storyboard/compliance bundle with adcp_version set.'
+    );
+  }
+  return { adcpVersion, schemaRoot: options.schemaRoot };
+}
+
+function storyboardVersionEnvelopeMode(adcpVersion: string): VersionEnvelopeMode {
+  const bundleKey = resolveBundleKey(adcpVersion);
+  const major = parseAdcpMajorVersion(bundleKey);
+  if (Number.isFinite(major) && major < 3) return 'none';
+  return 'auto';
+}
+
+/**
+ * Suffix appended to the skip detail when the sole-stateful-step exemption
+ * fires (`not_applicable` / `missing_tool` / `missing_test_controller` on
+ * the only stateful step in a phase, no `provides_state_for` rescue
+ * declared). Adopters reading the report otherwise have to infer from the
+ * absence of cascade-skips that the runner consciously chose not to
+ * cascade — this marker makes the decision explicit.
+ *
+ * Pre-formatted phrase, parameterized only by phase id. Greppable via
+ * `sole stateful step exemption applied`.
+ */
+function soleStatefulExemptionDetail(phaseId: string): string {
+  return ` Sole stateful step exemption applied for phase '${phaseId}': no peer could have established substitute state, so downstream phases run without cascade (adcp#4053, adcp-client#1146/#1545).`;
+}
+
+/**
+ * Per-reason override strings for detailed skip reasons that want a more
+ * specific message than the canonical fallback. Used only when the probe
+ * itself didn't emit an error-style detail.
+ */
+const DETAILED_SKIP_DETAILS: Partial<Record<RunnerDetailedSkipReason, string>> = {
+  oauth_not_advertised: OAUTH_NOT_ADVERTISED_DETAIL,
+  controller_seeding_failed: CONTROLLER_SEEDING_FAILED_DETAIL,
+  operator_skip: 'Step was excluded by request_signing.skipVectors.',
+  rate_abuse_opt_out: 'Rate-abuse vector was excluded by request_signing.skipRateAbuse.',
+  capability_profile_mismatch: 'Vector is outside the agent capability profile selected for this run.',
+  transport_ungradable: 'Vector cannot be graded faithfully by the selected transport.',
+  signing_transport_unavailable:
+    "Request-signing vectors have no shape this run's protocol can carry, so no verifier behavior was graded.",
+  rate_limit_not_triggered: 'No RATE_LIMITED response was observed within the configured max_attempts.',
+};
+
+/**
+ * Machine-readable detail values required by the AdCP report contract.
+ * The probe's human-readable error remains available on the legacy response.
+ */
+const CANONICAL_SKIP_DETAILS: Partial<Record<RunnerDetailedSkipReason, string>> = {
+  rate_limit_not_triggered: 'rate_limit_not_triggered',
+  // Same shape as `rate_limit_not_triggered` above, which
+  // runner-output-contract.yaml registers under
+  // `canonical_detail_sub_reasons.not_applicable` with a test-kit
+  // `spec_source`: emit the sub-reason token *exactly* as `skip.detail`,
+  // with empty validations and no pass/fail counter movement. The
+  // operator-facing remedy travels on the probe result (`response.error`),
+  // which is where the renderers read it.
+  //
+  // Upstream ask, tracked as the remaining external blocker: register
+  // `not_applicable.signing_transport_unavailable` with
+  // `spec_source: test-kits/signed-requests-runner.yaml`. Emitting the
+  // registered *shape* now means that registration changes nothing here.
+  signing_transport_unavailable: 'signing_transport_unavailable',
+};
+
+/**
+ * Per-request cap for the MCP session auth probe.
+ *
+ * A step runs a graded lifecycle (retried across at most three canonical
+ * candidates) plus one control lifecycle, so the shared 10 s `ssrfSafeFetch`
+ * default would let a tarpitting agent hold one step for minutes. This bounds
+ * a single exchange; `rawMcpSessionProbe` bounds the step as a whole.
+ */
+const MCP_SESSION_PROBE_REQUEST_TIMEOUT_MS = 5_000;
+
+const REPLAY_WEBHOOK_VECTOR_TASK = 'replay_webhook_vector';
+
+function isRunnerOwnedTask(task: string): boolean {
+  return (
+    task === VALIDATION_ONLY_TASK ||
+    task === MCP_SESSION_PROBE_TASK ||
+    task === 'assert_contribution' ||
+    task === REPLAY_WEBHOOK_VECTOR_TASK ||
+    TRUSTED_MATCH_PUBLISHER_AUTH_TASKS.has(task) ||
+    PROBE_TASKS.has(task) ||
+    WEBHOOK_ASSERTION_TASKS.has(task)
+  );
+}
+const REPLAY_TRUSTED_MATCH_CONTEXT_VECTOR_TASK = 'replay_trusted_match_context_vector';
+const WEBHOOK_REPLAY_DEFAULT_TIMEOUT_MS = 10_000;
+
+function selectionForProbeSkip(reason: RunnerDetailedSkipReason, detail: string): RunnerSelectionResult | undefined {
+  switch (reason) {
+    case 'live_side_effect_opt_in_required':
+      return { reason: 'run_mode_excluded', detail };
+    case 'operator_skip':
+    case 'rate_abuse_opt_out':
+      return { reason: 'explicit_scope_excluded', detail };
+    case 'not_in_only_vectors':
+    case 'mcp_mode_flattens_url_edges':
+    case 'capability_profile_mismatch':
+    case 'transport_ungradable':
+      return { reason: 'profile_excluded', detail };
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Walk a dotted key path (e.g. `"adcp.idempotency.supported"`) through a
+ * nested object. Returns `undefined` when any segment is missing or the
+ * intermediate value is not an object.
+ *
+ * Exported for direct testing. Inline copies of this logic in test code
+ * silently drift from the runtime when edge cases (null prototypes,
+ * Symbol keys, prototype-chain access) get tightened — testing the real
+ * implementation forecloses that class of bug.
+ */
+export function resolveCapabilityPath(raw: unknown, dottedPath: string): unknown {
+  const keys = dottedPath.split('.');
+  let current: unknown = raw;
+  for (const key of keys) {
+    if (current === null || typeof current !== 'object') return undefined;
+    if (!Object.prototype.hasOwnProperty.call(current, key)) return undefined;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return current;
+}
+
+const GET_ADCP_CAPABILITIES_RESPONSE_SCHEMA_REF = 'protocol/get-adcp-capabilities-response.json';
+
+function resolveCapabilityPathForGate(
+  raw: unknown,
+  predicate: RequiresCapabilityPredicate,
+  adcpVersion?: string
+): unknown {
+  const actual = resolveCapabilityPath(raw, predicate.path);
+  if (actual !== undefined) return actual;
+  // `present:` is an absence-detection matcher — an absent field IS the
+  // load-bearing signal. Materializing a schema default would make a defaulted
+  // field never read as absent, silently flipping the gate (e.g. a signals
+  // seller that omits `signals.discovery_modes`, default `["brief"]`, would run
+  // a `present: true`-gated scenario that should skip). Defaults are resolved
+  // only for the value matchers (`equals` / `contains` / `not_contains`), where the default's
+  // VALUE is what the gate tests.
+  if ('present' in predicate) return undefined;
+  if (!schemaDefaultShouldApply(raw, predicate.path)) return undefined;
+  return getSchemaDefaultByPath(GET_ADCP_CAPABILITIES_RESPONSE_SCHEMA_REF, predicate.path, adcpVersion);
+}
+
+function schemaDefaultShouldApply(raw: unknown, dottedPath: string): boolean {
+  const keys = dottedPath.split('.');
+  if (keys.length <= 1) return raw !== null && typeof raw === 'object';
+
+  let current: unknown = raw;
+  for (const key of keys.slice(0, -1)) {
+    if (current === null || typeof current !== 'object') return false;
+    if (!Object.prototype.hasOwnProperty.call(current, key)) return false;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return current !== null && typeof current === 'object';
+}
+
+/**
+ * Evaluate a `requires_capability` predicate against the value already
+ * resolved from the agent's raw capabilities. Returns `null` when the
+ * predicate is satisfied and a human-readable detail string when the
+ * storyboard should be skipped.
+ *
+ * Four matcher forms — see `Storyboard.requires_capability` for full semantics:
+ *
+ * - `equals: V` — scalar equality. `actual` must be declared and must equal
+ *   `V`. Absent fields (`undefined`) skip unless the capabilities schema
+ *   declares a default that the gate materialized before predicate evaluation.
+ *
+ * - `present: B` — presence is the load-bearing signal. `present: true`
+ *   skips when the field is absent (treats `undefined` and `null` as absent).
+ *   `present: false` skips when the field is present. Empty object `{}`
+ *   counts as present, per the spec's "presence of this object indicates
+ *   support" wording. Note: an explicit `null` on the wire is technically
+ *   non-conformant for object-typed capabilities (`"type": "object"` rejects
+ *   null in JSON Schema), but is coalesced with absent here in the spirit of
+ *   Postel — agents that misdeclare a not-supported capability as `null`
+ *   get the same not_applicable skip as agents that omit the field. Schema
+ *   defaults are deliberately NOT materialized for this matcher: presence is
+ *   the signal, so a default would defeat the gate (see
+ *   `resolveCapabilityPathForGate`).
+ *
+ * - `contains: V` — array-membership. `actual` must be an array that
+ *   includes `V` (structural JSON equality, except governance task-mode
+ *   predicates match a subset of a task's modes). Empty arrays, non-arrays,
+ *   and absent fields all skip unless the capabilities schema declares a
+ *   default that the gate materialized before predicate evaluation.
+ *
+ * - `not_contains: V` — negative array-membership. `actual` must be an array
+ *   that does not include `V` (structural JSON equality, no coercion). Missing and
+ *   non-array values skip; an empty array satisfies the predicate.
+ *
+ * Exported for direct testing so the predicate semantics are pinned without
+ * needing a full runStoryboard() roundtrip.
+ */
+export function evaluateCapabilityPredicate(predicate: RequiresCapabilityPredicate, actual: unknown): string | null {
+  if ('present' in predicate) {
+    const isPresent = actual !== undefined && actual !== null;
+    if (predicate.present && !isPresent) {
+      return `Capability predicate \`${predicate.path}\` must be present: ` + `agent did not declare it.`;
+    }
+    if (!predicate.present && isPresent) {
+      return (
+        `Capability predicate \`${predicate.path}\` must be absent: ` + `agent declared ${JSON.stringify(actual)}.`
+      );
+    }
+    return null;
+  }
+  if ('contains' in predicate) {
+    if (!Array.isArray(actual)) {
+      return (
+        `Capability predicate \`${predicate.path}\` must contain ${JSON.stringify(predicate.contains)}: ` +
+        `agent declared ${actual === undefined ? 'no value' : JSON.stringify(actual)}.`
+      );
+    }
+    if (!actual.some(value => capabilityContainsValue(predicate.path, value, predicate.contains))) {
+      return (
+        `Capability predicate \`${predicate.path}\` must contain ${JSON.stringify(predicate.contains)}: ` +
+        `agent declared ${JSON.stringify(actual)}.`
+      );
+    }
+    return null;
+  }
+  if ('not_contains' in predicate) {
+    if (!Array.isArray(actual)) {
+      return (
+        `Capability predicate \`${predicate.path}\` must not contain ${JSON.stringify(predicate.not_contains)}: ` +
+        `agent declared ${actual === undefined ? 'no value' : JSON.stringify(actual)}.`
+      );
+    }
+    if (actual.some(value => capabilityContainsValue(predicate.path, value, predicate.not_contains))) {
+      return (
+        `Capability predicate \`${predicate.path}\` must not contain ${JSON.stringify(predicate.not_contains)}: ` +
+        `agent declared ${JSON.stringify(actual)}.`
+      );
+    }
+    return null;
+  }
+  // `equals` form: absence means the agent did not declare the capability or
+  // capability variant this storyboard tests, so skip as unsupported.
+  if (actual === undefined) {
+    return (
+      `Capability predicate \`${predicate.path} === ${JSON.stringify(predicate.equals)}\` not satisfied: ` +
+      `agent did not declare support.`
+    );
+  }
+  if (actual !== undefined && actual !== predicate.equals) {
+    return (
+      `Capability predicate \`${predicate.path} === ${JSON.stringify(predicate.equals)}\` not satisfied: ` +
+      `agent declared ${JSON.stringify(actual)}.`
+    );
+  }
+  return null;
+}
+
+/** Governance task declarations combine all supported modes in one task entry. */
+function capabilityContainsValue(path: string, actual: unknown, expected: unknown): boolean {
+  if (path !== 'adcp.governance_enforcement.tasks') return capabilityValuesEqual(actual, expected);
+  if (!actual || !expected || typeof actual !== 'object' || typeof expected !== 'object') {
+    return capabilityValuesEqual(actual, expected);
+  }
+  const actualTask = actual as Record<string, unknown>;
+  const expectedTask = expected as Record<string, unknown>;
+  if (
+    typeof expectedTask.task !== 'string' ||
+    !Array.isArray(expectedTask.modes) ||
+    expectedTask.modes.length === 0 ||
+    Object.keys(expectedTask).some(key => key !== 'task' && key !== 'modes')
+  ) {
+    return capabilityValuesEqual(actual, expected);
+  }
+  const actualModes = actualTask.modes;
+  if (!Array.isArray(actualModes)) return false;
+  return (
+    actualTask.task === expectedTask.task &&
+    expectedTask.modes.every(mode => actualModes.some(actualMode => capabilityValuesEqual(actualMode, mode)))
+  );
+}
+
+/** Key-order-insensitive equality for JSON-valued capability declarations. */
+function capabilityValuesEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== typeof b || a === null || b === null || typeof a !== 'object') return false;
+  if (Array.isArray(a)) {
+    if (!Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((value, index) => capabilityValuesEqual(value, b[index]));
+  }
+  if (Array.isArray(b)) return false;
+  const aRecord = a as Record<string, unknown>;
+  const bRecord = b as Record<string, unknown>;
+  const aKeys = Object.keys(aRecord).sort();
+  const bKeys = Object.keys(bRecord).sort();
+  return (
+    aKeys.length === bKeys.length &&
+    aKeys.every((key, index) => key === bKeys[index] && capabilityValuesEqual(aRecord[key], bRecord[key]))
+  );
+}
+
+function evaluateRequiresCapabilityGate(
+  predicate: RequiresCapabilityPredicate,
+  profile: AgentProfile | undefined,
+  agentTools?: readonly string[],
+  adcpVersion?: string
+): string | null {
+  const rawCaps = profile?.raw_capabilities;
+  if (rawCaps !== undefined) {
+    const actual = resolveCapabilityPathForGate(rawCaps, predicate, adcpVersion);
+    return evaluateCapabilityPredicate(predicate, actual);
+  }
+  // OAuth 3.2 grading is opt-in on the raw wire declaration. A normalized
+  // profile or advertised get_adcp_capabilities tool is not evidence that the
+  // agent asserted oauth.supported: true.
+  if ('equals' in predicate && predicate.path === 'oauth.supported' && predicate.equals === true) {
+    return evaluateCapabilityPredicate(predicate, undefined);
+  }
+  // The TMP publisher-auth storyboard is selected only by an explicit
+  // experimental_features declaration. A normalized profile without the raw
+  // capability payload is not evidence of that opt-in.
+  if (
+    'contains' in predicate &&
+    predicate.path === 'experimental_features' &&
+    predicate.contains === 'trusted_match.core'
+  ) {
+    return evaluateCapabilityPredicate(predicate, undefined);
+  }
+  const tools = agentTools ?? profile?.tools;
+  if ('equals' in predicate && tools !== undefined && !tools.includes('get_adcp_capabilities')) {
+    return evaluateCapabilityPredicate(predicate, undefined);
+  }
+  return null;
+}
+
+/** @internal Preserve first-class schema/protocol diagnostics without treating failed evidence as absence. */
+export function storyboardAllowsCapabilityDiagnostic(storyboard: Storyboard): boolean {
+  const steps = storyboard.phases.flatMap(phase => phase.steps);
+  return (
+    !storyboardRequiresCapabilityEvidence(storyboard) &&
+    steps.length > 0 &&
+    steps.every(step => step.task === 'get_adcp_capabilities')
+  );
+}
+
+/** @internal Capability-gated execution cannot infer absence from malformed evidence. */
+export function storyboardRequiresCapabilityEvidence(storyboard: Storyboard): boolean {
+  return Boolean(
+    storyboard.requires_capability ||
+    storyboard.requires_all_capabilities?.length ||
+    storyboard.phases.some(phase => phase.requires_capability || phaseContainsOauthMetadataProbe(phase)) ||
+    storyboard.requires?.includes('request_signer') ||
+    detectImplicitRequires(storyboard).includes('request_signer') ||
+    storyboard.phases.some(phase => phase.steps.some(step => step.task === 'sync_accounts')) ||
+    storyboard.creative_build_probe
+  );
+}
+
+/**
+ * Every root applicability predicate a storyboard authors, across
+ * `requires_capability` and `requires_all_capabilities`. Exported so the
+ * compliance rollup keys on the same set the runner gates on, rather than
+ * re-listing the fields and drifting when one is added.
+ */
+export function storyboardCapabilityPredicates(storyboard: Storyboard): RequiresCapabilityPredicate[] {
+  return [
+    ...(storyboard.requires_capability ? [storyboard.requires_capability] : []),
+    ...(storyboard.requires_all_capabilities ?? []),
+  ];
+}
+
+export function describeStoryboardCapabilityGates(storyboard: Storyboard): string | null {
+  const predicates = storyboardCapabilityPredicates(storyboard);
+  if (predicates.length === 0) return null;
+  return predicates.map(describeCapabilityPredicate).join(' AND ');
+}
+
+function describeCapabilityPredicate(predicate: RequiresCapabilityPredicate): string {
+  if ('present' in predicate) return `${predicate.path} ${predicate.present ? 'present' : 'absent'}`;
+  if ('contains' in predicate) return `${predicate.path} contains ${JSON.stringify(predicate.contains)}`;
+  if ('not_contains' in predicate) {
+    return `${predicate.path} does not contain ${JSON.stringify(predicate.not_contains)}`;
+  }
+  return `${predicate.path} = ${JSON.stringify(predicate.equals)}`;
+}
+
+function evaluateStoryboardCapabilityGates(
+  storyboard: Storyboard,
+  profile: AgentProfile | undefined,
+  agentTools?: readonly string[],
+  adcpVersion?: string
+): string | null {
+  const predicates = [
+    ...(storyboard.requires_capability ? [{ predicate: storyboard.requires_capability, failClosed: false }] : []),
+    ...(storyboard.requires_all_capabilities ?? []).map(predicate => ({ predicate, failClosed: true })),
+  ];
+  const failures = predicates
+    .map(({ predicate, failClosed }) => {
+      if (!failClosed) return evaluateRequiresCapabilityGate(predicate, profile, agentTools, adcpVersion);
+      const rawCapabilities = profile?.raw_capabilities;
+      if (rawCapabilities === undefined) {
+        return (
+          `Capability predicate \`${describeCapabilityPredicate(predicate)}\` could not be evaluated: ` +
+          'no declared or resolved value (raw capabilities unavailable).'
+        );
+      }
+      const declared = resolveCapabilityPath(rawCapabilities, predicate.path);
+      const resolved = resolveCapabilityPathForGate(rawCapabilities, predicate, adcpVersion);
+      const detail = evaluateCapabilityPredicate(predicate, resolved);
+      if (detail === null) return null;
+      const provenance =
+        declared !== undefined
+          ? `declared value ${JSON.stringify(declared)}`
+          : resolved !== undefined
+            ? `resolved schema default ${JSON.stringify(resolved)}`
+            : 'no declared or resolved value';
+      return `${detail} [${provenance}]`;
+    })
+    .filter((detail): detail is string => detail !== null);
+  if (failures.length === 0) return null;
+  if (failures.length === 1) return failures[0]!;
+  return `Capability predicates not satisfied:\n${failures.map(detail => `- ${detail}`).join('\n')}`;
+}
+
+/**
+ * @internal The root capability verdict `runStoryboard()`'s single-agent
+ * pre-flight reaches for `options`, or `null` when the storyboard has no root
+ * predicate, the predicate is satisfied, or no profile is available yet (the
+ * runner then defers the gate until discovery). `comply()` uses this so a
+ * storyboard the agent under test does not claim keeps its `not_applicable`
+ * verdict instead of being handed to `ComplyOptions.routeStoryboard`.
+ */
+export function storyboardCapabilityGateUnmet(storyboard: Storyboard, options: StoryboardRunOptions): string | null {
+  if (storyboardCapabilityPredicates(storyboard).length === 0) return null;
+  const versioned = applyStoryboardVersionOptions(storyboard, applyReusableProfileOptions(options));
+  if (versioned._profile === undefined) return null;
+  return evaluateStoryboardCapabilityGates(storyboard, versioned._profile, versioned.agentTools, versioned.adcpVersion);
+}
+
+function collectPhaseCapabilitySkipDetails(
+  storyboard: Storyboard,
+  profile: AgentProfile | undefined,
+  agentTools?: readonly string[],
+  adcpVersion?: string
+): Map<string, string> {
+  const skipDetails = new Map<string, string>();
+  for (const phase of storyboard.phases) {
+    if (!phase.requires_capability) continue;
+    const unmetDetail = evaluateRequiresCapabilityGate(phase.requires_capability, profile, agentTools, adcpVersion);
+    if (unmetDetail !== null) {
+      skipDetails.set(phase.id, unmetDetail);
+    }
+  }
+  return skipDetails;
+}
+
+function allExecutablePhasesCapabilitySkipped(
+  storyboard: Storyboard,
+  phaseCapabilitySkipDetails: ReadonlyMap<string, string>
+): boolean {
+  const executablePhases = storyboard.phases.filter(phase => phase.steps.length > 0);
+  return executablePhases.length > 0 && executablePhases.every(phase => phaseCapabilitySkipDetails.has(phase.id));
+}
+
+function buildSkip(reason: RunnerSkipReason, detail?: string): { reason: RunnerSkipReason; detail: string } {
+  return { reason, detail: detail ?? SKIP_DETAILS[reason] };
+}
+
+type CreativeAssetFixtureUnavailableFailure = Extract<CreativeAssetExpansionFailure, { reason: 'fixture_unavailable' }>;
+
+function buildCreativeAssetFixtureUnavailableStep(
+  step: StoryboardStep,
+  phaseId: string,
+  context: StoryboardContext,
+  allSteps: FlatStep[],
+  runState: ExecutionState,
+  failure: CreativeAssetFixtureUnavailableFailure,
+  task = step.task
+): StoryboardStepResult {
+  const detail =
+    `creative_asset_fixture_unavailable: slot "${failure.slotId}", asset type "${failure.assetType}", ` +
+    `constraint: ${failure.constraint} (${failure.path})`;
+  return {
+    step_id: step.id,
+    phase_id: phaseId,
+    title: step.title,
+    task,
+    passed: true,
+    skipped: true,
+    skip_reason: 'fixture_unavailable',
+    skip: buildSkip('fixture_unavailable', detail),
+    duration_ms: 0,
+    validations: [],
+    context,
+    next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+    extraction: { path: 'none' },
+  };
+}
+
+interface ResponseDerivedSkip {
+  detail: string;
+  contextKeys: string[];
+}
+
+function detectResponseDerivedNotApplicable(
+  step: StoryboardStep,
+  request: Record<string, unknown>,
+  response: unknown,
+  runState?: ExecutionState,
+  allSteps?: Array<{ step: StoryboardStep }>
+): ResponseDerivedSkip | null {
+  if (response === undefined || response === null) return null;
+  const gates = [
+    ...normalizeResponseNotApplicableGates(step.not_applicable_if),
+    ...inferImplicitResponseNotApplicableGates(step, request, runState, allSteps),
+  ];
+  for (const gate of gates) {
+    if (gate.kind !== 'terminal_page') continue;
+    if (!terminalPageGateMatches(gate, request, response)) continue;
+    const detail =
+      gate.detail ??
+      `${gate.reason ?? 'single_page_result'}: ${step.task} response is terminal; cursor-walk not applicable`;
+    return {
+      detail,
+      contextKeys: responseNotApplicableContextKeys(step, gate),
+    };
+  }
+  return null;
+}
+
+function normalizeResponseNotApplicableGates(gates: StoryboardStep['not_applicable_if']): ResponseNotApplicableGate[] {
+  if (!gates) return [];
+  return Array.isArray(gates) ? gates : [gates];
+}
+
+function inferImplicitResponseNotApplicableGates(
+  step: StoryboardStep,
+  request: Record<string, unknown>,
+  runState?: ExecutionState,
+  allSteps?: Array<{ step: StoryboardStep }>
+): ResponseNotApplicableGate[] {
+  // Back-compat for the already-published pagination_integrity_list_accounts
+  // storyboard: it expresses the continuation requirement as validations
+  // rather than a dedicated response-derived gate. Keep this narrowly scoped
+  // to list_accounts so other seeded pagination storyboards do not silently
+  // waive fixture/setup mistakes.
+  if (step.task !== 'list_accounts') return [];
+  const expectsContinuation = step.validations?.some(
+    v => v.check === 'field_value' && v.path === 'pagination.has_more' && v.value === true
+  );
+  const capturesCursor = step.context_outputs?.some(o => o.path === 'pagination.cursor');
+  const validatesCursor = step.validations?.some(v => v.check === 'field_present' && v.path === 'pagination.cursor');
+  if (!expectsContinuation || (!capturesCursor && !validatesCursor)) return [];
+  const maxResults = resolvePath(request, 'pagination.max_results');
+  if (
+    typeof maxResults === 'number' &&
+    Number.isFinite(maxResults) &&
+    hasUnrunAccountSeedExceedingPageSize(allSteps, runState, maxResults)
+  ) {
+    return [];
+  }
+  const setupAccounts = resolvePath(runState?.priorStepResults.get('sync_three_accounts')?.response, 'accounts');
+  if (
+    typeof maxResults === 'number' &&
+    Number.isFinite(maxResults) &&
+    Array.isArray(setupAccounts) &&
+    setupAccounts.length > maxResults
+  ) {
+    return [];
+  }
+  return [{ kind: 'terminal_page', items_path: 'accounts', reason: 'single_page_result' }];
+}
+
+function hasUnrunAccountSeedExceedingPageSize(
+  allSteps: Array<{ step: StoryboardStep }> | undefined,
+  runState: ExecutionState | undefined,
+  maxResults: number
+): boolean {
+  return (
+    allSteps?.some(({ step }) => {
+      if (runState?.priorStepResults.has(step.id)) return false;
+      if (step.task !== 'sync_accounts') return false;
+      const accounts = resolvePath(step.sample_request, 'accounts');
+      return Array.isArray(accounts) && accounts.length > maxResults;
+    }) ?? false
+  );
+}
+
+function terminalPageGateMatches(
+  gate: Extract<ResponseNotApplicableGate, { kind: 'terminal_page' }>,
+  request: Record<string, unknown>,
+  response: unknown
+): boolean {
+  const maxResults = resolvePath(request, gate.request_max_results_path ?? 'pagination.max_results');
+  if (typeof maxResults !== 'number' || !Number.isFinite(maxResults) || maxResults <= 0) return false;
+
+  const items = resolvePath(response, gate.items_path);
+  if (!Array.isArray(items)) return false;
+
+  const pagination = resolvePath(response, 'pagination');
+  if (pagination === undefined || pagination === null) return items.length < maxResults;
+  if (typeof pagination !== 'object' || Array.isArray(pagination)) return false;
+
+  const p = pagination as Record<string, unknown>;
+  if (p.has_more === true) return false;
+  if (p.has_more !== false) return false;
+  if (typeof p.total_count === 'number' && p.total_count > items.length) return false;
+  if (items.length < maxResults) return true;
+  return typeof p.total_count === 'number' && p.total_count <= items.length;
+}
+
+function responseNotApplicableContextKeys(
+  step: StoryboardStep,
+  gate: Extract<ResponseNotApplicableGate, { kind: 'terminal_page' }>
+): string[] {
+  if (gate.context_keys?.length) return gate.context_keys;
+  return (step.context_outputs ?? [])
+    .filter(o => o.path === 'pagination.cursor')
+    .map(o => o.key)
+    .filter((key): key is string => typeof key === 'string' && key.length > 0);
+}
+
+/**
+ * Step id for the synthetic result that reports a fixture capture the
+ * protected funnel refused to detach.
+ */
+const FIXTURE_CAPTURE_STEP_ID = '__fixture_capture__';
+
+/**
+ * Name the AdCP task whose response the unbuildable capture came from.
+ *
+ * Fixture captures resolve against either `get_products` or
+ * `comply_test_controller`, and preparation records which per capture. The
+ * synthetic step carries one task name, so it reports the task behind the
+ * first refused key rather than assuming the catalog path — a storyboard
+ * seeded through the controller would otherwise be told to go look at a
+ * `get_products` response it never issued.
+ */
+function describeFixtureCaptureTask(
+  captures: PreparedFixtureCaptures | undefined,
+  refusedKeys: readonly string[]
+): string {
+  for (const key of refusedKeys) {
+    const task = captures?.provenance?.[key]?.source_task;
+    if (typeof task === 'string' && task.length > 0) return task;
+  }
+  const distinct = new Set(
+    Object.values(captures?.provenance ?? {})
+      .map(entry => entry.source_task)
+      .filter((task): task is string => typeof task === 'string' && task.length > 0)
+  );
+  return distinct.size === 1 ? [...distinct][0]! : VALIDATION_ONLY_TASK;
+}
+
+function responseDerivedContextResult(
+  runState: ExecutionState
+): Pick<StoryboardStepResult, 'response_derived_not_applicable_context_keys'> {
+  const entries = runState.responseDerivedNotApplicableContextKeys;
+  return entries && entries.size > 0
+    ? { response_derived_not_applicable_context_keys: Object.fromEntries(entries) }
+    : {};
+}
+
+/**
+ * True for skip reasons that imply state genuinely never materialized
+ * — no other code path could have established it. The runner trips
+ * the cascade immediately on these. `missing_tool` and
+ * `missing_test_controller` qualify: the agent doesn't advertise the
+ * tool, end of story.
+ *
+ * `not_applicable` is intentionally NOT in this set even though F6's
+ * first cut bundled it in. `not_applicable` means "this path doesn't
+ * apply to this agent", which is consistent with "a peer path in the
+ * same phase establishes equivalent state" — e.g. an explicit-mode
+ * seller skips `sync_accounts` as not_applicable because
+ * `list_accounts` is the canonical alternative for that account
+ * shape. Tripping the cascade on the first not_applicable would
+ * collapse this distinction and skip the substitute. The runner
+ * therefore defers `not_applicable`'s cascade decision to phase end —
+ * see `phasePendingNotApplicable` handling in the phase loop.
+ */
+function isHardMissingStateSkipReason(reason: RunnerSkipReason | RunnerDetailedSkipReason | undefined): boolean {
+  return reason === 'missing_tool' || reason === 'missing_test_controller';
+}
+
+/**
+ * Resolve each phase's branch-set membership, combining explicit
+ * `branch_set: { id, semantics }` declarations with the implicit detection
+ * fallback the schema + adcp#2646 mandate: an `optional: true` phase with a
+ * step declaring `contributes_to: <flag>` that matches a later
+ * `assert_contribution check: any_of, allowed_values: [<flag>]` target is a
+ * branch-set member even when the author hasn't migrated to the explicit
+ * keyword. Explicit declarations take precedence. Returned map is keyed by
+ * phase id; phases outside any branch set are absent from the map.
+ *
+ * First-match wins: if an optional phase has steps contributing to more
+ * than one any_of flag, the earliest matching step (by storyboard
+ * declaration order) decides the phase's branch-set membership. Authors
+ * wanting a phase in multiple branch sets should declare `branch_set:`
+ * explicitly — the implicit path does not synthesize multi-set membership.
+ */
+function resolveBranchSets(storyboard: Storyboard): Map<string, BranchSetSpec> {
+  const resolved = new Map<string, BranchSetSpec>();
+  for (const phase of storyboard.phases) {
+    if (phase.branch_set) resolved.set(phase.id, phase.branch_set);
+  }
+  const anyOfFlags = new Set<string>();
+  for (const phase of storyboard.phases) {
+    for (const step of phase.steps) {
+      if (step.task !== 'assert_contribution') continue;
+      for (const v of step.validations ?? []) {
+        if (v.check !== 'any_of') continue;
+        for (const flag of v.allowed_values ?? []) {
+          if (typeof flag === 'string') anyOfFlags.add(flag);
+        }
+      }
+    }
+  }
+  for (const phase of storyboard.phases) {
+    if (resolved.has(phase.id)) continue;
+    if (!phase.optional) continue;
+    for (const step of phase.steps) {
+      if (!step.contributes_to) continue;
+      if (!anyOfFlags.has(step.contributes_to)) continue;
+      resolved.set(phase.id, { id: step.contributes_to, semantics: 'any_of' });
+      break;
+    }
+  }
+  return resolved;
+}
+
+/**
+ * Re-grade non-contributing branch-set peers per the `any_of` semantics in
+ * storyboard-schema.yaml ("Per-step grading in any_of branch patterns").
+ *
+ * Runs after the main phase loop because peer contribution status isn't
+ * knowable until all peer phases have executed. For every phase in a
+ * branch set (explicit `branch_set:` declaration or implicit detection via
+ * `resolveBranchSets`) whose flag was contributed by a different phase,
+ * this phase's raw step failures are moot — the agent took the other
+ * branch. Each such failed step is rewritten to a skipped result with
+ * `skip_reason: 'peer_branch_taken'` and the detail string the
+ * runner-output-contract mandates:
+ *
+ *   "<flag> contributed by <peer_phase_id>.<peer_step_id> — <this_phase_id> is moot"
+ *
+ * The `<this_branch_id>` contract placeholder resolves to the non-chosen
+ * peer's phase id — `branch_set.id` is shared across peers and could not
+ * disambiguate. Only `any_of` semantics drives re-grading today; other
+ * (reserved) values are rejected at parse in `validateBranchSet`.
+ *
+ * `countedAsFailed` names step results the main loop added to `failedCount`
+ * as hard failures — either non-optional phases or the `presenceDetected`
+ * PRM 2xx path (adcp-client#677: "an agent that serves PRM MUST serve it
+ * correctly"). These stand: re-grading them would paper over the exact
+ * invariants the hard-failure paths exist to enforce. The post-pass only
+ * relabels swallowed optional-phase failures, which by construction are not
+ * in `countedAsFailed`.
+ */
+function applyBranchSetGrading(
+  phases: StoryboardPhase[],
+  phaseResults: StoryboardPhaseResult[],
+  branchSetByPhaseId: Map<string, BranchSetSpec>,
+  contributions: Set<string>,
+  contributionSources: Map<string, { phaseId: string; stepId: string }>,
+  countedAsFailed: Set<StoryboardStepResult>
+): { skippedDelta: number } {
+  let skippedDelta = 0;
+  for (let i = 0; i < phases.length; i++) {
+    const phaseDef = phases[i];
+    const phaseResult = phaseResults[i];
+    if (!phaseDef || !phaseResult) continue;
+    const branchSet = branchSetByPhaseId.get(phaseDef.id);
+    if (!branchSet) continue;
+    if (branchSet.semantics !== 'any_of') continue;
+    const flag = branchSet.id;
+    if (!contributions.has(flag)) continue;
+    const source = contributionSources.get(flag);
+    if (!source || source.phaseId === phaseDef.id) continue;
+    const detail = `${flag} contributed by ${source.phaseId}.${source.stepId} — ${phaseDef.id} is moot`;
+    let regraded = false;
+    for (const step of phaseResult.steps) {
+      if (step.passed || step.skipped) continue;
+      if (countedAsFailed.has(step)) continue;
+      step.passed = true;
+      step.skipped = true;
+      step.skip_reason = 'peer_branch_taken';
+      step.skip = { reason: 'peer_branch_taken', detail };
+      delete step.error;
+      delete step.adcp_error;
+      delete step.counts_toward_failure;
+      skippedDelta++;
+      regraded = true;
+    }
+    if (regraded) {
+      phaseResult.passed = phaseResult.steps.every(s => s.passed || s.skipped);
+    }
+  }
+  return { skippedDelta };
+}
+
+// ────────────────────────────────────────────────────────────
+// task_completion. context_outputs path resolution
+// ────────────────────────────────────────────────────────────
+
+/** Marker prefix on `context_outputs.path` that opts a capture into the
+ *  poll-tasks-get-for-the-completion-artifact resolution flow. The remainder
+ *  of the path is resolved against the artifact's `data`, not the immediate
+ *  submitted envelope. */
+const TASK_COMPLETION_PATH_PREFIX = 'task_completion.';
+
+/** Hard cap on how long the runner blocks one step waiting for a task to
+ *  reach terminal state. Long enough to cover most HITL approval flows that
+ *  are expected to complete inline; short enough that a stuck task surfaces
+ *  the failure on the step that authored the dependency rather than the
+ *  storyboard wall-clock budget. Override with `STORYBOARD_TASK_POLL_TIMEOUT_MS`. */
+const TASK_COMPLETION_DEFAULT_TIMEOUT_MS = 30_000;
+
+/** Per-poll cadence inside `pollTaskCompletion`. Scaled tight enough that
+ *  short HITL flows complete in a couple of polls; the bound is still the
+ *  outer timeout race. Override with `STORYBOARD_TASK_POLL_INTERVAL_MS`. */
+const TASK_COMPLETION_DEFAULT_POLL_INTERVAL_MS = 1_500;
+
+/** Defensive task_id pattern. AdCP doesn't constrain `task_id` shape on the
+ *  wire, but unbounded strings are an SSRF / log-injection lever — we cap
+ *  the length and reject control characters before the value reaches the
+ *  SDK's tasks/get JSON-RPC param. */
+const TASK_ID_MAX_LEN = 256;
+// eslint-disable-next-line no-control-regex -- intentional: reject control chars in task_id
+const TASK_ID_CONTROL_CHAR_RE = /[\x00-\x1F\x7F]/;
+
+/** Non-terminal task statuses that carry a `task_id` and warrant polling
+ *  the artifact for `task_completion.<inner>` captures. Per the AdCP
+ *  `tasks-get-response.json` enum, all three are explicitly non-terminal:
+ *  `submitted` (HITL or async-signed-IO), `working` ("expect completion
+ *  within 120 seconds"), and `input-required` (waiting on the buyer to
+ *  supply additional info — relevant when the storyboard test harness
+ *  satisfies the input requirement). The 30s default poll timeout still
+ *  bounds the worst case for storyboards that test these arms directly. */
+const POLL_ELIGIBLE_STATUSES = new Set(['submitted', 'working', 'input-required']);
+
+interface PollEligibleEnvelopeShape {
+  status: 'submitted' | 'working' | 'input-required';
+  task_id: string;
+}
+
+/**
+ * Clear retained A2A session state (`contextId`, `pendingTaskId`) on each
+ * shared client at the start of a storyboard run. AgentClient is documented
+ * as one-instance-per-conversation; `comply()` reuses a single instance
+ * across every storyboard for transport caching, so the runner has to
+ * re-establish the "fresh conversation" boundary per storyboard. Without
+ * this, a stale `pendingTaskId` from a prior storyboard's non-terminal
+ * step rides into this storyboard's first call and the seller surfaces
+ * "Task <uuid> not found". See adcp-client#1585.
+ *
+ * Calls go through a duck-typed `resetContext()` accessor so the helper
+ * stays compatible with adapter-built clients that don't subclass
+ * AgentClient directly.
+ */
+function resetClientSessions(clients: readonly TestClient[]): void {
+  for (const client of clients) {
+    const reset = (client as unknown as { resetContext?: () => void }).resetContext;
+    if (typeof reset === 'function') reset.call(client);
+  }
+}
+
+/**
+ * Ask a sandbox controller to clear seller-side fixtures before a storyboard.
+ * Older controllers may not implement the additive scenario; UNKNOWN_SCENARIO
+ * preserves backward compatibility while upgraded controllers establish the
+ * explicit isolation boundary that correlation IDs alone cannot provide.
+ */
+async function resetControllerState(
+  client: TestClient,
+  storyboard: Storyboard,
+  options: StoryboardRunOptions
+): Promise<TestStepResult | undefined> {
+  const controller = options._controllerCapabilities;
+  if (controller?.detected !== true || !controller.scenarios.includes('reset_state')) return undefined;
+  const outcome = await runStep('Reset test-controller state', 'comply_test_controller', () =>
+    callControllerRaw(
+      client,
+      {
+        scenario: 'reset_state',
+        context: { correlation_id: `${storyboard.id}--__reset_state__` },
+      },
+      options
+    )
+  );
+  if (!outcome.step.passed) return outcome.step;
+
+  const raw = outcome.result;
+  const data = raw?.data as { success?: boolean; error?: string; error_detail?: string } | undefined;
+  if (raw?.success && data?.success === true) return undefined;
+  if (raw?.success && data?.success === false && data.error === 'UNKNOWN_SCENARIO') return undefined;
+  return {
+    ...outcome.step,
+    passed: false,
+    error: data?.error_detail ?? data?.error ?? raw?.error ?? 'comply_test_controller reset_state failed',
+  };
+}
+
+async function resetControllerStates(
+  targets: ReadonlyArray<{ client: TestClient; options: StoryboardRunOptions }>,
+  storyboard: Storyboard
+): Promise<TestStepResult | undefined> {
+  const seen = new Set<TestClient>();
+  for (const target of targets) {
+    if (seen.has(target.client)) continue;
+    seen.add(target.client);
+    const failure = await resetControllerState(target.client, storyboard, target.options);
+    if (failure) return failure;
+  }
+  return undefined;
+}
+
+function isPollEligibleEnvelope(data: unknown): data is PollEligibleEnvelopeShape {
+  if (data == null || typeof data !== 'object') return false;
+  const obj = data as { status?: unknown; task_id?: unknown };
+  return (
+    typeof obj.status === 'string' &&
+    POLL_ELIGIBLE_STATUSES.has(obj.status) &&
+    typeof obj.task_id === 'string' &&
+    obj.task_id.length > 0
+  );
+}
+
+function isValidTaskId(taskId: string): boolean {
+  if (taskId.length === 0 || taskId.length > TASK_ID_MAX_LEN) return false;
+  if (TASK_ID_CONTROL_CHAR_RE.test(taskId)) return false;
+  return true;
+}
+
+interface TaskCompletionResolution {
+  /** Discriminator: was the resolution attempted? `false` short-circuits
+   *  the runner back to plain extraction against the immediate response. */
+  attempted: boolean;
+  /** Artifact data resolved by polling. Present (including `undefined`)
+   *  ONLY when polling succeeded — caller uses `'data' in resolution` to
+   *  distinguish "polled and got undefined" from "did not poll." */
+  data?: unknown;
+  /** Set when the bounded poll exceeded `pollTimeoutMs`. The runner uses
+   *  this to flip the synthesized failure check from
+   *  `capture_path_not_resolvable` to `capture_poll_timeout`. */
+  timedOut?: boolean;
+  pollTimeoutMs?: number;
+  /** Set when polling reached terminal state with `success: false`
+   *  (failed / canceled / rejected). The runner flips the synthesized
+   *  failure check to `capture_task_failed` so reports distinguish
+   *  "field absent on artifact" from "task itself terminally failed." */
+  taskFailed?: boolean;
+}
+
+function remapTaskCompletionOutputs<T extends { path?: string | undefined }>(outputs: readonly T[]): T[] {
+  return outputs.map(o => {
+    if (typeof o.path === 'string' && o.path.startsWith(TASK_COMPLETION_PATH_PREFIX)) {
+      return { ...o, path: o.path.slice(TASK_COMPLETION_PATH_PREFIX.length) };
+    }
+    return o;
+  });
+}
+
+async function resolveTaskCompletionOutputs(
+  taskResult: TaskResult | undefined,
+  outputs: readonly { path?: string | undefined }[],
+  client: TestClient,
+  webhookReceiver: WebhookReceiver | undefined,
+  originatingTaskName: string,
+  responseAdcpVersion: string | undefined
+): Promise<TaskCompletionResolution> {
+  const hasTaskCompletionPath = outputs.some(
+    o => typeof o.path === 'string' && o.path.startsWith(TASK_COMPLETION_PATH_PREFIX)
+  );
+  if (!hasTaskCompletionPath) return { attempted: false };
+  if (!taskResult || !isPollEligibleEnvelope(taskResult.data)) return { attempted: false };
+  const taskId = taskResult.data.task_id;
+  if (!isValidTaskId(taskId)) return { attempted: false };
+
+  const timeoutMs = readEnvIntOrDefault(
+    process.env['STORYBOARD_TASK_POLL_TIMEOUT_MS'],
+    TASK_COMPLETION_DEFAULT_TIMEOUT_MS
+  );
+  const pollIntervalMs = readEnvIntOrDefault(
+    process.env['STORYBOARD_TASK_POLL_INTERVAL_MS'],
+    TASK_COMPLETION_DEFAULT_POLL_INTERVAL_MS
+  );
+
+  // The SDK's `pollTaskCompletion` lives on the executor — accessed via the
+  // SingleAgentClient instance the storyboard runner created in
+  // `getOrCreateClient`. The runner historically uses `client: any` for
+  // dynamic dispatch (see task-map.ts:80) so this cast doesn't widen
+  // existing surface.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic SDK access
+  const dynamicClient = client as any;
+  const executor = dynamicClient?.executor;
+  const agent = dynamicClient?.agent;
+  const canPoll = !!(executor?.pollTaskCompletion && agent);
+  const canWebhook = !!webhookReceiver;
+  if (!canPoll && !canWebhook) return { attempted: false };
+
+  type PollWin = { kind: 'poll'; result: TaskResult };
+  type WebhookWin = { kind: 'webhook'; result: WebhookWaitResult };
+  type TimeoutWin = { kind: 'timeout' };
+  type Winner = PollWin | WebhookWin | TimeoutWin;
+
+  const racers: Promise<Winner>[] = [];
+
+  // Poll path. An AbortSignal tied to the same `timeoutMs` budget is passed
+  // to `pollTaskCompletion` so the inner loop exits as soon as the outer race
+  // timer fires — no orphaned `tasks/get` requests survive the step boundary.
+  // (adcp-client#1612: previously the loop ran indefinitely after the outer
+  // timeout resolved, accumulating background A2A calls that consumed the
+  // full comply() budget.)
+  if (canPoll) {
+    const pollSignal = AbortSignal.timeout(timeoutMs);
+    racers.push(
+      executor.pollTaskCompletion(agent, taskId, pollIntervalMs, undefined, pollSignal).then(
+        (result: TaskResult): PollWin => ({
+          kind: 'poll',
+          result,
+        })
+      )
+    );
+  }
+
+  // Webhook path. Per `tasks-get-response.json`, sellers MAY use webhook-
+  // only HITL completion (no polling). When a `--webhook-receiver` is
+  // active, race the receiver's `wait` (filtered by `task_id`) against
+  // the poll. The webhook payload's `result` field is the artifact's
+  // `data` (per the framework's task webhook payload shape, mirroring
+  // the HITL completion shape from `from-platform.ts`).
+  //
+  // Note: `webhook.wait` keeps an internal `setTimeout(timeout_ms)` that
+  // we can't cancel from here. When the poll wins or the outer timeout
+  // fires first, that internal timer continues until `timeout_ms`
+  // elapses. Acceptable because the receiver is process-scoped (closed
+  // on storyboard exit) and runner-owned receivers aren't injected.
+  if (webhookReceiver) {
+    racers.push(
+      webhookReceiver
+        .wait({ body: { task_id: taskId } }, timeoutMs)
+        .then((result): WebhookWin => ({ kind: 'webhook', result }))
+    );
+  }
+
+  let timer: NodeJS.Timeout | undefined;
+  const timeoutRacer = new Promise<TimeoutWin>(resolve => {
+    timer = setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs);
+    // Don't keep the event loop alive on this handle — the runner's
+    // wall-clock budget is already enforced by the storyboard runner
+    // shell, and a hung task shouldn't delay process exit by `timeoutMs`.
+    timer.unref?.();
+  });
+  racers.push(timeoutRacer);
+
+  try {
+    const winner = await Promise.race(racers);
+    if (winner.kind === 'timeout') {
+      return { attempted: true, timedOut: true, pollTimeoutMs: timeoutMs };
+    }
+    if (winner.kind === 'poll') {
+      const polled = winner.result;
+      if (polled.success === false) return { attempted: true, taskFailed: true };
+      return {
+        attempted: true,
+        data: normalizeTaskCompletionData(polled.data, originatingTaskName, responseAdcpVersion),
+      };
+    }
+    // Webhook win.
+    const waitResult = winner.result;
+    if (waitResult.timed_out) {
+      return { attempted: true, timedOut: true, pollTimeoutMs: timeoutMs };
+    }
+    const webhookBody = waitResult.webhook.body as { status?: unknown; result?: unknown } | undefined;
+    // Fail-closed on the success path: require `status === 'completed'`.
+    // The framework's `buildTaskWebhookPayload` always emits `status`, so a
+    // missing or non-completed value means either a malformed webhook or a
+    // genuine terminal-failed/canceled/rejected outcome — both should
+    // attribute to `capture_task_failed`, not silently fall through to a
+    // capture against an undefined `result`.
+    if (webhookBody?.status === 'completed') {
+      return {
+        attempted: true,
+        data: normalizeTaskCompletionData(webhookBody.result, originatingTaskName, responseAdcpVersion),
+      };
+    }
+    return { attempted: true, taskFailed: true };
+  } catch {
+    return { attempted: true, taskFailed: true };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function normalizeTaskCompletionData(data: unknown, taskName: string, adcpVersion: string | undefined): unknown {
+  if (data == null || typeof data !== 'object' || Array.isArray(data)) return data;
+  const original = data as Record<string, unknown>;
+  const compatOptions = { toolName: taskName, adcpVersion };
+  const compat = injectLegacyEnvelopeStatus(original, compatOptions);
+  if (!('status' in original) && 'status' in compat) {
+    const { status: _status, ...rest } = compat;
+    return normalizeLegacyMediaBuyStatusForReturn(rest, compatOptions);
+  }
+  if (
+    (taskName === 'create_media_buy' || taskName === 'update_media_buy') &&
+    typeof original.status === 'string' &&
+    compat.status === 'completed' &&
+    typeof compat.media_buy_status === 'string'
+  ) {
+    return normalizeLegacyMediaBuyStatusForReturn({ ...compat, status: original.status }, compatOptions);
+  }
+  return normalizeLegacyMediaBuyStatusForReturn(compat, compatOptions);
+}
+
+function readEnvIntOrDefault(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+function extractionFromTaskResult(taskResult: TaskResult | undefined): RunnerExtractionRecord {
+  if (!taskResult) return { path: 'none' };
+  // Prefer the explicit provenance stamped by the response unwrapper / raw
+  // MCP probe. Fall back to inference only when the tag is missing (e.g.,
+  // synthetic TaskResults built by validation harnesses).
+  if (taskResult._extraction_path !== undefined) return { path: taskResult._extraction_path };
+  if (!taskResult.success && taskResult.error) return { path: 'error' };
+  return taskResult.data !== undefined && taskResult.data !== null ? { path: 'structured_content' } : { path: 'none' };
+}
+
+export function __redactSecretsForTest(value: unknown): unknown {
+  return redactSecrets(value);
+}
+
+export function __filterResponseHeadersForTest(
+  headers: Record<string, string> | undefined
+): Record<string, string> | undefined {
+  return filterResponseHeaders(headers);
+}
+
+/**
+ * Test seam for the session probe's mechanism-matched control resolution.
+ * Exercised against the real `createTestClient` shape so the live-token
+ * lookup cannot silently regress to a structure no client actually returns.
+ */
+/**
+ * Test seam for protected-target selection. Exercised directly so the
+ * public-tier and mutating-task exclusions cannot regress silently.
+ */
+export function __selectProtectedToolTargetForTest(tools: readonly string[] | undefined): string | undefined {
+  return selectProtectedToolTarget(tools);
+}
+
+/** Test seam for the ordered candidate list. */
+export function __protectedToolCandidatesForTest(tools: readonly string[] | undefined): string[] {
+  return protectedToolCandidates(tools);
+}
+
+export function __sessionControlCredentialsForTest(
+  mechanism: SessionControlMechanism,
+  options: StoryboardRunOptions,
+  client: unknown,
+  agentUrl?: string
+): SessionControlResolution {
+  return sessionControlCredentials(mechanism, options, client, agentUrl);
+}
+
+export function __defaultAuthHeadersForRawProbeForTest(
+  options: StoryboardRunOptions
+): Record<string, string> | undefined {
+  return defaultAuthHeadersForRawProbe(options);
+}
+
+/**
+ * Response headers to echo on a RunnerResponseRecord. Everything else is
+ * dropped — agents can (and do) include `set-cookie`, echoed `authorization`,
+ * reverse-proxy breadcrumbs (`x-amz-*`, `x-azure-*`, `x-internal-*`) that a
+ * hostile agent could use to bait us into publishing internal state in a
+ * shared compliance report.
+ */
+const RESPONSE_HEADER_ALLOWLIST = new Set([
+  'content-type',
+  'content-length',
+  'content-encoding',
+  'www-authenticate',
+  'location',
+  'retry-after',
+  'x-request-id',
+  'x-correlation-id',
+]);
+
+function filterResponseHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    const lower = k.toLowerCase();
+    if (RESPONSE_HEADER_ALLOWLIST.has(lower)) {
+      out[lower] = lower === 'location' ? redactOAuthUrlForOutput(v) : v;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+// ────────────────────────────────────────────────────────────
+// runStoryboard: execute all phases/steps
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Run an entire storyboard against an agent.
+ *
+ * Pass a single URL for the standard single-instance run. Pass an array of
+ * URLs to engage multi-instance mode: the runner round-robins each step
+ * across the provided URLs so that (brand, account)-scoped state created on
+ * one instance must be visible on the next. Sellers whose state lives only
+ * in-process will fail this mode — the failure signature is a prior write
+ * succeeding on instance A while a subsequent read returns NOT_FOUND or
+ * empty on instance B.
+ */
+export async function runStoryboard(
+  agentUrlOrUrls: string | string[],
+  storyboard: Storyboard,
+  options: StoryboardRunOptions = {}
+): Promise<StoryboardResult> {
+  assertNoPreparationAuthorizer(options);
+  options = {
+    ...applyReusableProfileOptions(options),
+    _requireValidCapabilityEvidence: storyboardRequiresCapabilityEvidence(storyboard),
+    _allowCapabilityDiagnostic: storyboardAllowsCapabilityDiagnostic(storyboard),
+  };
+  if (hasTestClientScope() && !options._discoveryPass) options = { ...options, _discoveryPass: {} };
+  return withPropertyListCredentialRedaction(() =>
+    withMCPConnectionScope(
+      async () => {
+        options = applyStoryboardVersionOptions(storyboard, options);
+        options = applyFunctionalRequestSigning(options, {
+          ...(options.complianceDir && { complianceDir: options.complianceDir }),
+          ...(options.adcpVersion && { version: options.adcpVersion }),
+        });
+        // adcp#6735 — a declared prerequisites.test_kit is a loading directive,
+        // not decoration: resolve it into options.test_kit (caller-supplied
+        // kits win) so from_test_kit / $test_kit.* references get the
+        // credential the storyboard was authored against.
+        options = resolveDeclaredTestKit(storyboard, options);
+        options = applyNativeA2AComplianceTransportOptions(options);
+        if (
+          storyboard.requires?.[0] === 'property_list_reference_runner' &&
+          storyboardCapabilityPredicates(storyboard).length === 0 &&
+          propertyListReferenceNeedsMcp(options)
+        ) {
+          return buildRequirementUnmetResult(
+            Array.isArray(agentUrlOrUrls) ? agentUrlOrUrls : [agentUrlOrUrls],
+            storyboard,
+            'property_list_reference_runner',
+            'Credential-isolated property-list references currently require MCP; A2A probe coverage is unavailable.'
+          );
+        }
+        // Normalize BEFORE the gate: preparation and the standalone runner both
+        // digest the NORMALIZED storyboard, so gating on the raw document made
+        // any storyboard containing a validation-only step refuse its own
+        // prepared state on `storyboard_digest`.
+        storyboard = normalizeValidationOnlyTasks(storyboard);
+        // ALSO before the gate, not only inside `runStoryboardBody`.
+        // `validateStoryboardShape` mutates in place (`contributes` →
+        // `contributes_to`), and `prepareStoryboardFixtures` runs it before
+        // building its binding — so a storyboard using the shorthand AND a
+        // validation-only step digested differently in prepare and run and
+        // refused its own prepared state. Idempotent, so the later call in
+        // `runStoryboardBody` still stands.
+        validateStoryboardShape(storyboard);
+        const schemaRoot = getRunSchemaRoot(options);
+        // The gate must sit INSIDE the schema scopes and ABOVE the `_client`
+        // reuse fast path. Inside, because preparation computed its binding
+        // with the caller's schema root installed — gating outside would
+        // compare a scoped run against the bundled artifact and refuse valid
+        // reuse. Above, because the fast path discovers a profile and calls
+        // `get_adcp_capabilities` before `runStoryboardBody` and its
+        // per-pass gates are ever reached.
+        const gatedBody = async (): Promise<StoryboardResult> => {
+          // Same screen, same verdict shape, same place in the order as the
+          // standalone step route. Letting the funnel THROW here instead
+          // would make one hosted entry point answer a bad caller body with
+          // an exception and the other with a graded result, for the exact
+          // same mistake.
+          const metadataRefusal = describeReservedCallerOptions(options);
+          if (metadataRefusal !== undefined) {
+            return denyPreparedFixtures(
+              options,
+              buildPreparedRefusalRunResult(resolveBindingAgentUrls(agentUrlOrUrls, options), storyboard, {
+                code: 'unauthorized_metadata',
+                detail: metadataRefusal,
+              }),
+              'unauthorized_metadata'
+            );
+          }
+          if (options.prepared_fixtures !== undefined) {
+            // The SAME route projection preparation uses. Comparing a routed
+            // run's real routes against a positional `''` would refuse every
+            // routed reuse on `agent_urls`.
+            const urls = resolveBindingAgentUrls(agentUrlOrUrls, options);
+            const gate = await gatePreparedFixtures(storyboard, urls, options, undefined, 'run');
+            if (gate.used && 'refusal' in gate) {
+              return denyPreparedFixtures(
+                options,
+                buildPreparedRefusalRunResult(urls, storyboard, gate.refusal),
+                gate.refusal.code
+              );
+            }
+          }
+          if (hasTestClientScope() && options._client && !options.agents) {
+            const resolution = getOrCreateClientResolution(
+              typeof agentUrlOrUrls === 'string' ? agentUrlOrUrls : agentUrlOrUrls[0]!,
+              options
+            );
+            const discovered = await getOrDiscoverStoryboardProfile(resolution.client, options);
+            if (!discovered.step.passed)
+              return buildDiscoveryFailedResult(
+                resolveBindingAgentUrls(agentUrlOrUrls, options),
+                storyboard,
+                discovered.step,
+                discovered.profile
+              );
+            options = {
+              ...options,
+              _profile: discovered.step.passed ? discovered.profile : undefined,
+              agentTools: discovered.step.passed ? discovered.profile.tools : undefined,
+            };
+          }
+          return withServedReleaseSchemaRoots(options.servedReleaseSchemaRoots, () =>
+            runStoryboardBody(agentUrlOrUrls, storyboard, options)
+          );
+        };
+        if (schemaRoot) {
+          return await withExternalSchemaRoot(schemaRoot.adcpVersion, schemaRoot.schemaRoot, gatedBody);
+        }
+        return await gatedBody();
+      },
+      { isolate: !hasTestClientScope() }
+    )
+  );
+}
+
+async function runStoryboardBody(
+  agentUrlOrUrls: string | string[],
+  storyboard: Storyboard,
+  options: StoryboardRunOptions
+): Promise<StoryboardResult> {
+  validateTestKit(options.test_kit);
+  storyboard = normalizeValidationOnlyTasks(storyboard);
+  // Enforce authoring-time branch_set invariants regardless of how the
+  // storyboard reached us. YAML callers already ran these rules in
+  // parseStoryboard; programmatic callers (hand-built Storyboard objects or
+  // alternative YAML loaders) reach this point without the loader having
+  // fired, and the runtime's grading depends on the invariants holding.
+  // `validateStoryboardShape` is idempotent so the double-pass is safe.
+  validateStoryboardShape(storyboard);
+
+  // Per-specialism routing (#1066). Mutually exclusive with replica-array
+  // dispatch and `_client`. Validate the shape of `options.agents` here so
+  // misconfigured callers fail fast with a clear error rather than getting
+  // silently routed to the first URL or a stale single-agent client.
+  if (options.agents !== undefined) {
+    validateAgentsMap(agentUrlOrUrls, storyboard, options);
+  }
+
+  const agentUrls = Array.isArray(agentUrlOrUrls) ? agentUrlOrUrls : [agentUrlOrUrls];
+  if (!options.agents && agentUrls.length === 0) {
+    throw new Error('runStoryboard: at least one agent URL required');
+  }
+
+  const suppliedDiscoveryFailure =
+    options._profile &&
+    describeProfileDiscoveryFailure(
+      options._profile,
+      options._requireValidCapabilityEvidence === true,
+      options._allowCapabilityDiagnostic === true
+    );
+  if (!options.agents && suppliedDiscoveryFailure) {
+    return buildDiscoveryFailedResult(agentUrls, storyboard, suppliedDiscoveryFailure, options._profile);
+  }
+
+  const isMultiInstance = agentUrls.length > 1;
+  if (isMultiInstance && options._client) {
+    throw new Error(
+      'runStoryboard: _client override is incompatible with multi-instance mode. ' +
+        'Remove _client (or pass a single agent URL) to use round-robin dispatch.'
+    );
+  }
+
+  // When capabilities are already available, applicability MUST be evaluated
+  // before runtime requirements. Without a profile we defer both gates until
+  // executeStoryboardPass has completed discovery; reporting a missing runner
+  // adapter before learning that the agent never claimed the capability would
+  // incorrectly turn not_applicable into requirement_unmet.
+  const hasCapabilityGate = storyboardCapabilityPredicates(storyboard).length > 0;
+  const deferCapabilityAndRequires =
+    options.agents !== undefined || (hasCapabilityGate && options._profile === undefined);
+  if (hasCapabilityGate && !deferCapabilityAndRequires) {
+    const unmetDetail = evaluateStoryboardCapabilityGates(
+      storyboard,
+      options._profile,
+      options.agentTools,
+      options.adcpVersion
+    );
+    if (unmetDetail !== null) {
+      const resultAgentUrls = options.agents ? Object.values(options.agents).map(e => e.url) : agentUrls;
+      return {
+        ...buildCapabilityUnsupportedResult(resultAgentUrls, storyboard, unmetDetail),
+        notices: collectCapabilityNotices(storyboard, options._profile),
+      };
+    }
+  }
+
+  // Runtime gates still run before either multi-instance strategy when they
+  // can be evaluated faithfully, so a missing harness remains one whole-
+  // storyboard skip instead of being multiplied across passes.
+  const allRequires = resolveStoryboardRequires(storyboard, options);
+  // Without a root capability predicate nothing has to be discovered before
+  // the `requires` gate can speak, so the pre-flight evaluates as much of the
+  // declared list as it can — in declared order, and no further.
+  //
+  // "No further" is the load-bearing half. `checkRequires` reports the FIRST
+  // unmet gate in declared order, so a requirement that cannot be assessed
+  // yet has to defer *along with every requirement declared after it*.
+  // Filtering one out instead — or letting `checkRequires` fall through it —
+  // lets a later gate answer while an earlier one is still unknown, and the
+  // run then reports the wrong requirement. That is exactly how routed and
+  // non-routed runs of the same agent disagreed: a real `comply()` run
+  // threads `_profile` + `agentTools`, so non-routed settled a declared-first
+  // `controller` in the pre-flight, while routed skipped past it and reported
+  // whatever came next (adcp-client#2945 review).
+  //
+  // What is assessable is mode-dependent, so `preflightDefersRequirement`
+  // mirrors `checkRequires`'s own self-deferral conditions exactly. Everything
+  // else — `multi_agent`, `seeded_state`, the receiver/runner harness gates,
+  // unrecognized forward-compat values — is decidable from the run options
+  // alone and answers in place, which is what keeps a topology gate from being
+  // reported as a discovery failure.
+  //
+  // With a root capability predicate, AdCP 3.2's applicability order puts the
+  // capability verdict first ("predicates MUST be evaluated before the runner
+  // evaluates `requires`"), so the whole list defers until discovery has
+  // resolved it (adcp-client#2945).
+  const preflightDefersRequirement = (requirement: string): boolean => {
+    switch (requirement) {
+      case 'controller':
+        // Routed: per-route *discovered* tools are authoritative, and they are
+        // not known until `executeStoryboardPass` has run discovery. A
+        // caller-supplied `agentTools` is a stale or cross-tenant list and
+        // must never settle this gate. Non-routed: matches
+        // `checkRequires`'s `if (!options.agentTools) continue`.
+        return options.agents !== undefined || !options.agentTools;
+      case 'request_signer':
+        // Routed threads no run-level profile, so the gate is answered per
+        // selected route after discovery. Non-routed: matches
+        // `checkRequires`'s `if (!profile?.raw_capabilities) break`.
+        return options.agents !== undefined || !options._profile?.raw_capabilities;
+      default:
+        return false;
+    }
+  };
+  const firstDeferred = allRequires.findIndex(preflightDefersRequirement);
+  const earlyRequires = hasCapabilityGate ? [] : allRequires.slice(0, firstDeferred < 0 ? undefined : firstDeferred);
+  if (earlyRequires.length && (!deferCapabilityAndRequires || (options.agents && !hasCapabilityGate))) {
+    const requirementCheck = await checkRequires(
+      earlyRequires,
+      storyboard,
+      options,
+      options.agents ? undefined : options._profile
+    );
+    if ('requirement' in requirementCheck) {
+      const resultAgentUrls = options.agents ? Object.values(options.agents).map(e => e.url) : agentUrls;
+      return {
+        ...buildRequirementUnmetResult(
+          resultAgentUrls,
+          storyboard,
+          requirementCheck.requirement,
+          requirementCheck.detail
+        ),
+        notices: collectCapabilityNotices(storyboard, options._profile),
+      };
+    }
+    if (requirementCheck.preparedPublisherAuthProbes) {
+      options = withPreparedTrustedMatchPublisherAuth(options, requirementCheck.preparedPublisherAuthProbes);
+    }
+  }
+
+  const requestedStrategy = options.multi_instance_strategy ?? 'round-robin';
+  if (requestedStrategy === 'multi-pass' && isMultiInstance) {
+    // Webhook receivers bind a fresh ephemeral port per pass. Each pass would
+    // advertise a different URL via `{{runner.webhook_base}}`; agents caching
+    // the pass-1 URL would deliver into a dead port in pass 2. Reject rather
+    // than silently mis-route. The spec-correct test for webhook retry /
+    // idempotency is one pass.
+    if (options.webhook_receiver) {
+      throw new Error(
+        'runStoryboard: webhook_receiver is incompatible with multi_instance_strategy: "multi-pass". ' +
+          'Each pass would bind a fresh receiver URL, so agents caching the pass-1 URL would deliver ' +
+          'to a dead port in pass 2. Use round-robin when the storyboard needs a webhook receiver, ' +
+          'or run multi-pass on a storyboard without webhook observation.'
+      );
+    }
+    if (storyboard.creative_build_probe) return executeStoryboardPass(agentUrls, storyboard, options, 0);
+    return runMultiPass(agentUrls, storyboard, options);
+  }
+
+  if (options.agents) {
+    // Project the agents map's URLs into the legacy `agentUrls` array so
+    // downstream signatures (per-step `agent_url:` records, etc.) keep
+    // working unchanged. The routing dispatcher inside
+    // `executeStoryboardPass` reads `options.agents` directly for the
+    // actual per-tool routing.
+    const projected = Object.values(options.agents).map(e => e.url);
+    return executeStoryboardPass(projected, storyboard, options, 0);
+  }
+  return executeStoryboardPass(agentUrls, storyboard, options, 0);
+}
+
+/**
+ * Validate the shape and consistency of `StoryboardRunOptions.agents` (#1066).
+ *
+ * Catches the failure modes that would otherwise surface as confusing
+ * runtime errors deep inside discovery or dispatch:
+ *
+ *   - empty map
+ *   - `default_agent` referencing an unknown key
+ *   - `step.agent` referencing an unknown key
+ *   - co-existence with `multi_instance_strategy` (replicas, different concept)
+ *   - co-existence with `_client` (single client cannot serve multiple agents)
+ *   - first positional arg passed alongside the map (ambiguous routing intent)
+ */
+function validateAgentsMap(
+  agentUrlOrUrls: string | string[],
+  storyboard: Storyboard,
+  options: StoryboardRunOptions
+): void {
+  const agents = options.agents!;
+  const keys = Object.keys(agents);
+  if (keys.length === 0) {
+    throw new Error(
+      'runStoryboard: `agents` is set but contains no entries. ' + 'Either remove the key or supply at least one agent.'
+    );
+  }
+  for (const key of keys) {
+    const entry = agents[key];
+    if (!entry || typeof entry.url !== 'string' || entry.url === '') {
+      throw new Error(
+        `runStoryboard: agents['${key}'] missing a non-empty \`url\`. ` + 'Each entry must declare its endpoint URL.'
+      );
+    }
+  }
+
+  if (options.default_agent !== undefined && !(options.default_agent in agents)) {
+    throw new Error(
+      `runStoryboard: \`default_agent\` "${options.default_agent}" is not a key in \`agents\`. ` +
+        `Available keys: ${keys.join(', ')}.`
+    );
+  }
+
+  // Per-step `agent:` overrides must reference an agent that's actually in
+  // the map. Walk the storyboard once at entry so authoring errors surface
+  // before the first network call.
+  for (const phase of storyboard.phases ?? []) {
+    for (const step of phase.steps ?? []) {
+      if (step.agent !== undefined && !(step.agent in agents)) {
+        throw new Error(
+          `runStoryboard: step "${step.id}" declares \`agent: "${step.agent}"\` but ` +
+            `that key is not in the agents map. Available keys: ${keys.join(', ')}.`
+        );
+      }
+    }
+  }
+
+  if (options.multi_instance_strategy !== undefined) {
+    throw new Error(
+      'runStoryboard: `agents` (per-specialism routing) is incompatible with ' +
+        '`multi_instance_strategy` (replica round-robin). They are different concepts — ' +
+        'replicas test horizontal scaling of one agent, the agents map routes per tool ' +
+        'across different agents. Use one or the other.'
+    );
+  }
+  if (options._client) {
+    throw new Error(
+      'runStoryboard: `agents` is incompatible with `_client` override. ' +
+        'A single client cannot serve multiple agents; per-agent clients are ' +
+        'constructed from the map.'
+    );
+  }
+
+  // First positional arg must be empty when `agents` is set. Allowing a
+  // non-empty value is ambiguous: is the map authoritative, or is the
+  // positional arg a hidden default? Reject and require the caller to
+  // express intent through `agents` + `default_agent`.
+  const firstArgEmpty = agentUrlOrUrls === '' || (Array.isArray(agentUrlOrUrls) && agentUrlOrUrls.length === 0);
+  if (!firstArgEmpty) {
+    throw new Error(
+      'runStoryboard: pass `""` (or `[]`) as the first argument when using ' +
+        '`options.agents`. The agents map is authoritative for routing; mixing ' +
+        'a positional URL with the map is ambiguous.'
+    );
+  }
+}
+
+/** The public tool whose route owns state written by each seed scenario. */
+function fixtureOwnerTask(scenario: SeedCall['scenario']): string {
+  switch (scenario) {
+    case 'seed_account':
+    case 'seed_buyer_agent':
+      return 'sync_accounts';
+    case 'seed_product':
+    case 'seed_pricing_option':
+      return 'get_products';
+    case 'seed_creative_format':
+      return 'list_creative_formats';
+    case 'seed_creative':
+      return 'sync_creatives';
+    case 'seed_plan':
+      return 'sync_plans';
+    case 'seed_media_buy':
+      return 'get_media_buys';
+  }
+}
+
+/**
+ * Build a minimal StoryboardResult for a storyboard skipped by a
+ * root capability predicate. The single synthetic step carries
+ * `skip_reason: 'capability_unsupported'` so CLI reports and JUnit
+ * consumers render it as a skip rather than a pass or failure.
+ */
+function buildCapabilityUnsupportedResult(
+  agentUrls: string[],
+  storyboard: Storyboard,
+  detail: string
+): StoryboardResult {
+  const syntheticStep: StoryboardStepResult = {
+    storyboard_id: storyboard.id,
+    step_id: 'capability_unsupported',
+    phase_id: 'capability_unsupported',
+    title: 'Storyboard skipped: capability not supported by this agent',
+    task: '',
+    passed: true,
+    skipped: true,
+    skip_reason: 'capability_unsupported',
+    skip: { reason: DETAILED_SKIP_TO_CANONICAL.capability_unsupported, detail },
+    duration_ms: 0,
+    validations: [],
+    context: {},
+    error: detail,
+    extraction: { path: 'none' },
+  };
+  return {
+    storyboard_id: storyboard.id,
+    storyboard_title: storyboard.title,
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
+    overall_passed: true,
+    phases: [
+      {
+        phase_id: 'capability_unsupported',
+        phase_title: 'Capability unsupported',
+        passed: true,
+        steps: [syntheticStep],
+        duration_ms: 0,
+      },
+    ],
+    context: {},
+    total_duration_ms: 0,
+    // This synthetic phase is an applicability gate, not a real passed
+    // scenario. `overall_passed: true` preserves non-failing CI semantics,
+    // while passed_count stays 0 so rollups do not report unexecuted
+    // storyboards as successful coverage.
+    passed_count: 0,
+    failed_count: 0,
+    skipped_count: 1,
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
+    tested_at: new Date().toISOString(),
+    strict_validation_summary: {
+      observable: false,
+      checked: 0,
+      passed: 0,
+      failed: 0,
+      strict_only_failures: 0,
+      lenient_also_failed: 0,
+    },
+    notices: [],
+  };
+}
+
+function buildPhaseCapabilitySkippedSteps(
+  storyboard: Storyboard,
+  phase: StoryboardPhase,
+  detail: string,
+  context: StoryboardContext
+): StoryboardStepResult[] {
+  return phase.steps.map(step => ({
+    storyboard_id: storyboard.id,
+    step_id: step.id,
+    phase_id: phase.id,
+    title: step.title,
+    task: step.task,
+    passed: true,
+    skipped: true,
+    skip_reason: 'not_applicable',
+    skip: { reason: 'not_applicable', detail },
+    duration_ms: 0,
+    validations: [],
+    context,
+    error: detail,
+    extraction: { path: 'none' },
+  }));
+}
+
+/**
+ * Map a `requires:` requirement onto the canonical `RunnerSkipReason` to
+ * emit when that requirement is unmet. `controller` reuses the existing
+ * `missing_test_controller` value so back-compat consumers (skip-cause
+ * aggregators, dashboards keyed on the existing string) keep grouping
+ * controller-driven skips into the same bucket they already track. Other
+ * requirements use the new `requirement_unmet` reason; consumers that
+ * want per-requirement granularity read `RunnerSkipResult.requirement`.
+ *
+ * Spec: adcp-client#1626 (no-rename design — keep existing skip_reason
+ * values stable as the back-compat surface; add `requirement_unmet` only
+ * for requirement names that have no existing canonical reason).
+ */
+const REQUIREMENT_TO_SKIP_REASON: Record<RequirementName, RunnerSkipReason> = {
+  controller: 'missing_test_controller',
+  seeded_state: 'requirement_unmet',
+  real_wire: 'requirement_unmet',
+  webhook_receiver: 'requirement_unmet',
+  webhook_replay_receiver: 'not_applicable',
+  trusted_match_context_router_runner: 'not_applicable',
+  trusted_match_publisher_auth_runner: 'requirement_unmet',
+  property_list_reference_runner: 'requirement_unmet',
+  request_signer: 'not_applicable',
+  multi_agent: 'requirement_unmet',
+};
+
+function isKnownRequirement(requirement: string): requirement is RequirementName {
+  return KNOWN_REQUIREMENTS.has(requirement as RequirementName);
+}
+
+/**
+ * Build a minimal StoryboardResult for a storyboard skipped because a
+ * `requires:` tag named a requirement that isn't available on this run
+ * (e.g. `controller` when the agent doesn't advertise
+ * `comply_test_controller`, or `seeded_state` when the operator didn't
+ * pass `--asserts-seeded-state`). Mirrors `buildCapabilityUnsupportedResult`
+ * but carries the structured `requirement` field so consumers can group
+ * not-applicable scenarios by cause. Spec: adcp-client#1626.
+ */
+function buildRequirementUnmetResult(
+  agentUrls: string[],
+  storyboard: Storyboard,
+  requirement: string,
+  detail: string
+): StoryboardResult {
+  const reason = isKnownRequirement(requirement) ? REQUIREMENT_TO_SKIP_REASON[requirement] : 'requirement_unmet';
+  const syntheticStep: StoryboardStepResult = {
+    storyboard_id: storyboard.id,
+    step_id: `requirement_unmet:${requirement}`,
+    phase_id: 'requirement_unmet',
+    title: `Storyboard skipped: requires '${requirement}'`,
+    task: '',
+    passed: true,
+    skipped: true,
+    skip_reason: reason,
+    skip: { reason, detail, requirement },
+    duration_ms: 0,
+    validations: [],
+    context: {},
+    extraction: { path: 'none' },
+  };
+  return {
+    storyboard_id: storyboard.id,
+    storyboard_title: storyboard.title,
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
+    overall_passed: true,
+    phases: [
+      {
+        phase_id: 'requirement_unmet',
+        phase_title: `Requirement unmet: ${requirement}`,
+        passed: true,
+        steps: [syntheticStep],
+        duration_ms: 0,
+      },
+    ],
+    context: {},
+    total_duration_ms: 0,
+    // `required_any_of_tools` unmet is an applicability skip. Keep
+    // `overall_passed: true` for CI/non-failing semantics, but do not
+    // increment passed_count because no scenario behavior was exercised.
+    passed_count: 0,
+    failed_count: 0,
+    skipped_count: 1,
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
+    tested_at: new Date().toISOString(),
+    strict_validation_summary: {
+      observable: false,
+      checked: 0,
+      passed: 0,
+      failed: 0,
+      strict_only_failures: 0,
+      lenient_also_failed: 0,
+    },
+    notices: [],
+  };
+}
+
+function buildRequiredAnyOfToolsMissingResult(
+  agentUrls: string[],
+  storyboard: Storyboard,
+  detail: string
+): StoryboardResult {
+  const syntheticStep: StoryboardStepResult = {
+    storyboard_id: storyboard.id,
+    step_id: 'missing_required_tool_family',
+    phase_id: 'requirement_unmet',
+    title: 'Storyboard skipped: required tool family missing',
+    task: '',
+    passed: true,
+    skipped: true,
+    skip_reason: 'requirement_unmet',
+    skip: { reason: 'requirement_unmet', detail },
+    duration_ms: 0,
+    validations: [],
+    context: {},
+    extraction: { path: 'none' },
+  };
+  return {
+    storyboard_id: storyboard.id,
+    storyboard_title: storyboard.title,
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
+    overall_passed: true,
+    phases: [
+      {
+        phase_id: 'requirement_unmet',
+        phase_title: 'Requirement unmet: required_any_of_tools',
+        passed: true,
+        steps: [syntheticStep],
+        duration_ms: 0,
+      },
+    ],
+    context: {},
+    total_duration_ms: 0,
+    passed_count: 0,
+    failed_count: 0,
+    skipped_count: 1,
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
+    tested_at: new Date().toISOString(),
+    strict_validation_summary: {
+      observable: false,
+      checked: 0,
+      passed: 0,
+      failed: 0,
+      strict_only_failures: 0,
+      lenient_also_failed: 0,
+    },
+    notices: [],
+  };
+}
+
+/**
+ * A verdict about one runtime requirement that the caller established before
+ * calling `checkRequires`, because `checkRequires` cannot derive it from its
+ * own inputs. Routed runs are the case: `controller` and `request_signer` are
+ * answered per selected route during the routing preflight, never from the
+ * cross-tenant tool union the routed run assembles for `required_tools`
+ * ANY-OF gating.
+ *
+ *   - `'unmet'`   — report it, at its own declared position.
+ *   - `'met'`     — satisfied; declared order moves on to the next tag.
+ *   - `'unknown'` — the caller owns this requirement but could not settle it
+ *                   (a routing failure, or no route to read it from). Declared
+ *                   order moves on WITHOUT `checkRequires` re-deriving an
+ *                   answer from inputs the caller has ruled inadmissible.
+ */
+type PrecomputedRequirementVerdict =
+  | { status: 'unmet'; requirement: string; detail: string }
+  | { status: 'met' }
+  | { status: 'unknown' };
+
+/**
+ * Resolve a storyboard's `requires:` tags against the runtime environment.
+ * Returns the first unmet requirement (with a human-readable detail) or
+ * `null` when every requirement is available. Spec: adcp-client#1626.
+ *
+ * Detection rules:
+ *   - `controller` — agent advertises `comply_test_controller` (read from
+ *     `options.agentTools`). When `options.agentTools` is undefined the
+ *     gate is a no-op — the caller accepted responsibility for tool
+ *     compatibility by reusing an external client.
+ *   - `seeded_state` — operator passed `assertsSeededState: true`
+ *     (CLI: `--asserts-seeded-state`).
+ *   - `real_wire` — always available; the runner is hitting a real wire
+ *     by definition. The tag is a no-op gate today, reserved for a
+ *     future `--mock-only` mode.
+ *   - `webhook_receiver` — operator supplied `options.webhook_receiver`.
+ *     Autodetected from step `sample_request` token presence (see
+ *     `detectImplicitRequires`); authors don't write this tag manually.
+ *     Spec: adcp-client#1678.
+ *   - `webhook_replay_receiver` — operator supplied a non-empty
+ *     `options.webhook_replay_receiver.url`. Autodetected from any
+ *     `replay_webhook_vector` step (see `detectImplicitRequires`); authors
+ *     don't write this tag manually. Spec: adcp-client#2356.
+ *   - `trusted_match_context_router_runner` — operator supplied a router URL
+ *     and registration callback for raw `POST /context` replay. Autodetected
+ *     from `replay_trusted_match_context_vector`. Spec: adcp-client#2479.
+ *   - `trusted_match_publisher_auth_runner` — operator supplied exact
+ *     publisher-facing Context/Identity endpoints plus complete declarative
+ *     absent/invalid credential states. Spec: adcp-client#2526.
+ *   - `request_signer` — agent advertises `request_signing.supported: true`
+ *     in `get_adcp_capabilities`. Autodetected for any storyboard whose
+ *     id is `'signed_requests'` or that contains a `request_signing_probe`
+ *     step (see `detectImplicitRequires`); authors don't write this tag
+ *     manually. Absence-skip semantics are INVERTED from the general
+ *     `requires_capability` rule: the signed-requests universal
+ *     storyboard's own gating spec (signed-requests.yaml prerequisites)
+ *     declares "agents that do not advertise support are not tested
+ *     against this storyboard — absence of advertisement is not a
+ *     failure". When the runner can't read capabilities (no profile
+ *     threaded through), the gate is a no-op — the caller accepted
+ *     responsibility for capability compatibility by reusing an external
+ *     client. Spec: adcp-client#1702.
+ *   - `multi_agent` — `options.agents` is set and the storyboard's
+ *     declared route keys (`default_agent` and step-level `agent:` overrides)
+ *     resolve to at least two distinct entries in that map. Raw
+ *     `options.agents` cardinality is not enough; the requirement describes
+ *     the topology this storyboard actually routes through.
+ *     Spec: adcp-client#2281.
+ */
+function propertyListReferenceNeedsMcp(options: StoryboardRunOptions): boolean {
+  return options.agents
+    ? Object.values(options.agents).some(agent => (agent.transport ?? options.protocol) === 'a2a')
+    : options.protocol === 'a2a';
+}
+
+async function checkRequires(
+  requires: readonly string[],
+  storyboard: Storyboard,
+  options: StoryboardRunOptions,
+  profile?: AgentProfile,
+  /**
+   * Verdicts the caller already established for specific requirements, keyed
+   * by requirement name. Routed runs resolve `controller` and
+   * `request_signer` per selected route during the routing preflight —
+   * `checkRequires` cannot redo either, because routed mode threads no single
+   * run-level profile and its `options.agentTools` is a cross-tenant union.
+   * Handing the verdict back in here keeps it subject to the same ordered,
+   * forward-compatible precedence as every other gate, instead of
+   * short-circuiting ahead of an earlier unmet requirement
+   * (adcp-client#2945 review).
+   *
+   * An entry — of ANY status, including `'unknown'` — also means the caller
+   * owns that requirement's provenance, so this function must not fall back
+   * to its own inputs for it.
+   */
+  precomputed?: ReadonlyMap<string, PrecomputedRequirementVerdict>
+): Promise<
+  { requirement: string; detail: string } | { preparedPublisherAuthProbes?: PreparedTrustedMatchPublisherAuthProbes }
+> {
+  let preparedPublisherAuthProbes = getPreparedTrustedMatchPublisherAuth(options);
+  // Declared order, unconditionally. `checkRequires` reports the first unmet
+  // gate in the list; reordering it — or letting one requirement class
+  // override another — is what made routed and non-routed runs of the same
+  // agent disagree (adcp-client#2945 review). Which gates are *assessable*
+  // at this point is the only thing that varies: `controller` and
+  // `request_signer` self-defer while no profile is threaded through, so a
+  // pre-discovery pass naturally falls through to the next declared
+  // requirement, and a post-discovery pass answers them in place.
+  for (const requirement of requires) {
+    if (!isKnownRequirement(requirement)) {
+      return {
+        requirement,
+        detail:
+          `Storyboard requires unknown runtime requirement '${requirement}'. ` +
+          `This SDK does not know how to satisfy it, so the requirement is treated as unmet ` +
+          `for forward compatibility.`,
+      };
+    }
+    // A precomputed verdict answers this requirement at its own declared
+    // position — the routed equivalent of the switch below resolving it — so
+    // an earlier unmet gate still wins and a later one never pre-empts it.
+    // `'met'` and `'unknown'` both move declared order along without letting
+    // the switch re-derive the answer from inputs the caller has already
+    // ruled inadmissible (in routed mode, the cross-tenant tool union).
+    const established = precomputed?.get(requirement);
+    if (established) {
+      if (established.status === 'unmet') {
+        return { requirement: established.requirement, detail: established.detail };
+      }
+      continue;
+    }
+    switch (requirement) {
+      case 'controller': {
+        if (!options.agentTools) continue;
+        if (!options.agentTools.includes('comply_test_controller')) {
+          return {
+            requirement,
+            detail:
+              `Storyboard requires 'controller'; agent does not advertise comply_test_controller. ` +
+              `Agent tools: [${options.agentTools.join(', ')}].`,
+          };
+        }
+        break;
+      }
+      case 'seeded_state': {
+        if (options.assertsSeededState !== true) {
+          return {
+            requirement,
+            detail:
+              "Storyboard requires 'seeded_state'; pass --asserts-seeded-state to declare " +
+              'that initial state has been provisioned out-of-band.',
+          };
+        }
+        break;
+      }
+      case 'real_wire':
+        // Always available — reserved for a future --mock-only mode.
+        break;
+      case 'property_list_reference_runner': {
+        if (propertyListReferenceNeedsMcp(options)) {
+          return {
+            requirement,
+            detail:
+              'Credential-isolated property-list references currently require MCP; A2A probe coverage is unavailable.',
+          };
+        }
+        break;
+      }
+      case 'webhook_receiver': {
+        if (options.webhook_receiver === undefined) {
+          return {
+            requirement,
+            detail:
+              'Storyboard references `{{runner.webhook_url:…}}` or `{{runner.webhook_base}}` but no ' +
+              'webhook receiver is configured. Pass `webhook_receiver` in StoryboardRunOptions ' +
+              '(or `--webhook-receiver` on the CLI) to host a receiver, or omit this storyboard. ' +
+              'Required by the webhook-emission universal: ' +
+              'compliance/{version}/universal/webhook-emission.yaml grades not_applicable when ' +
+              'no receiver is configured (prerequisites section).',
+          };
+        }
+        break;
+      }
+      case 'webhook_replay_receiver': {
+        if (!options.webhook_replay_receiver?.url) {
+          return {
+            requirement,
+            detail:
+              'Storyboard contains a `replay_webhook_vector` step but no webhook replay receiver URL ' +
+              'is configured. Pass `webhook_replay_receiver.url` in StoryboardRunOptions to run ' +
+              'inbound buyer/orchestrator receiver conformance. Seller agents without an inbound ' +
+              'receiver grade not_applicable for this storyboard.',
+          };
+        }
+        break;
+      }
+      case 'trusted_match_context_router_runner': {
+        const runner = options.trusted_match_context_router_runner;
+        if (!runner?.router_url || typeof runner.registerProviders !== 'function') {
+          return {
+            requirement,
+            detail:
+              'Storyboard contains a `replay_trusted_match_context_vector` step but no Trusted Match ' +
+              'Context router harness is configured. Pass `trusted_match_context_router_runner` with ' +
+              '`router_url` and `registerProviders` to run raw POST /context conformance.',
+          };
+        }
+        break;
+      }
+      case 'trusted_match_publisher_auth_runner': {
+        const runner = options.trusted_match_publisher_auth_runner;
+        if (
+          !runner ||
+          typeof runner.contextEndpoint !== 'string' ||
+          typeof runner.identityEndpoint !== 'string' ||
+          typeof runner.preparePublisherAuthProbe !== 'function'
+        ) {
+          return {
+            requirement,
+            detail:
+              'Storyboard requires `trusted_match_publisher_auth_runner`; configure exact HTTPS ' +
+              '`contextEndpoint` and `identityEndpoint` URLs plus `preparePublisherAuthProbe` for ' +
+              'both absent and invalid credential states.',
+          };
+        }
+        if (!preparedPublisherAuthProbes) {
+          try {
+            preparedPublisherAuthProbes = await prepareTrustedMatchPublisherAuthProbes(runner);
+          } catch (error) {
+            return {
+              requirement,
+              detail:
+                'Storyboard requires a complete `trusted_match_publisher_auth_runner` configuration: ' +
+                (error instanceof Error ? error.message : String(error)),
+            };
+          }
+        }
+        break;
+      }
+      case 'request_signer': {
+        // Gate is a no-op when no profile is threaded through (external
+        // `_client` mode). The caller has accepted responsibility for
+        // capability compatibility; failing the gate here would surprise
+        // them with a skip they can't explain from CLI options alone.
+        //
+        // Deliberately NOT gated on whether this run can frame the signing
+        // vectors: that is a per-step property (a routed `agents` run can
+        // pair a top-level `protocol: 'a2a'` with an MCP seller whose
+        // vectors grade fine), and a whole-storyboard skip would leave the
+        // security_transport track free to roll up green off a sibling
+        // oauth_setup pass. The ungradable case is reported per vector and
+        // caught by `signingCoverage`, which is what holds the storyboard
+        // and the track open.
+        if (!profile?.raw_capabilities) break;
+        const supported = resolveCapabilityPath(profile.raw_capabilities, 'request_signing.supported');
+        if (supported === true) break;
+        return {
+          requirement,
+          detail:
+            'Storyboard requires `request_signing.supported: true` in `get_adcp_capabilities`; ' +
+            `agent declared ${supported === undefined ? 'no request_signing block' : JSON.stringify(supported)}. ` +
+            'Per compliance/{version}/universal/signed-requests.yaml: "Agents that do not advertise ' +
+            'support are not tested against this storyboard — absence of advertisement is not a ' +
+            'failure, it is a declaration that the agent does not offer verified signed requests." ' +
+            'To opt in, advertise `request_signing.supported: true` and pre-register the runner ' +
+            'compliance test keypair per test-kits/signed-requests-runner.yaml. ' +
+            'Forward-readiness: optional in AdCP 3.0; the schema (request_signing block description) ' +
+            'declares request signing required for spend-committing operations in AdCP 4.0. Sellers ' +
+            'that intend to support spend-committing tools SHOULD advertise the capability and ' +
+            'register the test keypair before the 4.0 cut to avoid a hard compliance failure then.',
+        };
+      }
+      case 'multi_agent': {
+        const routeKeys = collectMultiAgentRequirementRouteKeys(storyboard, options);
+        if (routeKeys.length >= 2) break;
+        const availableKeys = options.agents ? Object.keys(options.agents) : [];
+        const routed = routeKeys.length ? routeKeys.join(', ') : '(none)';
+        const available = availableKeys.length ? availableKeys.join(', ') : '(none)';
+        return {
+          requirement,
+          detail:
+            "Storyboard requires 'multi_agent'; configure `agents` and route this storyboard " +
+            'to at least two distinct agent keys via `default_agent` and/or step-level `agent:` overrides. ' +
+            `Resolved route keys: [${routed}]. Available agents: [${available}].`,
+        };
+      }
+    }
+  }
+  return { ...(preparedPublisherAuthProbes && { preparedPublisherAuthProbes }) };
+}
+
+function collectMultiAgentRequirementRouteKeys(storyboard: Storyboard, options: StoryboardRunOptions): string[] {
+  const agents = options.agents;
+  if (!agents) return [];
+
+  const routeKeys = new Set<string>();
+  if (options.default_agent !== undefined && options.default_agent in agents) {
+    routeKeys.add(options.default_agent);
+  }
+  for (const phase of storyboard.phases ?? []) {
+    for (const step of phase.steps ?? []) {
+      if (step.agent !== undefined && step.agent in agents) {
+        routeKeys.add(step.agent);
+      }
+    }
+  }
+  return [...routeKeys];
+}
+
+function resolveStoryboardRequires(storyboard: Storyboard, options: StoryboardRunOptions): string[] {
+  const declared = storyboard.requires ?? [];
+  const implicit = detectImplicitRequires(storyboard, options);
+  return [...declared, ...implicit.filter(r => !declared.includes(r))];
+}
+
+/**
+ * Webhook-token regex used to autodetect the implicit `webhook_receiver`
+ * requirement. Matches `{{runner.webhook_url:<step_id>}}` and the bare
+ * `{{runner.webhook_base}}`. Same shape as the `MUSTACHE_TOKEN_RE` in
+ * context.ts but scoped to the two webhook-bearing tokens — we only care
+ * whether the storyboard needs a receiver, not what substitution it
+ * would produce. Single `[^{}]+` body avoids the polynomial-redos
+ * backtrack pattern flagged by CodeQL alert #49.
+ */
+const WEBHOOK_TOKEN_RE = /\{\{runner\.(?:webhook_url:[A-Za-z0-9_]+|webhook_base)\}\}/;
+
+/**
+ * Recursively scan a JSON-like value for any webhook receiver token. The
+ * scan only touches strings; objects and arrays are walked structurally
+ * so deeply-nested `push_notification_config.url` entries (or any other
+ * authoring pattern) are discovered without a hard-coded field list.
+ */
+function valueContainsWebhookToken(value: unknown): boolean {
+  if (typeof value === 'string') {
+    return WEBHOOK_TOKEN_RE.test(value);
+  }
+  if (Array.isArray(value)) {
+    return value.some(valueContainsWebhookToken);
+  }
+  if (value !== null && typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>).some(valueContainsWebhookToken);
+  }
+  return false;
+}
+
+/**
+ * Return the implicit requirements a storyboard needs based on its
+ * structure (not its declared `requires:` list). Today:
+ *   - `'webhook_receiver'`, autodetected from `{{runner.webhook_url:…}}`
+ *     / `{{runner.webhook_base}}` token presence inside any step's
+ *     `sample_request` or in-scope `rate_limit_trip.trip_target_sample_request`.
+ *     Token presence is the authoring contract — a storyboard that names
+ *     the runner's webhook receiver cannot run without one — so authors
+ *     don't need to remember to add `requires: [webhook_receiver]`
+ *     separately. Contract-gated synthetic steps only count when their
+ *     `requires_contract` is configured for this run. Rate-limit trip probes
+ *     additionally require the exact runner contract and explicit live-side-
+ *     effect authorization before their target request contributes an
+ *     implicit webhook requirement. Spec: adcp-client#1678.
+ *   - `'webhook_replay_receiver'`, autodetected from any
+ *     `replay_webhook_vector` step. These vectors target an inbound
+ *     buyer/orchestrator receiver, so without `webhook_replay_receiver.url`
+ *     the whole storyboard grades not_applicable instead of executing an
+ *     all-skipped phase that fails the required-phase rollup. Spec:
+ *     adcp-client#2356.
+ *   - `'trusted_match_context_router_runner'`, autodetected from any
+ *     `replay_trusted_match_context_vector` step. Without the operator-owned
+ *     registration seam the raw router test grades not_applicable and never
+ *     falls back to an MCP/A2A tool call. Spec: adcp-client#2479.
+ *   - `'request_signer'`, autodetected from `storyboard.id ===
+ *     'signed_requests'` or any step using the synthesized
+ *     `request_signing_probe` task. The signed-requests universal
+ *     storyboard's own prerequisites section declares the
+ *     `request_signing.supported: true` capability gate; the runner
+ *     enforces it here so adopters don't see false-negative vector
+ *     failures on bearer-only agents that never claimed signing.
+ *     Spec: adcp-client#1702.
+ */
+function detectImplicitRequires(
+  storyboard: Storyboard,
+  options: Pick<StoryboardRunOptions, 'contracts' | 'allowLiveSideEffects'> = {}
+): RequirementName[] {
+  const requires: RequirementName[] = [];
+  let needsWebhook = false;
+  let needsWebhookReplayReceiver = false;
+  let needsTrustedMatchContextRouterRunner = false;
+  let needsSigner = storyboard.id === 'signed_requests';
+  const contractsInScope = new Set(options.contracts ?? []);
+  for (const phase of storyboard.phases) {
+    for (const step of phase.steps) {
+      const stepContractInScope = !step.requires_contract || contractsInScope.has(step.requires_contract);
+      const rateLimitProbeInScope =
+        step.task !== 'expect_rate_limit_not_replayed' ||
+        (stepContractInScope &&
+          contractsInScope.has(RATE_LIMIT_TRIP_CONTRACT) &&
+          options.allowLiveSideEffects === true);
+      if (
+        !needsWebhook &&
+        ((step.sample_request && rateLimitProbeInScope && valueContainsWebhookToken(step.sample_request)) ||
+          (step.rate_limit_trip?.trip_target_sample_request &&
+            stepContractInScope &&
+            rateLimitProbeInScope &&
+            valueContainsWebhookToken(step.rate_limit_trip.trip_target_sample_request)))
+      ) {
+        needsWebhook = true;
+      }
+      if (!needsSigner && step.task === 'request_signing_probe') {
+        needsSigner = true;
+      }
+      if (!needsWebhookReplayReceiver && stepContractInScope && step.task === REPLAY_WEBHOOK_VECTOR_TASK) {
+        needsWebhookReplayReceiver = true;
+      }
+      if (
+        !needsTrustedMatchContextRouterRunner &&
+        stepContractInScope &&
+        step.task === REPLAY_TRUSTED_MATCH_CONTEXT_VECTOR_TASK
+      ) {
+        needsTrustedMatchContextRouterRunner = true;
+      }
+      if (needsWebhook && needsWebhookReplayReceiver && needsTrustedMatchContextRouterRunner && needsSigner) break;
+    }
+    if (needsWebhook && needsWebhookReplayReceiver && needsTrustedMatchContextRouterRunner && needsSigner) break;
+  }
+  if (needsWebhook) requires.push('webhook_receiver');
+  if (needsWebhookReplayReceiver) requires.push('webhook_replay_receiver');
+  if (needsTrustedMatchContextRouterRunner) requires.push('trusted_match_context_router_runner');
+  if (needsSigner) requires.push('request_signer');
+  return requires;
+}
+
+/**
+ * HTTP status of a probe step's recorded response, or 0 when there was no
+ * wire exchange. `StoryboardStepResult.response` is typed `unknown` (a task
+ * result on task steps, an `HttpProbeResult` on probes), so narrow rather
+ * than cast.
+ */
+function probeResponseStatus(response: unknown): number {
+  if (response === null || typeof response !== 'object') return 0;
+  const status = (response as { status?: unknown }).status;
+  return typeof status === 'number' ? status : 0;
+}
+
+/**
+ * What a finished run actually verified about the agent's signing surface.
+ *
+ *   - `not_probed` — the run has no request-signing probe steps.
+ *   - `graded` — at least one vector reached the agent.
+ *   - `probe_errored` — the probes could not complete: a transport or
+ *     precondition failure (MCP initialize, DNS, an unreadable vector cache).
+ *   - `transport_unverified` — the runner has no dispatch shape for this
+ *     run's protocol.
+ *   - `scope_excluded` — every probe was skipped by the run's own selection
+ *     (`onlyVectors`, `skipVectors`, a profile exclusion).
+ *   - `self_check_only` — what ran decided in-library against the SDK
+ *     verifier and never contacted the agent.
+ *
+ * The four unverified states are deliberately distinct: the runner-output
+ * contract keeps caller-scope exclusions (`selection_result`) apart from
+ * coverage gaps, and each one sends the operator somewhere different — fix
+ * the connection, grade another binding, drop a flag, or nothing at all.
+ * Neither may report a pass, though — the question is not why a vector was
+ * skipped but whether any produced evidence. Keying the verdict on one skip
+ * reason left every other exclusion route open: dropping the wire vectors
+ * and keeping the in-library self-check laundered a green `signed_requests`
+ * out of a step that grades the SDK and never contacts the agent
+ * (adcp-client#2954).
+ *
+ * "Reached the agent" is read from the probe's own HTTP status, the dispatch
+ * contract's signal: only a wire exchange yields a non-zero status, and an
+ * in-library grade reports 0 by definition. Deliberately not read from the
+ * step's validations — the runner appends invariant results to steps, so
+ * "its only check is `probe_passed`" silently stops matching the moment an
+ * invariant is registered.
+ *
+ * Exported as the single definition of this rule. The storyboard verdict,
+ * the compliance track rollup, the compliance report and the CLI exit
+ * contract all consume it — the CLI through `dist`, over a view of the
+ * mapped `TestStepResult` shape — because hand-written copies of it drifted
+ * within one revision of this change, one of them into a false CI failure.
+ */
+export type SigningCoverage =
+  | 'not_probed'
+  | 'graded'
+  | 'probe_errored'
+  | 'transport_unverified'
+  | 'scope_excluded'
+  | 'self_check_only';
+
+/**
+ * Minimal step view the coverage rule needs. `StoryboardStepResult` satisfies
+ * it directly; the compliance projection maps `observation_data` onto
+ * `response`.
+ */
+export interface SigningCoverageStepView {
+  task?: string;
+  skipped?: boolean;
+  skip_reason?: string;
+  /** The probe's `HttpProbeResult`, as recorded on the step. */
+  response?: unknown;
+}
+
+export function signingCoverage(steps: readonly SigningCoverageStepView[]): SigningCoverage {
+  const probes = steps.filter(step => step.task === REQUEST_SIGNING_PROBE_TASK);
+  if (probes.length === 0) return 'not_probed';
+  // A response carrying a transport fault is not evidence, even when it also
+  // carries a status: the rate-abuse grader can reach the agent for its
+  // (cap+1) request after a cap-fill request died on the wire, and that
+  // verdict rests on a cap that was never established. Another probe that
+  // completed cleanly still makes the storyboard graded.
+  if (
+    probes.some(step => step.skipped !== true && probeResponseStatus(step.response) > 0 && !isProbeFault(step.response))
+  )
+    return 'graded';
+  // Ordered so the operator is told the thing they have to act on. A failed
+  // handshake or DNS lookup is not an exclusion, and advising someone to
+  // drop `--signing-skip-vectors` when the agent was unreachable sends them
+  // the wrong way.
+  if (probes.some(step => isProbeFault(step.response))) return 'probe_errored';
+  if (probes.some(step => step.skip_reason === 'signing_transport_unavailable')) return 'transport_unverified';
+  if (probes.every(step => step.skipped === true)) return 'scope_excluded';
+  // Nothing skipped, nothing errored, nothing on the wire: what ran decided
+  // in-library against the SDK verifier and never contacted the agent.
+  return 'self_check_only';
+}
+
+function isProbeFault(response: unknown): boolean {
+  return (
+    response !== null && typeof response === 'object' && (response as { probe_error?: unknown }).probe_error === true
+  );
+}
+
+/** True when signing probes ran and none of them reached the agent. */
+export function signingCoverageUnverified(steps: readonly SigningCoverageStepView[]): boolean {
+  const coverage = signingCoverage(steps);
+  return coverage !== 'not_probed' && coverage !== 'graded';
+}
+
+/**
+ * Build a hard-failure StoryboardResult for when agent capability
+ * discovery (`get_agent_info` / MCP `tools/list`) failed. Surfacing
+ * discovery errors as a hard storyboard failure prevents the silent
+ * "X/X clean, 100% skipped" failure mode where transport / auth
+ * misconfiguration produced an empty `agentTools: []` and every step
+ * skipped with `missing_tool`.
+ *
+ * @public — exported for direct testing of the failure-result shape;
+ * called from `runStoryboard` when discovery throws.
+ */
+export function buildDiscoveryFailedResult(
+  agentUrls: string[],
+  storyboard: Storyboard,
+  discoveryStep: TestStepResult,
+  profile?: AgentProfile
+): StoryboardResult {
+  const detail = discoveryStep.error ?? 'Discovery failed (no agent tools advertised).';
+  const syntheticStep: StoryboardStepResult = {
+    storyboard_id: storyboard.id,
+    step_id: 'discovery_failed',
+    phase_id: 'discovery_failed',
+    title: 'Storyboard failed: agent capability discovery did not succeed',
+    task: discoveryStep.task ?? '',
+    passed: false,
+    skipped: false,
+    duration_ms: discoveryStep.duration_ms,
+    validations: [],
+    context: {},
+    error: `Discovery failure: ${detail}. The runner cannot evaluate storyboard applicability from failed discovery evidence. Fix the discovery error before re-running.`,
+    extraction: discoveryStep.extraction ?? { path: 'none' },
+    ...(discoveryStep.request && { request: discoveryStep.request }),
+    ...(discoveryStep.response_record && { response_record: discoveryStep.response_record }),
+    ...(discoveryStep.adcp_error && { adcp_error: discoveryStep.adcp_error }),
+    ...(discoveryStep.authorization_required && { authorization_required: discoveryStep.authorization_required }),
+  };
+  return {
+    storyboard_id: storyboard.id,
+    storyboard_title: storyboard.title,
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
+    overall_passed: false,
+    phases: [
+      {
+        phase_id: 'discovery_failed',
+        phase_title: 'Discovery failed',
+        passed: false,
+        steps: [syntheticStep],
+        duration_ms: discoveryStep.duration_ms,
+      },
+    ],
+    context: {},
+    total_duration_ms: discoveryStep.duration_ms,
+    passed_count: 0,
+    failed_count: 1,
+    skipped_count: 0,
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
+    tested_at: new Date().toISOString(),
+    strict_validation_summary: {
+      observable: false,
+      checked: 0,
+      passed: 0,
+      failed: 0,
+      strict_only_failures: 0,
+      lenient_also_failed: 0,
+    },
+    notices: collectCapabilityNotices(storyboard, profile),
+  };
+}
+
+/**
+ * Build a minimal StoryboardResult for a storyboard skipped because the agent
+ * does not advertise any of the tools listed in `required_tools`. The result
+ * carries `skip_reason: 'missing_tool'` and `overall_passed: true` so CLI
+ * reports and JUnit consumers render it as a skip, not a failure.
+ *
+ * `missing_tool` (not `not_applicable`) is the correct canonical reason here:
+ * the agent declared a compatible protocol/specialism but lacks the specific
+ * tools this storyboard exercises — distinct from a protocol/version mismatch.
+ */
+function buildRequiredToolsMissingResult(
+  agentUrls: string[],
+  storyboard: Storyboard,
+  detail: string
+): StoryboardResult {
+  return {
+    storyboard_id: storyboard.id,
+    storyboard_title: storyboard.title,
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
+    overall_passed: true,
+    phases: [
+      {
+        phase_id: 'missing_tool',
+        phase_title: 'Skipped — required tools not advertised',
+        passed: true,
+        duration_ms: 0,
+        steps: [
+          {
+            storyboard_id: storyboard.id,
+            step_id: 'missing_tool',
+            phase_id: 'missing_tool',
+            title: `Skipped — ${detail}`,
+            task: '',
+            passed: true,
+            skipped: true,
+            skip_reason: 'missing_tool' as const,
+            skip: { reason: 'missing_tool' as const, detail },
+            duration_ms: 0,
+            validations: [],
+            context: {},
+            extraction: { path: 'none' },
+          },
+        ],
+      },
+    ],
+    context: {},
+    total_duration_ms: 0,
+    passed_count: 0,
+    failed_count: 0,
+    skipped_count: 1,
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
+    tested_at: new Date().toISOString(),
+    strict_validation_summary: {
+      observable: false,
+      checked: 0,
+      passed: 0,
+      failed: 0,
+      strict_only_failures: 0,
+      lenient_also_failed: 0,
+    },
+    notices: [],
+  };
+}
+
+/**
+ * Collect protocol-compliance notices for a storyboard run based on the
+ * agent's declared capabilities. Returns an empty array when rawCaps is
+ * absent (standalone runner without pre-fetched profile).
+ *
+ * Currently emits four spec-grounded notices (adcp-client#1704, #2082, #2461):
+ *
+ * - `capabilities_response_schema_invalid`: one informational notice per
+ *   schema issue, identified by its RFC 6901 `capability_pointer`.
+ *
+ * - `signed_requests_specialism_deprecated`: agent claims deprecated
+ *   `specialisms: ['signed-requests']` alongside `request_signing.supported:
+ *   true` on the signed_requests storyboard. The enum value is removed in
+ *   `effective_version: '4.0'`.
+ *
+ * - `request_signing_required_in_4_0`: `request_signing.supported` is absent or
+ *   false on the signed_requests storyboard. Signing becomes required for
+ *   spend-committing operations in `effective_version: '4.0'`.
+ *
+ * - `legacy_hmac_fallback_removed_in_4_0`: agent claims
+ *   `webhook_signing.legacy_hmac_fallback: true`, which is removed in
+ *   `effective_version: '4.0'`.
+ */
+/** @internal Exported for comply()'s synthesized requirement_unmet results. */
+export function collectCapabilityNotices(storyboard: Storyboard, profile: AgentProfile | undefined): RunnerNotice[] {
+  const notices: RunnerNotice[] = (profile?.capabilities_schema_issues ?? []).map(issue => ({
+    severity: 'info',
+    code: 'capabilities_response_schema_invalid',
+    message:
+      `The agent's get_adcp_capabilities response failed schema validation at ${issue.pointer || '/'}: ` +
+      `${issue.message}. Track results may share this root cause; fix it first, then re-read the failures.`,
+    capability_pointer: issue.pointer,
+    docs_url: 'https://github.com/adcontextprotocol/adcp/issues/6254',
+    storyboard_ids: [storyboard.id],
+  }));
+  const rawCaps = profile?.raw_capabilities;
+  if (!rawCaps || typeof rawCaps !== 'object') return notices;
+  const caps = rawCaps as Record<string, unknown>;
+
+  // Notice: request_signing required in AdCP 4.0.
+  // Fired when this is the signed_requests storyboard and the agent hasn't
+  // declared request_signing support. The storyboard is identified by id OR
+  // by the presence of a request_signing_probe step (mirrors the implicit-
+  // require detection in detectImplicitRequires for PR #1703's gate).
+  const isSignedRequestsNoticeStoryboard = storyboard.id === 'signed_requests';
+  const isRequestSigningStoryboard =
+    isSignedRequestsNoticeStoryboard ||
+    storyboard.phases.some(p => p.steps.some(s => s.task === 'request_signing_probe'));
+  if (isRequestSigningStoryboard) {
+    const requestSigning = caps['request_signing'] as Record<string, unknown> | undefined;
+    const specialisms = caps['specialisms'];
+    // Canonical deprecation notice standardized by adcontextprotocol/adcp#4796.
+    if (
+      isSignedRequestsNoticeStoryboard &&
+      requestSigning?.['supported'] === true &&
+      Array.isArray(specialisms) &&
+      specialisms.includes('signed-requests')
+    ) {
+      notices.push({
+        severity: 'deprecation',
+        code: 'signed_requests_specialism_deprecated',
+        message:
+          'The `signed-requests` specialism claim is deprecated and removed in AdCP 4.0. ' +
+          'Drop it and rely on `request_signing.supported: true` instead.',
+        effective_version: '4.0',
+        capability_path: 'specialisms',
+        docs_url: 'https://adcontextprotocol.org/docs/building/implementation/security#signed-requests-transport-layer',
+        storyboard_ids: [storyboard.id],
+      });
+    }
+
+    if (requestSigning?.['supported'] !== true) {
+      notices.push({
+        severity: 'future_required',
+        code: 'request_signing_required_in_4_0',
+        message:
+          'RFC 9421 request signing (`request_signing.supported: true`) is not advertised. ' +
+          'Required for spend-committing operations in AdCP 4.0 — declare the capability and ' +
+          'pre-register the runner compliance test keypair before the 4.0 cut.',
+        effective_version: '4.0',
+        capability_path: 'request_signing.supported',
+        docs_url: 'https://adcontextprotocol.org/docs/building/implementation/security#signed-requests-transport-layer',
+        storyboard_ids: [storyboard.id],
+      });
+    }
+  }
+
+  // Notice: legacy_hmac_fallback removed in AdCP 4.0.
+  // Scoped via the WEBHOOK_STEP_TASKS step-task set rather than an id-regex.
+  // Step-task presence is the authoring contract — a storyboard that asserts
+  // webhook delivery uses one of these tasks. A storyboard id alone (e.g. a
+  // hypothetical `webhook_authoring_guide`) shouldn't trigger the notice
+  // unless it actually exercises the delivery path.
+  const WEBHOOK_STEP_TASKS = new Set([
+    'expect_webhook',
+    'expect_no_webhook',
+    'expect_webhook_retry_keys_stable',
+    'expect_webhook_signature_valid',
+  ]);
+  const isWebhookRelatedStoryboard = storyboard.phases.some(p => p.steps.some(s => WEBHOOK_STEP_TASKS.has(s.task)));
+  if (isWebhookRelatedStoryboard) {
+    const webhookSigning = caps['webhook_signing'] as Record<string, unknown> | undefined;
+    if (webhookSigning?.['legacy_hmac_fallback'] === true) {
+      notices.push({
+        severity: 'deprecation',
+        code: 'legacy_hmac_fallback_removed_in_4_0',
+        message:
+          '`webhook_signing.legacy_hmac_fallback: true` is deprecated and removed in AdCP 4.0. ' +
+          'Migrate webhook signature verification to RFC 9421 before the 4.0 cut.',
+        effective_version: '4.0',
+        capability_path: 'webhook_signing.legacy_hmac_fallback',
+        docs_url: 'https://adcontextprotocol.org/docs/building/implementation/webhooks',
+        storyboard_ids: [storyboard.id],
+      });
+    }
+  }
+
+  return notices;
+}
+
+function collectInputSchemaFieldStripNotices(debugLogs: unknown, storyboardId: string): RunnerNotice[] {
+  if (!Array.isArray(debugLogs)) return [];
+  const notices: RunnerNotice[] = [];
+  const seen = new Set<string>();
+  for (const entry of debugLogs) {
+    if (!entry || typeof entry !== 'object') continue;
+    const details = (entry as { details?: unknown }).details;
+    if (!details || typeof details !== 'object') continue;
+    const record = details as Record<string, unknown>;
+    if (record.code !== 'input_schema_field_stripped') continue;
+    const task = typeof record.task === 'string' ? record.task : 'unknown_task';
+    const fields = Array.isArray(record.fields)
+      ? record.fields.filter((field): field is string => typeof field === 'string')
+      : [];
+    if (fields.length === 0) continue;
+    const key = `${task}\u0000${fields.join('\u0000')}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    notices.push({
+      severity: 'info',
+      code: 'input_schema_field_stripped',
+      message:
+        `Runner stripped request fields not declared by either the agent's tool input schema or the canonical AdCP ` +
+        `request schema for ${task}: ${fields.join(', ')}. Check the caller or runner payload before changing the agent schema.`,
+      docs_url: 'https://github.com/adcontextprotocol/adcp/issues/6437',
+      storyboard_ids: [storyboardId],
+    });
+  }
+  return notices;
+}
+
+function mergeRunnerNotices(notices: RunnerNotice[]): RunnerNotice[] {
+  const byCode = new Map<string, RunnerNotice>();
+  for (const notice of notices) {
+    const key = runnerNoticeKey(notice);
+    const existing = byCode.get(key);
+    if (existing) {
+      for (const sid of notice.storyboard_ids) {
+        if (!existing.storyboard_ids.includes(sid)) existing.storyboard_ids.push(sid);
+      }
+    } else {
+      byCode.set(key, { ...notice, storyboard_ids: [...notice.storyboard_ids] });
+    }
+  }
+  return [...byCode.values()];
+}
+
+function runnerNoticeKey(notice: RunnerNotice): string {
+  return notice.capability_pointer === undefined ? notice.code : `${notice.code}\u0000${notice.capability_pointer}`;
+}
+
+function collectStepNotices(phases: StoryboardPhaseResult[]): RunnerNotice[] {
+  return phases.flatMap(phase => phase.steps.flatMap(step => step.notices ?? []));
+}
+
+/** Context suffixes the creative-build probe owns and replaces per run. */
+const CREATIVE_PROBE_CONTEXT_SUFFIXES = [
+  'capability_id',
+  'target_format_id',
+  'message',
+  'creative_manifest',
+  'creative_id',
+  'transformer_id',
+  'config',
+] as const;
+
+/**
+ * Build a run's initial storyboard context through the protected-write
+ * policy instead of a bare `{ ...storyboard.context, ...options.context }`
+ * spread.
+ *
+ * Both inputs are untrusted with respect to the reserved namespace: a
+ * storyboard is authored content and `options.context` is whatever the
+ * caller (including a hosted step route forwarding browser JSON) supplied.
+ * Either one naming a `__adcp_fixture_` key is an attempt to pre-seed
+ * fixture-preparation state that no fixture graph produced, so it is
+ * rejected loudly rather than silently winning or silently losing.
+ */
+function createRunContext(
+  storyboard: Storyboard,
+  options: StoryboardRunOptions
+): { context: StoryboardContext; protectedWriter: ProtectedContextWriter } {
+  const protectedWriter = createProtectedContextWriter();
+  const context: StoryboardContext = {};
+  registerProtectedContext(context, protectedWriter);
+  applyProtectedContextPatch(
+    context,
+    { set: { ...storyboard.context } },
+    { origin: `[${storyboard.id}] storyboard.context` }
+  );
+  applyProtectedContextPatch(context, { set: { ...options.context } }, { origin: 'options.context' });
+  if (storyboard.context) forwardAliasCache(storyboard.context, context);
+  if (options.context) forwardAliasCache(options.context, context);
+  return { context, protectedWriter };
+}
+
+/**
+ * Refuse reserved or prototype-sensitive keys in a caller-supplied metadata
+ * map. These maps bypass the per-patch funnel by construction (they seed the
+ * sinks the funnel writes into), so they get the same rule at the door.
+ */
+function describeReservedCallerMetadata(
+  map: Record<string, unknown> | undefined,
+  location: string
+): string | undefined {
+  if (!map) return undefined;
+  const offending = Object.keys(map).filter(
+    key => isProtectedContextKey(key) || key === '__proto__' || key === 'constructor' || key === 'prototype'
+  );
+  if (offending.length === 0) return undefined;
+  return `${location}: cannot carry reserved or prototype-sensitive key(s) ${offending.join(', ')}; fixture-preparation metadata is not caller-supplied. Rename the key to anything not starting with "__adcp_fixture_" and not named __proto__, constructor or prototype — or, if you meant to reuse a prepared graph, pass it as options.prepared_fixtures with an authorizer instead of threading its context back.`;
+}
+
+/**
+ * Screen every caller-supplied metadata map on the options object.
+ *
+ * One helper so the full and standalone entry points cannot drift on WHICH
+ * maps are screened — the earlier asymmetry was exactly that kind of drift.
+ */
+function describeReservedCallerOptions(options: StoryboardRunOptions): string | undefined {
+  return (
+    describeReservedCallerMetadata(options.context, 'options.context') ??
+    describeReservedCallerMetadata(options.context_provenance, 'options.context_provenance') ??
+    describeReservedCallerMetadata(
+      options.response_derived_not_applicable_context_keys,
+      'options.response_derived_not_applicable_context_keys'
+    )
+  );
+}
+
+/**
+ * Canonical, nonsecret description of a step-auth directive.
+ *
+ * Literal credential values are folded into the fingerprint (which is an
+ * HMAC under a per-process key), never surfaced: the authorizer sees a
+ * fingerprint, not the probe credential.
+ */
+function describeStepAuthDirective(directive: StepAuthDirective): string {
+  if (directive === 'none') return 'none';
+  if (typeof directive !== 'object') return JSON.stringify(directive);
+  // JSON-encoded per component, like `describeAuth`. `key=value` joined on
+  // `;` collided: `{password: 'a;username=b', username: 'c'}` and
+  // `{password: 'a', username: 'b;username=c'}` both rendered
+  // `basic;password=a;username=b;username=c`, so two different step
+  // credentials produced one fingerprint.
+  const parts: string[] = [JSON.stringify(directive.type)];
+  for (const [key, value] of Object.entries(directive as Record<string, unknown>).sort(([a], [b]) =>
+    a < b ? -1 : 1
+  )) {
+    if (key === 'type') continue;
+    parts.push(JSON.stringify([key, value]));
+  }
+  return parts.join(';');
+}
+
+/**
+ * Routes a prepared binding is pinned to.
+ *
+ * `options.agents` is authoritative when present — the runner requires the
+ * positional argument to be `''` in that mode — so every gate and
+ * preparation must project it the same way or they will disagree about what
+ * "the same route" means.
+ */
+function resolveBindingAgentUrls(agentUrlOrUrls: string | string[], options: StoryboardRunOptions): string[] {
+  if (options.agents) return Object.values(options.agents).map(entry => entry.url);
+  return Array.isArray(agentUrlOrUrls) ? agentUrlOrUrls : [agentUrlOrUrls];
+}
+
+async function gatePreparedFixtures(
+  storyboard: Storyboard,
+  agentUrls: string[],
+  options: StoryboardRunOptions,
+  step?: StoryboardStep,
+  gate: 'run' | 'pass' | 'step' = 'pass'
+): Promise<
+  { used: false } | { used: true; state: PreparedStoryboardFixtures } | { used: true; refusal: PreparedFixturesRefusal }
+> {
+  const outcome = await resolvePreparedFixtures({
+    supplied: options.prepared_fixtures,
+    // The run context is built here so the binding can report the account
+    // the step's request will ACTUALLY carry. Without it the standalone
+    // entry gate — the one `runStoryboardStep` uses — reported no
+    // `request_account_scope` at all, and a caller-supplied or
+    // context-substituted foreign account reached the seller while the
+    // authorizer saw nothing to refuse. Building the context performs no
+    // I/O and is what the run would build moments later anyway.
+    current: buildCurrentPreparedBinding(
+      storyboard,
+      agentUrls,
+      options,
+      step,
+      options,
+      step !== undefined ? createRunContext(storyboard, options).context : undefined
+    ),
+    ...(options.prepared_fixtures_authorizer && { authorizer: options.prepared_fixtures_authorizer }),
+    ...(step !== undefined && { stepId: step.id }),
+    gate,
+  });
+  if (outcome === undefined) return { used: false };
+  if (!outcome.ok) return { used: true, refusal: outcome.refusal };
+  return { used: true, state: outcome.state };
+}
+
+/** Commit an authorized state's captures. Separate from the gate so the gate
+ * can run before any seller contact, while the commit happens where the run
+ * context exists. */
+function hydratePreparedCaptures(
+  state: PreparedStoryboardFixtures,
+  context: StoryboardContext,
+  protectedWriter: ProtectedContextWriter,
+  contextProvenance: Map<string, ContextProvenanceEntry>
+): ValidationResult | undefined {
+  const captures = state.captures;
+  if (Object.keys(captures).length === 0) return undefined;
+  // Graded, not thrown — the only remaining commit site that could have
+  // turned a namespace refusal into a 500 instead of a verdict.
+  return tryProtectedContextPatch(
+    context,
+    { set: captures, setProvenance: state.captureProvenance },
+    { writer: protectedWriter, sinks: { provenance: contextProvenance }, origin: 'prepared fixture state' }
+  );
+}
+
+/**
+ * Resolve a storyboard's fixture graph once and return reusable, immutable
+ * prepared state.
+ *
+ * This is the public form of what `executeStoryboardPass` already does
+ * internally, promoted so the standalone step runner and hosted step routes
+ * stop falling back to literal authored handles. The returned state carries
+ * the pinned seller identities, the declaration-local captures from the
+ * SAME selected graph, the retained collection witnesses, the resolution
+ * evidence, any coverage gaps, and the terminal preparation disposition.
+ *
+ * The state is deliberately process-local: its trust is a live object
+ * identity, and its credential fingerprint is keyed by a per-process random
+ * HMAC key. It will not survive serialization, and it is not meant to — a
+ * frozen JSON snapshot carries no evidence that its grant is still live.
+ * Hosted multi-process reuse belongs behind an authenticated reference
+ * lookup with the authorizer hook. See `docs/guides/COLLECTION-FIXTURE-FOUNDATION.md`.
+ *
+ * A failed or unsatisfied preparation is returned, not thrown: the terminal
+ * disposition is part of the evidence and must be carried forward verbatim
+ * so a retry cannot hide it behind a freshly discovered alternative.
+ *
+ * @throws PreparedFixturesDeniedError when the optional preparation authorizer
+ * refuses or the authorized scope changes. The reuse authorizer is not called.
+ */
+export async function prepareStoryboardFixtures(
+  agentUrl: string | string[],
+  storyboard: Storyboard,
+  options: PrepareStoryboardFixturesOptions = {}
+): Promise<PreparedStoryboardFixtures> {
+  options = {
+    ...applyReusableProfileOptions(options),
+    _requireValidCapabilityEvidence: storyboardRequiresCapabilityEvidence(storyboard),
+    _allowCapabilityDiagnostic: storyboardAllowsCapabilityDiagnostic(storyboard),
+  };
+  return withPropertyListCredentialRedaction(() =>
+    withMCPConnectionScope(
+      async () => {
+        storyboard = normalizeValidationOnlyTasks(storyboard);
+        validateStoryboardShape(storyboard);
+        options = applyStoryboardVersionOptions(storyboard, options);
+        // Both consumers apply these; preparation did not, so its
+        // `get_products` / `comply_test_controller` calls dispatched
+        // unsigned and without the A2A legacy-compat opt-out against an
+        // agent the run then contacts with both. Neither affects the
+        // credential fingerprint, so the symptom was preparation failing
+        // discovery against a signed-requests seller, not a false mismatch.
+        options = applyFunctionalRequestSigning(options, {
+          ...(options.complianceDir && { complianceDir: options.complianceDir }),
+          ...(options.adcpVersion && { version: options.adcpVersion }),
+        });
+        options = resolveDeclaredTestKit(storyboard, options);
+        options = applyNativeA2AComplianceTransportOptions(options);
+        const schemaRoot = getRunSchemaRoot(options);
+        const body = () =>
+          withServedReleaseSchemaRoots(options.servedReleaseSchemaRoots, () =>
+            prepareStoryboardFixturesBody(agentUrl, storyboard, options)
+          );
+        if (schemaRoot) {
+          return await withExternalSchemaRoot(schemaRoot.adcpVersion, schemaRoot.schemaRoot, body);
+        }
+        return await body();
+      },
+      { isolate: !hasTestClientScope() }
+    )
+  );
+}
+
+/**
+ * Options for the agent preparation will actually contact.
+ *
+ * In a routed run `options.agents[key].auth` is the configured credential
+ * for that route; run-level `auth` is only the default. Preparation reaches
+ * one concrete agent, so it must use that agent's view — the same
+ * projection `buildAgentOptions` applies for ordinary routed dispatch —
+ * rather than the run default.
+ */
+function resolvePreparationRouteOptions(agentUrl: string, options: StoryboardRunOptions): StoryboardRunOptions {
+  const agents = options.agents;
+  if (!agents) return options;
+  const match = Object.entries(agents).find(([, entry]) => entry?.url === agentUrl);
+  if (!match) return options;
+  const [, entry] = match;
+  return {
+    ...options,
+    ...(entry?.auth !== undefined && { auth: entry.auth }),
+    ...(entry?.transport !== undefined && { protocol: entry.transport }),
+  };
+}
+
+/**
+ * Ask the supplied authorizer whether preparation itself may proceed.
+ *
+ * The `prepare` gate carries NO `binding`: nothing has been prepared yet,
+ * and copying `current` into it would tell the host that stored state
+ * matches when there is no stored state. `current` is the real
+ * SDK-owned binding — storyboard digest, routes, on-disk schema artifact,
+ * account and brand scope, sandbox, principal and credential fingerprint
+ * — all of which are computable without touching the seller, which is why
+ * this can be asked before the first byte.
+ *
+ * Every non-grant answer is a refusal, matching the reuse gate exactly: a
+ * decision that is denied, absent, malformed, throwing or rejecting all
+ * fail closed. The host's own error text is never echoed.
+ */
+async function resolvePreparationAuthorization(
+  authorizer: PreparedFixturesPreparationAuthorizer,
+  current: PreparedFixtureBinding
+): Promise<{ ok: true } | { ok: false; refusal: PreparedFixturesRefusal }> {
+  const refusal: PreparedFixturesRefusal = {
+    code: 'authorizer_denied',
+    detail: 'fixture preparation was refused by the configured authorizer',
+  };
+  try {
+    const decision = await authorizer({ current: structuredClone(current), gate: 'prepare' });
+    // Strictly `true`, like every other gate. A truthy string, `1` or a
+    // missing field is a malformed decision, and reading one as consent
+    // is the failure this gate exists to prevent.
+    return decision?.authorized === true ? { ok: true } : { ok: false, refusal };
+  } catch {
+    // A host authorizer that throws or rejects fails closed, and its own
+    // error text stays with the host.
+    return { ok: false, refusal };
+  }
+}
+
+/** Detach mutable JSON inputs; runtime services retain their host-owned identity. */
+function snapshotPreparationAuth(auth: StoryboardRunOptions['auth']): StoryboardRunOptions['auth'] {
+  if (auth === undefined) return undefined;
+  if (auth.type === 'oauth') {
+    const { storage, ...data } = auth;
+    return { ...structuredClone(data), ...(storage && { storage }) };
+  }
+  return structuredClone(auth);
+}
+
+function snapshotPreparationOptions(options: PrepareStoryboardFixturesOptions): PrepareStoryboardFixturesOptions {
+  return {
+    ...options,
+    ...(options.context && { context: structuredClone(options.context) }),
+    ...(options.brand && { brand: { ...options.brand } }),
+    ...(options.brand_manifest && { brand_manifest: structuredClone(options.brand_manifest) }),
+    ...(options.headers && { headers: { ...options.headers } }),
+    ...(options.auth && { auth: snapshotPreparationAuth(options.auth) }),
+    ...(options.agents && {
+      agents: Object.fromEntries(
+        Object.entries(options.agents).map(([key, agent]) => [
+          key,
+          { ...agent, ...(agent.auth && { auth: snapshotPreparationAuth(agent.auth) }) },
+        ])
+      ),
+    }),
+  };
+}
+
+async function prepareStoryboardFixturesBody(
+  agentUrl: string | string[],
+  storyboard: Storyboard,
+  options: PrepareStoryboardFixturesOptions
+): Promise<PreparedStoryboardFixtures> {
+  // Project the agents map the same way `runStoryboardBody` does, so a
+  // routed storyboard can be prepared at all: without it `prepareStoryboardFixtures('')`
+  // fails discovery on an empty URL and passing a URL alongside `agents`
+  // is rejected by the runner, leaving no workable argument pair.
+  const agentUrls = [...resolveBindingAgentUrls(agentUrl, options)];
+  // Same screen, same place in the order, as both consumers. Preparation is
+  // the function that MINTS trusted state, and it was the only one of the
+  // three public entry points that reached the agent first and then threw
+  // a raw `ProtectedContextViolation` instead of returning a disposition —
+  // contradicting its own contract that a failed preparation is returned,
+  // not thrown.
+  //
+  // That contract covers the PREPARATION OUTCOME. It does not cover an
+  // authorization decision: the `prepare` gate below throws, because a
+  // refused caller must not be handed a prepared-state object for a run
+  // they were denied. The asymmetry is deliberate — a refused caller BODY
+  // is still graded here while `runStoryboard` / `runStoryboardStep` deny
+  // it, which is a known inconsistency raised for contract coordination
+  // rather than changed unilaterally.
+  const metadataRefusal = describeReservedCallerOptions(options);
+  if (metadataRefusal !== undefined) {
+    return buildPreparedFixtures(storyboard, agentUrls, options, undefined, {
+      status: 'failed',
+      detail: metadataRefusal,
+    });
+  }
+  // Preparation is the PRODUCER of prepared state, never a consumer of it.
+  // Supplying `prepared_fixtures` here was silently ignored: the authorizer
+  // was never called — not once, not even on a denial — and preparation went
+  // on to do a full capability-discovery and catalog round trip. A caller
+  // who believed they were reusing an authorized graph got an unauthorized
+  // re-resolution plus seller contact. Refused before anything is
+  // constructed, matching `comply()`'s refusal of the same option.
+  if (options.prepared_fixtures !== undefined) {
+    return buildPreparedFixtures(storyboard, agentUrls, options, undefined, {
+      status: 'failed',
+      detail:
+        'prepareStoryboardFixtures() does not accept prepared_fixtures: it produces prepared state, it does not consume it. ' +
+        'Passing state here authorizes nothing — the authorizer is never consulted — and preparation would re-resolve the ' +
+        'graph against the seller anyway. Pass the state to runStoryboard() or runStoryboardStep() instead, with ' +
+        'prepared_fixtures_authorizer. See docs/guides/COLLECTION-FIXTURE-FOUNDATION.md section 4.',
+    });
+  }
+  // Initial-preparation authorization, BEFORE any seller contact at all —
+  // before a client exists, before `initialize`, before capability
+  // discovery or controller seeding. Preparation is the step that reads
+  // the seller's catalog and pins the graph, so a host that opts into the
+  // preparation authorizer can refuse it independently of later reuse.
+  //
+  // Asked exactly once, and only when an authorizer was supplied: making
+  // one mandatory would refuse every preparation that exists today.
+  const bindingOptions = options;
+  const bindingStoryboard = storyboard;
+  let authorizedBinding: PreparedFixtureBinding | undefined;
+  const refusePreparation = (refusal: PreparedFixturesRefusal, seeding?: ControllerSeedingResult) => {
+    const record = buildPreparedRefusalRunResult(agentUrls, storyboard, refusal, 'prepare');
+    if (seeding) {
+      record.phases = [seeding.phase, ...record.phases];
+      record.fixture_resolutions = seeding.resolutionRecords ?? [];
+      const auditSteps = record.phases.flatMap(phase => phase.steps);
+      record.passed_count = auditSteps.filter(step => step.passed && !step.skipped).length;
+      record.failed_count = auditSteps.filter(step => !step.passed && !step.skipped).length;
+      record.skipped_count = auditSteps.filter(step => step.skipped).length;
+    }
+    return denyPreparedFixtures(options, record, refusal.code);
+  };
+  const scopeStillMatches = () => {
+    if (!authorizedBinding) return true;
+    try {
+      return isDeepStrictEqual(
+        authorizedBinding,
+        buildCurrentPreparedBinding(
+          bindingStoryboard,
+          resolveBindingAgentUrls(agentUrl, bindingOptions),
+          bindingOptions
+        )
+      );
+    } catch {
+      return false;
+    }
+  };
+  const driftRefusal: PreparedFixturesRefusal = {
+    code: 'binding_mismatch',
+    detail: 'fixture preparation scope changed after host authorization',
+  };
+  if (options.prepared_fixtures_preparation_authorizer !== undefined) {
+    authorizedBinding = buildCurrentPreparedBinding(storyboard, agentUrls, options);
+    const decision = await resolvePreparationAuthorization(
+      options.prepared_fixtures_preparation_authorizer,
+      authorizedBinding
+    );
+    if (!decision.ok) {
+      return refusePreparation(decision.refusal);
+    }
+    if (!scopeStillMatches()) return refusePreparation(driftRefusal);
+    // Later awaits must not read mutations to the caller's account, credentials,
+    // routes or fixture document. Runtime services (transport, signal, OAuth
+    // storage) remain host-owned. Final drift still refuses minting state.
+    storyboard = structuredClone(storyboard);
+    options = snapshotPreparationOptions(options);
+  }
+  const callerOwnsClients = hasTestClientScope();
+  // Per-ROUTE options, not run-level, when the run is routed. Preparation
+  // issues `get_products` and `comply_test_controller` against a concrete
+  // agent, and resolving the client from run options sent the catalog
+  // request under the RUN bearer while the route declared its own — the
+  // credential the seller actually saw was not the configured one.
+  const runOptions = options;
+  const preparationOptions = resolvePreparationRouteOptions(agentUrls[0]!, runOptions);
+  const resolution = getOrCreateClientResolution(agentUrls[0]!, preparationOptions);
+  let client = resolution.client;
+  // The route projection is a DISPATCH concern. Binding it would fold the
+  // route credential in twice here (once lifted to `auth`, once under
+  // `agents`) and only once in the run, so an identically-routed reuse
+  // would read as a credential_fingerprint mismatch and be refused. The
+  // route credential still binds — `resolveBindingCredential` folds
+  // `agents[*].auth` paired with its url on both sides — so changing it
+  // still refuses reuse. See the routed-reuse and routed-credential-change
+  // regressions in test/lib/storyboard-prepared-fixtures.test.js.
+  const finishPreparation = (
+    seeding: ControllerSeedingResult | undefined | null,
+    disposition: PreparedFixturesDisposition
+  ) => {
+    // Use the run view, not the flattened route view, for the scope comparison.
+    if (!scopeStillMatches()) {
+      return refusePreparation(driftRefusal, seeding ?? undefined);
+    }
+    return buildPreparedFixtures(storyboard, agentUrls, bindingOptions, seeding, disposition);
+  };
+  options = preparationOptions;
+  try {
+    let profile = options._profile;
+    let discoveryStep: TestStepResult | undefined;
+    let routingContext: AgentRoutingContext | undefined;
+    const failDiscovery = (step: TestStepResult, failedProfile?: AgentProfile) => {
+      const failed = buildDiscoveryFailedResult(agentUrls, storyboard, step, failedProfile);
+      return finishPreparation(
+        { phase: failed.phases[0]!, allPassed: false, passedCount: 0, failedCount: 1 },
+        { status: 'failed', detail: step.error ?? 'agent discovery failed before fixture preparation' }
+      );
+    };
+    // An ungated preparation only owns its established first-route fixture
+    // work. Discover the rest of a topology only when applicability needs it.
+    if (
+      runOptions.agents &&
+      (storyboardCapabilityPredicates(storyboard).length > 0 ||
+        storyboard.required_tools?.length ||
+        storyboard.required_any_of_tools?.length)
+    ) {
+      try {
+        validateAgentsMap(agentUrl, storyboard, runOptions);
+        // A preparation cannot infer absence from a failed route, even when
+        // exploratory execution opted into resilient partial discovery.
+        routingContext = await buildRoutingContext(storyboard, { ...runOptions, discovery_resilient: false });
+      } catch (error) {
+        const failedStep = error instanceof DiscoveryFailure ? error.step : undefined;
+        return await failDiscovery({
+          ...failedStep,
+          step: failedStep?.step ?? 'Discover preparation topology',
+          passed: false,
+          duration_ms: failedStep?.duration_ms ?? 0,
+          error: redactOAuthUrlsInText(
+            error instanceof DiscoveryFailure
+              ? `Discovery failed for agent "${error.agentKey}" (${redactOAuthUrlForOutput(error.url)}): ${error.underlying}`
+              : error instanceof Error
+                ? error.message
+                : String(error)
+          ),
+        });
+      }
+      for (const routeProfile of routingContext.profiles.values()) {
+        const failure = describeProfileDiscoveryFailure(
+          routeProfile,
+          runOptions._requireValidCapabilityEvidence === true,
+          runOptions._allowCapabilityDiagnostic === true
+        );
+        if (failure) return await failDiscovery(failure, routeProfile);
+      }
+      const firstKey = Object.keys(runOptions.agents)[0]!;
+      profile = routingContext.profiles.get(firstKey)!;
+      client = routingContext.clients.get(firstKey)!;
+      discoveryStep = routingContext.discoverySteps?.get(firstKey);
+      // Seeding still belongs to the first route. Its own options must not
+      // inherit the cross-route applicability union or a caller's profile.
+      options = { ...options, _profile: profile, agentTools: normalizeAgentToolNames(profile.tools) };
+    }
+    const suppliedFailure =
+      profile &&
+      describeProfileDiscoveryFailure(
+        profile,
+        options._requireValidCapabilityEvidence === true,
+        options._allowCapabilityDiagnostic === true
+      );
+    if (suppliedFailure) {
+      const failed = buildDiscoveryFailedResult(agentUrls, storyboard, suppliedFailure, profile);
+      return await finishPreparation(
+        { phase: failed.phases[0]!, allPassed: false, passedCount: 0, failedCount: 1 },
+        { status: 'failed', detail: suppliedFailure.error ?? 'agent discovery failed' }
+      );
+    }
+    if (!profile) {
+      const discovered = await getOrDiscoverStoryboardProfile(client, options);
+      discoveryStep = discovered.evidence ?? discovered.step;
+      if (discovered.step.passed === false) {
+        const failed = buildDiscoveryFailedResult(agentUrls, storyboard, discovered.step, discovered.profile);
+        return await finishPreparation(
+          { phase: failed.phases[0]!, allPassed: false, passedCount: 0, failedCount: 1 },
+          {
+            status: 'failed',
+            detail: discovered.step.error ?? 'agent discovery failed before fixture preparation',
+          }
+        );
+      }
+      profile = discovered.profile;
+    }
+    if (profile && (!options._profile || !options.agentTools)) {
+      options = {
+        ...options,
+        ...(!options._profile && { _profile: profile }),
+        ...(!options.agentTools && { agentTools: normalizeAgentToolNames(profile.tools) }),
+      };
+    }
+    if (!scopeStillMatches()) return await refusePreparation(driftRefusal);
+    let capabilityUnmet: string | null;
+    const applicabilityTools = routingContext
+      ? [...new Set([...routingContext.profiles.values()].flatMap(p => normalizeAgentToolNames(p.tools) ?? []))]
+      : options.agentTools;
+    try {
+      if (routingContext && runOptions.agents) {
+        const dispatch = createRoutingDispatcher(routingContext, runOptions, runOptions.agents);
+        const defaultProfile = runOptions.default_agent
+          ? routingContext.profiles.get(runOptions.default_agent)
+          : undefined;
+        const rootDetails = storyboard.phases.flatMap(phase =>
+          phase.steps
+            .filter(step => step.task !== VALIDATION_ONLY_TASK)
+            .map(step => {
+              // Resolve every authored route before accepting an applicability
+              // verdict: a broken route is a failure, never capability absence.
+              const selected = dispatch.nextFor(step);
+              const owner = runOptions.default_agent ? defaultProfile : selected.profile;
+              return evaluateStoryboardCapabilityGates(
+                storyboard,
+                owner,
+                normalizeAgentToolNames(owner?.tools),
+                runOptions.adcpVersion
+              );
+            })
+        );
+        capabilityUnmet =
+          rootDetails.length > 0 && rootDetails.every(detail => detail !== null) ? rootDetails[0]! : null;
+      } else {
+        capabilityUnmet = evaluateStoryboardCapabilityGates(
+          storyboard,
+          profile,
+          options.agentTools,
+          options.adcpVersion
+        );
+      }
+    } catch (error) {
+      return await failDiscovery({
+        step: 'Resolve preparation routes',
+        passed: false,
+        duration_ms: 0,
+        error: redactOAuthUrlsInText(error instanceof Error ? error.message : String(error)),
+      });
+    }
+    const missingFamily =
+      applicabilityTools &&
+      storyboard.required_any_of_tools?.find(family => !hasAnyRequiredTool(family.tools, applicabilityTools));
+    const unmetDetail =
+      capabilityUnmet ??
+      (missingFamily
+        ? `missing_required_tool_family: needs ${missingFamily.tools.join(' or ')}` +
+          (missingFamily.rationale ? ` (${missingFamily.rationale})` : '')
+        : null) ??
+      (storyboard.required_tools?.length &&
+      applicabilityTools &&
+      !hasAnyRequiredTool(storyboard.required_tools, applicabilityTools)
+        ? `agent does not advertise any of [${storyboard.required_tools.join(', ')}]`
+        : null);
+    if (unmetDetail !== null) {
+      const observations =
+        routingContext && runOptions.agents
+          ? Object.entries(runOptions.agents).map(([key, entry]) => ({
+              key,
+              url: entry.url,
+              step: routingContext!.discoverySteps?.get(key),
+            }))
+          : [{ key: 'discovery', url: agentUrls[0]!, step: discoveryStep }];
+      const steps: StoryboardStepResult[] = observations.map(({ key, url, step }) => ({
+        storyboard_id: storyboard.id,
+        phase_id: 'discovery',
+        step_id: key,
+        title: step ? 'Agent capability discovery' : 'Supplied agent capability profile',
+        task: step?.task ?? '',
+        passed: true,
+        duration_ms: step?.duration_ms ?? 0,
+        validations: [],
+        context: {},
+        ...(routingContext && { agent_url: redactOAuthUrlForOutput(url) }),
+        extraction: step?.extraction ?? { path: 'none' },
+        ...(step?.request && { request: step.request }),
+        ...(step?.response_record && { response_record: step.response_record }),
+      }));
+      return await finishPreparation(
+        {
+          phase: {
+            phase_id: 'discovery',
+            phase_title: 'Agent capability discovery',
+            passed: true,
+            duration_ms: steps.reduce((total, step) => total + step.duration_ms, 0),
+            steps,
+          },
+          allPassed: true,
+          passedCount: steps.length,
+          failedCount: 0,
+        },
+        { status: 'unsupported', reason: 'not_applicable', detail: unmetDetail }
+      );
+    }
+    const context = createRunContext(storyboard, options).context;
+    const seeding = await runControllerSeeding(client, storyboard, options, context);
+    if (!seeding) {
+      // No declared fixtures: an honest "nothing to prepare" rather than a
+      // synthesized success that implies a graph was pinned.
+      return await finishPreparation(undefined, { status: 'resolved' });
+    }
+    const disposition: PreparedFixturesDisposition =
+      seeding.fixtureUnavailable && seeding.failedCount === 0
+        ? { status: 'unsupported', reason: 'not_applicable', detail: seeding.fixtureUnavailable }
+        : seeding.missingController
+          ? { status: 'unsupported', detail: 'agent does not advertise comply_test_controller' }
+          : seeding.seedUnsupported
+            ? { status: 'unsupported', detail: 'agent did not advertise a required seed_* scenario' }
+            : seeding.failedCount > 0
+              ? {
+                  status: 'failed',
+                  detail:
+                    seeding.phase.steps.find(step => !step.passed && !step.skipped && step.error)?.error ??
+                    'fixture resolution failed during preparation',
+                }
+              : seeding.fixtureUnsatisfied === true
+                ? { status: 'unsatisfied', detail: describeUnsatisfiedFixtures(seeding.resolutionRecords) }
+                : { status: 'resolved' };
+    return await finishPreparation(seeding, disposition);
+  } finally {
+    if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+  }
+}
+
+/**
+ * `fixture_unsatisfied` detail, in the contract's exact form.
+ *
+ * `runner-output-contract.yaml` requires the detail to name EVERY
+ * unsatisfied fixture as `<fixture_type>:<handle>`, with pricing options
+ * scoped as `pricing_option:<product_handle>/<handle>`. Naming only the
+ * first one in prose left a consumer unable to enumerate the gap, and
+ * disagreed with the full runner's own path, which already lists them all.
+ */
+function describeUnsatisfiedFixtures(records: FixtureResolutionRecord[] | undefined): string {
+  const unsatisfied = (records ?? []).filter(record => record.status === 'unsatisfied');
+  if (unsatisfied.length === 0) return 'a declared strategy ladder exhausted without a binding';
+  const names = unsatisfied.map(record =>
+    record.fixture_type === 'pricing_option' && record.product_handle
+      ? `pricing_option:${record.product_handle}/${record.handle}`
+      : `${record.fixture_type}:${record.handle}`
+  );
+  return `fixture_unsatisfied: ${names.join(', ')}`;
+}
+
+function buildPreparedFixtures(
+  storyboard: Storyboard,
+  agentUrls: string[],
+  options: StoryboardRunOptions,
+  seeding: ControllerSeedingResult | undefined | null,
+  disposition: PreparedFixturesDisposition
+): PreparedStoryboardFixtures {
+  const captures = disposition.status === 'resolved' ? (seeding?.preparedCaptures?.values ?? {}) : {};
+  const captureProvenance = disposition.status === 'resolved' ? (seeding?.preparedCaptures?.provenance ?? {}) : {};
+  const witnesses = disposition.status === 'resolved' ? (seeding?.preparedCaptures?.witnesses ?? {}) : {};
+  const unsatisfied = (seeding?.resolutionRecords ?? []).filter(record => record.status === 'unsatisfied');
+  return createPreparedStoryboardFixtures({
+    binding: buildCurrentPreparedBinding(storyboard, agentUrls, options),
+    ...(seeding?.bindings && { bindings: seeding.bindings }),
+    resolutions: seeding?.resolutionRecords ?? [],
+    coverageGaps:
+      unsatisfied.length > 0
+        ? [
+            {
+              reason: 'fixture_unsatisfied',
+              detail:
+                'detail' in disposition ? disposition.detail : 'a declared strategy ladder exhausted without a binding',
+              fixtures: unsatisfied.map(record => ({
+                fixture_type: record.fixture_type,
+                handle: record.handle,
+                ...(record.product_handle && { product_handle: record.product_handle }),
+                requirements: record.requirements,
+              })),
+            },
+          ]
+        : [],
+    captures,
+    captureProvenance,
+    witnesses,
+    disposition,
+    ...(seeding?.phase && { phase: seeding.phase }),
+  });
+}
+
+/**
+ * Nonsecret binding for the scope a run is executing in RIGHT NOW. Recomputed
+ * at every prepared-state lookup so a reroute, account switch or auth
+ * override after preparation is observed rather than inherited.
+ */
+function buildCurrentPreparedBinding(
+  storyboard: Storyboard,
+  agentUrls: string[],
+  options: StoryboardRunOptions,
+  step?: StoryboardStep,
+  runOptions?: StoryboardRunOptions,
+  context?: StoryboardContext,
+  selectedRoute?: { agentKey?: string; agentUrl?: string },
+  runnerVars?: RunnerVariables
+): PreparedFixtureBinding {
+  return buildPreparedBinding({
+    storyboard,
+    agentUrls,
+    ...(options.adcpVersion && { adcpVersion: options.adcpVersion }),
+    ...((runOptions ?? options).agents && {
+      agentRouteMap: Object.entries((runOptions ?? options).agents ?? {}).map(
+        ([key, entry]) => [key, entry?.url ?? ''] as [string, string]
+      ),
+    }),
+    accountScope: resolveBindingAccountScope(storyboard, options),
+    brandScope: resolveBindingBrandScope(storyboard, options),
+    ...(step !== undefined && { ...resolveBindingRequestAccountScope(step, context, options, runnerVars) }),
+    sandbox: !(options.disable_sandbox === true || options.sandbox === false),
+    ...(options.prepared_fixtures_principal !== undefined && { principal: options.prepared_fixtures_principal }),
+    // The diffed credential always comes from the RUN options. A routed
+    // dispatch flattens `agents[key].auth` into a bare `auth` on its
+    // per-step view, so deriving it from `assignment.options` would make an
+    // unchanged routed credential read as a mismatch and refuse every step
+    // of every routed run. The step's own view feeds the separate,
+    // undiffed `step_credential_fingerprint` instead.
+    credential: resolveBindingCredential(runOptions ?? options),
+    ...(() => {
+      if (step === undefined) return {};
+      // Emitted whenever the step's EFFECTIVE credential differs from the
+      // run's, not only when the step authors `auth`. A routed step
+      // inherits `agents[key].auth` flattened onto its per-step view, so
+      // keying on `step.auth` alone showed the authorizer the aggregate run
+      // fingerprint for a step dispatching under one specialism's
+      // credential.
+      const stepCredential = resolveBindingCredential(options, step);
+      if (stepCredential === resolveBindingCredential(runOptions ?? options)) return {};
+      return {
+        stepCredential,
+        // The fingerprint is an HMAC under a per-process key, so a host can
+        // observe that it changed but never what it is. This companion is the
+        // value an authorizer can actually branch on.
+        stepAuthKind:
+          step.auth === undefined
+            ? ('routed' as const)
+            : step.auth === 'none'
+              ? ('none' as const)
+              : ('override' as const),
+      };
+    })(),
+    ...(step !== undefined && runOptions !== undefined && (runOptions.agents || selectedRoute)
+      ? resolveBindingStepRoute(step, runOptions, selectedRoute)
+      : {}),
+    // Never mint one here: `current.run_id` is handed to the authorizer as
+    // "identity of the preparation run", and a fresh UUID per lookup is
+    // noise for a host trying to correlate on it.
+    runId: options.prepared_fixtures_run_id ?? '',
+  });
+}
+
+/**
+ * The specialism key and URL this step actually dispatches to.
+ *
+ * `agent_urls` is the sorted set of every route in the run, which says
+ * nothing about which one THIS step uses. An authorizer scoping a grant to
+ * one seller needs the step's own route, not the run's route set.
+ */
+function resolveBindingStepRoute(
+  step: StoryboardStep,
+  runOptions: StoryboardRunOptions,
+  selected?: { agentKey?: string; agentUrl?: string }
+): { stepRoute?: string } {
+  // The DISPATCHER's answer first. Routing resolves by protocol claim (or
+  // `options.default_agent`) when the author names no `step.agent`, and
+  // that decision is invisible to the authorizer otherwise — which left
+  // the common routed case with no field naming the seller about to be
+  // contacted, the exact gap this closes.
+  if (typeof selected?.agentUrl === 'string' && selected.agentUrl.length > 0) {
+    return { stepRoute: `${selected.agentKey ?? '#default'}@${redactOAuthUrlForOutput(selected.agentUrl)}` };
+  }
+  const agents = runOptions.agents ?? {};
+  const key = step.agent;
+  if (typeof key !== 'string' || !Object.hasOwn(agents, key)) return {};
+  const url = agents[key]?.url;
+  if (typeof url !== 'string') return {};
+  return { stepRoute: `${key}@${redactOAuthUrlForOutput(url)}` };
+}
+
+/**
+ * The account the step's request will ACTUALLY carry.
+ *
+ * Built by calling `buildStepRequest` — the same function dispatch calls —
+ * rather than re-deriving the request. A reimplementation drifted from it
+ * immediately: it missed the `expect_error` and `governedFixture` arms,
+ * and it keyed the enricher on the authored `step.task` rather than the
+ * resolved one, so a `$test_kit.*` step reported no account at all while
+ * a context-substituted one went out on the wire.
+ *
+ * `applyBrandInvariant` runs inside the builder, so a step that authors
+ * no account still reports the synthesized one — what the authorizer is
+ * shown is what the seller receives.
+ */
+function resolveBindingRequestAccountScope(
+  step: StoryboardStep,
+  context: StoryboardContext | undefined,
+  options: StoryboardRunOptions,
+  runnerVars?: RunnerVariables
+): { requestAccountScope?: string } {
+  if (!context) return {};
+  let account: unknown;
+  try {
+    // Resolved exactly as dispatch resolves it: `$test_kit.<path>` names a
+    // task through the test kit, and the enricher is keyed on the result.
+    const resolvedTask = resolveTaskName(step, options) ?? step.task;
+    const effectiveStep: StoryboardStep = resolvedTask === step.task ? step : { ...step, task: resolvedTask };
+    account = buildStepRequest(step, effectiveStep, context, options, runnerVars).account;
+  } catch {
+    // A request the builder cannot assemble is a step that will fail
+    // before dispatch; reporting no scope is truthful there.
+    return {};
+  }
+  if (account === undefined || account === null) return {};
+  return { requestAccountScope: canonicalizeScope(account) };
+}
+
+/**
+ * The brand the run actually discovers under.
+ *
+ * `discoverProductCatalog` resolves TWO scoping dimensions and sends both on
+ * `get_products`: the account, and separately `context.brand ?? account.brand
+ * ?? resolveBrand(options)`. Binding only the account let a graph discovered
+ * under one advertiser's catalog be reused under another's — with the
+ * authorizer unable to refuse, because the lookup payload could not express
+ * the difference. Mirror seeding's resolution exactly.
+ */
+function resolveBindingBrandScope(storyboard: Storyboard, options: StoryboardRunOptions): string {
+  const merged = { ...storyboard.context, ...options.context } as Record<string, unknown>;
+  const record = (value: unknown): Record<string, unknown> | undefined =>
+    value !== null && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  const contextAccount = record(merged.account);
+  const brand = record(merged.brand) ?? record(contextAccount?.brand) ?? resolveBrand(options);
+  return canonicalizeScope(brand ?? {});
+}
+
+/** Stable, key-ordered rendering used by both scope fields. */
+function canonicalizeScope(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(canonicalizeScope).join(',')}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .filter(([, nested]) => nested !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([key, nested]) => `${JSON.stringify(key)}:${canonicalizeScope(nested)}`)
+    .join(',')}}`;
+}
+
+/**
+ * The account identity the run actually transacts under.
+ *
+ * Read from the SAME source `discoverProductCatalog` uses — `context.account`
+ * when the storyboard or caller supplies one, otherwise `resolveAccount` —
+ * rather than from the brand alone. `resolveAccount` derives `operator` from
+ * `brand.domain`, so a brand-derived proxy conflates accounts that share a
+ * brand but differ by operator or unit, which is a real catalog shape
+ * (`brand: acmeoutdoor.example`, `operator: pinnacle-agency.example`).
+ *
+ * Every scoping field on the account reference is folded in, canonicalized,
+ * so a unit or account_id that distinguishes two accounts also distinguishes
+ * two bindings.
+ */
+function resolveBindingAccountScope(storyboard: Storyboard, options: StoryboardRunOptions): string {
+  // The runner hands discovery the MERGED run context (storyboard defaults
+  // then caller overrides), so reading `options.context` alone would miss a
+  // storyboard-level account default and hand the authorizer a scope the
+  // discovery call never used.
+  const merged = { ...storyboard.context, ...options.context } as Record<string, unknown>;
+  const contextAccount =
+    merged.account !== null && typeof merged.account === 'object' && !Array.isArray(merged.account)
+      ? (merged.account as Record<string, unknown>)
+      : undefined;
+  const account = contextAccount ?? (resolveAccount(options) as unknown as Record<string, unknown>);
+  return canonicalizeScope(account ?? {});
+}
+
+/**
+ * Transport credential used only to derive a per-process HMAC fingerprint.
+ * The value never leaves this function; nothing downstream sees the secret.
+ */
+function resolveBindingCredential(options: StoryboardRunOptions, step?: StoryboardStep): string {
+  const parts: string[] = [];
+  // The EFFECTIVE credential for the step about to execute, not just the
+  // run's. `step.auth` is applied later inside step execution, so a binding
+  // built from run options alone would tell the authorizer the credential is
+  // unchanged while the step actually dispatches unauthenticated or with a
+  // deliberately invalid key.
+  if (step?.auth !== undefined) {
+    parts.push(`step_auth:${JSON.stringify(describeStepAuthDirective(step.auth))}`);
+  }
+  // EVERY header, not just `Authorization`. The SDK's own documentation for
+  // `headers` gives `x-api-key` and `x-org-id` as the canonical example, and
+  // cherry-picking `Authorization` would let two tenants that scope
+  // themselves that way produce identical bindings — an ABSENT fingerprint
+  // on both sides, which compares equal.
+  // Sort on the LOWERCASED name: a hosted route receives headers already
+  // lowercased by Node, so sorting on the raw name would order an identical
+  // credential set differently and read as a mismatch.
+  // Comparator must return 0 for equal keys: two headers differing only in
+  // case lowercase to the same emitted part, and an inconsistent comparator
+  // made the fingerprint depend on insertion order.
+  const headerEntries = Object.entries(options.headers ?? {}).sort(([a], [b]) => {
+    const left = a.toLowerCase();
+    const right = b.toLowerCase();
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+  for (const [name, value] of headerEntries) {
+    // Stringify rather than skip: undici transmits a numeric header value
+    // just fine, and skipping it made a tenant-scoping header fingerprint
+    // identically to no credential at all.
+    if (value !== undefined && value !== null)
+      parts.push(`header:${JSON.stringify([name.toLowerCase(), String(value)])}`);
+  }
+  const describeAuth = (auth: StoryboardRunOptions['auth'], label: string): void => {
+    if (!auth) return;
+    // Every component is JSON-encoded before joining. Colon-joining was
+    // ambiguous: basic `{username: 'a:b', password: 'c'}` and
+    // `{username: 'a', password: 'b:c'}` produced the same string while
+    // transmitting different credentials.
+    if (auth.type === 'bearer') parts.push(`${label}:bearer:${JSON.stringify(auth.token)}`);
+    else if (auth.type === 'basic') parts.push(`${label}:basic:${JSON.stringify([auth.username, auth.password])}`);
+    // OAuth access tokens rotate by design, so the stable identity is the
+    // grant's client id rather than the current token. Binding to a rotating
+    // token would break legitimate reuse without adding any protection.
+    else if (auth.type === 'oauth') {
+      // BOTH the application and the grant. `client_id` identifies the
+      // application only, so two users who authorized the same application
+      // would otherwise produce one binding. The refresh token is the
+      // stable per-grant identity; the access token rotates by design, so
+      // the whole token set is the fallback only when no refresh token
+      // exists.
+      parts.push(
+        `${label}:oauth:${JSON.stringify([
+          auth.client?.client_id ?? null,
+          typeof auth.tokens?.refresh_token === 'string' ? auth.tokens.refresh_token : null,
+          typeof auth.tokens?.refresh_token === 'string' ? null : (auth.tokens ?? null),
+        ])}`
+      );
+    } else {
+      parts.push(
+        `${label}:oauth_cc:${JSON.stringify([
+          auth.credentials?.client_id ?? null,
+          auth.credentials?.client_secret ?? null,
+        ])}`
+      );
+    }
+  };
+  describeAuth(options.auth, 'run');
+  for (const [key, entry] of Object.entries(options.agents ?? {}).sort(([a], [b]) => (a < b ? -1 : 1))) {
+    // Keyed by SPECIALISM KEY *and* URL, not the key alone. `agent_urls` is
+    // sorted so route order does not matter, which means swapping the URLs
+    // of two specialisms while leaving their credentials in place produced
+    // a byte-identical binding — while sending each credential to the other
+    // seller. The pairing is the thing that changed, so the pairing is what
+    // has to be described.
+    describeAuth(entry?.auth, `agent:${JSON.stringify([key, entry?.url ?? null])}`);
+  }
+  // The WHOLE kit, not just `test_kit.auth`. `resolveStepBasicFromTestKit`
+  // walks an arbitrary dotted path from the kit ROOT, so a step authoring
+  // `auth: { type: 'basic', from_test_kit: 'tenants.b.basic' }` dispatched a
+  // credential neither fingerprint could see: the directive text is pinned
+  // by `storyboard_digest`, but its RESOLUTION was pinned by nothing, and
+  // two kits differing only outside `auth` produced byte-identical run and
+  // step fingerprints while putting different principals on the wire.
+  const kit = options.test_kit as Record<string, unknown> | undefined;
+  if (kit) {
+    for (const [key, value] of Object.entries(kit).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+      if (key === 'auth') {
+        // `auth` keeps its per-field expansion so `probe_task` — a task
+        // name, not a credential, and one that legitimately differs
+        // between otherwise-identical kits — stays out of the fingerprint.
+        //
+        // `authField`, not `authKey`: this binds the FIELD NAME inside
+        // `test_kit.auth` (`api_key`, `basic`, `probe_task`), never a
+        // credential — `authValue` is the credential. The accurate name
+        // also stops a static analyzer reading the label as a secret and
+        // reporting a second, spurious source into the fingerprint HMAC
+        // alongside the real one.
+        for (const [authField, authValue] of Object.entries((value ?? {}) as Record<string, unknown>).sort(
+          ([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)
+        )) {
+          if (authField === 'probe_task') continue;
+          if (authValue !== undefined && authValue !== null) {
+            parts.push(`test_kit:${JSON.stringify([`auth.${authField}`, authValue])}`);
+          }
+        }
+        continue;
+      }
+      if (value !== undefined && value !== null) parts.push(`test_kit:${JSON.stringify([key, value])}`);
+    }
+  }
+  // An explicit sentinel rather than `undefined`: "prepared with no
+  // credential" and "prepared with one, reused without" must not both read
+  // as an absent field that compares equal.
+  return parts.length > 0 ? parts.join('\u0000') : 'none';
+}
+
+/**
+ * Execute a single pass of the storyboard against the supplied replica URLs
+ * using round-robin dispatch starting at `dispatchOffset`. Called directly
+ * by `runStoryboard` (offset 0) and repeatedly by `runMultiPass` (offsets
+ * 0..N-1). Taking the offset as an explicit parameter keeps the dispatcher
+ * primitive out of the public `StoryboardRunOptions` type.
+ */
+async function executeStoryboardPass(
+  agentUrls: string[],
+  storyboard: Storyboard,
+  options: StoryboardRunOptions,
+  dispatchOffset: number,
+  preSeeded?: PreSeededInput
+): Promise<StoryboardResult> {
+  const start = Date.now();
+  const isMultiInstance = agentUrls.length > 1;
+  const useRouting = options.agents !== undefined;
+
+  // Authorize BEFORE any seller contact at all — before clients are
+  // constructed and before capability discovery, not merely before the
+  // mutating calls. The binding needs no seller input (storyboard digest,
+  // routes, on-disk schema artifact, caller account and credential), so
+  // there is no reason for an unauthorized caller to reach the agent's
+  // discovery endpoint.
+  let preparedGate: Awaited<ReturnType<typeof gatePreparedFixtures>> = { used: false };
+  if (options.prepared_fixtures !== undefined) {
+    preparedGate = await gatePreparedFixtures(storyboard, agentUrls, options);
+    if (preparedGate.used && 'refusal' in preparedGate) {
+      return denyPreparedFixtures(
+        options,
+        buildPreparedRefusalRunResult(agentUrls, storyboard, preparedGate.refusal),
+        preparedGate.refusal.code
+      );
+    }
+  }
+
+  // Per-specialism routing builds its own clients + per-agent discovery; the
+  // legacy single/multi-instance path discovers against the first replica.
+  let clients: TestClient[];
+  let routingContext: AgentRoutingContext | undefined;
+  let profile: AgentProfile | undefined;
+  let callerOwnsClients = hasTestClientScope();
+
+  if (useRouting) {
+    try {
+      routingContext = await buildRoutingContext(storyboard, options);
+    } catch (err) {
+      const detail = redactOAuthUrlsInText((err as Error)?.message ?? String(err));
+      const failedStep: TestStepResult = {
+        step:
+          err instanceof DiscoveryFailure
+            ? `Discover agent capabilities (${err.agentKey})`
+            : 'Build agent routing index',
+        passed: false,
+        duration_ms: 0,
+        error: detail,
+      };
+      if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+      return buildDiscoveryFailedResult(agentUrls, storyboard, failedStep);
+    }
+    clients = [...routingContext.clients.values()];
+    // See note on the non-routing branch below: per-storyboard session reset
+    // prevents a stale `pendingTaskId` from a prior storyboard's non-terminal
+    // step from auto-threading into this storyboard's first call. (#1585)
+    resetClientSessions(clients);
+    // Retain a primary profile for run-level reporting. Execution and
+    // capability applicability below use each step's selected agent.
+    profile = [...routingContext.profiles.values()][0];
+    // For `required_tools` gating, union every agent's advertised tools so
+    // a storyboard that needs ≥1 of [sync_governance, activate_signal]
+    // passes the gate when any tenant in the map serves either one.
+    const unionedTools = new Set<string>();
+    for (const p of routingContext.profiles.values()) {
+      for (const t of normalizeAgentToolNames(p.tools) ?? []) unionedTools.add(t);
+    }
+    // Routed discovery is authoritative. Caller-supplied single-agent tools
+    // cannot widen or suppress this topology's storyboard applicability.
+    options = { ...options, agentTools: [...unionedTools], _profile: profile };
+  } else {
+    // Build one client per URL. In single-URL mode `_client` (from comply()) is
+    // honored so the shared MCP transport is reused across storyboards.
+    const clientResolutions = agentUrls.map(url => getOrCreateClientResolution(url, options));
+    clients = clientResolutions.map(r => r.client);
+    callerOwnsClients ||= clientResolutions.some(r => r.reusedShared);
+
+    // Drop any retained A2A session ids before this storyboard's first call.
+    // `comply()` shares one client across N storyboards for transport reuse;
+    // AgentClient.retainSession holds onto `pendingTaskId` from non-terminal
+    // responses (`submitted`/`working`/`input-required`) and auto-threads it
+    // into every subsequent `message/send`. Without a per-storyboard reset, a
+    // prior storyboard's stale `task_id` rides into the next storyboard's
+    // first call (typically `get_products`) and the seller correctly
+    // returns "Task <uuid> not found" on a buyer-side reference to a task it
+    // never opened. (#1585)
+    resetClientSessions(clients);
+
+    // Discover agent profile against the first instance; all instances are
+    // expected to run the same code behind a shared state store, so one probe
+    // is sufficient. For multi-instance runs, skipping N-1 redundant
+    // get_agent_info calls also keeps CI output clean.
+    if (hasTestClientScope() || !callerOwnsClients) {
+      const discovered = await getOrDiscoverStoryboardProfile(clients[0]!, options);
+      // Discovery failure must surface as a HARD STORYBOARD FAILURE, not a
+      // silent empty `agentTools: []` that lets every step skip with
+      // `missing_tool`. The latter mode produces "X/X clean" summaries with
+      // 100% skipped — invisible CI failure when transport setup is broken
+      // (auth misconfig, MCP transport-fallback bugs, network policy, etc.).
+      // See: https://github.com/adcontextprotocol/adcp-client/issues/...
+      if (discovered.step.passed === false) {
+        if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+        return buildDiscoveryFailedResult(agentUrls, storyboard, discovered.step, discovered.profile);
+      }
+      profile = discovered.profile;
+      // Populate agentTools and _profile from discovered profile if not already set.
+      // _profile is threaded into executeStep so capability-based skip gates
+      // (e.g. account-mode branching) can read raw_capabilities at step time.
+      const profileTools = normalizeAgentToolNames(profile?.tools);
+      if (hasTestClientScope() && profileTools) {
+        options = { ...options, agentTools: profileTools, _profile: profile };
+      } else if (!options.agentTools && profileTools) {
+        options = { ...options, agentTools: profileTools, _profile: profile };
+      } else if (profile && !options._profile) {
+        options = { ...options, _profile: profile };
+      }
+    } else {
+      profile = options._profile;
+      const profileTools = normalizeAgentToolNames(profile?.tools);
+      if (!options.agentTools && profileTools) {
+        options = { ...options, agentTools: profileTools, _profile: profile };
+      } else if (
+        !options.agentTools &&
+        typeof (clients[0] as unknown as { getAgentInfo?: unknown })?.getAgentInfo === 'function'
+      ) {
+        const discovered = await getOrDiscoverStoryboardProfile(clients[0]!, options);
+        if (discovered.step.passed === false) {
+          return buildDiscoveryFailedResult(agentUrls, storyboard, discovered.step, discovered.profile);
+        }
+        profile = discovered.profile;
+        const discoveredTools = normalizeAgentToolNames(profile?.tools);
+        if (discoveredTools) {
+          options = { ...options, agentTools: discoveredTools, _profile: profile };
+        } else if (profile && !options._profile) {
+          options = { ...options, _profile: profile };
+        }
+      }
+    }
+  }
+
+  const reusedDiscoveryFailure =
+    profile &&
+    describeProfileDiscoveryFailure(
+      profile,
+      options._requireValidCapabilityEvidence === true,
+      options._allowCapabilityDiagnostic === true
+    );
+  if (reusedDiscoveryFailure) {
+    if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+    return buildDiscoveryFailedResult(agentUrls, storyboard, reusedDiscoveryFailure, profile);
+  }
+
+  // A pinned graph is authoritative: resetting and re-seeding would discard
+  // the very state the prepared run is supposed to execute against.
+  if (preSeeded === undefined && !preparedGate.used) {
+    const resetTargets =
+      routingContext && options.agents
+        ? [...routingContext.profiles.entries()].map(([key, profile]) => ({
+            client: routingContext!.clients.get(key)!,
+            options: routedAgentOptions(options.agents![key]!, options, profile),
+          }))
+        : clients.map(client => ({ client, options }));
+    const resetFailure = await resetControllerStates(resetTargets, storyboard);
+    if (resetFailure) {
+      if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+      return buildDiscoveryFailedResult(agentUrls, storyboard, resetFailure);
+    }
+  }
+
+  const allRequires = resolveStoryboardRequires(storyboard, options);
+  let dispatch =
+    routingContext && options.agents
+      ? createRoutingDispatcher(routingContext, options, options.agents)
+      : createDispatcher(agentUrls, clients, 'round-robin', dispatchOffset, profile);
+  // Root predicates describe the agent under test. A declared default agent
+  // owns that gate for the whole storyboard, including governance-agent steps.
+  // Without a default, keep each selected route's own applicability verdict.
+  // Phase predicates always remain scoped to the selected step route.
+  const routedRootCapabilityDetail = (() => {
+    if (!routingContext || !options.default_agent || storyboardCapabilityPredicates(storyboard).length === 0)
+      return null;
+    const profile = routingContext.profiles.get(options.default_agent);
+    if (!profile) {
+      return (
+        evaluateStoryboardCapabilityGates(storyboard, undefined, undefined, options.adcpVersion) ??
+        'Capability predicates could not be evaluated: no discovered agent profile.'
+      );
+    }
+    return evaluateStoryboardCapabilityGates(
+      storyboard,
+      profile,
+      normalizeAgentToolNames(profile.tools),
+      options.adcpVersion
+    );
+  })();
+  const routedStepCapabilitySkips = new Map<StoryboardStep, string>();
+  const routedPhaseCapabilitySkips = new Map<string, string>();
+  const routedStepRequirements = new Map<StoryboardStep, string>();
+  const routedRootCapabilitySkips: string[] = [];
+  // Routed requirement failures are kept in their OWN channel. Folding them
+  // into `routedRootCapabilitySkips` made an unmet `request_signer` surface as
+  // `capability_unsupported` with no `skip.requirement`, so routed and
+  // non-routed runs of the same agent disagreed and the provenance of the
+  // skip — authored capability predicate vs. unmet runtime requirement — was
+  // unrecoverable downstream (adcp-client#2945 review).
+  const routedRootRequirementSkips: Array<{ requirement: string; detail: string }> = [];
+  // `controller` answers from the route that owns the state this storyboard
+  // exercises — never from the cross-tenant union assembled above. That union
+  // exists for `required_tools` ANY-OF gating ("a storyboard that needs >=1 of
+  // [sync_governance, activate_signal] passes when any tenant serves either
+  // one"), which is disjunctive by design. Controller availability is the
+  // opposite question: a peer tenant's `comply_test_controller` cannot seed
+  // another tenant's state, which is the invariant the fixture-resolution
+  // callback below already asserts — "No union member can authorize a selected
+  // agent's operation". Reading the union let a signals peer's controller
+  // satisfy a seller's gate, and the seller's steps then executed against
+  // unseeded state and graded green (adcp-client#2945 review).
+  //
+  // Scope is deliberately (C), not "every callable route must have one": a
+  // route that is merely read from — a signals peer serving static marketplace
+  // data — is not a fixture target and needs no controller of its own. So the
+  // gate is unmet only when NO route serving a state-exercising step advertises
+  // one. The fixture seeding pass checks controller availability again on
+  // each selected owner route, so this broad prerequisite cannot authorize
+  // a peer tenant's seed operation.
+  //
+  // Keyed by the EXACT `options.agents` key, never by URL: two keys may share
+  // one URL with different `auth` (one tenant per bearer behind a shared
+  // control plane). URL keying collapsed them into whichever key the map lists
+  // first, so the last step to dispatch overwrote the other's tool list and
+  // the verdict flipped with step order — a false negative for a seller that
+  // does advertise a controller, and misattributed route names in the detail
+  // (adcp-client#2945 review).
+  const routedControllerRoutes = new Map<
+    string,
+    {
+      /** Tools discovered for this exact route. */
+      tools: readonly string[];
+      /**
+       * True once this route serves a step that is not itself a
+       * `comply_test_controller` back-channel call — i.e. a step whose state
+       * a controller would have to seed.
+       */
+      stateExercising: boolean;
+    }
+  >();
+  const routedErrors = new Map<StoryboardStep, unknown>();
+  const reportedRoutingErrors = new Set<StoryboardStep>();
+  const runContext = createRunContext(storyboard, options);
+  const protectedWriter = runContext.protectedWriter;
+  let context: StoryboardContext = runContext.context;
+  const routingFailedStep = (step: StoryboardStep, phaseId: string, err: unknown): StoryboardStepResult => {
+    const detail = redactOAuthUrlsInText(
+      err instanceof RoutingError ? err.message : ((err as Error)?.message ?? String(err))
+    );
+    const failedAgentKey = step.agent ?? options.default_agent;
+    const failedAgentUrl = failedAgentKey ? options.agents?.[failedAgentKey]?.url : undefined;
+    const failedAgentIndex = failedAgentKey ? Object.keys(options.agents ?? {}).indexOf(failedAgentKey) : -1;
+    return {
+      storyboard_id: storyboard.id,
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      passed: false,
+      duration_ms: 0,
+      validations: [],
+      context,
+      error: detail,
+      ...(failedAgentUrl && { agent_url: redactOAuthUrlForOutput(failedAgentUrl) }),
+      ...(failedAgentIndex >= 0 && { agent_index: failedAgentIndex + 1 }),
+      extraction: { path: 'none' },
+    };
+  };
+  if (routingContext) {
+    for (const phase of storyboard.phases) {
+      for (const step of phase.steps) {
+        if (step.task === VALIDATION_ONLY_TASK) continue;
+        try {
+          const selected = dispatch.nextFor(step);
+          const selectedOptions = selected.options!;
+          const rootDetail = options.default_agent
+            ? routedRootCapabilityDetail
+            : evaluateStoryboardCapabilityGates(
+                storyboard,
+                selected.profile,
+                selectedOptions.agentTools,
+                options.adcpVersion
+              );
+          let requirementSkip: { requirement: string; detail: string } | undefined;
+          if (rootDetail === null && allRequires.includes('request_signer')) {
+            const requirement = await checkRequires(['request_signer'], storyboard, selectedOptions, {
+              ...selected.profile!,
+              // Routed discovery is authoritative. A legacy agent without a
+              // capabilities response did not opt into request signing.
+              raw_capabilities: selected.profile!.raw_capabilities ?? {},
+            });
+            if ('requirement' in requirement) {
+              requirementSkip = requirement;
+              routedStepRequirements.set(step, requirement.requirement);
+            }
+          }
+          // Evaluated up front, not lazily behind `??`, because the controller
+          // provenance below has to know whether this step will actually run.
+          // `evaluateRequiresCapabilityGate` is pure, so hoisting it is free.
+          const phaseDetail = phase.requires_capability
+            ? evaluateRequiresCapabilityGate(
+                phase.requires_capability,
+                selected.profile,
+                selectedOptions.agentTools,
+                options.adcpVersion
+              )
+            : null;
+          // Only routes whose step will actually run can vouch for — or be
+          // held to — the `controller` gate. A route the storyboard's own
+          // capability predicate (root OR phase) puts out of scope executes
+          // nothing, so it exercises no state and is no fixture target
+          // (adcp-client#2945 review).
+          //
+          // A route whose `request_signer` verdict came back unmet is
+          // deliberately NOT excluded: that route IS in the storyboard's
+          // declared scope and merely lacks a runtime capability, so it stays
+          // in the set and declared order — not exclusion order — decides
+          // which of the two gates is reported. That is what keeps parity with
+          // a non-routed run, which assesses both from the same profile.
+          if (allRequires.includes('controller') && rootDetail === null && phaseDetail === null) {
+            // Always set in routed mode: `createRoutingDispatcher` throws
+            // rather than returning an assignment without a key.
+            const routeKey = selected.agentKey ?? selected.agentUrl;
+            // `routedAgentOptions` always projects the route's discovered
+            // tools (`[]` when the agent advertises none), so there is no
+            // undiscovered-tools case to guess at here.
+            const routeTools = selectedOptions.agentTools ?? [];
+            const resolvedTask = resolveTaskName(step, selectedOptions) ?? step.task;
+            const previous = routedControllerRoutes.get(routeKey);
+            routedControllerRoutes.set(routeKey, {
+              tools: routeTools,
+              // A `comply_test_controller` step is the back-channel itself,
+              // not the state under test, so it cannot vouch for the route it
+              // is dispatched to. One state-exercising step is enough to mark
+              // the route, whatever order the steps arrive in.
+              stateExercising: (previous?.stateExercising ?? false) || resolvedTask !== 'comply_test_controller',
+            });
+          }
+          // Two provenances, two channels. Per-step skip detail is unchanged:
+          // a route that opted out still yields a `not_applicable` step skip
+          // carrying `skip.requirement`, which is the established routed
+          // behaviour for partial coverage.
+          if (rootDetail !== null) routedRootCapabilitySkips.push(rootDetail);
+          else if (requirementSkip) routedRootRequirementSkips.push(requirementSkip);
+          const detail = rootDetail ?? requirementSkip?.detail ?? phaseDetail;
+          if (detail !== null) routedStepCapabilitySkips.set(step, detail);
+        } catch (error) {
+          // Routing errors remain failures, never evidence of inapplicability:
+          // an ambiguous claim, an unmapped tool, a broken route, or a
+          // topology that cannot serve a step the storyboard authored are all
+          // actionable.
+          routedErrors.set(step, error);
+        }
+      }
+      const callableSteps = phase.steps.filter(step => step.task !== VALIDATION_ONLY_TASK);
+      if (callableSteps.length && callableSteps.every(step => routedStepCapabilitySkips.has(step))) {
+        routedPhaseCapabilitySkips.set(phase.id, routedStepCapabilitySkips.get(callableSteps[0]!)!);
+      }
+    }
+  }
+
+  const routedPreflightAssignment = routingContext
+    ? (step: StoryboardStep): StepAssignment | undefined => {
+        if (routedStepCapabilitySkips.has(step)) return undefined;
+        try {
+          return dispatch.nextFor(step);
+        } catch {
+          return undefined;
+        }
+      }
+    : undefined;
+
+  // Evaluate `requires` tags before any phase setup. The runner detects
+  // which requirements are available on this run; an unmet requirement
+  // skips the whole storyboard with `requirement_unmet` rather than
+  // producing a cascade of `missing_test_controller` per-step skips.
+  // Spec: adcp-client#1626. The default (no `requires` field) is
+  // `[real_wire]`, which is always available — untagged storyboards
+  // run unchanged.
+  //
+  // Implicit requirements (adcp-client#1678) are unioned with the
+  // declared list: today this means `'webhook_receiver'` is added when
+  // any step's `sample_request` references `{{runner.webhook_url:…}}`
+  // or `{{runner.webhook_base}}`. Authors do not need to retag those
+  // storyboards — the token presence is the declaration. Without the
+  // implicit gate, storyboards that name the receiver but run without
+  // one would silently ship literal mustache tokens on the wire and
+  // get rejected by 3.0-strict sellers as `INVALID_REQUEST: relative URL`.
+  // Pre-flight notice collection. Uses options._profile (set by the comply()
+  // pipeline before calling runStoryboard) so the notices are available on
+  // early-return results (requirement-unmet, capability-unsupported). In the
+  // standalone runner path options._profile may be undefined; notices will be
+  // collected again from the fully-fetched profile at result-build time.
+  const preflightNotices = collectCapabilityNotices(storyboard, options._profile);
+
+  const callableStepCount = storyboard.phases.reduce(
+    (n, phase) => n + phase.steps.filter(step => step.task !== VALIDATION_ONLY_TASK).length,
+    0
+  );
+
+  // Capability applicability is intentionally first. Optional capability
+  // storyboards must grade not_applicable for agents that did not opt in,
+  // without inspecting or reporting any missing operator runtime adapter.
+  if (storyboardCapabilityPredicates(storyboard).length > 0) {
+    const unmetDetail = routingContext
+      ? routedRootCapabilitySkips.length > 0 && routedRootCapabilitySkips.length === callableStepCount
+        ? routedRootCapabilitySkips[0]!
+        : null
+      : evaluateStoryboardCapabilityGates(storyboard, profile, options.agentTools, options.adcpVersion);
+    if (unmetDetail !== null) {
+      if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+      return {
+        ...buildCapabilityUnsupportedResult(agentUrls, storyboard, unmetDetail),
+        notices: preflightNotices,
+      };
+    }
+  }
+
+  // Every route opted out of a runtime requirement: hand that verdict to the
+  // ordered `requires` gate below rather than returning here, so it competes
+  // on the same footing as `controller` and any unknown forward-compat value.
+  // Returning early reported `request_signer` even when an earlier gate was
+  // also unmet, which diverged from a non-routed run of the same agent
+  // (adcp-client#2945 review). The verdict itself is still the routed one —
+  // `checkRequires` cannot recompute it without a run-level profile — and it
+  // still replaces the old `capability_unsupported` mislabel, which claimed
+  // the authored capability predicate had evaluated false when the agent had
+  // in fact satisfied it.
+  const establishedRequirements = new Map<string, PrecomputedRequirementVerdict>();
+  // In routed mode BOTH agent-dependent requirements are the preflight's to
+  // own — always, in every status. Entering them here (rather than filtering
+  // them out of the gate's input list) is what lets `checkRequires` evaluate
+  // the full declared list, so an earlier declared requirement still wins and
+  // declared-order parity with a non-routed run of the same agent holds.
+  if (routingContext && allRequires.includes('controller')) {
+    const decided = [...routedControllerRoutes].filter(([, route]) => route.stateExercising);
+    // A storyboard whose only in-scope callable steps ARE the controller
+    // back-channel still needs a controller — on the route those steps
+    // dispatch to. Falling back to every in-scope route keeps that fail-closed
+    // instead of silently dropping the gate and dialing the wire
+    // (adcp-client#2945 review).
+    const routes = decided.length > 0 ? decided : [...routedControllerRoutes];
+    if (routedErrors.size > 0 || routes.length === 0) {
+      // Routing failures outrank every requirement, and with no in-scope
+      // route there is nothing authoritative to read. Either way the union
+      // must not answer in its place.
+      establishedRequirements.set('controller', { status: 'unknown' });
+    } else if (routes.some(([, route]) => route.tools.includes('comply_test_controller'))) {
+      establishedRequirements.set('controller', { status: 'met' });
+    } else {
+      const exercised = routes.map(([key]) => key);
+      const exercisedKeys = new Set(exercised);
+      const peersWithController = [...routingContext.profiles.entries()]
+        .filter(
+          ([key, peer]) =>
+            !exercisedKeys.has(key) && normalizeAgentToolNames(peer.tools)?.includes('comply_test_controller')
+        )
+        .map(([key]) => key);
+      establishedRequirements.set('controller', {
+        status: 'unmet',
+        requirement: 'controller',
+        detail:
+          `Storyboard requires 'controller'; no route serving this storyboard's steps advertises ` +
+          `comply_test_controller. Route(s) exercised: [${exercised.join(', ')}]. ` +
+          (peersWithController.length
+            ? `Agent(s) [${peersWithController.join(', ')}] in this map do advertise it, but a peer ` +
+              `route's controller cannot seed another route's state — a run-level tool union does not ` +
+              `grant it. `
+            : '') +
+          `Add comply_test_controller to the route that owns the state, or pin the seeding step to ` +
+          `that route with 'agent:'.`,
+      });
+    }
+  }
+  if (routingContext && allRequires.includes('request_signer')) {
+    // Every in-scope route opted out: that is the run-level verdict, at its
+    // declared position. Partial opt-out stays per-step (`skip.requirement` on
+    // the routes that declined), and a routing failure leaves it unsettled.
+    establishedRequirements.set(
+      'request_signer',
+      routedErrors.size === 0 &&
+        routedRootRequirementSkips.length > 0 &&
+        routedRootRequirementSkips.length === callableStepCount
+        ? { status: 'unmet', ...routedRootRequirementSkips[0]! }
+        : { status: 'unknown' }
+    );
+  }
+
+  if (allRequires.length) {
+    const requirementCheck = await checkRequires(
+      allRequires,
+      storyboard,
+      options,
+      routingContext ? undefined : profile,
+      establishedRequirements
+    );
+    if ('requirement' in requirementCheck) {
+      if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+      const result = buildRequirementUnmetResult(
+        agentUrls,
+        storyboard,
+        requirementCheck.requirement,
+        requirementCheck.detail
+      );
+      // Runtime adapters still prevent wire execution, but cannot erase
+      // routing failures already established by authoritative discovery.
+      for (const phase of storyboard.phases) {
+        const failures = phase.steps
+          .filter(step => routedErrors.has(step))
+          .map(step => routingFailedStep(step, phase.id, routedErrors.get(step)));
+        if (failures.length) {
+          result.phases.push({
+            phase_id: phase.id,
+            phase_title: phase.title,
+            passed: false,
+            steps: failures,
+            duration_ms: 0,
+          });
+          result.failed_count += failures.length;
+          result.overall_passed = false;
+        }
+      }
+      return { ...result, notices: preflightNotices };
+    }
+    if (requirementCheck.preparedPublisherAuthProbes) {
+      options = withPreparedTrustedMatchPublisherAuth(options, requirementCheck.preparedPublisherAuthProbes);
+      if (routingContext && options.agents) dispatch = createRoutingDispatcher(routingContext, options, options.agents);
+    }
+  }
+
+  if (
+    storyboard.required_any_of_tools?.length &&
+    options.agentTools &&
+    !routingContext?.discoveryFailures.length &&
+    routedErrors.size === 0
+  ) {
+    const agentTools = new Set(options.agentTools);
+    const missing = storyboard.required_any_of_tools.find(family => !family.tools.some(tool => agentTools.has(tool)));
+    if (missing) {
+      const detail =
+        `missing_required_tool_family: needs ${missing.tools.join(' or ')}` +
+        (missing.rationale ? ` (${missing.rationale})` : '');
+      if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+      return {
+        ...buildRequiredAnyOfToolsMissingResult(agentUrls, storyboard, detail),
+        notices: preflightNotices,
+      };
+    }
+  }
+
+  // Enforce required_tools pre-flight gate: if the storyboard declares tools
+  // that make it applicable (at least one must be present) and the agent
+  // advertises none of them, skip the whole storyboard instead of producing
+  // misleading per-step failures.
+  //
+  // Gate condition: `options.agentTools` is populated from discovery or
+  // `_profile.tools` before this point, including reused-client callers when
+  // discovery is available. If a direct `_client` caller supplies neither
+  // `agentTools` nor a discoverable profile, this gate remains a no-op and
+  // step-level `requires_tool` checks carry the compatibility signal.
+  if (
+    storyboard.required_tools?.length &&
+    options.agentTools &&
+    !routingContext?.discoveryFailures.length &&
+    routedErrors.size === 0
+  ) {
+    const hasAnyRequired = hasAnyRequiredTool(storyboard.required_tools, options.agentTools);
+    if (!hasAnyRequired) {
+      if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+      return {
+        ...buildRequiredToolsMissingResult(
+          agentUrls,
+          storyboard,
+          `agent does not advertise any of [${storyboard.required_tools.join(', ')}]`
+        ),
+        notices: preflightNotices,
+      };
+    }
+  }
+
+  const contributions = new Set<string>();
+  // First phase/step that contributed each flag. Branch-set post-pass reads
+  // this to emit the contract-mandated peer_branch_taken detail string
+  // ("<flag> contributed by <peer_phase_id>.<peer_step_id> — …"). Only the
+  // first contributor is recorded — downstream peers observing the same flag
+  // are redundant and the contract calls out a single peer.
+  const contributionSources = new Map<string, { phaseId: string; stepId: string }>();
+  const priorStepResults = new Map<string, StoryboardStepResult>();
+  const priorProbes = new Map<string, HttpProbeResult>();
+  const routedPriorProbes = new Map<number, Map<string, HttpProbeResult>>();
+  const contextProvenance = new Map<string, ContextProvenanceEntry>();
+  const priorA2aEnvelopes = new Map<string, A2ATaskEnvelope>();
+  const stepRequestStarts = new Map<string, string>();
+  const responseDerivedNotApplicableContextKeys = new Map<string, string>();
+  const acceptancePolicyDiscovery: AcceptancePolicyDiscoveryRunState = {};
+  // Unavailable outputs are tracked separately for neutral capability gates
+  // and hard routed prerequisites. The per-step execution state
+  // receives only keys from phases it actually depends on, preserving the
+  // declared depends_on / any_of branch-set topology.
+  const capabilityUnavailableContextKeysByPhase = new Map<string, Set<string>>();
+  const missingPrerequisiteContextKeysByPhase = new Map<string, Set<string>>();
+  const recordUnavailableOutputs = (
+    phaseId: string,
+    step: StoryboardStep,
+    keysByPhase = capabilityUnavailableContextKeysByPhase
+  ): void => {
+    const keys = keysByPhase.get(phaseId) ?? new Set<string>();
+    for (const output of step.context_outputs ?? []) {
+      if (output.key) keys.add(output.key);
+    }
+    keysByPhase.set(phaseId, keys);
+  };
+  const phaseResults: StoryboardPhaseResult[] = [];
+  let passedCount = 0;
+  let failedCount = 0;
+  let skippedCount = 0;
+  const phaseCapabilitySkippedIds = new Set<string>();
+  // Per-phase stateful-cascade tracking (#1161).
+  //
+  // Map entry exists iff the phase tripped its stateful cascade — i.e.,
+  // a stateful step in the phase failed or skipped for a missing-state
+  // reason. Value is the trigger context (skip-step diagnostic) OR null
+  // when the trip was a real failure (failure-wins-within-phase rule, so
+  // downstream cascade-detail says "prior stateful step failed" rather
+  // than referencing an earlier benign skip).
+  //
+  // Replaces the storyboard-scope `statefulFailed` boolean: each phase's
+  // stateful steps consult `phase.depends_on` (default: all prior phases)
+  // to decide whether any upstream phase tripped. Independent phases
+  // (`depends_on: []`) keep running even if other phases tripped.
+  //
+  // Within-phase cascade is preserved: once any stateful step in a phase
+  // trips, subsequent stateful steps in the SAME phase cascade-skip
+  // unconditionally (later steps need state from earlier steps in this
+  // phase by storyboard authoring intent).
+  //
+  // `substitution_chain` is set when the trigger came from a
+  // deferred-and-unrescued `peer_substitutes_for` declaration (#1144) so
+  // the cascade-detail message can name the substitute(s) that didn't
+  // pass. Absent for the immediate-trip path and the legacy any-peer
+  // not_applicable path.
+  type CascadeTrigger = {
+    stepId: string;
+    reason: RunnerSkipReason | RunnerDetailedSkipReason;
+    substitution_chain?: string;
+    /** The trigger is an explicit phase capability gate, not a failed setup. */
+    capabilityUnavailable?: boolean;
+  };
+  const phaseStatefulCascades = new Map<string, CascadeTrigger | null>();
+  // Phase IDs in declaration order, accumulated as we iterate so the
+  // default `depends_on` resolution ("all prior phases") doesn't re-scan
+  // the storyboard. Phases push their own id at end-of-phase.
+  const priorPhaseIds: string[] = [];
+
+  // Phase → branch-set membership, resolved once up front so the stateful
+  // cascade (and the post-loop branch-set re-grade) can consult it. Phases
+  // outside any branch set are absent from the map.
+  const branchSetsByPhaseId = resolveBranchSets(storyboard);
+
+  // Helpers for per-phase cascade state.
+  const effectiveDependsOn = (phase: { depends_on?: string[] }, prior: readonly string[]): readonly string[] =>
+    phase.depends_on ?? prior;
+  const cascadeForPhase = (
+    phase: { id: string; depends_on?: string[] },
+    prior: readonly string[]
+  ): { tripped: true; trigger: CascadeTrigger | null } | { tripped: false } => {
+    // Branch-set peers under `any_of` are mutually-exclusive ALTERNATIVES, not
+    // a stateful dependency chain: a conformant seller satisfies exactly one
+    // peer, so the non-taken peer(s) fail by design (storyboard-schema.yaml,
+    // "Per-step grading in any_of branch patterns"). A peer's expected
+    // failure must NOT cascade-skip a sibling peer — doing so suppresses the
+    // only viable contribution and fails the any_of gate even though the
+    // seller behaved conformantly. Exclude same-branch-set peers from this
+    // phase's cascade dependencies. (adcontextprotocol/adcp-client#2305)
+    //
+    // Scoped to `any_of` deliberately: `BranchSetSpec.semantics` is typed
+    // `string` to leave room for future semantics (e.g. `all_of`/`one_of`)
+    // where peers legitimately DO depend on each other and must keep
+    // cascading. `all_of` is rejected at load time today, so this is
+    // forward-compat hardening rather than live behavior.
+    const ownSpec = branchSetsByPhaseId.get(phase.id);
+    const ownAnyOfBranchSet = ownSpec?.semantics === 'any_of' ? ownSpec.id : undefined;
+    let capabilityTrigger: CascadeTrigger | undefined;
+    let missingStateTrigger: CascadeTrigger | undefined;
+    // Include this phase's own state, then inspect every applicable dependency.
+    // A neutral capability gate cannot conceal an independent hard failure.
+    for (const depId of [phase.id, ...effectiveDependsOn(phase, prior)]) {
+      if (
+        depId !== phase.id &&
+        ownAnyOfBranchSet !== undefined &&
+        branchSetsByPhaseId.get(depId)?.id === ownAnyOfBranchSet
+      ) {
+        continue;
+      }
+      if (phaseStatefulCascades.has(depId)) {
+        const trigger = phaseStatefulCascades.get(depId) ?? null;
+        if (trigger === null) return { tripped: true, trigger: null };
+        if (trigger.capabilityUnavailable) capabilityTrigger ??= trigger;
+        else missingStateTrigger ??= trigger;
+      }
+    }
+    const trigger = missingStateTrigger ?? capabilityTrigger;
+    return trigger ? { tripped: true, trigger } : { tripped: false };
+  };
+  const unavailableContextKeysForPhase = (
+    phase: { id: string; depends_on?: string[] },
+    prior: readonly string[],
+    keysByPhase = capabilityUnavailableContextKeysByPhase
+  ): Set<string> => {
+    const keys = new Set(keysByPhase.get(phase.id));
+    const ownSpec = branchSetsByPhaseId.get(phase.id);
+    const ownAnyOfBranchSet = ownSpec?.semantics === 'any_of' ? ownSpec.id : undefined;
+    for (const depId of effectiveDependsOn(phase, prior)) {
+      if (ownAnyOfBranchSet !== undefined && branchSetsByPhaseId.get(depId)?.id === ownAnyOfBranchSet) continue;
+      for (const key of keysByPhase.get(depId) ?? []) keys.add(key);
+    }
+    return keys;
+  };
+  // Step results whose failures the main loop added to failedCount. The
+  // branch-set post-pass decrements only for entries that were actually
+  // counted, so an optional phase that hit `presenceDetected` (a PRM 2xx
+  // inside an otherwise-optional phase) has its leak correctly reversed.
+  const countedAsFailed = new Set<StoryboardStepResult>();
+
+  // Start an ephemeral webhook receiver when the run opts in. The base URL
+  // is exposed via `{{runner.webhook_base}}` / `{{runner.webhook_url:<id>}}`
+  // substitutions so storyboards can inject per-step URLs into
+  // `push_notification_config.url`. See adcontextprotocol/adcp#2431.
+  const webhookReceiver = options.webhook_receiver
+    ? await createWebhookReceiver({
+        ...(options.webhook_receiver.mode && { mode: options.webhook_receiver.mode }),
+        ...(options.webhook_receiver.host !== undefined && { host: options.webhook_receiver.host }),
+        ...(options.webhook_receiver.port !== undefined && { port: options.webhook_receiver.port }),
+        ...(options.webhook_receiver.public_url !== undefined && { public_url: options.webhook_receiver.public_url }),
+        allowHttp: options.allow_http === true,
+        ...(options.webhook_receiver.tls !== undefined && { tls: options.webhook_receiver.tls }),
+      })
+    : undefined;
+  const runnerVars = createRunnerVariables({
+    ...(webhookReceiver && { webhookBase: webhookReceiver.base_url }),
+  });
+  // Pre-arm retry-replay policies for any expect_webhook_retry_keys_stable
+  // steps. Ordering matters: the receiver must be rejecting deliveries
+  // before the triggering step fires its webhook, otherwise the first
+  // delivery succeeds and the sender never retries.
+  if (webhookReceiver) armWebhookAssertions(storyboard, runnerVars, webhookReceiver);
+
+  // Flatten all steps for next-step preview lookups
+  const allSteps = flattenSteps(storyboard);
+  // Resolve cross-step assertions declared on `storyboard.invariants`.
+  // `resolveAssertions` throws on unknown ids — fail fast here rather than
+  // silently skip, since a missing assertion means unknown conformance gaps.
+  const assertions = resolveAssertions(storyboard.invariants);
+  // Step-level `invariants.disable` uses the resolved set as its universe:
+  // an id is only a valid step-level opt-out if it actually runs on this
+  // storyboard. Typos and dead-code references (already disabled run-wide)
+  // fail fast here for the same reason.
+  validateStepInvariants(storyboard, assertions);
+  const assertionContexts = new Map<string, AssertionContext>();
+  for (const spec of assertions) {
+    assertionContexts.set(spec.id, {
+      storyboard,
+      agentUrl: agentUrls[0]!,
+      options,
+      state: {},
+    });
+  }
+  const assertionResults: AssertionResult[] = [];
+  let assertionsFailed = false;
+  for (const spec of assertions) {
+    if (spec.onStart) await spec.onStart(assertionContexts.get(spec.id)!);
+  }
+
+  // Placeholder storyboards with no executable phases get a distinct skip
+  // reason per the runner-output contract. Without this, the overall result
+  // would pass vacuously — `passed_count === 0 && failed_count === 0` — and
+  // an implementor reading the report can't tell "nothing tested" from
+  // "everything passed".
+  const hasExecutableSteps = storyboard.phases.some(p => p.steps.length > 0);
+  const phaseCapabilitySkipDetails = routingContext
+    ? routedPhaseCapabilitySkips
+    : collectPhaseCapabilitySkipDetails(storyboard, profile, options.agentTools, options.adcpVersion);
+  const skipControllerSeedingForPhaseGates = allExecutablePhasesCapabilitySkipped(
+    storyboard,
+    phaseCapabilitySkipDetails
+  );
+  const preflightExcludedPhaseIds = new Set([
+    ...phaseCapabilitySkipDetails.keys(),
+    ...storyboard.phases.filter(phase => shouldSkipPhaseBeforeRun(phase, options)).map(phase => phase.id),
+    ...storyboard.phases.filter(phase => phaseUsesRuntimeContext(phase)).map(phase => phase.id),
+  ]);
+  let creativeAssetFixtureGap = preflightRemainingCreativeAssetDirectives(
+    allSteps,
+    -1,
+    context,
+    options,
+    {
+      contributions,
+      priorStepResults,
+      priorProbes,
+      agentUrl: agentUrls[0]!,
+      webhookReceiver,
+      runnerVars,
+      contextProvenance,
+      priorA2aEnvelopes,
+      stepRequestStarts,
+      responseDerivedNotApplicableContextKeys,
+      agentProfile: profile,
+      agentLibraryVersion: profile?.library_version,
+      storyboardRequiresRequestSigner: allRequires.includes('request_signer'),
+      storyboardRequiresPublisherAuthRunner:
+        storyboard.requires?.includes('trusted_match_publisher_auth_runner') === true,
+    },
+    preflightExcludedPhaseIds,
+    routedPreflightAssignment
+  );
+  let creativeAssetFixtureGapRecorded = false;
+  if (!hasExecutableSteps) {
+    const isScenarioComposed = (storyboard.requires_scenarios?.length ?? 0) > 0;
+    const detail = isScenarioComposed
+      ? `Storyboard "${storyboard.id}" has no local phases — its test surface is fully composed from the scenarios listed in \`requires_scenarios\`.`
+      : `Storyboard "${storyboard.id}" has no executable phases — populate \`phases[].steps\` or remove the storyboard.`;
+    const syntheticStep: StoryboardStepResult = {
+      storyboard_id: storyboard.id,
+      // Synthetic sentinel. Functionally non-colliding because downstream
+      // consumers (CLI report, storyboard-tracks) key on `skip_reason`,
+      // not `phase_id`/`step_id`. Matches the documented `RunnerSkipReason`
+      // vocabulary in storyboard/types.ts.
+      step_id: 'no_phases',
+      phase_id: 'no_phases',
+      title: 'Storyboard has no executable phases',
+      task: '',
+      passed: true,
+      skipped: true,
+      skip_reason: 'no_phases',
+      skip: buildSkip('no_phases', detail),
+      duration_ms: 0,
+      validations: [],
+      context,
+      error: detail,
+      extraction: { path: 'none' },
+    };
+    phaseResults.push({
+      phase_id: 'no_phases',
+      phase_title: 'No phases',
+      passed: true, // skipped step is neutral — phase must not fail
+      steps: [syntheticStep],
+      duration_ms: 0,
+    });
+    skippedCount++;
+  }
+
+  // Pre-flight controller seeding (adcp-client#778). When the storyboard
+  // declares `prerequisites.controller_seeding: true` and carries a
+  // `fixtures:` block, fire the corresponding `seed_*` scenarios on
+  // `comply_test_controller` so the seller's catalog / ledger holds every
+  // fixture id the downstream phases reference. On any seed failure we
+  // cascade-skip the remaining phases with `controller_seeding_failed` so
+  // the report shows "setup broke" instead of a thicket of per-step
+  // PRODUCT_NOT_FOUND / VALIDATION_ERROR failures. Routed runs send each
+  // seed to the owner route; multi-instance runs use the first replica and
+  // expect the seller to share state across replicas. Sellers that hold
+  // per-replica state must opt out via `skip_controller_seeding`.
+  //
+  // The seeding phase is held in a sidecar rather than pushed into
+  // `phaseResults` up-front so every downstream consumer that indexes
+  // `phaseResults[i]` against `storyboard.phases[i]` (branch-set grading,
+  // `requiredPhasesPassed`) keeps working. It is spliced to the front of
+  // `phaseResults` at the end so the report reads top-to-bottom in the
+  // order the runner actually executed things.
+  //
+  // Multi-pass mode populates `preSeeded` so seeding fires exactly once
+  // across all passes — see `runMultiPass`. Without the sidecar, every
+  // pass would re-seed and the aggregator's cross-pass sum would inflate
+  // `failed_count`/`skipped_count` by N when a single fixture broke.
+  let seedingPhaseResult: StoryboardPhaseResult | null = null;
+  /** Refused creative-probe context commit, merged into whichever phase attaches. */
+  let probeViolationStep: StoryboardStepResult | undefined;
+  let seedingFailed = false;
+  let creativeBuildCatalogFailed = false;
+  let seedingMissingController = false;
+  let seedingUnsupported = false;
+  let fixtureUnsatisfied = false;
+  let fixtureBindings: FixtureBindingRegistry | undefined;
+  let fixtureResolutionRecords: FixtureResolutionRecord[] | undefined;
+  let fixtureCoverageGap: FixtureResolutionCoverageGap | undefined;
+  if (storyboard.creative_build_probe && !skipControllerSeedingForPhaseGates) {
+    let resolution: ReturnType<typeof prepareCreativeBuildProbe>;
+    try {
+      resolution =
+        routingContext || isMultiInstance
+          ? {
+              status: 'unsatisfied',
+              detail: `fixture_unsatisfied: creative_format:${storyboard.creative_build_probe.context_prefix}: resolve an independent fixture for each routed or replicated agent in a single-agent run`,
+            }
+          : prepareCreativeBuildProbe(
+              profile?.raw_capabilities,
+              storyboard.creative_build_probe,
+              options.test_kit,
+              options.adcpVersion
+            );
+    } catch (error) {
+      // Operator fixture errors remain authoring errors, but must release the
+      // adapters already created for this run before propagating to the caller.
+      await Promise.allSettled([
+        ...(webhookReceiver ? [webhookReceiver.close()] : []),
+        ...(!callerOwnsClients ? [closeScopedConnections(options.protocol)] : []),
+      ]);
+      throw error;
+    }
+    const handle = storyboard.creative_build_probe.context_prefix;
+    fixtureResolutionRecords = [
+      {
+        fixture_type: 'creative_format',
+        handle,
+        requirements: resolution.status === 'resolved' ? resolution.requirements : [],
+        status: resolution.status,
+        ...(resolution.status === 'resolved'
+          ? {
+              seller_ids:
+                resolution.capabilityId !== undefined
+                  ? { capability_id: resolution.capabilityId }
+                  : { format_id: resolution.formatId },
+            }
+          : {}),
+        strategy: 'discover',
+        strategies_attempted: [
+          {
+            strategy: 'discover',
+            disposition: resolution.status === 'unsatisfied' ? 'unavailable' : resolution.status,
+            detail:
+              resolution.status === 'resolved'
+                ? `Bound build route using ${resolution.source} input`
+                : resolution.detail,
+          },
+        ],
+      },
+    ];
+    if (resolution.status !== 'resolved') {
+      const noPhasesIndex = phaseResults.findIndex(phase => phase.phase_id === 'no_phases');
+      if (noPhasesIndex >= 0) {
+        skippedCount -= phaseResults[noPhasesIndex]!.steps.filter(step => step.skipped).length;
+        phaseResults.splice(noPhasesIndex, 1);
+      }
+    }
+    if (resolution.status === 'failed') {
+      seedingFailed = true;
+      creativeBuildCatalogFailed = true;
+      failedCount += 1;
+      seedingPhaseResult = {
+        phase_id: 'fixture_resolution',
+        phase_title: 'Creative build fixture resolution',
+        passed: false,
+        duration_ms: 0,
+        steps: [
+          {
+            storyboard_id: storyboard.id,
+            phase_id: 'fixture_resolution',
+            step_id: 'creative_build_catalog',
+            title: 'Validate advertised creative build catalog',
+            task: 'get_adcp_capabilities',
+            passed: false,
+            duration_ms: 0,
+            context: {},
+            extraction: { path: 'none' },
+            validations: [
+              {
+                check: 'creative_build_probe_catalog',
+                passed: false,
+                description: 'Advertised creative catalog satisfies its format and routing contract',
+                error: resolution.detail,
+              },
+            ],
+          },
+        ],
+      };
+    } else if (resolution.status === 'resolved') {
+      // Creative preparation is not permission to write fixture captures:
+      // its prefix cleanup and context insertion go through the same funnel
+      // as every other untrusted writer.
+      const probeViolation = tryProtectedContextPatch(
+        context,
+        {
+          unset: CREATIVE_PROBE_CONTEXT_SUFFIXES.map(key => `${handle}_${key}`),
+          set: resolution.context,
+        },
+        { origin: `creative_build_probe '${handle}'` }
+      );
+      if (probeViolation) {
+        // Graded as a setup failure on the probe's own synthetic phase —
+        // the same `seedingPhaseResult` channel the probe's catalog failure
+        // already uses — rather than thrown out of `runStoryboard`.
+        seedingFailed = true;
+        failedCount += 1;
+        // Stashed rather than written straight to `seedingPhaseResult`:
+        // controller seeding runs AFTER this block and would overwrite it,
+        // losing the diagnostic step (the verdict would survive on
+        // `seedingFailed`, but a verdict with no `check` is the thing the
+        // synthesized kinds exist to avoid). Merged in below.
+        probeViolationStep = {
+          storyboard_id: storyboard.id,
+          phase_id: 'fixture_resolution',
+          step_id: `creative_build_probe_context.${handle}`,
+          title: 'Publish creative build probe context',
+          task: 'get_adcp_capabilities',
+          passed: false,
+          duration_ms: 0,
+          validations: [probeViolation],
+          context: withoutProtectedCaptures(context),
+          extraction: { path: 'none' },
+          error: probeViolation.error,
+        };
+        seedingPhaseResult = {
+          phase_id: 'fixture_resolution',
+          phase_title: 'Creative build fixture resolution',
+          passed: false,
+          duration_ms: 0,
+          steps: [probeViolationStep],
+        };
+      }
+      options = { ...options, contracts: [...new Set([...(options.contracts ?? []), 'creative_build_probe_runner'])] };
+    } else {
+      fixtureUnsatisfied = true;
+      if (preSeeded === undefined || preSeeded.attach) skippedCount += 1;
+      fixtureCoverageGap = {
+        reason: 'fixture_unsatisfied',
+        detail: resolution.detail,
+        fixtures: [{ fixture_type: 'creative_format', handle, requirements: [] }],
+      };
+    }
+  }
+  // Prepared state short-circuits fixture resolution for the whole pass. The
+  // lookup is re-validated and re-authorized here, and again before each
+  // step below, so a grant revoked mid-run fails the next step rather than
+  // riding on the decision made at preparation time.
+  let preparedFixtureState: PreparedStoryboardFixtures | undefined;
+  // Set when any lookup in this pass was refused. The per-step result is
+  // projected already; the run-level echo must be too, or a caller whose
+  // grant was revoked still receives the pinned identity and captured
+  // pricing in the response body.
+  let preparedRefused: string | undefined;
+  {
+    const prepared = preparedGate;
+    if (prepared.used && 'state' in prepared) {
+      const hydrationViolation = hydratePreparedCaptures(prepared.state, context, protectedWriter, contextProvenance);
+      if (hydrationViolation) {
+        if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+        return buildDiscoveryFailedResult(agentUrls, storyboard, {
+          step: 'Publish prepared fixture captures',
+          passed: false,
+          duration_ms: 0,
+          error: hydrationViolation.error,
+        });
+      }
+      preparedFixtureState = prepared.state;
+      fixtureBindings = preparedBindingRegistryFor(prepared.state);
+      fixtureResolutionRecords = prepared.state.resolutions;
+      const disposition = prepared.state.disposition;
+      if (disposition.status === 'failed') {
+        if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+        return buildPreparationFailedRunResult(agentUrls, storyboard, prepared.state, disposition.detail);
+      }
+      if (disposition.status === 'unsatisfied') {
+        fixtureUnsatisfied = true;
+        // The prepared state carries the gap; the result must not drop it.
+        fixtureCoverageGap = prepared.state.coverageGaps[0] ?? fixtureCoverageGap;
+      }
+      if (disposition.status === 'unsupported' && disposition.reason === 'not_applicable') {
+        if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+        return buildFixtureDiscoveryUnavailableResult(
+          agentUrls,
+          storyboard,
+          disposition.detail,
+          prepared.state.phase,
+          prepared.state.resolutions
+        );
+      }
+      if (disposition.status === 'unsupported') seedingMissingController = true;
+    }
+  }
+  {
+    let seeding;
+    try {
+      seeding =
+        preparedFixtureState !== undefined ||
+        creativeAssetFixtureGap ||
+        fixtureUnsatisfied ||
+        seedingFailed ||
+        skipControllerSeedingForPhaseGates
+          ? null
+          : preSeeded !== undefined
+            ? preSeeded.result
+            : await runControllerSeeding(
+                clients[0]!,
+                storyboard,
+                options,
+                context,
+                clients[0]!,
+                routingContext
+                  ? (task, call) => {
+                      // Preserve the established discovery-only ladder when
+                      // this storyboard did not request controller seeding.
+                      if (storyboard.prerequisites?.controller_seeding !== true) {
+                        if (!options.agentTools?.includes(task)) {
+                          return { client: clients[0]!, options: { ...options, agentTools: [] } };
+                        }
+                        const selected = dispatch.nextFor({
+                          id: `__fixture_resolution_${task}__`,
+                          title: `Fixture resolution via ${task}`,
+                          task,
+                        });
+                        return { client: selected.client, options: selected.options! };
+                      }
+                      // The controller is a back-channel, not a specialism
+                      // claimant. Route by the public tool that owns the
+                      // fixture state and keep its auth/profile together.
+                      const ownerTask = call ? fixtureOwnerTask(call.scenario) : task;
+                      const matching = storyboard.phases.flatMap(phase =>
+                        phase.steps.filter(step => step.task === ownerTask && step.agent !== undefined)
+                      );
+                      const keys = [...new Set(matching.map(step => step.agent!))];
+                      if (keys.length > 1) {
+                        throw new RoutingError(
+                          `Fixture ${call?.step_id ?? task} has multiple owner routes [${keys.join(', ')}]. ` +
+                            'Disambiguate the storyboard topology before seeding (adcp-client#3047).',
+                          ownerTask,
+                          'ambiguous fixture owner'
+                        );
+                      }
+                      const selected = dispatch.nextFor({
+                        id: `__fixture_resolution_${call?.step_id ?? task}__`,
+                        title: `Fixture resolution via ${ownerTask}`,
+                        task: ownerTask,
+                        ...(keys.length === 1 && { agent: keys[0] }),
+                      });
+                      return { client: selected.client, options: selected.options! };
+                    }
+                  : undefined
+              );
+    } catch (error) {
+      if (webhookReceiver) await webhookReceiver.close();
+      if (!(error instanceof RoutingError)) throw error;
+      if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+      return buildDiscoveryFailedResult(agentUrls, storyboard, {
+        step: 'Resolve fixture agent routes',
+        passed: false,
+        duration_ms: 0,
+        error: redactOAuthUrlsInText(error.message),
+      });
+    }
+    if (seeding) {
+      if (seeding.fixtureUnavailable && seeding.failedCount === 0) {
+        if (webhookReceiver) await webhookReceiver.close();
+        if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+        return buildFixtureDiscoveryUnavailableResult(
+          agentUrls,
+          storyboard,
+          seeding.fixtureUnavailable,
+          seeding.phase,
+          seeding.resolutionRecords
+        );
+      }
+      const attach = preSeeded === undefined || preSeeded.attach;
+      if (attach) {
+        seedingPhaseResult = seeding.phase;
+        // Preserve a refused probe commit recorded before seeding ran.
+        if (probeViolationStep && !seeding.phase.steps.some(entry => entry.step_id === probeViolationStep!.step_id)) {
+          seeding.phase.steps.unshift({ ...probeViolationStep, phase_id: seeding.phase.phase_id });
+          seeding.phase.passed = false;
+        }
+        passedCount += seeding.passedCount;
+        failedCount += seeding.failedCount;
+        if (
+          seeding.missingController ||
+          seeding.seedUnsupported ||
+          seeding.fixtureUnsatisfied ||
+          seeding.fixtureUnavailable
+        ) {
+          skippedCount += seeding.phase.steps.filter(step => step.skipped).length;
+        }
+      }
+      fixtureBindings = seeding.bindings;
+      // Declaration-local captures are committed with the run's preparation
+      // capability, once, after the whole graph resolved. From here they are
+      // immutable: no later step, caller patch or seller response can
+      // replace, delete or suppress them.
+      if (seeding.preparedCaptures) {
+        // Guarded like every other commit: a capture the funnel refuses to
+        // detach must grade as a setup failure, not crash the run.
+        //
+        // Defense in depth, not the primary path. Preparation already
+        // pre-screens each capture with `describeUncapturableValue` and
+        // grades the overrun on the seed step itself, which is where the
+        // reachable depth/size refusals surface today. The funnel enforces
+        // rules that pre-check does not model — freezability and target
+        // extensibility — so a future witness kind can fail only here.
+        try {
+          applyProtectedContextPatch(
+            context,
+            { set: seeding.preparedCaptures.values, setProvenance: seeding.preparedCaptures.provenance },
+            {
+              writer: protectedWriter,
+              sinks: { provenance: contextProvenance },
+              origin: 'fixture preparation',
+            }
+          );
+        } catch (error) {
+          if (!(error instanceof ProtectedContextViolation)) throw error;
+          seedingFailed = true;
+          seeding.phase.passed = false;
+          // Multi-pass shares one seeding result across every pass, so the
+          // synthetic step is attached exactly once — on the same pass that
+          // attaches the rest of the seeding phase. Pushing per pass would
+          // report the one preparation failure N times and inflate
+          // `failedCount` by N.
+          const alreadyReported = seeding.phase.steps.some(entry => entry.step_id === FIXTURE_CAPTURE_STEP_ID);
+          if (attach && !alreadyReported) {
+            seeding.phase.steps.push({
+              storyboard_id: storyboard.id,
+              step_id: FIXTURE_CAPTURE_STEP_ID,
+              phase_id: seeding.phase.phase_id,
+              title: 'Publish fixture captures',
+              task: describeFixtureCaptureTask(seeding.preparedCaptures, error.keys),
+              passed: false,
+              duration_ms: 0,
+              validations: [
+                {
+                  check: 'fixture_capture_unbuildable',
+                  passed: false,
+                  description: 'Every declared fixture capture must be detachable from the pinned entity',
+                  error: error.message,
+                  json_pointer: null,
+                  expected: 'a capture the runner can deep-clone and freeze',
+                  actual: error.keys.join(', '),
+                  schema_id: null,
+                  schema_url: null,
+                },
+              ],
+              // The commit failed, so nothing reserved is in `context` yet —
+              // but the projection is applied unconditionally so a partially
+              // applied patch can never surface a protected value in a
+              // report.
+              context: withoutProtectedCaptures(context),
+              extraction: { path: 'none' },
+              error: error.message,
+            });
+            failedCount += 1;
+          }
+        }
+      }
+      fixtureResolutionRecords = fixtureResolutionRecords
+        ? [...fixtureResolutionRecords, ...(seeding.resolutionRecords ?? [])]
+        : seeding.resolutionRecords;
+      fixtureUnsatisfied = seeding.fixtureUnsatisfied === true && seeding.failedCount === 0;
+      if (fixtureUnsatisfied) {
+        // Fixture coverage is the more specific storyboard-level reason when
+        // an authored placeholder has no executable phases. Do not retain the
+        // generic no_phases sentinel or count both reasons.
+        const noPhasesIndex = phaseResults.findIndex(phase => phase.phase_id === 'no_phases');
+        if (noPhasesIndex >= 0) {
+          skippedCount -= phaseResults[noPhasesIndex]!.steps.filter(step => step.skipped).length;
+          phaseResults.splice(noPhasesIndex, 1);
+        }
+        // Multi-pass attaches/counts pre-flight resolution only on pass one,
+        // so the aggregate contains exactly one storyboard-level skip.
+        if (attach) skippedCount += 1;
+      }
+      const hasUnsatisfiedFixtures = fixtureResolutionRecords?.some(record => record.status === 'unsatisfied') === true;
+      if (hasUnsatisfiedFixtures && fixtureResolutionRecords) {
+        const fixtures = fixtureResolutionRecords
+          .filter(record => record.status === 'unsatisfied')
+          .map(record => ({
+            fixture_type: record.fixture_type,
+            handle: record.handle,
+            ...(record.product_handle && { product_handle: record.product_handle }),
+            requirements: record.requirements,
+          }));
+        fixtureCoverageGap = {
+          reason: 'fixture_unsatisfied',
+          // The SAME spelling the disposition uses. Two renderings of one
+          // reason over the same data meant a consumer parsing the
+          // documented `<fixture_type>:<handle>` grammar matched on one
+          // field and not the other.
+          detail: describeUnsatisfiedFixtures(fixtureResolutionRecords),
+          fixtures,
+        };
+      }
+      if (seeding.missingController) {
+        seedingMissingController = true;
+      } else if (seeding.seedUnsupported) {
+        seedingUnsupported = true;
+      } else if (!seeding.allPassed) {
+        seedingFailed = true;
+      }
+    }
+  }
+
+  const buildExecutionState = (
+    agentUrl = agentUrls[0]!,
+    agentProfile: AgentProfile | undefined = profile
+  ): ExecutionState => ({
+    contributions,
+    priorStepResults,
+    priorProbes,
+    agentUrl,
+    acceptancePolicyDiscovery,
+    webhookReceiver,
+    runnerVars,
+    contextProvenance,
+    priorA2aEnvelopes,
+    stepRequestStarts,
+    responseDerivedNotApplicableContextKeys,
+    agentProfile,
+    agentLibraryVersion: agentProfile?.library_version,
+    storyboardRequiresRequestSigner: allRequires.includes('request_signer'),
+    storyboardRequiresPublisherAuthRunner:
+      storyboard.requires?.includes('trusted_match_publisher_auth_runner') === true,
+    fixtureBindings,
+  });
+
+  if (
+    !creativeAssetFixtureGap &&
+    !seedingMissingController &&
+    !seedingUnsupported &&
+    !seedingFailed &&
+    !fixtureUnsatisfied
+  ) {
+    creativeAssetFixtureGap = preflightRemainingCreativeAssetDirectives(
+      allSteps,
+      -1,
+      context,
+      options,
+      buildExecutionState(),
+      preflightExcludedPhaseIds,
+      routedPreflightAssignment
+    );
+  }
+
+  for (const phase of storyboard.phases) {
+    // adcp-client#1612: bail at phase boundaries when comply()'s combined
+    // timeout/external signal has aborted. Without this the phase loop runs
+    // to completion regardless of the outer budget.
+    options.signal?.throwIfAborted();
+    const phaseStart = Date.now();
+
+    // A pure resolution miss is one storyboard-level skip, not an
+    // ordinary-step skip. Short-circuit before capability and other phase
+    // gates so no ordinary rows or per-step counts are produced for this run.
+    if (fixtureUnsatisfied) {
+      phaseResults.push({
+        phase_id: phase.id,
+        phase_title: phase.title,
+        passed: true,
+        steps: [],
+        duration_ms: 0,
+      });
+      continue;
+    }
+
+    // A captured seller format proved that a future creative directive cannot
+    // be synthesized. Preserve earlier observations, record the directive
+    // step once, and leave every other remaining phase empty: no side effect
+    // or prerequisite cascade may occur after this runner-owned coverage gap.
+    if (creativeAssetFixtureGap) {
+      const gapSteps: StoryboardStepResult[] = [];
+      if (!creativeAssetFixtureGapRecorded && creativeAssetFixtureGap.target.phaseId === phase.id) {
+        const gapStep = buildCreativeAssetFixtureUnavailableStep(
+          creativeAssetFixtureGap.target.step,
+          phase.id,
+          context,
+          allSteps,
+          buildExecutionState(),
+          creativeAssetFixtureGap.failure
+        );
+        gapStep.storyboard_id = storyboard.id;
+        gapSteps.push(gapStep);
+        priorStepResults.set(gapStep.step_id, gapStep);
+        skippedCount++;
+        creativeAssetFixtureGapRecorded = true;
+      }
+      phaseResults.push({
+        phase_id: phase.id,
+        phase_title: phase.title,
+        passed: true,
+        steps: gapSteps,
+        duration_ms: 0,
+      });
+      priorPhaseIds.push(phase.id);
+      continue;
+    }
+
+    const phaseCapabilitySkipDetail = phaseCapabilitySkipDetails.get(phase.id);
+    if (phaseCapabilitySkipDetail !== undefined) {
+      const skippedSteps = routingContext
+        ? phase.steps.map(step => {
+            const selected = step.task === VALIDATION_ONLY_TASK ? undefined : dispatch.nextFor(step);
+            const skipped = buildPhaseCapabilitySkippedSteps(
+              storyboard,
+              { ...phase, steps: [step] },
+              routedStepCapabilitySkips.get(step) ?? phaseCapabilitySkipDetail,
+              context
+            )[0]!;
+            return {
+              ...skipped,
+              ...(routedStepRequirements.has(step) && {
+                skip: { ...skipped.skip!, requirement: routedStepRequirements.get(step)! },
+              }),
+              ...(selected && {
+                agent_url: redactOAuthUrlForOutput(selected.agentUrl),
+                agent_index: selected.instanceIndex + 1,
+              }),
+            };
+          })
+        : buildPhaseCapabilitySkippedSteps(storyboard, phase, phaseCapabilitySkipDetail, context);
+      phaseResults.push({
+        phase_id: phase.id,
+        phase_title: phase.title,
+        passed: true,
+        steps: skippedSteps,
+        duration_ms: Date.now() - phaseStart,
+      });
+      skippedCount += skippedSteps.length;
+      phaseCapabilitySkippedIds.add(phase.id);
+      // A capability-gated phase can make downstream state unavailable either
+      // through an explicitly stateful setup step or an author-declared
+      // context output on an otherwise stateless step. Preserve the existing
+      // depends_on / any_of branch-set cascade semantics for stateful
+      // consumers, while executeStep handles non-stateful consumers that
+      // directly reference one of these keys.
+      for (const step of phase.steps) {
+        recordUnavailableOutputs(phase.id, step);
+      }
+      if (phase.steps.some(s => s.stateful)) {
+        phaseStatefulCascades.set(phase.id, {
+          stepId: phase.steps.find(s => s.stateful)!.id,
+          reason: 'not_applicable',
+          capabilityUnavailable: true,
+        });
+      }
+      priorPhaseIds.push(phase.id);
+      continue;
+    }
+    const stepResults: StoryboardStepResult[] = [];
+    let phasePassed = true;
+    // `statefulFailed` and `statefulSkipTrigger` live at storyboard
+    // scope (declared above the phase loop) so the cascade survives
+    // cross-phase setup → assertion patterns. See declaration site for
+    // the rationale (signal_marketplace/governance_denied story).
+    //
+    // Phase-scoped substitution tracking (adcp-client#1005, round-9; #1144).
+    //
+    // Two deferral paths:
+    //   1. `not_applicable` on a stateful step (any-peer rescue) — preserved
+    //      from the F6 fix. Rescued by ANY passing stateful step in the
+    //      phase. Backward-compatible with storyboards that haven't adopted
+    //      explicit substitution declarations.
+    //   2. `missing_tool` / `missing_test_controller` on a stateful step
+    //      WITH a declared substitute peer (`peer_substitutes_for`) in the
+    //      same phase. Rescued ONLY when the declared substitute actually
+    //      passes. Without a declaration, hard-missing reasons trip the
+    //      cascade immediately as before.
+    //
+    // Path (2) is opt-in via storyboard YAML: a substitute step declares
+    // `peer_substitutes_for: <target_step_id>` to assert that its passing
+    // establishes equivalent state. Phase membership alone is NOT treated
+    // as substitutability — explicit declaration is required.
+    let phasePendingNotApplicable: CascadeTrigger | null = null;
+    let phaseInheritedCapabilityTrigger: CascadeTrigger | undefined;
+    let phaseEstablishedStatefulState = false;
+    // Path (2): index of declared substitutions for this phase. Map keys
+    // are target step IDs (the steps being substituted FOR); values are the
+    // step IDs that declared the substitution. Built once per phase from
+    // each step's `provides_state_for` field (or the deprecated
+    // `peer_substitutes_for` synonym; the loader normalizes both onto
+    // `provides_state_for` at parse time, so reading either works).
+    const phaseSubstitutes = new Map<string, string[]>();
+    for (const declaringStep of phase.steps) {
+      const decl = declaringStep.provides_state_for ?? declaringStep.peer_substitutes_for;
+      if (decl === undefined) continue;
+      const targets = Array.isArray(decl) ? decl : [decl];
+      for (const target of targets) {
+        const arr = phaseSubstitutes.get(target) ?? [];
+        arr.push(declaringStep.id);
+        phaseSubstitutes.set(target, arr);
+      }
+    }
+    // Path (2) state. `phasePendingMissingTool` is the deferred-cascade
+    // trigger for a stateful step that skipped with a hard-missing reason
+    // AND has at least one declared substitute in this phase. Only the
+    // first such trigger is recorded — the cascade-detail message
+    // references the leftmost step.
+    const phasePendingMissingTool: {
+      trigger: {
+        stepId: string;
+        reason: RunnerSkipReason | RunnerDetailedSkipReason;
+        substitutes: string[];
+      } | null;
+    } = { trigger: null };
+    // Targets actually rescued by a passing declared substitute. Populated
+    // when a step with `provides_state_for: X` (or the deprecated synonym
+    // `peer_substitutes_for: X`) passes — every X in its declaration list
+    // lands here.
+    const phaseRescuedTargets = new Set<string>();
+    // Map from rescued target id → the substitute step id that rescued it.
+    // Populated when the substitute passes; consumed at phase end to format
+    // the spec-mandated `peer_substituted` detail string. First substitute
+    // wins if multiple peers cover the same target.
+    const phaseRescueSource = new Map<string, string>();
+    // Stateful step IDs in the phase. Used at phase end to decide whether
+    // a deferred not_applicable trigger should cascade: if the sole stateful
+    // step in the phase returned not_applicable AND there were no peers that
+    // could have established substitute state, the cascade should NOT fire —
+    // the platform simply doesn't use that pathway, which is valid. Only when
+    // peer-stateful steps existed (and none established state) do we promote
+    // the pending trigger to a hard cascade. Computed eagerly at phase
+    // initialization so it's always available when the resolution block runs.
+    const phaseStatefulStepIds = phase.steps.filter(s => s.stateful).map(s => s.id);
+    // PRM presence-probe state (adcp-client#677). `phaseAbsent` flips when
+    // /.well-known/oauth-protected-resource returns 404 — subsequent steps
+    // in this phase cascade-skip instead of failing their http_status:200
+    // validations. `presenceDetected` flips when PRM returns a 2xx: the
+    // agent IS advertising OAuth, so validation failures in this phase
+    // become hard failures regardless of `optional: true`, closing the
+    // spoofing path where a broken PRM + valid API key could silently pass.
+    let phaseAbsent = false;
+    const routedOauthAbsent = new Set<number>();
+    let presenceDetected = false;
+    const routedOauthPresent = new Set<number>();
+
+    if (shouldSkipPhase(phase, options, context)) {
+      // Reconciliation still emits the authored routing-error rows, but a
+      // dependent mutation must see the failed setup before it can dispatch.
+      const skippedRoutingFailures = routingContext ? phase.steps.filter(step => routedErrors.has(step)) : [];
+      const skippedCapabilitySteps = routingContext
+        ? phase.steps.filter(step => routedStepCapabilitySkips.has(step))
+        : [];
+      for (const step of skippedCapabilitySteps) recordUnavailableOutputs(phase.id, step);
+      if (skippedRoutingFailures.length > 0) {
+        for (const step of skippedRoutingFailures) {
+          recordUnavailableOutputs(phase.id, step, missingPrerequisiteContextKeysByPhase);
+        }
+        if (skippedRoutingFailures.some(step => step.stateful)) phaseStatefulCascades.set(phase.id, null);
+      }
+      if (skippedRoutingFailures.length > 0 || skippedCapabilitySteps.length > 0) {
+        // Known routed gaps expose absent outputs to implicit dependencies;
+        // an authored phase skip alone introduces no output or state policy.
+        priorPhaseIds.push(phase.id);
+      }
+      phaseResults.push({
+        phase_id: phase.id,
+        phase_title: phase.title,
+        passed: true, // optional phase skipped — neutral
+        steps: [],
+        duration_ms: 0,
+      });
+      continue;
+    }
+
+    // A context-gated phase cannot be preflighted until the context it reads
+    // is complete. Once its guard resolves to "run", make the phase eligible
+    // and inspect all of its creative directives before dispatching its first
+    // step. This preserves the no-partial-side-effects preflight contract
+    // without treating an unavailable future context key as a reason to skip.
+    if (phaseUsesRuntimeContext(phase)) {
+      preflightExcludedPhaseIds.delete(phase.id);
+      const firstPhaseStepIndex = allSteps.find(target => target.phaseId === phase.id)?.globalIndex ?? 0;
+      creativeAssetFixtureGap = preflightRemainingCreativeAssetDirectives(
+        allSteps,
+        firstPhaseStepIndex - 1,
+        context,
+        options,
+        buildExecutionState(),
+        preflightExcludedPhaseIds,
+        routedPreflightAssignment
+      );
+      if (creativeAssetFixtureGap?.target.phaseId === phase.id) {
+        const gapStep = buildCreativeAssetFixtureUnavailableStep(
+          creativeAssetFixtureGap.target.step,
+          phase.id,
+          context,
+          allSteps,
+          buildExecutionState(),
+          creativeAssetFixtureGap.failure
+        );
+        gapStep.storyboard_id = storyboard.id;
+        priorStepResults.set(gapStep.step_id, gapStep);
+        skippedCount++;
+        creativeAssetFixtureGapRecorded = true;
+        phaseResults.push({
+          phase_id: phase.id,
+          phase_title: phase.title,
+          passed: true,
+          steps: [gapStep],
+          duration_ms: Date.now() - phaseStart,
+        });
+        priorPhaseIds.push(phase.id);
+        continue;
+      }
+    }
+
+    // Pre-empt OAuth-metadata probes when the agent's capabilities never
+    // advertised OAuth at all (adcp-client#1702). Without this, an
+    // API-key-only agent (e.g. Wonderstruck) has its PRM endpoint
+    // probed; if the well-known path returns anything other than 404
+    // (the existing reactive cascade trigger in `executeProbeStep`),
+    // validations fail and `oauth_discovery` produces 5 false-negative
+    // step failures even though the phase is `optional: true`. The skip
+    // is phase-level — not storyboard-level — so the universal
+    // `unauth_rejection` and `mechanism_required` phases still run.
+    if (!routingContext && phaseContainsOauthMetadataProbe(phase) && !agentAdvertisesOauth(profile)) {
+      phaseAbsent = true;
+    }
+
+    // Reset alias cache at this phase boundary (#1657). $generate:uuid_v4#alias
+    // is designed to be stable within a scenario — the initial call and its
+    // idempotency replay share the same UUID — but aliases must NOT bleed across
+    // phases. Independent test groups that each start with a "setup" step need
+    // fresh idempotency keys; otherwise the seller's idempotency cache replays
+    // stale state from a prior group into the new one. Creating a new object
+    // identity drops the WeakMap entry without losing any $context.* values
+    // (those ride as plain properties on the spread result).
+    const priorPhaseContext = context;
+    context = { ...context };
+    // Protection rides the context object identity (like the alias cache),
+    // so the new identity must inherit it. Without this the single-commit
+    // rule and the writer-identity binding silently stop being enforced
+    // from the first executable phase onward.
+    forwardProtectedContext(priorPhaseContext, context);
+
+    // Seeding-cascade skip: the pre-flight seed phase can fail as a setup
+    // break, or the agent can be out-of-scope for fixture seeding because it
+    // lacks either the controller tool or a required seed_* scenario. Emit
+    // full step rows so implementors see which buyer-side operations were
+    // elided.
+    if (seedingMissingController || seedingUnsupported || seedingFailed) {
+      const cascadeSkip: Pick<StoryboardStepResult, 'skip_reason' | 'skip'> = seedingMissingController
+        ? {
+            skip_reason: 'missing_test_controller',
+            skip: { reason: 'missing_test_controller', detail: SKIP_DETAILS.missing_test_controller },
+          }
+        : seedingUnsupported
+          ? {
+              skip_reason: 'fixture_seed_unsupported',
+              skip: { reason: 'not_applicable', detail: FIXTURE_SEED_UNSUPPORTED_DETAIL },
+            }
+          : creativeBuildCatalogFailed
+            ? {
+                skip_reason: 'prerequisite_failed',
+                skip: {
+                  reason: 'prerequisite_failed',
+                  detail: 'Creative build catalog validation failed in fixture_resolution.creative_build_catalog.',
+                },
+              }
+            : seedingFailed
+              ? {
+                  skip_reason: 'controller_seeding_failed',
+                  skip: { reason: 'prerequisite_failed', detail: CONTROLLER_SEEDING_FAILED_DETAIL },
+                }
+              : {
+                  skip_reason: 'controller_seeding_failed',
+                  skip: { reason: 'prerequisite_failed', detail: CONTROLLER_SEEDING_FAILED_DETAIL },
+                };
+      const cascadeSteps: StoryboardStepResult[] = phase.steps.map(step => ({
+        storyboard_id: storyboard.id,
+        step_id: step.id,
+        phase_id: phase.id,
+        title: step.title,
+        task: step.task,
+        passed: true,
+        skipped: true,
+        ...cascadeSkip,
+        duration_ms: 0,
+        validations: [],
+        context,
+        extraction: { path: 'none' },
+      }));
+      phaseResults.push({
+        phase_id: phase.id,
+        phase_title: phase.title,
+        passed: true,
+        steps: cascadeSteps,
+        duration_ms: 0,
+      });
+      skippedCount += cascadeSteps.length;
+      continue;
+    }
+
+    // A failed stateful prerequisite must remain visible to a later phase
+    // that depends on this phase alone, without explicit context references.
+    const recordHardPrerequisiteFailure = (step: StoryboardStep, realFailure = false): void => {
+      if (realFailure) {
+        phaseStatefulCascades.set(phase.id, null);
+      } else if (
+        !phaseStatefulCascades.has(phase.id) ||
+        phaseStatefulCascades.get(phase.id)?.capabilityUnavailable === true
+      ) {
+        phaseStatefulCascades.set(phase.id, { stepId: step.id, reason: 'prerequisite_failed' });
+      }
+    };
+
+    const recordHardMissingState = (step: StoryboardStep, result: StoryboardStepResult): void => {
+      // Hard-missing skip on a stateful step. Defer the cascade only
+      // when a peer in this phase has declared
+      // `peer_substitutes_for: <this_step_id>` — that peer's pass
+      // establishes equivalent state. Without a declaration,
+      // missing_tool / missing_test_controller trips the cascade
+      // immediately (existing behavior).
+      const substitutes = phaseSubstitutes.get(step.id);
+      if (substitutes && substitutes.length > 0) {
+        if (phasePendingMissingTool.trigger === null) {
+          phasePendingMissingTool.trigger = {
+            stepId: step.id,
+            reason: result.skip_reason ?? 'missing_tool',
+            substitutes,
+          };
+        }
+      } else {
+        // Sole-stateful-step exemption (adcp-client-python#550):
+        // when a hard-missing skip lands on the ONLY stateful step
+        // in the phase, no peer could have established substitute
+        // state — same shape as #1146's `not_applicable` exemption.
+        // The platform legitimately doesn't implement this pathway
+        // (e.g., proposal-mode / implicit-account adopters that
+        // skip `sync_accounts` because account state materializes
+        // on the first `get_products` call). Cascading every
+        // downstream phase to `prerequisite_failed` collapses
+        // useful coverage; let downstream phases run and fail on
+        // their own merits if state genuinely never materialized.
+        //
+        // The skipping step is always stateful and always in
+        // `phaseStatefulStepIds` (built eagerly at phase init), so
+        // length > 1 ⇔ a stateful peer exists.
+        const hasStatefulPeers = phaseStatefulStepIds.length > 1;
+        if (hasStatefulPeers && !phaseStatefulCascades.has(phase.id)) {
+          // Multiple stateful steps in the phase but no declared
+          // substitute. Trip the cascade. First trip wins —
+          // subsequent triggers don't overwrite, since the cascade
+          // text references the originating diagnostic (the
+          // leftmost missing-state stateful step in the phase).
+          phaseStatefulCascades.set(phase.id, {
+            stepId: step.id,
+            reason: result.skip_reason ?? 'missing_tool',
+          });
+        } else if (!hasStatefulPeers && result.skip) {
+          // Exemption applied. Surface the runner's decision on the
+          // step result so adopters reading per-step output don't
+          // have to infer it from the absence of downstream skips.
+          result.skip = {
+            ...result.skip,
+            detail: result.skip.detail + soleStatefulExemptionDetail(phase.id),
+          };
+        }
+      }
+    };
+
+    for (const step of phase.steps) {
+      // adcp-client#1612: per-step abort gate. The dominant comply() cost
+      // on a healthy seller is sequential per-tool calls inside a single
+      // storyboard's phase — without this check the phase runs to completion
+      // even after comply() has already signalled "give up".
+      options.signal?.throwIfAborted();
+      // Validation-only coverage has no agent task to route.
+      if (routingContext && step.task === VALIDATION_ONLY_TASK) {
+        const result = validationOnlyCoverageGap(step, phase.id, context, allSteps, runnerVars, storyboard.id);
+        stepResults.push(result);
+        priorStepResults.set(step.id, result);
+        skippedCount++;
+        continue;
+      }
+
+      let assignment: StepAssignment | undefined;
+      try {
+        if (routingContext) assignment = dispatch.nextFor(step);
+      } catch (err) {
+        // Routing failures land here when no agent in the map serves a
+        // step's tool's protocol. Build-time conflict detection already
+        // catches the multi-claim case, so this branch covers genuine
+        // coverage gaps (storyboard authored a tool the topology can't
+        // serve) and unmapped tools without a `default_agent`. Render as
+        // a failed step with the routing error verbatim so the report
+        // tells the operator exactly what's missing.
+        const failed = routingFailedStep(step, phase.id, err);
+        reportedRoutingErrors.add(step);
+        stepResults.push(failed);
+        countedAsFailed.add(failed);
+        priorStepResults.set(step.id, failed);
+        failedCount++;
+        phasePassed = false;
+        recordUnavailableOutputs(phase.id, step, missingPrerequisiteContextKeysByPhase);
+        if (step.stateful) phaseStatefulCascades.set(phase.id, null);
+        continue;
+      }
+      // OAuth metadata absence belongs to the selected route, including a
+      // 404 observed earlier in this phase; it cannot suppress another agent.
+      if (
+        routingContext &&
+        assignment &&
+        phaseContainsOauthMetadataProbe(phase) &&
+        !agentAdvertisesOauth(assignment.profile)
+      ) {
+        routedOauthAbsent.add(assignment.instanceIndex);
+      }
+      // Explicit capability skips must reach their normal output/state
+      // bookkeeping even when this route also does not advertise OAuth.
+      if (
+        (phaseAbsent || (assignment && routedOauthAbsent.has(assignment.instanceIndex))) &&
+        !routedStepCapabilitySkips.has(step)
+      ) {
+        const cascadeResult: StoryboardStepResult = {
+          storyboard_id: storyboard.id,
+          step_id: step.id,
+          phase_id: phase.id,
+          title: step.title,
+          task: step.task,
+          passed: true,
+          skipped: true,
+          skip_reason: 'oauth_not_advertised',
+          skip: { reason: 'not_applicable', detail: OAUTH_NOT_ADVERTISED_DETAIL },
+          duration_ms: 0,
+          validations: [],
+          context,
+          extraction: { path: 'none' },
+        };
+        stepResults.push(cascadeResult);
+        priorStepResults.set(step.id, cascadeResult);
+        skippedCount++;
+        continue;
+      }
+
+      const selectedOptions = assignment?.options ?? options;
+      const routedCapabilityDetail = routedStepCapabilitySkips.get(step);
+
+      // Skip remaining steps if a stateful dependency failed (or
+      // skipped for a missing-state reason). Before applying the
+      // cascade reason, check the step's intrinsic skip-eligibility:
+      // if the agent never advertised this step's tool, the correct
+      // reason is `missing_tool` (a benign, passed: true skip) —
+      // not `prerequisite_failed` (a failed skip). This distinguishes
+      // "this agent has a real setup bug" from "this agent doesn't
+      // claim this surface, by design" (adcp-client#1169 / #1171).
+      //
+      // Uses resolveTaskName so that $test_kit.* steps are checked
+      // against the resolved concrete task name, not the template
+      // string (which would never be in agentTools).
+      //
+      // Per-phase cascade scoping (#1161): consults `phase.depends_on`
+      // (default: all prior phases) plus the current phase's own
+      // within-phase cascade state. Replaces the storyboard-scope
+      // `statefulFailed` boolean.
+      const cascade = step.stateful ? cascadeForPhase(phase, priorPhaseIds) : { tripped: false };
+      if (cascade.tripped && step.stateful && routedCapabilityDetail === undefined) {
+        const resolvedTask = resolveTaskName(step, selectedOptions);
+        const missingTool =
+          selectedOptions.agentTools &&
+          (routingContext && step.requires_tool && !selectedOptions.agentTools.includes(step.requires_tool)
+            ? step.requires_tool
+            : resolvedTask && !isRunnerOwnedTask(resolvedTask) && !selectedOptions.agentTools.includes(resolvedTask)
+              ? resolvedTask
+              : undefined);
+        if (missingTool) {
+          const missingReason =
+            routingContext && missingTool === 'comply_test_controller' ? 'missing_test_controller' : 'missing_tool';
+          const toolDetail = `Agent did not advertise tool "${missingTool}"; agent tools: [${selectedOptions.agentTools!.join(', ')}].`;
+          const missingToolResult: StoryboardStepResult = {
+            storyboard_id: storyboard.id,
+            step_id: step.id,
+            phase_id: phase.id,
+            title: step.title,
+            task: resolvedTask ?? step.task,
+            passed: true,
+            skipped: true,
+            skip_reason: missingReason,
+            skip: buildSkip(missingReason, toolDetail),
+            duration_ms: 0,
+            validations: [],
+            context,
+            extraction: { path: 'none' },
+          };
+          stepResults.push(missingToolResult);
+          priorStepResults.set(step.id, missingToolResult);
+          if (routingContext) {
+            recordUnavailableOutputs(phase.id, step, missingPrerequisiteContextKeysByPhase);
+            recordHardMissingState(step, missingToolResult);
+          }
+          skippedCount++;
+          continue;
+        }
+        const trigger = (cascade as { tripped: true; trigger: CascadeTrigger | null }).trigger;
+        let detail = trigger
+          ? trigger.substitution_chain
+            ? `Skipped: prior stateful step "${trigger.stepId}" skipped (${trigger.reason}); ${trigger.substitution_chain}; state never materialized.`
+            : `Skipped: prior stateful step "${trigger.stepId}" skipped (${trigger.reason}); state never materialized.`
+          : 'Skipped: prior stateful step failed.';
+        let capabilityUnavailable = trigger?.capabilityUnavailable === true;
+        if (
+          capabilityUnavailable &&
+          routingContext &&
+          !TRUSTED_MATCH_PUBLISHER_AUTH_TASKS.has(step.task) &&
+          !PROBE_TASKS.has(step.task) &&
+          !WEBHOOK_ASSERTION_TASKS.has(step.task) &&
+          step.task !== REPLAY_WEBHOOK_VECTOR_TASK &&
+          (!step.requires_contract || (selectedOptions.contracts ?? []).includes(step.requires_contract))
+        ) {
+          const hardKeys = unavailableContextKeysForPhase(phase, priorPhaseIds, missingPrerequisiteContextKeysByPhase);
+          if (hardKeys.size > 0) {
+            const effectiveRequest = buildEffectiveStepRequest(
+              { ...step, task: resolvedTask ?? step.task },
+              context,
+              selectedOptions,
+              buildExecutionState(assignment?.agentUrl, assignment?.profile)
+            );
+            const missingKeys = new Set([
+              ...(effectiveRequest.ok ? findUnresolvedContextVars(effectiveRequest.request) : [])
+                .filter(v => hardKeys.has(v.key))
+                .map(v => v.key),
+              ...(step.context_inputs ?? [])
+                .filter(input => !Object.hasOwn(context, input.key) && hardKeys.has(input.key))
+                .map(input => input.key),
+            ]);
+            if (missingKeys.size > 0) {
+              capabilityUnavailable = false;
+              detail = `Skipped: context required from a failed or unavailable prerequisite is missing: ${[...missingKeys].join(', ')}.`;
+            }
+          }
+        }
+        if (capabilityUnavailable) {
+          recordUnavailableOutputs(phase.id, step);
+          if (routingContext) phaseInheritedCapabilityTrigger ??= trigger ?? undefined;
+        } else if (routingContext) {
+          recordUnavailableOutputs(phase.id, step, missingPrerequisiteContextKeysByPhase);
+          recordHardPrerequisiteFailure(step, trigger === null);
+        }
+        stepResults.push({
+          storyboard_id: storyboard.id,
+          step_id: step.id,
+          phase_id: phase.id,
+          title: step.title,
+          task: step.task,
+          passed: capabilityUnavailable,
+          skipped: true,
+          skip_reason: capabilityUnavailable ? 'capability_prerequisite_unavailable' : 'prerequisite_failed',
+          skip: buildSkip(capabilityUnavailable ? 'not_applicable' : 'prerequisite_failed', detail),
+          duration_ms: 0,
+          validations: [],
+          context,
+          ...(!capabilityUnavailable && { error: detail }),
+          extraction: { path: 'none' },
+        });
+        skippedCount++;
+        if (!capabilityUnavailable) phasePassed = false;
+        continue;
+      }
+
+      if (step.task === VALIDATION_ONLY_TASK) {
+        const result = validationOnlyCoverageGap(step, phase.id, context, allSteps, runnerVars, storyboard.id);
+        stepResults.push(result);
+        priorStepResults.set(step.id, result);
+        skippedCount++;
+        continue;
+      }
+
+      assignment ??= dispatch.nextFor(step);
+      const stepExecutionState = buildExecutionState(assignment.agentUrl, assignment.profile);
+      if (routingContext) {
+        // Route identity includes the selected credential even when two entries
+        // share a URL. Cross-agent step/context dependencies remain run-scoped.
+        let probes = routedPriorProbes.get(assignment.instanceIndex);
+        if (!probes) {
+          probes = new Map();
+          routedPriorProbes.set(assignment.instanceIndex, probes);
+        }
+        stepExecutionState.priorProbes = probes;
+        stepExecutionState.allowPriorProbeFallback = false;
+      }
+      stepExecutionState.capabilityUnavailableContextKeys = unavailableContextKeysForPhase(phase, priorPhaseIds);
+      if (routingContext) {
+        stepExecutionState.missingPrerequisiteContextKeys = unavailableContextKeysForPhase(
+          phase,
+          priorPhaseIds,
+          missingPrerequisiteContextKeysByPhase
+        );
+      }
+      // Every-lookup authority: a prepared state authorized at run start is
+      // re-checked before each step. The effective route, account and
+      // credential can change between steps (per-step auth overrides,
+      // routed dispatch), and a grant can be revoked mid-run — neither is
+      // observable from a decision cached at preparation time.
+      if (preparedFixtureState !== undefined) {
+        const recheck = await resolvePreparedFixtures({
+          supplied: options.prepared_fixtures,
+          // The EFFECTIVE scope for this step: the routed options actually
+          // dispatching it, plus its own auth directive.
+          current: buildCurrentPreparedBinding(
+            storyboard,
+            agentUrls,
+            assignment.options ?? options,
+            step,
+            options,
+            context,
+            {
+              ...(assignment.agentKey !== undefined && { agentKey: assignment.agentKey }),
+              ...(assignment.agentUrl !== undefined && { agentUrl: assignment.agentUrl }),
+            },
+            runnerVars
+          ),
+          ...(options.prepared_fixtures_authorizer && { authorizer: options.prepared_fixtures_authorizer }),
+          stepId: step.id,
+          gate: 'step',
+        });
+        if (recheck !== undefined && !recheck.ok) {
+          const refusalResult: StoryboardStepResult = {
+            storyboard_id: storyboard.id,
+            step_id: step.id,
+            phase_id: phase.id,
+            title: step.title,
+            task: step.task,
+            passed: false,
+            duration_ms: 0,
+            validations: [
+              {
+                check: 'prepared_fixtures_authorization',
+                passed: false,
+                // One description for all three gates. Three spellings of
+                // the same check read to a report renderer as three kinds.
+                description: 'Prepared fixture state is re-validated and re-authorized on every lookup',
+                error: recheck.refusal.detail,
+                json_pointer: null,
+                expected: 'an authorized prepared state bound to this exact step scope',
+                actual: recheck.refusal.code,
+                schema_id: null,
+                schema_url: null,
+                // Explicit nulls, not omission: this is a PRE-WIRE
+                // refusal, and an absent key cannot be told apart from a
+                // runner that forgot to record one.
+                request: null,
+                response: null,
+              },
+            ],
+            // UNREDACTED. This result is never returned to the refused
+            // caller — it goes to the host's authorized audit scope, where
+            // withholding the evidence would defeat the point.
+            context,
+            extraction: { path: 'none' },
+            error: recheck.refusal.detail,
+          };
+          // Mirror the ordinary failure path's bookkeeping. Pushing the
+          // result and bumping the count is not enough: without these the
+          // phase grades green around a refused step, a refused STATEFUL
+          // step fails to trip the cascade (so downstream steps make real
+          // wire calls against state that was never pinned), and branch-set
+          // grading can relabel the refusal `peer_branch_taken` while the
+          // failed count stays elevated.
+          stepResults.push(refusalResult);
+          preparedRefused = recheck.refusal.code;
+          failedCount++;
+          phasePassed = false;
+          countedAsFailed.add(refusalResult);
+          priorStepResults.set(step.id, refusalResult);
+          if (step.stateful) phaseStatefulCascades.set(phase.id, null);
+          if (isMultiInstance || useRouting) {
+            // Same redaction and one-based index as the ordinary result
+            // path: a route URL can carry userinfo or query credentials,
+            // and a zero-based index misattributes the denial to the
+            // preceding replica.
+            refusalResult.agent_url = redactOAuthUrlForOutput(assignment.agentUrl);
+            refusalResult.agent_index = assignment.instanceIndex + 1;
+          }
+          continue;
+        }
+      }
+      const rawResult =
+        routedCapabilityDetail !== undefined
+          ? buildPhaseCapabilitySkippedSteps(
+              storyboard,
+              { ...phase, steps: [step] },
+              routedCapabilityDetail,
+              context
+            )[0]!
+          : await executeStep(
+              assignment.client,
+              step,
+              storyboard.id,
+              phase.id,
+              context,
+              allSteps,
+              assignment.options ?? options,
+              stepExecutionState
+            );
+      const result: StoryboardStepResult = { ...rawResult, storyboard_id: storyboard.id };
+      if (routedCapabilityDetail !== undefined || result.skip_reason === 'capability_prerequisite_unavailable') {
+        recordUnavailableOutputs(phase.id, step);
+      }
+      if (routedCapabilityDetail !== undefined && routedStepRequirements.has(step)) {
+        result.skip = { ...result.skip!, requirement: routedStepRequirements.get(step)! };
+      }
+      if (isMultiInstance || useRouting) {
+        // Echo per-step routing on the result so JUnit/CI consumers and
+        // bug reports show which agent served which tool. In routed mode
+        // every step gets the field; in replica round-robin only when
+        // there are 2+ URLs.
+        result.agent_url = redactOAuthUrlForOutput(assignment.agentUrl);
+        result.agent_index = assignment.instanceIndex + 1;
+      }
+      stepResults.push(result);
+      priorStepResults.set(step.id, result);
+
+      // Schema-validation short-circuit (adcp-client#1709). When the
+      // response unwrapper rejected the agent's response against the SDK's
+      // Zod schema, the step-execution path synthesized a failing
+      // `response_schema` ValidationResult on `result.validations`.
+      // Running step-scope invariants against a response the SDK has
+      // already declared malformed produces noise — the invariants
+      // can't meaningfully grade a payload that didn't parse. Worse,
+      // before #1709 the invariants' failure entries crowded out the
+      // schema-validation entry in `extractFailures`, masking the root
+      // cause across BidMachine's 10+ deploys (see adcp#4419). Skip the
+      // invariant pass entirely on this step and emit a single skipped
+      // `assertion` entry per invariant so consumers can still see WHICH
+      // invariants were skipped and why.
+      const schemaInvalidResponse = result.validations.some(
+        v => v.check === 'response_schema' && validationFailsStep(v)
+      );
+
+      // Rate-limit exhaustion is a contract-defined applicability result,
+      // not a response to grade. Preserve its empty validations array and
+      // passing skip status. Step assertions still run and remain visible on
+      // the storyboard-level assertions surface, but are not mirrored onto
+      // this skipped step or counted as a failed step.
+      const rateLimitTripNotApplicable = result.skipped === true && result.skip_reason === 'rate_limit_not_triggered';
+
+      // Fire per-step assertions. Each result is appended to the step's
+      // `validations[]` under `check: "assertion"` so existing UI renders
+      // them alongside inline checks, and mirrored into `assertionResults`
+      // for the storyboard-level `assertions[]` surface. Any failure flips
+      // `result.passed` so the counting below treats it like a validation
+      // failure — that's what makes assertions gating, not advisory.
+      for (const spec of assertions) {
+        if (!spec.onStep) continue;
+        // Per-step opt-out: authors use `step.invariants.disable: [id]` to
+        // suppress a default invariant on a step that deliberately models
+        // behavior the invariant would flag (validated at runner start).
+        if (stepDisablesAssertion(step.invariants, spec.id)) continue;
+        if (schemaInvalidResponse) {
+          // Emit a skipped marker so the report shows the invariant was
+          // intentionally bypassed (not silently dropped). `passed: true`
+          // keeps it from flipping `result.passed` — the schema-validation
+          // failure already did that.
+          result.validations.push({
+            check: 'assertion',
+            passed: true,
+            description: `${spec.id}: skipped — response failed schema validation (adcp-client#1709)`,
+          });
+          continue;
+        }
+        // The step result's `context` IS the live run context object, which
+        // the runner adopts as the next step's context. Handing it to an
+        // operator-supplied `--invariants` module let that module delete a
+        // committed capture with no funnel involvement — the next step then
+        // built its request without the pinned entity. Invariants get a
+        // detached projection; everything else about `result` is unchanged.
+        const raw = await spec.onStep(assertionContexts.get(spec.id)!, {
+          ...result,
+          context: withoutProtectedCaptures(result.context ?? {}),
+        });
+        for (const r of raw) {
+          const full: AssertionResult = { ...r, assertion_id: spec.id, scope: 'step', step_id: step.id };
+          assertionResults.push(full);
+          if (!rateLimitTripNotApplicable) {
+            result.validations.push({
+              check: 'assertion',
+              passed: r.passed,
+              description: `${spec.id}: ${r.description}`,
+              ...(r.error !== undefined && { error: r.error }),
+            });
+          }
+          // Issue #935: assertions can attach a structured hint that the
+          // runner mirrors into the owning step's `hints[]`. Producers today
+          // include `status.monotonic` (monotonic_violation) and
+          // `impairment.coherence` (impairment_coherence_violation); the
+          // merge here keeps the taxonomy unified so a single CLI/JUnit/Addie
+          // renderer can drive off `step.hints[]` regardless of which
+          // subsystem produced it.
+          if (r.hint) {
+            const existing = result.hints ?? [];
+            result.hints = [...existing, r.hint];
+          }
+          if (!r.passed) {
+            if (!rateLimitTripNotApplicable) result.passed = false;
+            assertionsFailed = true;
+          }
+        }
+      }
+
+      // PRM presence accounting — must happen after the step result lands so
+      // both the skipped-404 and 2xx paths are visible.
+      if (step.task === 'protected_resource_metadata') {
+        if (result.skipped && result.skip_reason === 'oauth_not_advertised') {
+          if (routingContext) routedOauthAbsent.add(assignment.instanceIndex);
+          else phaseAbsent = true;
+        } else {
+          const status = (result.response as HttpProbeResult | undefined)?.status;
+          if (typeof status === 'number' && status >= 200 && status < 300) {
+            if (routingContext) routedOauthPresent.add(assignment.instanceIndex);
+            else presenceDetected = true;
+          }
+        }
+      }
+
+      // Record contribution on success, honoring optional contributes_if predicate.
+      if (!result.skipped && result.passed && step.contributes_to) {
+        if (evalContributesIf(step.contributes_if, priorStepResults)) {
+          const flag = step.contributes_to;
+          if (!contributions.has(flag)) {
+            contributionSources.set(flag, { phaseId: phase.id, stepId: step.id });
+          }
+          contributions.add(flag);
+        }
+      }
+
+      if (result.skipped) {
+        skippedCount++;
+        context = result.context;
+        const hardPrerequisite =
+          isHardMissingStateSkipReason(result.skip_reason) || result.skip_reason === 'prerequisite_failed';
+        // Phase grading is shared by all routing modes. Skipped failures do
+        // not increment executed-failure counts, but cannot grade a phase green.
+        if (result.skip_reason === 'prerequisite_failed' && !result.passed) phasePassed = false;
+        if (routingContext && hardPrerequisite) {
+          recordUnavailableOutputs(phase.id, step, missingPrerequisiteContextKeysByPhase);
+          if (!result.passed) {
+            phasePassed = false;
+            if (step.stateful) recordHardPrerequisiteFailure(step);
+          }
+        }
+        // Cascade-skip extension: a stateful step that SKIPS because the
+        // agent simply lacks the tool (`missing_tool`,
+        // `missing_test_controller`) is equivalent to a failed stateful
+        // step — state genuinely never materialized. Trip immediately so
+        // downstream stateful steps skip with `prerequisite_failed`
+        // instead of running against absent state and surfacing a
+        // misleading assertion failure.
+        //
+        // `not_applicable` is handled separately (adcp-client#1005,
+        // round-9). It signals "this path doesn't apply to this agent",
+        // and the storyboard may have a peer step in the same phase
+        // that establishes equivalent state — e.g. an explicit-mode
+        // seller's `list_accounts` substituting for `sync_accounts`.
+        // We record a pending trigger and let the rest of the phase
+        // run; the cascade decision is finalized at phase end based on
+        // whether any stateful peer passed.
+        //
+        // Skips that imply state DID materialize via another path
+        // (`peer_branch_taken`, `controller_seeding_failed` — handled
+        // by phase-level cascade, `oauth_not_advertised` — phase-absent
+        // path) deliberately don't trip the flag.
+        if (step.stateful) {
+          if (isHardMissingStateSkipReason(result.skip_reason)) {
+            recordHardMissingState(step, result);
+          } else if (
+            result.skip_reason === 'not_applicable' ||
+            result.skip_reason === 'capability_prerequisite_unavailable'
+          ) {
+            // Defer cascade decision until end of phase. Ordinary missing
+            // state outranks capability-only unavailability; retain the
+            // leftmost trigger within the same class for stable diagnostics.
+            //
+            // Scope note: this branch matches the canonical literal
+            // `'not_applicable'` and capability-unavailable dependencies.
+            // Other detailed-form skip reasons that
+            // canonicalize to not_applicable (`probe_skipped`,
+            // `not_in_only_vectors`, `grader_skipped`,
+            // `mcp_mode_flattens_url_edges`) carry the detailed form
+            // on `result.skip_reason` and do NOT enter the deferred
+            // path — they preserve the pre-fix behavior of not
+            // tripping the cascade. `oauth_not_advertised` is handled
+            // by the separate `phaseAbsent` code path before this
+            // branch is reached. If a future detailed reason should
+            // participate in substitute-aware deferral, extend this
+            // condition deliberately rather than assuming canonical
+            // mapping is enough.
+            const capabilityUnavailable =
+              routedCapabilityDetail !== undefined || result.skip_reason === 'capability_prerequisite_unavailable';
+            if (
+              phasePendingNotApplicable === null ||
+              (phasePendingNotApplicable.capabilityUnavailable === true && !capabilityUnavailable)
+            ) {
+              phasePendingNotApplicable = {
+                stepId: step.id,
+                reason: result.skip_reason,
+                ...(capabilityUnavailable ? { capabilityUnavailable: true } : {}),
+              };
+            }
+          }
+        }
+      } else if (result.passed) {
+        context = result.context;
+        passedCount++;
+        // A passing stateful step counts as the phase establishing
+        // state. If a sibling skipped not_applicable earlier (or skips
+        // it later in the loop), this pass is the substitute path —
+        // the deferred cascade should NOT fire at phase end.
+        if (step.stateful) {
+          phaseEstablishedStatefulState = true;
+          // Path (2) rescue tracking: a passing step that declared
+          // `provides_state_for: X` (or the deprecated synonym
+          // `peer_substitutes_for`) rescues X. Recorded against every
+          // declared target so phase-end resolution sees the target as
+          // covered even if its skip arrives later in the loop.
+          const decl = step.provides_state_for ?? step.peer_substitutes_for;
+          if (decl !== undefined) {
+            const targets = Array.isArray(decl) ? decl : [decl];
+            for (const target of targets) {
+              phaseRescuedTargets.add(target);
+              // Track the rescuing substitute's id so phase-end can format
+              // the contract-mandated `peer_substituted` detail string.
+              if (!phaseRescueSource.has(target)) {
+                phaseRescueSource.set(target, step.id);
+              }
+            }
+          }
+        }
+      } else {
+        phasePassed = false;
+        // Optional phases normally swallow step failures — the storyboard's
+        // final assert_contribution gate decides pass/fail via the "API key
+        // OR OAuth" logic. Exception: once a PRM presence probe has
+        // detected the agent IS advertising OAuth, subsequent validation
+        // failures in this phase are hard failures (adcp-client#677). An
+        // agent that serves PRM MUST serve it correctly.
+        if (!phase.optional || (routingContext ? routedOauthPresent.has(assignment.instanceIndex) : presenceDetected)) {
+          failedCount++;
+          countedAsFailed.add(result);
+        } else if (!result.validations.some(validation => validation.check === 'assertion' && !validation.passed)) {
+          // Cross-step invariants gate the storyboard even inside optional
+          // phases, independently of the executed-step failure count.
+          result.counts_toward_failure = false;
+        }
+        if (step.stateful) {
+          // Real failure takes precedence over a prior skip-trigger in
+          // the cascade detail message — failures are the worse
+          // diagnostic, so downstream cascade-skipped steps should
+          // reference the failure rather than the earlier benign-ish
+          // missing-state skip. `null` trigger encodes "real failure,
+          // detail says 'prior stateful step failed'."
+          phaseStatefulCascades.set(phase.id, null);
+        }
+        // In multi-instance mode, annotate the failure with the cross-instance
+        // attribution block so CI readers pattern-match it as a deployment bug.
+        if (isMultiInstance) {
+          annotateMultiInstanceFailure(result, storyboard, stepResults);
+        }
+      }
+
+      if (!result.skipped && result.passed) {
+        const currentGlobalIndex = allSteps.find(
+          flat => flat.phaseId === phase.id && flat.step.id === step.id
+        )?.globalIndex;
+        if (currentGlobalIndex !== undefined) {
+          creativeAssetFixtureGap = preflightRemainingCreativeAssetDirectives(
+            allSteps,
+            currentGlobalIndex,
+            context,
+            options,
+            stepExecutionState,
+            preflightExcludedPhaseIds,
+            routedPreflightAssignment
+          );
+        }
+        if (creativeAssetFixtureGap) {
+          if (creativeAssetFixtureGap.target.phaseId === phase.id) {
+            const gapStep = buildCreativeAssetFixtureUnavailableStep(
+              creativeAssetFixtureGap.target.step,
+              phase.id,
+              context,
+              allSteps,
+              stepExecutionState,
+              creativeAssetFixtureGap.failure
+            );
+            gapStep.storyboard_id = storyboard.id;
+            stepResults.push(gapStep);
+            priorStepResults.set(gapStep.step_id, gapStep);
+            skippedCount++;
+            creativeAssetFixtureGapRecorded = true;
+          }
+          break;
+        }
+      }
+    }
+
+    // Phase-end cascade resolution for deferred `missing_tool` triggers
+    // (#1144). A stateful step that skipped with a hard-missing reason
+    // and had at least one declared substitute (`provides_state_for`,
+    // formerly `peer_substitutes_for`) was deferred above. If none of
+    // the declared substitutes passed, the substitution path failed to
+    // establish state — promote to a hard cascade with a detail message
+    // that names the substitute(s) tried so adopters reading the report
+    // see the substitution chain rather than a bare `missing_tool`
+    // cascade origin.
+    if (
+      phasePendingMissingTool.trigger &&
+      !phaseRescuedTargets.has(phasePendingMissingTool.trigger.stepId) &&
+      !phaseStatefulCascades.has(phase.id)
+    ) {
+      const subs = phasePendingMissingTool.trigger.substitutes;
+      const subsList = subs.length === 1 ? `"${subs[0]}"` : subs.map(s => `"${s}"`).join(', ');
+      phaseStatefulCascades.set(phase.id, {
+        stepId: phasePendingMissingTool.trigger.stepId,
+        reason: phasePendingMissingTool.trigger.reason,
+        substitution_chain: `declared substitute ${subsList} did not pass`,
+      });
+    }
+
+    // Unrescued missing-tool state takes precedence over capability-only
+    // unavailability when both deferred triggers exist in this phase.
+    // Phase-end cascade resolution for deferred `not_applicable` triggers.
+    // If a stateful step skipped not_applicable earlier in this phase and
+    // no stateful peer subsequently passed, we MAY promote to a hard cascade
+    // so downstream phases skip cleanly instead of running against absent state.
+    //
+    // Cascade fires ONLY when there was at least one other stateful step in
+    // the phase that could have served as a substitute — i.e. the phase had
+    // peer steps, but none of them established state (#1146). A peer that
+    // passed (e.g. `list_accounts` substituting for an explicit-mode
+    // `sync_accounts`) cancels the trigger entirely. A peer that *failed*
+    // already tripped this phase's cascade at the failure site with the
+    // worse-diagnostic real-failure message; we defer to that and don't
+    // overwrite.
+    //
+    // When the not_applicable step was the SOLE stateful step in the phase
+    // (no peers existed at all), the cascade does NOT fire. That platform
+    // simply doesn't use this sync pathway — which is valid. Cascading on a
+    // sole not_applicable would incorrectly penalise adapters that manage
+    // state implicitly and have no list_accounts peer (adcp-client#1146).
+    if (phasePendingNotApplicable && !phaseEstablishedStatefulState && !phaseStatefulCascades.has(phase.id)) {
+      const hadStatefulPeers = phaseStatefulStepIds.some(id => id !== phasePendingNotApplicable!.stepId);
+      if (hadStatefulPeers) {
+        phaseStatefulCascades.set(phase.id, phasePendingNotApplicable);
+      } else {
+        // Sole-stateful-step exemption fired. Mark the not_applicable
+        // step result so adopters see the runner's decision explicitly
+        // (parity with the missing_tool / missing_test_controller path
+        // upstream — both decision sites annotate the skip detail).
+        const naResult = stepResults.find(r => r.step_id === phasePendingNotApplicable!.stepId);
+        if (naResult?.skip) {
+          naResult.skip = {
+            ...naResult.skip,
+            detail: naResult.skip.detail + soleStatefulExemptionDetail(phase.id),
+          };
+        }
+      }
+    }
+
+    // Carry inherited capability unavailability through explicit dependency
+    // hops. Resolve local hard/ordinary triggers first so this neutral evidence
+    // cannot suppress their promotion or change producer exemption rules.
+    if (phaseInheritedCapabilityTrigger && !phaseStatefulCascades.has(phase.id)) {
+      phaseStatefulCascades.set(phase.id, phaseInheritedCapabilityTrigger);
+    }
+
+    // Phase-end re-grading for rescued targets (adcp#3734, AdCP 3.0.3+).
+    // When a deferred `missing_tool` / `missing_test_controller` skip was
+    // rescued by a passing same-phase substitute, the spec mandates the
+    // target be re-graded with `skip_reason: 'peer_substituted'` and the
+    // detail string `"<target_step_id> state provided by <phase_id>.<substitute_step_id>"`
+    // — see `runner-output-contract.yaml` > `skip_result.reasons.peer_substituted`.
+    // Without this re-grading the target keeps its original `missing_tool`
+    // grade, which is misleading: state DID materialize, just via a
+    // declared substitute path. Tracked: adcp-client#1267.
+    for (const target of phaseRescuedTargets) {
+      const sourceId = phaseRescueSource.get(target);
+      if (!sourceId) continue;
+      const targetResult = stepResults.find(r => r.step_id === target);
+      if (!targetResult || !targetResult.skipped) continue;
+      // Only re-grade hard-missing-state skips. Other skip reasons (e.g.
+      // `prerequisite_failed`, `peer_branch_taken`) on the target are
+      // outside the substitute-rescue contract. Uses the same helper as
+      // the deferral path (line ~1269 above) so the two sides stay in
+      // lockstep when a future RunnerSkipReason joins the family.
+      if (!isHardMissingStateSkipReason(targetResult.skip_reason)) continue;
+      const detail = `${target} state provided by ${phase.id}.${sourceId}`;
+      targetResult.skip_reason = 'peer_substituted';
+      targetResult.skip = { reason: 'peer_substituted', detail };
+    }
+
+    phaseResults.push({
+      phase_id: phase.id,
+      phase_title: phase.title,
+      passed: phasePassed,
+      steps: stepResults,
+      duration_ms: Date.now() - phaseStart,
+    });
+    // Accumulate phase id for default `depends_on` resolution in the next
+    // iteration — phases declared later see this one as a prior phase.
+    priorPhaseIds.push(phase.id);
+  }
+
+  // Preflight and phase skips cannot erase a known routing failure.
+  // Track authored step identity so repeated IDs in other phases remain distinct.
+  for (const phase of storyboard.phases) {
+    const result = phaseResults.find(p => p.phase_id === phase.id)!;
+    for (const step of phase.steps) {
+      if (!routedErrors.has(step) || reportedRoutingErrors.has(step)) continue;
+      const failed = routingFailedStep(step, phase.id, routedErrors.get(step));
+      const existingIndex = result.steps.findIndex(row => row.step_id === step.id);
+      if (existingIndex >= 0) {
+        const existing = result.steps[existingIndex]!;
+        if (existing.skipped) skippedCount--;
+        if (countedAsFailed.delete(existing)) failedCount--;
+        result.steps[existingIndex] = failed;
+      } else {
+        result.steps.push(failed);
+      }
+      reportedRoutingErrors.add(step);
+      countedAsFailed.add(failed);
+      result.passed = false;
+      priorStepResults.set(step.id, failed);
+      failedCount++;
+    }
+  }
+
+  // Branch-set post-pass: phases in a branch set (explicit `branch_set:`
+  // declaration or implicit detection via shared `contributes_to` + a later
+  // any_of `assert_contribution`) whose flag was contributed by a peer have
+  // their failed steps re-graded as skipped with `peer_branch_taken`. See
+  // storyboard-schema.yaml (lines 205-223) and runner-output-contract.yaml
+  // (reasons.peer_branch_taken). Done after all phases run — peer
+  // contribution status isn't knowable inside the per-phase loop. Runs
+  // before storyboard-scoped assertions so `onEnd` hooks see the finalized
+  // per-step grades (a moot peer's "failure" should not trip a cross-step
+  // invariant). `branchSetsByPhaseId` was resolved before the phase loop so
+  // the stateful cascade could consult it (branch-set peers don't cascade
+  // onto each other); reuse it here.
+  const branchSetDelta = creativeAssetFixtureGap
+    ? { skippedDelta: 0 }
+    : applyBranchSetGrading(
+        storyboard.phases,
+        phaseResults,
+        branchSetsByPhaseId,
+        contributions,
+        contributionSources,
+        countedAsFailed
+      );
+  skippedCount += branchSetDelta.skippedDelta;
+
+  // Fire storyboard-scoped assertions. These observe the full run and can
+  // emit `scope: "storyboard"` findings that flip `overall_passed` without
+  // being attributable to a single step (e.g. "saw >1 acquire for the same
+  // replayed idempotency_key across the run").
+  if (!creativeAssetFixtureGap) {
+    for (const spec of assertions) {
+      if (!spec.onEnd) continue;
+      const raw = await spec.onEnd(assertionContexts.get(spec.id)!);
+      for (const r of raw) {
+        assertionResults.push({ ...r, assertion_id: spec.id, scope: 'storyboard' });
+        if (!r.passed) assertionsFailed = true;
+      }
+    }
+  }
+
+  // Overall pass requires (a) no required-phase failures, (b) either an
+  // executed pass or every required step being skipped because it is canonically
+  // not_applicable or gated by an unavailable test-kit contract, and (c) no
+  // assertion failures. Without (b), a storyboard where every phase
+  // is optional or every required step is skipped for another reason (for
+  // example, missing_tool) would pass vacuously. Contract-gated storyboards
+  // are the deliberate exception: the runner has positively established that
+  // their opt-in adapter is out of scope, so the result is non-failing.
+  // (c) makes assertions gating — a run with all validations green but a
+  // cross-step invariant broken is not conformant.
+  // When no phases had executable steps the storyboard result is a skip, not a
+  // failure. The index-aligned guard below would hit storyboard.phases[0] ===
+  // undefined for an empty-phases storyboard and force requiredPhasesPassed to
+  // false, flipping overall_passed to false. Short-circuit to true so the
+  // no-phases sentinel produces overall_passed: true (consistent with how
+  // buildNotApplicableStoryboardResult shapes its result in comply.ts).
+  const requiredPhaseHasExecutedPass = phaseResults.some((p, idx) => {
+    const phaseDef = storyboard.phases[idx];
+    if (!phaseDef || phaseDef.optional || !p.passed) return false;
+    return p.steps.some(s => !s.skipped && s.passed);
+  });
+  const requiredPhaseDefs = storyboard.phases.filter(phaseDef => !phaseDef.optional);
+  // Optional-only storyboards still prove coverage when a real step passed.
+  // Empty/skipped runs and failed prerequisites must never pass vacuously.
+  const optionalOnlyHasExecutedPass =
+    requiredPhaseDefs.length === 0 &&
+    failedCount === 0 &&
+    phaseResults.some(phase => phase.passed && phase.steps.some(step => !step.skipped && step.passed)) &&
+    phaseResults.every(phase => {
+      if (phase.passed) return true;
+      const branchSet = branchSetsByPhaseId.get(phase.phase_id);
+      const source = branchSet && contributionSources.get(branchSet.id);
+      // Only a successful contributing peer makes a failed alternative moot.
+      // An unrelated optional read cannot rescue an entirely failed branch set.
+      return (
+        branchSet?.semantics === 'any_of' &&
+        source?.phaseId !== phase.phase_id &&
+        phaseResults.some(peer => peer.phase_id === source?.phaseId && peer.passed)
+      );
+    });
+  const requiredPhasesNonFailingSkipped =
+    requiredPhaseDefs.length > 0 &&
+    requiredPhaseDefs.every(phaseDef => {
+      const phaseResult = phaseResults.find(p => p.phase_id === phaseDef.id);
+      return (
+        !!phaseResult &&
+        phaseResult.passed &&
+        phaseResult.steps.length > 0 &&
+        phaseResult.steps.every(
+          step =>
+            step.skipped && (step.skip?.reason === 'not_applicable' || step.skip_reason === 'missing_test_kit_contract')
+        )
+      );
+    });
+  const requiredPhasesCoveredByCapabilityGates =
+    phaseCapabilitySkippedIds.size > 0 &&
+    requiredPhaseDefs.length > 0 &&
+    requiredPhaseDefs.every(phaseDef => {
+      if (phaseCapabilitySkippedIds.has(phaseDef.id)) return true;
+      const phaseResult = phaseResults.find(p => p.phase_id === phaseDef.id);
+      return !!phaseResult && phaseResult.passed && phaseResult.steps.some(s => !s.skipped && s.passed);
+    });
+  // Hard prerequisite skips fail their required phase without counting as
+  // executed failures. Check the finalized phase grades after any-of regrading
+  // so an unrelated passing read cannot conceal that missing state.
+  const requiredPhasesPassed =
+    !hasExecutableSteps ||
+    (requiredPhaseDefs.every(phaseDef => phaseResults.find(p => p.phase_id === phaseDef.id)?.passed === true) &&
+      (requiredPhaseHasExecutedPass ||
+        optionalOnlyHasExecutedPass ||
+        requiredPhasesNonFailingSkipped ||
+        (failedCount === 0 && requiredPhasesCoveredByCapabilityGates)));
+  const storyboardWideFixtureUnavailable =
+    (seedingUnsupported || fixtureUnsatisfied || creativeAssetFixtureGap !== undefined) && failedCount === 0;
+  // A storyboard that never exercised the agent for the coverage it exists to
+  // assert must not report a pass — see `signingCoverageUnverified` for why
+  // this reads the probe's wire status rather than its skip reason. Distinct
+  // from `storyboardWideFixtureUnavailable`, which deliberately preserves a
+  // pass for single missing fixtures inside a run that did exercise the agent.
+  const hasUnverifiedCoverage = signingCoverageUnverified(phaseResults.flatMap(phase => phase.steps));
+  // Prepend the pre-flight seeding phase now that every consumer that
+  // index-aligns `phaseResults` with `storyboard.phases` has run. Reader
+  // order matches execution order.
+  if (seedingPhaseResult) phaseResults.unshift(seedingPhaseResult);
+  const schemasUsed = collectSchemasUsed(phaseResults);
+  const strictSummary = summarizeStrictValidation(phaseResults);
+  const validationsNotApplicable = countValidationsNotApplicable(phaseResults);
+  const validationsAdvisoryFailed = countValidationsAdvisoryFailed(phaseResults);
+  // Use the fully-fetched profile for notice detection; fall back to pre-flight
+  // notices (which used options._profile) when profile was not re-fetched in
+  // this pass (standalone runner with options._profile pre-set skips the fetch).
+  const notices = mergeRunnerNotices([
+    ...collectCapabilityNotices(storyboard, profile ?? options._profile),
+    ...collectStepNotices(phaseResults),
+  ]);
+  const result: StoryboardResult = {
+    storyboard_id: storyboard.id,
+    storyboard_title: storyboard.title,
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
+    ...(isMultiInstance && { agent_urls: agentUrls.map(redactOAuthUrlForOutput) }),
+    // Inner multi-pass passes surface as `round-robin` (that's what they are
+    // individually); the aggregating wrapper relabels the top-level result
+    // `multi-pass`.
+    ...(isMultiInstance && { multi_instance_strategy: 'round-robin' as const }),
+    ...(routingContext && {
+      agent_map: Object.fromEntries(
+        Object.entries(routingContext.agentMap).map(([specialism, url]) => [specialism, redactOAuthUrlForOutput(url)])
+      ),
+    }),
+    overall_passed:
+      failedCount === 0 &&
+      (requiredPhasesPassed || storyboardWideFixtureUnavailable) &&
+      !assertionsFailed &&
+      !hasUnverifiedCoverage,
+    phases: phaseResults,
+    context,
+    total_duration_ms: Date.now() - start,
+    passed_count: passedCount,
+    failed_count: failedCount,
+    skipped_count: skippedCount,
+    ...(validationsAdvisoryFailed > 0 ? { validations_advisory_failed: validationsAdvisoryFailed } : {}),
+    ...(validationsNotApplicable > 0 ? { validations_not_applicable: validationsNotApplicable } : {}),
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
+    tested_at: new Date().toISOString(),
+    ...(schemasUsed.length > 0 ? { schemas_used: schemasUsed } : {}),
+    ...(assertionResults.length > 0 ? { assertions: assertionResults } : {}),
+    strict_validation_summary: strictSummary,
+    notices,
+    // `fixture_resolutions` carries `seller_ids`, so it is withheld on the
+    // same condition as the context projection above.
+    ...(fixtureResolutionRecords && { fixture_resolutions: fixtureResolutionRecords }),
+    ...(fixtureCoverageGap && { coverage_gaps: [fixtureCoverageGap] }),
+    ...(routingContext && routingContext.discoveryFailures.length > 0
+      ? {
+          discovery_failures: routingContext.discoveryFailures.map(f => ({
+            agent_key: f.agentKey,
+            url: redactOAuthUrlForOutput(f.url),
+            error: redactOAuthUrlsInText(f.underlying),
+          })),
+        }
+      : {}),
+  };
+
+  // Close protocol connections when the runner created its own client. The
+  // The runner scope tracks every URL used by this storyboard, so one scoped
+  // close releases all of its transports without disrupting concurrent runs.
+  if (!callerOwnsClients) {
+    await closeScopedConnections(options.protocol);
+  }
+
+  if (webhookReceiver) await webhookReceiver.close();
+
+  // An authorization refusal is an access-control error, not a grading
+  // outcome. The record above is COMPLETE and unredacted — it is the
+  // host's audit evidence, not the caller's report — so it goes to the
+  // authorized sink and the caller gets a typed denial carrying the
+  // machine refusal code and nothing else.
+  if (preparedRefused !== undefined) {
+    await emitPreparedFixturesAudit(options, result);
+    throw new PreparedFixturesDeniedError(preparedRefused);
+  }
+  return result;
+}
+
+/**
+ * Run the storyboard N times — once per replica — with the round-robin
+ * dispatcher starting at a different replica each pass. Lets each step hit
+ * a different replica across passes, so a bug isolated to one replica
+ * (stale config, divergent version, local cache miss) surfaces on the pass
+ * that sends the relevant step there.
+ *
+ * Known limitation (follow-up adcontextprotocol/adcp-client#607 option 2):
+ * for N=2, offset-shift preserves pair parity — a write→read pair whose
+ * dispatch indices differ by an even amount lands same-replica in every
+ * pass (the canonical property_lists case: write at step 0, read at step
+ * 2). Cross-replica state-persistence testing at N=2 is primarily the job
+ * of single-pass round-robin (which catches adjacent write→read pairs);
+ * dependency-aware dispatch that reads `context_inputs` and assigns a
+ * replica different from the writer of the specific state key being read
+ * is the spec-aligned fix for non-adjacent pairs and should be preferred
+ * over multi-pass for that purpose.
+ *
+ * The aggregated result AND-combines `overall_passed` across passes, sums
+ * the pass/fail/skip counts, and exposes the per-pass detail via `passes[]`.
+ * The top-level `phases` is the first pass's phases so single-pass consumers
+ * keep working; richer consumers read `passes[]`.
+ */
+async function runMultiPass(
+  agentUrls: string[],
+  storyboard: Storyboard,
+  options: StoryboardRunOptions
+): Promise<StoryboardResult> {
+  const start = Date.now();
+
+  // Same ordering rule as the single-pass path, and it must come first here
+  // too: the pre-seed below constructs clients and discovers profiles before
+  // it ever reaches a pass.
+  if (options.prepared_fixtures !== undefined) {
+    // `'run'`, not the default `'pass'`: each `executeStoryboardPass` gates
+    // again with `'pass'`, so labelling this one `'pass'` gave a host
+    // counting lookups P+1 passes for P passes.
+    const gate = await gatePreparedFixtures(storyboard, agentUrls, options, undefined, 'run');
+    if (gate.used && 'refusal' in gate) {
+      // Same contract-shaped refusal every other gate emits. A bare
+      // `discovery_failed` carries no `prepared_fixtures_authorization`
+      // validation, so it violates the "a failed step carries at least one
+      // failing validation" rule AND is invisible to
+      // `resultRefusedPreparedFixtures`, which then does not project.
+      return denyPreparedFixtures(
+        options,
+        buildPreparedRefusalRunResult(agentUrls, storyboard, gate.refusal),
+        gate.refusal.code
+      );
+    }
+  }
+
+  // Run pre-flight controller seeding ONCE at the run level (adcp-client#778)
+  // so the aggregator doesn't sum N redundant seed batches into
+  // `failed_count` / `skipped_count`. Every pass inherits the same outcome;
+  // only the first pass attaches the synthetic `__controller_seeding__`
+  // phase to its `phaseResults`, so the aggregated top-level counts reflect
+  // a single seeding pass across the whole run.
+  const preSeedClients = agentUrls.map(url => getOrCreateClientResolution(url, options).client);
+  const preSeedContext: StoryboardContext = createRunContext(storyboard, options).context;
+  let preSeedProfile = options._profile;
+  if (!preSeedProfile) {
+    const discovered = await getOrDiscoverStoryboardProfile(preSeedClients[0]!, options);
+    if (discovered.step.passed === false) {
+      await closeScopedConnections(options.protocol);
+      return buildDiscoveryFailedResult(agentUrls, storyboard, discovered.step, discovered.profile);
+    }
+    preSeedProfile = discovered.profile;
+  }
+  if (preSeedProfile && (!options._profile || !options.agentTools)) {
+    options = {
+      ...options,
+      _profile: preSeedProfile,
+      ...(options.agentTools ? {} : { agentTools: normalizeAgentToolNames(preSeedProfile.tools) }),
+    };
+  }
+
+  // A pinned graph is authoritative across every pass; resetting and
+  // re-seeding would discard the state the prepared run executes against.
+  if (options.prepared_fixtures === undefined) {
+    const resetFailure = await resetControllerStates(
+      preSeedClients.map(client => ({ client, options })),
+      storyboard
+    );
+    if (resetFailure) {
+      await closeScopedConnections(options.protocol);
+      return buildDiscoveryFailedResult(agentUrls, storyboard, resetFailure);
+    }
+  }
+
+  // runStoryboardBody cannot evaluate capability-gated requirements until
+  // this multi-pass preflight has discovered the profile. Resolve both gates
+  // once here so an optional capability remains not_applicable and a missing
+  // run-scoped harness remains one storyboard skip rather than N pass skips.
+  if (storyboardCapabilityPredicates(storyboard).length > 0) {
+    const unmetDetail = evaluateStoryboardCapabilityGates(
+      storyboard,
+      preSeedProfile,
+      options.agentTools,
+      options.adcpVersion
+    );
+    if (unmetDetail !== null) {
+      await closeScopedConnections(options.protocol);
+      return {
+        ...buildCapabilityUnsupportedResult(agentUrls, storyboard, unmetDetail),
+        notices: collectCapabilityNotices(storyboard, preSeedProfile),
+      };
+    }
+  }
+  const allRequires = resolveStoryboardRequires(storyboard, options);
+  if (allRequires.length > 0) {
+    const requirementCheck = await checkRequires(allRequires, storyboard, options, preSeedProfile);
+    if ('requirement' in requirementCheck) {
+      await closeScopedConnections(options.protocol);
+      return {
+        ...buildRequirementUnmetResult(agentUrls, storyboard, requirementCheck.requirement, requirementCheck.detail),
+        notices: collectCapabilityNotices(storyboard, preSeedProfile),
+      };
+    }
+    if (requirementCheck.preparedPublisherAuthProbes) {
+      options = withPreparedTrustedMatchPublisherAuth(options, requirementCheck.preparedPublisherAuthProbes);
+    }
+  }
+  const phaseCapabilitySkipDetails = collectPhaseCapabilitySkipDetails(
+    storyboard,
+    preSeedProfile,
+    options.agentTools,
+    options.adcpVersion
+  );
+  const preSeedExcludedPhaseIds = new Set([
+    ...phaseCapabilitySkipDetails.keys(),
+    ...storyboard.phases.filter(phase => shouldSkipPhaseBeforeRun(phase, options)).map(phase => phase.id),
+    ...storyboard.phases.filter(phase => phaseUsesRuntimeContext(phase)).map(phase => phase.id),
+  ]);
+  const preSeedFixtureGap = preflightRemainingCreativeAssetDirectives(
+    flattenSteps(storyboard),
+    -1,
+    preSeedContext,
+    options,
+    {
+      contributions: new Set(),
+      priorStepResults: new Map(),
+      priorProbes: new Map(),
+      agentUrl: agentUrls[0]!,
+    },
+    preSeedExcludedPhaseIds
+  );
+  const preSeededResult =
+    // A pinned graph is authoritative across every pass. Re-seeding would
+    // issue fresh `seed_*` mutations that replace the very seller state the
+    // prepared captures describe, while the passes keep the original
+    // bindings — the reset is guarded above for the same reason.
+    options.prepared_fixtures !== undefined ||
+    preSeedFixtureGap ||
+    allExecutablePhasesCapabilitySkipped(storyboard, phaseCapabilitySkipDetails)
+      ? null
+      : await runControllerSeeding(preSeedClients[0]!, storyboard, options, preSeedContext);
+
+  if (preSeededResult?.fixtureUnavailable && preSeededResult.failedCount === 0) {
+    await closeScopedConnections(options.protocol);
+    return buildFixtureDiscoveryUnavailableResult(
+      agentUrls,
+      storyboard,
+      preSeededResult.fixtureUnavailable,
+      preSeededResult.phase,
+      preSeededResult.resolutionRecords
+    );
+  }
+
+  const passes: StoryboardPassResult[] = [];
+  const passResults: StoryboardResult[] = [];
+  for (let passIdx = 0; passIdx < agentUrls.length; passIdx++) {
+    const passSeeded: PreSeededInput = { result: preSeededResult, attach: passIdx === 0 };
+    const result = await executeStoryboardPass(agentUrls, storyboard, options, passIdx, passSeeded);
+    passResults.push(result);
+    passes.push({
+      pass_index: passIdx + 1,
+      dispatch_offset: passIdx,
+      overall_passed: result.overall_passed,
+      phases: result.phases,
+      passed_count: result.passed_count,
+      failed_count: result.failed_count,
+      skipped_count: result.skipped_count,
+      ...(result.validations_advisory_failed
+        ? { validations_advisory_failed: result.validations_advisory_failed }
+        : {}),
+      ...(result.validations_not_applicable ? { validations_not_applicable: result.validations_not_applicable } : {}),
+      duration_ms: result.total_duration_ms,
+    });
+  }
+
+  const first = passResults[0]!;
+  // No aggregate projection: a pass whose grant was refused throws from
+  // `executeStoryboardPass` rather than returning, so `passResults` can
+  // only contain authorized passes by the time control reaches here.
+  const overallPassed = passes.every(p => p.overall_passed);
+  const passed = passes.reduce((sum, p) => sum + p.passed_count, 0);
+  const failed = passes.reduce((sum, p) => sum + p.failed_count, 0);
+  const skipped = passes.reduce((sum, p) => sum + p.skipped_count, 0);
+  const advisoryFailed = passes.reduce((sum, p) => sum + (p.validations_advisory_failed ?? 0), 0);
+  const notApplicable = passes.reduce((sum, p) => sum + (p.validations_not_applicable ?? 0), 0);
+  const schemasUsed = passResults.flatMap(r => r.schemas_used ?? []);
+  const schemasDedup = [...new Map(schemasUsed.map(s => [s.schema_id, s])).values()];
+  // Assertions are scoped per-pass — each pass's runner resolved them
+  // independently and reported `assertion_id` identically. Concatenate so
+  // readers see a per-pass timeline; de-duplicating would hide a real
+  // "passed on pass 1, failed on pass 2" divergence.
+  const assertionsAgg = passResults.flatMap((r, index) =>
+    (r.assertions ?? []).map(assertion => ({ ...assertion, pass_index: index + 1 }))
+  );
+  // Notices are identical across passes (same agent, same capabilities).
+  // Schema-invalid capabilities notices retain one row per RFC 6901 pointer.
+  const noticesDedup = [...new Map(passResults.flatMap(r => r.notices).map(n => [runnerNoticeKey(n), n])).values()];
+
+  return {
+    storyboard_id: storyboard.id,
+    storyboard_title: storyboard.title,
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
+    agent_urls: agentUrls.map(redactOAuthUrlForOutput),
+    multi_instance_strategy: 'multi-pass',
+    overall_passed: overallPassed,
+    phases: first.phases,
+    passes,
+    context: first.context,
+    total_duration_ms: Date.now() - start,
+    passed_count: passed,
+    failed_count: failed,
+    skipped_count: skipped,
+    ...(advisoryFailed > 0 ? { validations_advisory_failed: advisoryFailed } : {}),
+    ...(notApplicable > 0 ? { validations_not_applicable: notApplicable } : {}),
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
+    tested_at: new Date().toISOString(),
+    ...(schemasDedup.length > 0 ? { schemas_used: schemasDedup } : {}),
+    ...(assertionsAgg.length > 0 ? { assertions: assertionsAgg } : {}),
+    // `fixture_resolutions` carries `seller_ids`, so the aggregate withholds
+    // it on the same condition the single-pass result does. Projecting
+    // `phases` and `context` but republishing the pinned seller ids here
+    // withheld the copies and published the original.
+    ...(first.fixture_resolutions ? { fixture_resolutions: first.fixture_resolutions } : {}),
+    ...(first.coverage_gaps ? { coverage_gaps: first.coverage_gaps } : {}),
+    notices: noticesDedup,
+  };
+}
+
+/**
+ * Collect a deduplicated list of schemas applied during this run. Drawn
+ * from every validation result with a schema_id; dropping empties keeps
+ * the list proportional to what actually ran.
+ */
+/**
+ * Count validation results graded `not_applicable` across every step. Per
+ * runner-output-contract.yaml v2.0.0 these come from the forward-compat
+ * default in the validation dispatcher: when a storyboard declares an
+ * authored `check` value the runner does not implement, the dispatcher
+ * grades it `passed: true, not_applicable: true` rather than failing the
+ * step. Surfacing the count separately lets consumers distinguish
+ * "runner is older than the storyboard" from clean passes.
+ */
+function countValidationsNotApplicable(phases: StoryboardPhaseResult[]): number {
+  let n = 0;
+  for (const phase of phases) {
+    for (const step of phase.steps) {
+      for (const v of step.validations) {
+        if (v.not_applicable) n++;
+      }
+    }
+  }
+  return n;
+}
+
+/** Count failed, unpromoted advisories without affecting step verdicts. */
+function countValidationsAdvisoryFailed(phases: StoryboardPhaseResult[]): number {
+  let n = 0;
+  for (const phase of phases) {
+    for (const step of phase.steps) {
+      for (const validation of step.validations) {
+        if (!validation.passed && validation.severity === 'advisory') n++;
+      }
+    }
+  }
+  return n;
+}
+
+function collectSchemasUsed(phases: StoryboardPhaseResult[]): Array<{ schema_id: string; schema_url: string }> {
+  const seen = new Set<string>();
+  const out: Array<{ schema_id: string; schema_url: string }> = [];
+  for (const phase of phases) {
+    for (const step of phase.steps) {
+      for (const v of step.validations) {
+        if (v.schema_id && v.schema_url && !seen.has(v.schema_id)) {
+          seen.add(v.schema_id);
+          out.push({ schema_id: v.schema_id, schema_url: v.schema_url });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Walk every response_schema validation and aggregate the strict/lenient
+ * delta. Always returns a summary; `observable: false` signals "run had
+ * no strict-eligible checks" (distinct from strict-clean with zero
+ * findings). See issue #820 follow-up.
+ *
+ * `checked` counts validations with a `strict` verdict attached.
+ * `passed` / `failed` partition `checked` by `strict.valid`.
+ * `strict_only_failures` = #(lenient-pass ∧ strict-fail) — the agent's
+ * production-readiness gap.
+ * `lenient_also_failed` = #(lenient-fail ∧ strict-fail) — step already
+ * broken, strict-rejection isn't new signal.
+ * `lenient_unobserved` = #(no packaged Zod comparator ∧ strict-fail).
+ *
+ * Exported so callers post-processing a `StoryboardResult` (dashboards,
+ * CI formatters) can compute the same summary over a subset of phases
+ * without re-running validation.
+ */
+/**
+ * Flatten every `strict_only_failure` (lenient-pass ∧ strict-fail) into a
+ * dashboard-friendly row list. Each row carries the step/phase context
+ * needed for triage without re-walking the nested result tree:
+ *
+ *   { phase_id, step_id, task, variant, issues }
+ *
+ * Exported because the ValidationResult tree is four levels deep
+ * (`phases[].steps[].validations[].strict.issues[]`) and a consumer
+ * seeing `strict_only_failures: 7` in the summary needs a direct path
+ * to the seven offending responses. This is that path.
+ *
+ * Returns `[]` on runs with no strict-only failures OR no AJV coverage
+ * (both cases produce zero rows). Inspect `strict_validation_summary`
+ * for the total counts.
+ */
+export function listStrictOnlyFailures(
+  phases: StoryboardPhaseResult[]
+): Array<{ phase_id: string; step_id: string; task: string; variant: string; issues: SchemaValidationError[] }> {
+  const rows: Array<{
+    phase_id: string;
+    step_id: string;
+    task: string;
+    variant: string;
+    issues: SchemaValidationError[];
+  }> = [];
+  for (const phase of phases) {
+    for (const step of phase.steps) {
+      for (const v of step.validations) {
+        if (v.check !== 'response_schema') continue;
+        if (v.strict === undefined) continue;
+        if (v.strict.valid) continue;
+        const lenientAccepted = v.strict.lenient_valid === true || (v.strict.lenient_valid === undefined && v.passed);
+        if (!lenientAccepted) continue;
+        rows.push({
+          phase_id: phase.phase_id,
+          step_id: step.step_id,
+          task: step.task,
+          variant: v.strict.variant,
+          issues: v.strict.issues ?? [],
+        });
+      }
+    }
+  }
+  return rows;
+}
+
+export function summarizeStrictValidation(phases: StoryboardPhaseResult[]): StrictValidationSummary {
+  let checked = 0;
+  let passed = 0;
+  let strictOnlyFailures = 0;
+  let lenientAlsoFailed = 0;
+  let lenientUnobserved = 0;
+  for (const phase of phases) {
+    for (const step of phase.steps) {
+      for (const v of step.validations) {
+        if (v.check !== 'response_schema' || v.strict === undefined) continue;
+        checked++;
+        if (v.strict.valid) {
+          passed++;
+        } else {
+          const lenientValid = v.strict.lenient_valid;
+          if (lenientValid === true || (lenientValid === undefined && v.passed)) {
+            // Lenient Zod accepted this response; strict AJV rejected it.
+            // That's the agent's strictness gap — the signal #820 wants.
+            strictOnlyFailures++;
+          } else if (lenientValid === false || lenientValid === undefined) {
+            lenientAlsoFailed++;
+          } else {
+            lenientUnobserved++;
+          }
+        }
+      }
+    }
+  }
+  const failed = checked - passed;
+  return {
+    observable: checked > 0,
+    checked,
+    passed,
+    failed,
+    strict_only_failures: strictOnlyFailures,
+    lenient_also_failed: lenientAlsoFailed,
+    ...(lenientUnobserved > 0 && { lenient_unobserved: lenientUnobserved }),
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// runStoryboardStep: execute a single step (stateless)
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Run a single storyboard step.
+ *
+ * This is the core primitive for stateless, LLM-friendly execution.
+ * Context is passed in and returned, enabling step-by-step orchestration.
+ */
+export async function runStoryboardStep(
+  agentUrl: string,
+  storyboard: Storyboard,
+  stepId: string,
+  options: StoryboardRunOptions = {}
+): Promise<StoryboardStepResult> {
+  assertNoPreparationAuthorizer(options);
+  options = {
+    ...applyReusableProfileOptions(options),
+    _requireValidCapabilityEvidence: storyboardRequiresCapabilityEvidence(storyboard),
+    _allowCapabilityDiagnostic: storyboardAllowsCapabilityDiagnostic(storyboard),
+  };
+  return withPropertyListCredentialRedaction(() =>
+    withMCPConnectionScope(
+      async () => {
+        storyboard = normalizeValidationOnlyTasks(storyboard);
+        validateStoryboardShape(storyboard);
+        options = applyStoryboardVersionOptions(storyboard, options);
+        options = applyFunctionalRequestSigning(options, {
+          ...(options.complianceDir && { complianceDir: options.complianceDir }),
+          ...(options.adcpVersion && { version: options.adcpVersion }),
+        });
+        // adcp#6735 — same declared-kit resolution as runStoryboard, so the
+        // printed fix_command path exercises the step with its real credential.
+        options = resolveDeclaredTestKit(storyboard, options);
+        options = applyNativeA2AComplianceTransportOptions(options);
+        const schemaRoot = getRunSchemaRoot(options);
+        const runBody = () =>
+          withServedReleaseSchemaRoots(options.servedReleaseSchemaRoots, () =>
+            runStoryboardStepBody(agentUrl, storyboard, stepId, options)
+          );
+        if (schemaRoot) {
+          return await withExternalSchemaRoot(schemaRoot.adcpVersion, schemaRoot.schemaRoot, runBody);
+        }
+        return await runBody();
+      },
+      { isolate: !hasTestClientScope() }
+    )
+  );
+}
+
+/**
+ * True when a pass result carries a failed prepared-state authorization.
+ *
+ * Reads the machine-readable check name rather than the error prose, so a
+ * reworded refusal message cannot quietly stop the aggregate from being
+ * projected.
+ */
+
+/**
+ * Project a context for a refused/unresolved prepared-state result.
+ *
+ * Reserved keys are stripped. A grant that was revoked mid-run must not keep
+ * leaking the pinned product identity and captured pricing into every
+ * subsequent step result just because the wire call was blocked.
+ *
+ * Scope is the reserved namespace, NOT the transitive closure of everything
+ * derived from it. A step that copies a pinned value into an ordinary
+ * `context_outputs` key keeps that key: the step ran under a valid grant and
+ * its result is already with the caller, and stripping authored context
+ * would break the storyboard. This is withholding, not retroactive
+ * un-disclosure, and the guide says so to the adopter in those words.
+ */
+function withoutProtectedCaptures(context: StoryboardContext): StoryboardContext {
+  const projected: StoryboardContext = {};
+  for (const [key, value] of Object.entries(context)) {
+    if (!isProtectedContextKey(key)) projected[key] = value;
+  }
+  return projected;
+}
+
+/**
+ * Run-level result for a refused prepared-state lookup.
+ *
+ * Carries the `prepared_fixtures_authorization` validation rather than a
+ * bare `discovery_failed` with an empty `validations[]`: the contract
+ * requires a failed step to carry at least one failing validation, and an
+ * authorization refusal must be machine-distinguishable from a genuine
+ * discovery failure without regexing the error string.
+ */
+/**
+ * Refuse a caller and leave the evidence where it belongs.
+ *
+ * An authorization failure is an ACCESS-CONTROL error, not a grading
+ * outcome. The caller gets a typed denial carrying the machine refusal
+ * code and nothing else — no grading result, partial or redacted, and so
+ * no fixture identities, seller ids, captures, binding values,
+ * request/response records or earlier-step results. The complete,
+ * UNREDACTED record goes to the host's authorized scope first.
+ */
+async function denyPreparedFixtures(
+  options: StoryboardRunOptions,
+  record: StoryboardResult | StoryboardStepResult,
+  refusalCode: string
+): Promise<never> {
+  await emitPreparedFixturesAudit(options, record);
+  throw new PreparedFixturesDeniedError(refusalCode);
+}
+
+/**
+ * Hand a refused run's COMPLETE record to the host's authorized scope.
+ *
+ * The record is unredacted on purpose: this is the accountable copy, and
+ * every output MUST applies to it. The caller never sees it.
+ *
+ * A sink that throws or rejects does not change the outcome. Reporting
+ * its failure to the refused caller would turn the sink into an oracle
+ * over host state, and swallowing the denial because an audit write
+ * broke would be worse still.
+ */
+async function emitPreparedFixturesAudit(
+  options: StoryboardRunOptions,
+  record: StoryboardResult | StoryboardStepResult
+): Promise<void> {
+  const sink = options.prepared_fixtures_audit_sink;
+  if (!sink) return;
+  try {
+    const state = options.prepared_fixtures;
+    const auditRecord =
+      isTrustedPreparedFixtures(state) && state.disposition.status === 'failed'
+        ? {
+            ...record,
+            fixture_resolutions: state.resolutions,
+            ...(state.phase && { fixture_preparation: state.phase }),
+          }
+        : record;
+    await sink(auditRecord);
+  } catch {
+    // Intentionally swallowed; see above.
+  }
+}
+
+function buildPreparedRefusalRunResult(
+  agentUrls: string[],
+  storyboard: Storyboard,
+  refusal: PreparedFixturesRefusal,
+  gate?: 'prepare'
+): StoryboardResult {
+  const base = buildDiscoveryFailedResult(agentUrls, storyboard, {
+    step: gate === 'prepare' ? 'Authorize fixture preparation' : 'Authorize prepared fixture state',
+    passed: false,
+    duration_ms: 0,
+    error: refusal.detail,
+  });
+  const validation: ValidationResult = {
+    check: 'prepared_fixtures_authorization',
+    passed: false,
+    description:
+      gate === 'prepare'
+        ? 'Fresh fixture preparation requires host authorization before seller contact'
+        : 'Prepared fixture state is re-validated and re-authorized on every lookup',
+    error: refusal.detail,
+    json_pointer: null,
+    expected:
+      gate === 'prepare'
+        ? 'an authorized fixture preparation for this exact run scope'
+        : 'an authorized prepared state bound to this exact run scope',
+    actual: refusal.code,
+    schema_id: null,
+    schema_url: null,
+    // Explicit nulls: the refusal check itself makes no seller call.
+    // Earlier producer exchanges remain in the private audit record;
+    // an omitted key would be indistinguishable from missing evidence.
+    request: null,
+    response: null,
+  };
+  return {
+    ...base,
+    phases: base.phases.map(phase => ({
+      ...phase,
+      steps: phase.steps.map(step => ({ ...step, validations: [...step.validations, validation] })),
+    })),
+  };
+}
+
+/**
+ * Project a phase's retained step results after a refusal.
+ *
+ * The run-level projection alone withheld the cheap copy of the pinned
+ * identity while still publishing the expensive one: steps that ran under a
+ * valid grant keep their captures in `context` and their next-step preview.
+ * A whole-run result is returned in one piece, so a mid-run revocation must
+ * clean the whole piece.
+ */
+/**
+ * Marker the output contract already defines for withheld request data.
+ *
+ * `security.payload_redaction` names `[redacted]`, and
+ * `request.required_fields` requires `transport`, `operation` AND
+ * `payload` — so a refusal must REPLACE the protected values inside the
+ * payload, not delete the payload. Deleting it loses required evidence and
+ * pretends no exchange happened; the exchange did happen, under a grant
+ * that was valid at the time.
+ */
+/** Terminal step result for a refused prepared-state lookup. */
+function buildPreparedRefusalStepResult(
+  storyboard: Storyboard,
+  found: { step: StoryboardStep; phaseId: string },
+  context: StoryboardContext,
+  refusal: PreparedFixturesRefusal,
+  contributions: Iterable<string>
+): StoryboardStepResult {
+  return {
+    storyboard_id: storyboard.id,
+    step_id: found.step.id,
+    phase_id: found.phaseId,
+    title: found.step.title,
+    task: found.step.task,
+    passed: false,
+    duration_ms: 0,
+    validations: [
+      {
+        check: 'prepared_fixtures_authorization',
+        passed: false,
+        description: 'Prepared fixture state is re-validated and re-authorized on every lookup',
+        error: refusal.detail,
+        json_pointer: null,
+        // `step scope`, matching the per-step gate. This builds a STEP
+        // result; saying `run scope` here made the published grammar
+        // disagree with itself depending on which gate refused.
+        expected: 'an authorized prepared state bound to this exact step scope',
+        actual: refusal.code,
+        schema_id: null,
+        schema_url: null,
+        request: null,
+        response: null,
+      },
+    ],
+    // UNREDACTED: this record is the host's audit evidence, never the
+    // refused caller's report.
+    context,
+    extraction: { path: 'none' },
+    contributions: Array.from(contributions),
+    error: refusal.detail,
+  };
+}
+
+/** Historical producer evidence does not add graded steps to the consumer run. */
+function preparedPhaseForOutput(phase: StoryboardPhaseResult): StoryboardPhaseResult {
+  return { ...phase, steps: phase.steps.map(step => ({ ...step, context: withoutProtectedCaptures(step.context) })) };
+}
+
+/**
+ * Result for a full run reusing a prepared state that FAILED preparation.
+ *
+ * Not `buildDiscoveryFailedResult`: that reports agent capability
+ * discovery, and reusing a failed preparation is a different failure with
+ * different evidence. Saying `discovery_failed` with task `''` and no
+ * validations sent an implementor looking at their transport and auth
+ * when the actual failure was product discovery, and it dropped the
+ * producer records the preparation had already collected.
+ *
+ * The producer phase is retained separately as diagnostic evidence, with
+ * protected captures stripped from context. Its errors and exchanges survive,
+ * and `fixture_resolutions`
+ * carries the same records `prepared.resolutions` holds. Counts and
+ * failure meaning are unchanged: this is a failure, never a skip, and
+ * never `fixture_unsatisfied`.
+ */
+function buildPreparationFailedRunResult(
+  agentUrls: string[],
+  storyboard: Storyboard,
+  state: PreparedStoryboardFixtures,
+  detail: string
+): StoryboardResult {
+  const resolutions = state.resolutions;
+  const producerPhase = state.phase;
+  // The task that actually failed, read off the producer's own record
+  // rather than guessed. Absent only when preparation failed before any
+  // step was recorded.
+  const failingStep = producerPhase?.steps.find(step => step.passed === false);
+  const syntheticStep: StoryboardStepResult = {
+    storyboard_id: storyboard.id,
+    step_id: 'prepared_fixtures_preparation_failed',
+    phase_id: 'prepared_fixtures_preparation_failed',
+    title: 'Storyboard failed: fixture preparation did not resolve',
+    task: failingStep?.task ?? '',
+    passed: false,
+    skipped: false,
+    duration_ms: 0,
+    validations: [
+      {
+        check: 'fixture_capture_unbuildable',
+        passed: false,
+        description: 'Fixture preparation must resolve before a run can reuse it',
+        error: detail,
+        json_pointer: null,
+        expected: 'a fixture graph that resolved during preparation',
+        actual: 'preparation_failed',
+        schema_id: null,
+        schema_url: null,
+        // Pre-wire for THIS run: the consumer never dispatched. The
+        // producer's own exchange is retained in fixture_preparation.
+        request: null,
+        response: null,
+      },
+    ],
+    context: {},
+    extraction: { path: 'none' },
+    error: detail,
+  };
+  const phases: StoryboardPhaseResult[] = [
+    {
+      phase_id: 'prepared_fixtures_preparation_failed',
+      phase_title: 'Prepared fixture preparation failed',
+      passed: false,
+      steps: [syntheticStep],
+      duration_ms: 0,
+    },
+  ];
+  return {
+    storyboard_id: storyboard.id,
+    storyboard_title: storyboard.title,
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
+    agent_urls: agentUrls.map(redactOAuthUrlForOutput),
+    overall_passed: false,
+    ...(resolutions.length > 0 && { fixture_resolutions: resolutions }),
+    ...(state.coverageGaps.length > 0 && { coverage_gaps: state.coverageGaps }),
+    phases,
+    ...(producerPhase && { fixture_preparation: preparedPhaseForOutput(producerPhase) }),
+    context: {},
+    total_duration_ms: 0,
+    passed_count: 0,
+    failed_count: 1,
+    skipped_count: 0,
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
+    tested_at: new Date().toISOString(),
+    strict_validation_summary: summarizeStrictValidation(phases),
+    notices: [],
+  };
+}
+
+/** A bounded runner could not establish a complete catalog; this is no seller verdict. */
+function buildFixtureDiscoveryUnavailableResult(
+  agentUrls: string[],
+  storyboard: Storyboard,
+  detail: string,
+  producerPhase?: StoryboardPhaseResult,
+  resolutions: readonly FixtureResolutionRecord[] = []
+): StoryboardResult {
+  const result = buildCapabilityUnsupportedResult(agentUrls, storyboard, detail);
+  const phase = result.phases[0]!;
+  phase.phase_id = 'fixture_discovery_unavailable';
+  phase.phase_title = 'Fixture discovery unavailable';
+  const step = phase.steps[0]!;
+  step.step_id = phase.phase_id;
+  step.phase_id = phase.phase_id;
+  step.title = 'Fixture discovery unavailable within runner budget';
+  step.task = 'get_products';
+  step.skip_reason = 'not_applicable';
+  step.skip = { reason: 'not_applicable', detail };
+  result.fixture_resolutions = [...resolutions];
+  if (producerPhase) result.fixture_preparation = preparedPhaseForOutput(producerPhase);
+  return result;
+}
+
+/** Terminal step result carrying a non-resolved preparation disposition. */
+function buildPreparedDispositionStepResult(
+  storyboard: Storyboard,
+  found: { step: StoryboardStep; phaseId: string },
+  context: StoryboardContext,
+  disposition: PreparedFixturesDisposition,
+  contributions: Iterable<string>,
+  /** Producer records to republish; a standalone result is the whole run. */
+  resolutions: readonly FixtureResolutionRecord[] = [],
+  producerPhase?: StoryboardPhaseResult
+): StoryboardStepResult {
+  const skipReason =
+    disposition.status === 'unsupported' && disposition.reason === 'not_applicable'
+      ? 'not_applicable'
+      : disposition.status === 'unsatisfied'
+        ? 'fixture_unsatisfied'
+        : 'missing_test_controller';
+  const detail = 'detail' in disposition ? disposition.detail : 'fixture preparation did not resolve';
+  if (disposition.status === 'failed') {
+    return {
+      storyboard_id: storyboard.id,
+      step_id: found.step.id,
+      phase_id: found.phaseId,
+      title: found.step.title,
+      task: found.step.task,
+      passed: false,
+      duration_ms: 0,
+      // A failed step MUST carry at least one failing validation
+      // (runner-output-contract.yaml, `step_result`). The `error`-only
+      // carve-out beside that rule is for TRANSPORT failures, and a failed
+      // preparation is discovery, schema validation or setup — none of
+      // which is transport. Without this the caller saw a red step with no
+      // `check` discriminator and had to regex the prose, which is the one
+      // thing the synthesized kinds exist to avoid.
+      validations: [
+        {
+          check: 'fixture_capture_unbuildable',
+          passed: false,
+          description: 'Fixture preparation must resolve before a step can reuse it',
+          error: detail,
+          json_pointer: null,
+          expected: 'a fixture graph that resolved during preparation',
+          actual: 'preparation_failed',
+          schema_id: null,
+          schema_url: null,
+          // Pre-wire for THIS step: the consumer never dispatched. The
+          // producer's own exchange rides on its records below.
+          request: null,
+          response: null,
+        },
+      ],
+      // The producer's own records, so a standalone consumer sees the same
+      // fixture-handle evidence a full run carries. It had none before:
+      // the caller was told preparation failed with no way to see which
+      // handle, which strategy, or what the seller actually returned.
+      ...(resolutions.length > 0 && { fixture_resolutions: [...resolutions] }),
+      ...(producerPhase && { fixture_preparation: preparedPhaseForOutput(producerPhase) }),
+      context: withoutProtectedCaptures(context),
+      extraction: { path: 'none' },
+      contributions: Array.from(contributions),
+      error: detail,
+    };
+  }
+  return {
+    storyboard_id: storyboard.id,
+    step_id: found.step.id,
+    phase_id: found.phaseId,
+    title: found.step.title,
+    task: found.step.task,
+    passed: true,
+    skipped: true,
+    skip_reason: skipReason,
+    // Match the full runner: reporting a missing controller as a
+    // branch-substitutable `not_applicable` would let a consumer credit a
+    // peer path that does not exist.
+    //
+    // `fixture_unsatisfied` is now the canonical reason too, not a
+    // detailed one mapped down to `not_applicable`. The published contract
+    // lists it as a canonical `skip_result.reason`, and "our other code
+    // path spells it differently" was SDK precedent, not a spec argument —
+    // which the repo's own `spec → mock → SDK` triage order resolves
+    // against the SDK. Promoting it in `RunnerSkipReason` fixed both paths
+    // at once, so the two no longer disagree.
+    skip: {
+      reason: skipReason,
+      detail,
+    },
+    duration_ms: 0,
+    validations: [],
+    ...(skipReason === 'not_applicable' && {
+      fixture_resolutions: [...resolutions],
+      ...(producerPhase && { fixture_preparation: preparedPhaseForOutput(producerPhase) }),
+    }),
+    context: withoutProtectedCaptures(context),
+    extraction: { path: 'none' },
+    contributions: Array.from(contributions),
+  };
+}
+
+async function runStoryboardStepBody(
+  agentUrl: string,
+  storyboard: Storyboard,
+  stepId: string,
+  options: StoryboardRunOptions
+): Promise<StoryboardStepResult> {
+  validateTestKit(options.test_kit);
+
+  // Caller-supplied metadata is screened before any seller contact, for the
+  // same reason prepared state is: these maps seed the sinks the protected
+  // funnel writes into. The refusal is a graded step result, not a thrown
+  // exception — a hosted route must answer a bad body with a verdict.
+  // `options.context` is the largest and most obviously attacker-shaped
+  // caller input on a hosted route. It was reaching the agent before being
+  // refused, and refusing by THROWING rather than grading — both of which
+  // the two smaller maps already avoid.
+  const metadataRefusal = describeReservedCallerOptions(options);
+  if (metadataRefusal !== undefined) {
+    const target = flattenSteps(storyboard).find(entry => entry.step.id === stepId);
+    if (!target) throw new Error(`Step "${stepId}" not found in storyboard "${storyboard.id}".`);
+    return denyPreparedFixtures(
+      options,
+      buildPreparedRefusalStepResult(
+        storyboard,
+        target,
+        {},
+        { code: 'unauthorized_metadata', detail: metadataRefusal },
+        options.contributions ?? []
+      ),
+      'unauthorized_metadata'
+    );
+  }
+
+  // Authorize before any seller contact, including capability discovery.
+  // The step is resolved first only to name it in the lookup and the
+  // refusal; nothing about that touches the agent.
+  let standaloneGate: Awaited<ReturnType<typeof gatePreparedFixtures>> = { used: false };
+  if (options.prepared_fixtures !== undefined) {
+    const target = flattenSteps(storyboard).find(entry => entry.step.id === stepId);
+    if (!target) {
+      throw new Error(
+        `Step "${stepId}" not found in storyboard "${storyboard.id}". ` +
+          `Available steps: ${flattenSteps(storyboard)
+            .map(entry => entry.step.id)
+            .join(', ')}`
+      );
+    }
+    // `'step'`, not the `'pass'` default. A host that implements the
+    // documented taxonomy — a per-step lookup gets the fine-grained
+    // check, a pass lookup the coarse one — was applying the WEAKER
+    // check to the hosted step route, which is the entry point this
+    // whole feature exists for.
+    standaloneGate = await gatePreparedFixtures(storyboard, [agentUrl], options, target.step, 'step');
+    if (standaloneGate.used && 'refusal' in standaloneGate) {
+      return denyPreparedFixtures(
+        options,
+        buildPreparedRefusalStepResult(
+          storyboard,
+          target,
+          createRunContext(storyboard, options).context,
+          standaloneGate.refusal,
+          options.contributions ?? []
+        ),
+        standaloneGate.refusal.code
+      );
+    }
+  }
+
+  if (
+    storyboard.requires?.[0] === 'property_list_reference_runner' &&
+    storyboardCapabilityPredicates(storyboard).length === 0 &&
+    propertyListReferenceNeedsMcp(options)
+  ) {
+    const found = flattenSteps(storyboard).find(entry => entry.step.id === stepId);
+    if (!found) throw new Error(`Step "${stepId}" not found in storyboard "${storyboard.id}".`);
+    return {
+      storyboard_id: storyboard.id,
+      step_id: stepId,
+      phase_id: found.phaseId,
+      title: found.step.title,
+      task: found.step.task,
+      passed: true,
+      skipped: true,
+      skip_reason: 'requirement_unmet',
+      skip: {
+        reason: 'requirement_unmet',
+        requirement: 'property_list_reference_runner',
+        detail:
+          'Credential-isolated property-list references currently require MCP; A2A probe coverage is unavailable.',
+      },
+      duration_ms: 0,
+      validations: [],
+      // Validated the same way as the executing path so a reserved key in
+      // caller context fails closed on the early-return branch too.
+      context: createRunContext(storyboard, options).context,
+      extraction: { path: 'none' },
+    };
+  }
+  const clientResolution = getOrCreateClientResolution(agentUrl, options);
+  const client = clientResolution.client;
+
+  // Discover agent profile for standalone step execution. Captured so the
+  // executeStep call below can thread `library_version` through to
+  // shape-drift hint detection (issue #850). Also threads _profile into
+  // options so capability-based skip gates in executeStep (e.g. account-mode
+  // branching) can read raw_capabilities, mirroring executeStoryboardPass.
+  let profile: AgentProfile | undefined;
+  if (!clientResolution.reusedShared || hasTestClientScope()) {
+    const discovered = await getOrDiscoverStoryboardProfile(client, options);
+    if (!discovered.step.passed) {
+      if (!clientResolution.reusedShared) await closeScopedConnections(options.protocol);
+      return buildDiscoveryFailedResult([agentUrl], storyboard, discovered.step, discovered.profile).phases[0]!
+        .steps[0]!;
+    }
+    profile = discovered.profile;
+    if (profile && (!options._profile || !options.agentTools)) {
+      options = {
+        ...options,
+        ...(!options._profile && { _profile: profile }),
+        ...(!options.agentTools && { agentTools: normalizeAgentToolNames(profile.tools) }),
+      };
+    }
+  } else {
+    profile = options._profile;
+  }
+
+  const reusedDiscoveryFailure =
+    profile &&
+    describeProfileDiscoveryFailure(
+      profile,
+      options._requireValidCapabilityEvidence === true,
+      options._allowCapabilityDiagnostic === true
+    );
+  if (reusedDiscoveryFailure) {
+    if (!clientResolution.reusedShared) await closeScopedConnections(options.protocol);
+    return buildDiscoveryFailedResult([agentUrl], storyboard, reusedDiscoveryFailure, profile).phases[0]!.steps[0]!;
+  }
+
+  const standaloneRunContext = createRunContext(storyboard, options);
+  const protectedWriter = standaloneRunContext.protectedWriter;
+  const context: StoryboardContext = standaloneRunContext.context;
+
+  // Find the step
+  const allSteps = flattenSteps(storyboard);
+  const found = allSteps.find(s => s.step.id === stepId);
+  if (!found) {
+    throw new Error(
+      `Step "${stepId}" not found in storyboard "${storyboard.id}". ` +
+        `Available steps: ${allSteps.map(s => s.step.id).join(', ')}`
+    );
+  }
+
+  // Standalone execution must preserve the whole-storyboard ordering:
+  // capability applicability comes before the operator runtime requirement.
+  // In particular, a non-TMP agent must not be told that it is missing a
+  // publisher-auth adapter for a capability it never declared.
+  if (storyboardCapabilityPredicates(storyboard).length > 0) {
+    const unmetDetail = evaluateStoryboardCapabilityGates(storyboard, profile, options.agentTools, options.adcpVersion);
+    if (unmetDetail !== null) {
+      const result: StoryboardStepResult = {
+        storyboard_id: storyboard.id,
+        step_id: found.step.id,
+        phase_id: found.phaseId,
+        title: found.step.title,
+        task: found.step.task,
+        passed: true,
+        skipped: true,
+        skip_reason: 'not_applicable',
+        skip: { reason: 'not_applicable', detail: unmetDetail },
+        duration_ms: 0,
+        validations: [],
+        context,
+        error: unmetDetail,
+        extraction: { path: 'none' },
+        contributions: Array.from(options.contributions ?? []),
+      };
+      if (!clientResolution.reusedShared) await closeScopedConnections(options.protocol);
+      return result;
+    }
+  }
+
+  if (storyboard.creative_build_probe) {
+    let resolution: ReturnType<typeof prepareCreativeBuildProbe>;
+    try {
+      resolution = prepareCreativeBuildProbe(
+        profile?.raw_capabilities,
+        storyboard.creative_build_probe,
+        options.test_kit,
+        options.adcpVersion
+      );
+    } catch (error) {
+      // No receiver has been created here. In particular the caller's injected
+      // receiver remains caller-owned even when fixture authoring fails.
+      if (!clientResolution.reusedShared) {
+        await Promise.allSettled([closeScopedConnections(options.protocol)]);
+      }
+      throw error;
+    }
+    if (resolution.status === 'failed') {
+      if (!clientResolution.reusedShared) await closeScopedConnections(options.protocol);
+      return {
+        storyboard_id: storyboard.id,
+        step_id: found.step.id,
+        phase_id: found.phaseId,
+        title: found.step.title,
+        task: found.step.task,
+        passed: false,
+        duration_ms: 0,
+        validations: [
+          {
+            check: 'creative_build_probe_catalog',
+            passed: false,
+            description: 'Advertised creative catalog satisfies its format and routing contract',
+            error: resolution.detail,
+          },
+        ],
+        context,
+        extraction: { path: 'none' },
+        contributions: Array.from(options.contributions ?? []),
+      };
+    }
+    if (resolution.status === 'unsatisfied') {
+      if (!clientResolution.reusedShared) await closeScopedConnections(options.protocol);
+      return {
+        storyboard_id: storyboard.id,
+        step_id: found.step.id,
+        phase_id: found.phaseId,
+        title: found.step.title,
+        task: found.step.task,
+        passed: true,
+        skipped: true,
+        skip_reason: 'fixture_unsatisfied',
+        // Canonical too, now that `fixture_unsatisfied` is in
+        // `RunnerSkipReason`. Both unsatisfied paths spell it the same way,
+        // which is what the contract asks for and what the previous
+        // `not_applicable` mapping obscured.
+        skip: { reason: 'fixture_unsatisfied', detail: resolution.detail },
+        duration_ms: 0,
+        validations: [],
+        context,
+        extraction: { path: 'none' },
+        contributions: Array.from(options.contributions ?? []),
+      };
+    }
+    const probeViolation = tryProtectedContextPatch(
+      context,
+      {
+        unset: CREATIVE_PROBE_CONTEXT_SUFFIXES.map(key => `${storyboard.creative_build_probe!.context_prefix}_${key}`),
+        set: resolution.context,
+      },
+      { origin: `creative_build_probe '${storyboard.creative_build_probe.context_prefix}'` }
+    );
+    if (probeViolation) {
+      return {
+        storyboard_id: storyboard.id,
+        step_id: found.step.id,
+        phase_id: found.phaseId,
+        title: found.step.title,
+        task: found.step.task,
+        passed: false,
+        duration_ms: 0,
+        validations: [probeViolation],
+        context: withoutProtectedCaptures(context),
+        extraction: { path: 'none' },
+        contributions: Array.from(options.contributions ?? []),
+        error: probeViolation.error,
+      };
+    }
+    options = { ...options, contracts: [...new Set([...(options.contracts ?? []), 'creative_build_probe_runner'])] };
+  }
+
+  // Construct runtime adapters only after root applicability has passed.
+  // `_webhookReceiver` is a test-only injection point; production callers
+  // pass `webhook_receiver` and the runner constructs the listener.
+  const injectedReceiver = options._webhookReceiver;
+  const webhookReceiver: WebhookReceiver | undefined =
+    injectedReceiver ??
+    (options.webhook_receiver
+      ? await createWebhookReceiver({
+          ...(options.webhook_receiver.mode && { mode: options.webhook_receiver.mode }),
+          ...(options.webhook_receiver.host !== undefined && { host: options.webhook_receiver.host }),
+          ...(options.webhook_receiver.port !== undefined && { port: options.webhook_receiver.port }),
+          ...(options.webhook_receiver.public_url !== undefined && {
+            public_url: options.webhook_receiver.public_url,
+          }),
+          allowHttp: options.allow_http === true,
+          ...(options.webhook_receiver.tls !== undefined && { tls: options.webhook_receiver.tls }),
+        })
+      : undefined);
+  const ownsWebhookReceiver = !injectedReceiver && !!webhookReceiver;
+  try {
+    const runnerVars = createRunnerVariables({
+      ...(webhookReceiver && { webhookBase: webhookReceiver.base_url }),
+    });
+    if (webhookReceiver) armWebhookAssertions(storyboard, runnerVars, webhookReceiver);
+
+    // Seed provenance from the caller-supplied map (threaded through from a
+    // previous step's result). Storyboard-level runs build this internally;
+    // here the caller owns accumulation across stateless invocations.
+    //
+    // Both maps are the documented hosted thread-back channel, which means
+    // browser JSON on a hosted step route. Reserved keys are refused rather
+    // than filtered: a caller marking a prepared capture unavailable would
+    // suppress its consumer, and a caller forging its provenance would make
+    // the run's evidence claim a fixture_preparation source for a run where
+    // no preparation happened.
+    const contextProvenance = new Map<string, ContextProvenanceEntry>(Object.entries(options.context_provenance ?? {}));
+    const responseDerivedNotApplicableContextKeys = new Map<string, string>(
+      Object.entries(options.response_derived_not_applicable_context_keys ?? {})
+    );
+    const contributions = new Set(options.contributions ?? []);
+    const runState: ExecutionState = {
+      contributions,
+      priorStepResults: new Map(),
+      priorProbes: new Map(),
+      agentUrl,
+      acceptancePolicyDiscovery: {},
+      webhookReceiver,
+      runnerVars,
+      contextProvenance,
+      priorA2aEnvelopes: new Map(),
+      stepRequestStarts: new Map(),
+      responseDerivedNotApplicableContextKeys,
+      agentProfile: profile,
+      agentLibraryVersion: profile?.library_version,
+      storyboardRequiresRequestSigner: resolveStoryboardRequires(storyboard, options).includes('request_signer'),
+      storyboardRequiresPublisherAuthRunner:
+        storyboard.requires?.includes('trusted_match_publisher_auth_runner') === true,
+      protectedWriter,
+    };
+
+    // Standalone execution against prepared state. This is what lets a
+    // hosted step route stop transmitting literal authored handles: the
+    // pinned seller identities, the same-graph captures and the retained
+    // witnesses come from the preparation that actually ran. The lookup was
+    // authorized at the top of this function, before any client existed.
+    const prepared = standaloneGate;
+    if (prepared.used && 'state' in prepared) {
+      const disposition = prepared.state.disposition;
+      if (disposition.status !== 'resolved') {
+        // A terminal preparation outcome is carried forward verbatim. A
+        // retry must not be able to launder a failed graph into a freshly
+        // discovered alternative.
+        return buildPreparedDispositionStepResult(
+          storyboard,
+          found,
+          context,
+          disposition,
+          contributions,
+          prepared.state.resolutions,
+          prepared.state.phase
+        );
+      }
+      const hydrationViolation = hydratePreparedCaptures(prepared.state, context, protectedWriter, contextProvenance);
+      if (hydrationViolation) {
+        return {
+          storyboard_id: storyboard.id,
+          step_id: found.step.id,
+          phase_id: found.phaseId,
+          title: found.step.title,
+          task: found.step.task,
+          passed: false,
+          duration_ms: 0,
+          validations: [hydrationViolation],
+          context: withoutProtectedCaptures(context),
+          extraction: { path: 'none' },
+          contributions: Array.from(contributions),
+          error: hydrationViolation.error,
+        };
+      }
+      runState.fixtureBindings = preparedBindingRegistryFor(prepared.state);
+      runState.preparedFixtures = prepared.state;
+    }
+
+    // The product step depends on a remotely verified catalog that is normally
+    // retained by the preceding capability step. Standalone execution performs
+    // that prerequisite in the same ephemeral state instead of falsely grading
+    // every compliant seller as unresolved.
+    let prerequisiteFailure: StoryboardStepResult | undefined;
+    if (
+      storyboard.id === 'media_buy_seller/acceptance_policy_discovery' &&
+      found.step.id === 'get_contextual_products' &&
+      options.acceptancePolicyDiscovery?.enabled !== false
+    ) {
+      const capabilityStep = allSteps.find(value => value.step.id === 'get_acceptance_policy_capability');
+      if (capabilityStep) {
+        const prerequisite = await executeStep(
+          client,
+          capabilityStep.step,
+          storyboard.id,
+          capabilityStep.phaseId,
+          context,
+          allSteps,
+          options,
+          runState
+        );
+        runState.priorStepResults.set(capabilityStep.step.id, prerequisite);
+        if (prerequisite.skipped) {
+          prerequisiteFailure = {
+            storyboard_id: storyboard.id,
+            step_id: found.step.id,
+            phase_id: found.phaseId,
+            title: found.step.title,
+            task: found.step.task,
+            passed: prerequisite.passed,
+            skipped: true,
+            ...(prerequisite.skip_reason !== undefined && { skip_reason: prerequisite.skip_reason }),
+            ...(prerequisite.skip !== undefined && { skip: prerequisite.skip }),
+            duration_ms: prerequisite.duration_ms,
+            validations: prerequisite.validations,
+            context,
+            ...(prerequisite.error !== undefined && { error: prerequisite.error }),
+            extraction: { path: 'none' },
+          };
+        } else if (!prerequisite.passed) {
+          prerequisiteFailure = {
+            storyboard_id: storyboard.id,
+            step_id: found.step.id,
+            phase_id: found.phaseId,
+            title: found.step.title,
+            task: found.step.task,
+            passed: false,
+            duration_ms: prerequisite.duration_ms,
+            validations: prerequisite.validations,
+            context,
+            error: 'The acceptance-policy catalog prerequisite did not pass remote verification.',
+            extraction: { path: 'none' },
+          };
+        }
+      }
+    }
+
+    const result =
+      prerequisiteFailure ??
+      (await executeStep(client, found.step, storyboard.id, found.phaseId, context, allSteps, options, runState));
+
+    if (!result.skipped && result.passed && found.step.contributes_to) {
+      if (evalContributesIf(found.step.contributes_if, new Map())) {
+        contributions.add(found.step.contributes_to);
+      }
+    }
+
+    // The standalone result is a thread-back channel: a hosted step loop
+    // feeds `result.context` into the next call's `options.context`, which
+    // REFUSES a reserved key. Echoing the namespace broke that loop on its
+    // own output, and published the pinned graph on the ordinary success
+    // path where no refusal projection applies. A standalone caller gets
+    // its captures from `prepared_fixtures`, not from threading them back.
+    // `context_provenance` was already withheld here for the same reason.
+    return {
+      ...result,
+      context: withoutProtectedCaptures(result.context ?? {}),
+      contributions: Array.from(contributions),
+    };
+  } finally {
+    await Promise.all([
+      ...(!clientResolution.reusedShared ? [closeScopedConnections(options.protocol)] : []),
+      ...(ownsWebhookReceiver && webhookReceiver ? [webhookReceiver.close()] : []),
+    ]);
+  }
+}
+
+// ────────────────────────────────────────────────────────────
+// Internal: execute a single step
+// ────────────────────────────────────────────────────────────
+
+interface ExecutionState {
+  contributions: Set<string>;
+  priorStepResults: Map<string, StoryboardStepResult>;
+  priorProbes: Map<string, HttpProbeResult>;
+  /** Routed probes cannot borrow evidence from the run-wide step-result fallback. */
+  allowPriorProbeFallback?: boolean;
+  agentUrl: string;
+  /** Run-scoped verified catalog used by the acceptance-policy discovery storyboard. */
+  acceptancePolicyDiscovery?: AcceptancePolicyDiscoveryRunState;
+  /** Run-scoped seller ids selected for authored fixture handles. */
+  fixtureBindings?: FixtureBindingRegistry;
+  /**
+   * ISO timestamps captured immediately before each step's AdCP request
+   * dispatch. Threaded into `upstream_traffic` validations as the
+   * `since_timestamp` window bound (the step's own start by default; an
+   * earlier prior step's start when the validation declares
+   * `since: prior_step_id` for a cumulative assertion). Empty when no
+   * step in the run has fired a request yet.
+   */
+  stepRequestStarts?: Map<string, string>;
+  /**
+   * Context keys whose producer step was response-gated as not_applicable.
+   * Consumer steps referencing only these keys should skip as not_applicable
+   * rather than prerequisite_failed.
+   */
+  responseDerivedNotApplicableContextKeys?: Map<string, string>;
+  /** Context keys from capability-gated phases this step depends on. */
+  capabilityUnavailableContextKeys?: Set<string>;
+  /** Routed-only prerequisite scope, present even when no hard outputs are absent. */
+  missingPrerequisiteContextKeys?: Set<string>;
+  /** Shared ephemeral webhook receiver, when the run has one enabled. */
+  webhookReceiver?: WebhookReceiver;
+  /** Shared runner-variable bag for `{{runner.*}}` substitution. */
+  runnerVars?: RunnerVariables;
+  /**
+   * Context-key → write-provenance map, accumulated across the run so a
+   * later step's rejection can cite the step that wrote the value. Issue
+   * #870. Later writes shadow earlier ones under the same key, matching
+   * the shallow-merge semantics of the context itself.
+   */
+  contextProvenance?: Map<string, ContextProvenanceEntry>;
+  /**
+   * Run-owned protected-context write capability. Threaded as a typed
+   * reference on the execution state, never through public JSON context or
+   * the free-form `runnerVars.runState` map — a capability reachable from
+   * caller data is not a capability.
+   */
+  protectedWriter?: ProtectedContextWriter;
+  /** Prepared fixture state pinned for this run, when one is in use. */
+  preparedFixtures?: PreparedStoryboardFixtures;
+  /**
+   * Per-step A2A envelopes captured during the run, keyed by step id.
+   * Cross-step A2A validators (`a2a_context_continuity`) read this to
+   * compare consecutive `Task.contextId` values. The map is mutated
+   * by `executeStep` after each step's capture; reads pick the most
+   * recently inserted entry to seed `priorA2aEnvelope` on the
+   * ValidationContext for the next step. Issue adcp-client#962.
+   *
+   * Map shared by reference across `executeStep` invocations — like
+   * `priorStepResults`, this is the state that has to live one level
+   * up from the per-step `ExecutionState` literal.
+   */
+  priorA2aEnvelopes?: Map<string, A2ATaskEnvelope>;
+  /**
+   * Profile for the agent selected to execute this step. In routed runs this
+   * must be the selected agent's profile, not the run-level primary profile.
+   */
+  agentProfile?: AgentProfile;
+  /**
+   * Agent's reported `@adcp/client@X.Y.Z` library version, captured from
+   * the `get_adcp_capabilities` discovery probe. Threaded into shape-drift
+   * hints so the runner can suffix recommendations with a version-staleness
+   * note when a recommended helper postdates the agent's pinned SDK. Issue
+   * #850. Undefined when the agent did not advertise `library_version`.
+   */
+  agentLibraryVersion?: string;
+  /**
+   * Whether the storyboard declares or implicitly requires a request signer.
+   * Unsigned functional storyboards use this to distinguish an expected
+   * signature-required rejection from a failure in a signing test.
+   */
+  storyboardRequiresRequestSigner?: boolean;
+  /** Dedicated TMP raw-HTTP tasks are invalid outside their explicit runner contract. */
+  storyboardRequiresPublisherAuthRunner?: boolean;
+}
+
+function unresolvedStepContextVars(
+  step: StoryboardStep,
+  request: Record<string, unknown>,
+  context: StoryboardContext,
+  runState: ExecutionState
+): ReturnType<typeof findUnresolvedContextVars> {
+  const unavailableInputs = (step.context_inputs ?? []).filter(
+    input =>
+      !Object.hasOwn(context, input.key) &&
+      (runState.capabilityUnavailableContextKeys?.has(input.key) === true ||
+        runState.missingPrerequisiteContextKeys?.has(input.key) === true)
+  );
+  return [
+    ...findUnresolvedContextVars(request),
+    ...unavailableInputs.map(input => ({ key: input.key, token: `$context.${input.key}` })),
+  ];
+}
+
+// Shared request construction for execution and inspection before a cascade
+// skip. This never dispatches, but may generate context/runner aliases.
+/** @internal Builds the exact runner request before protocol-owned fields are added. */
+export function buildStepRequest(
+  step: StoryboardStep,
+  effectiveStep: StoryboardStep,
+  context: StoryboardContext,
+  options: StoryboardRunOptions,
+  runnerVars?: RunnerVariables
+): Record<string, unknown> {
+  // Build request — priority (issue #820, fixture-authoritative):
+  // 1. User-provided --request override
+  // 2. For expect_error steps: sample_request directly (preserves intentionally invalid input)
+  // 3. enrichRequest — fixture is the base, enricher fills gaps (fixture wins conflicts)
+  // 4. sample_request with context injection when no enricher is registered
+  // 5. Empty object (only reachable for non-mutating tasks with neither fixture nor enricher)
+  let request: Record<string, unknown>;
+  const governedSource = options.request ?? step.sample_request;
+  const payloadBoundGovernance = isAdcpVersionAtLeast(options.adcpVersion ?? ADCP_VERSION, '3.2.0-beta.1');
+  const contextGovernance =
+    step.context_inputs?.length &&
+    Object.prototype.hasOwnProperty.call(applyContextInputs({}, step.context_inputs, context), 'governance_context');
+  const governedFixture =
+    payloadBoundGovernance &&
+    effectiveStep.task !== 'check_governance' &&
+    effectiveStep.task !== 'report_plan_outcome' &&
+    ((governedSource !== undefined && Object.prototype.hasOwnProperty.call(governedSource, 'governance_context')) ||
+      contextGovernance);
+  if (options.request) {
+    request = injectContext({ ...options.request }, context, runnerVars);
+  } else if (step.expect_error && step.sample_request) {
+    request = injectContext({ ...step.sample_request }, context, runnerVars);
+  } else if (governedFixture) {
+    // The governance agent authorized the authored downstream payload. Extra
+    // enricher or runner defaults would change its hash after approval.
+    request = injectContext({ ...(step.sample_request ?? {}) }, context, runnerVars);
+  } else if (hasRequestEnricher(effectiveStep.task)) {
+    request = enrichRequest(effectiveStep, context, options, runnerVars);
+  } else if (step.sample_request) {
+    request = injectContext({ ...step.sample_request }, context, runnerVars);
+  } else {
+    request = {};
+  }
+
+  // Apply explicit context_inputs on top of whatever request source was used
+  if (step.context_inputs?.length) {
+    request = applyContextInputs(request, step.context_inputs, context);
+  }
+
+  if (governedFixture) {
+    // Apply run-scoped fields symmetrically to the approval intent and the
+    // downstream request. The enricher and idempotency defaults remain skipped.
+    request = applyBrandInvariant(request, options, effectiveStep.task, { omit_account: true });
+    return options.disable_sandbox === true ? applyDisableSandboxHint(request, effectiveStep.task) : request;
+  }
+
+  // Brand/account is a storyboard-run-scoped invariant: every step in a run
+  // targets the same brand, so every outgoing request's brand context must
+  // match the options. Enforcing this here (after builder + sample_request)
+  // prevents session-key divergence across create/get/update/delete steps
+  // when individual builders or sample_request YAML omit brand.
+  // `step.omit_account` suppresses account synthesis for schema_validation
+  // steps that deliberately test the seller's missing-account rejection path.
+  request = applyBrandInvariant(request, options, effectiveStep.task, { omit_account: step.omit_account });
+
+  // Per-run sandbox-bypass hint (#841). When the operator passes
+  // `--no-sandbox` (or sets `disable_sandbox: true` programmatically), the
+  // runner stamps `ext.adcp.disable_sandbox: true` on every outgoing
+  // request. Adopters that read this field bypass their internal sandbox
+  // routing — env-var fallbacks, brand-domain heuristics, fixture
+  // substitutes — and exercise their real adapter path. Agents that
+  // don't recognize the field ignore it (per spec, `ext` is accepted
+  // without error and not echoed). Gated on the schema check that
+  // `applyBrandInvariant` uses for `account` and `brand` so tools whose
+  // `additionalProperties: false` schema would reject `ext` aren't broken.
+  if (options.disable_sandbox === true) {
+    request = applyDisableSandboxHint(request, effectiveStep.task);
+  }
+
+  // Mutating AdCP requests require idempotency_key per spec. Storyboard
+  // yamls generally omit it so authors don't have to remember it on every
+  // mutating step — mint one here on the runner's behalf, matching how a
+  // real buyer would operate. Suppressed when the step expects a missing-key
+  // error (see `testsIdempotencyKeyOmission` below) so that compliance
+  // surfaces can still exercise the server's required-field check.
+  request = applyIdempotencyInvariant(request, effectiveStep.task, step);
+
+  if (
+    payloadBoundGovernance &&
+    effectiveStep.task === 'check_governance' &&
+    request.phase !== 'delivery' &&
+    request.payload !== null &&
+    typeof request.payload === 'object' &&
+    !Array.isArray(request.payload)
+  ) {
+    const toolName = typeof request.tool === 'string' ? request.tool : undefined;
+    const brandedPayload = applyBrandInvariant(request.payload as Record<string, unknown>, options, toolName, {
+      omit_account: true,
+    });
+    let payload = prepareGovernedStoryboardWireArgs(
+      brandedPayload,
+      toolName,
+      typeof request.target_agent === 'string' ? request.target_agent : '',
+      options
+    );
+    if (options.disable_sandbox === true) {
+      payload = applyDisableSandboxHint(payload, toolName);
+    }
+    request = {
+      ...request,
+      payload,
+    };
+  }
+
+  return request;
+}
+
+/** @internal Prepare the exact no-webhook wire args used by governed storyboard requests. */
+export function prepareGovernedStoryboardWireArgs(
+  request: Record<string, unknown>,
+  toolName: string | undefined,
+  agentUri: string,
+  options: StoryboardRunOptions
+): Record<string, unknown> {
+  // The envelope settings are run-scoped; AgentEntry only overrides auth
+  // and transport. Without a webhook, transport does not change AdCP args.
+  return prepareProtocolToolCall(
+    { id: 'governed-target', name: 'governed-target', agent_uri: agentUri, protocol: 'mcp' },
+    request,
+    {
+      toolName,
+      adcpVersion: options.adcpVersion,
+      wireAdcpVersion: options.wireAdcpVersion,
+      versionEnvelope: options.versionEnvelope,
+    }
+  ).args;
+}
+
+async function executeStep(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- client type varies (TestClient)
+  client: any,
+  step: StoryboardStep,
+  storyboardId: string,
+  phaseId: string,
+  context: StoryboardContext,
+  allSteps: FlatStep[],
+  options: StoryboardRunOptions,
+  state?: ExecutionState
+): Promise<StoryboardStepResult> {
+  // Default empty state when this function is called standalone (runStoryboardStep).
+  const runState: ExecutionState = state ?? {
+    contributions: new Set(),
+    priorStepResults: new Map(),
+    priorProbes: new Map(),
+    agentUrl: '',
+    acceptancePolicyDiscovery: {},
+    contextProvenance: new Map(),
+    stepRequestStarts: new Map(),
+    responseDerivedNotApplicableContextKeys: new Map(),
+    capabilityUnavailableContextKeys: new Set(),
+  };
+
+  if (step.task === VALIDATION_ONLY_TASK) {
+    return validationOnlyCoverageGap(step, phaseId, context, allSteps, runState.runnerVars);
+  }
+
+  // Recognize the dedicated TMP publisher-auth probes before generic auth
+  // overrides, missing-tool checks, or MCP/A2A routing.
+  if (TRUSTED_MATCH_PUBLISHER_AUTH_TASKS.has(step.task)) {
+    if (runState.storyboardRequiresPublisherAuthRunner !== true) {
+      return invalidTrustedMatchPublisherAuthTask(step, phaseId, context, allSteps, runState);
+    }
+    return executeProbeStep(client, step, phaseId, context, allSteps, options, runState);
+  }
+
+  // HTTP probe tasks bypass the MCP client entirely.
+  if (PROBE_TASKS.has(step.task)) {
+    return executeProbeStep(client, step, phaseId, context, allSteps, options, runState);
+  }
+
+  // Webhook-assertion pseudo-tasks observe the shared receiver instead of
+  // driving the agent. They never reach the MCP/A2A transport.
+  if (WEBHOOK_ASSERTION_TASKS.has(step.task)) {
+    return executeWebhookAssertionStep(step, phaseId, context, allSteps, options, runState);
+  }
+
+  // Inbound webhook receiver conformance posts canonical vectors to a
+  // buyer/orchestrator receiver URL. This is a runner-native HTTP probe, not
+  // a seller tool call.
+  if (step.task === REPLAY_WEBHOOK_VECTOR_TASK) {
+    return executeReplayWebhookVectorStep(step, phaseId, context, allSteps, options, runState);
+  }
+
+  // Ordinary MCP/A2A steps honor the same opt-in contract boundary as the
+  // runner-native probe and replay paths above. Gate before resolving a
+  // dynamic task name, inspecting tool availability, building a request, or
+  // dispatching so an out-of-scope adapter is never invoked accidentally.
+  if (step.requires_contract && !new Set(options.contracts ?? []).has(step.requires_contract)) {
+    const detail = `Test-kit contract "${step.requires_contract}" is not configured on this runner.`;
+    const reason =
+      step.requires_contract === PARALLEL_DISPATCH_CONTRACT ? 'not_applicable' : 'missing_test_kit_contract';
+    const canonicalReason = reason === 'not_applicable' ? reason : DETAILED_SKIP_TO_CANONICAL[reason];
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      passed: true,
+      skipped: true,
+      skip_reason: reason,
+      skip: buildSkip(canonicalReason, detail),
+      duration_ms: 0,
+      validations: [],
+      context,
+      next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+      extraction: { path: 'none', note: 'test-kit contract not configured' },
+    };
+  }
+
+  // Resolve $test_kit.* task references before any downstream dispatch / skip checks.
+  // When the reference resolves to nothing, fall back to `task_default`.
+  const resolvedTask = resolveTaskName(step, options);
+  if (!resolvedTask) {
+    if (step.task === '$test_kit.auth.probe_task' && options.agentTools) {
+      const detail =
+        `Agent does not advertise an auth-required, read-only tool that accepts an empty request body; ` +
+        `security auth probes are not applicable to tools [${options.agentTools.join(', ')}].`;
+      return {
+        step_id: step.id,
+        phase_id: phaseId,
+        title: step.title,
+        task: step.task,
+        passed: true,
+        skipped: true,
+        skip_reason: 'not_applicable',
+        skip: buildSkip('not_applicable', detail),
+        duration_ms: 0,
+        validations: [],
+        context,
+        next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+        extraction: { path: 'none' },
+      };
+    }
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      passed: false,
+      duration_ms: 0,
+      validations: [],
+      context,
+      error: `Step task "${step.task}" references a test-kit field that resolved to nothing and no task_default is set.`,
+      extraction: { path: 'none' },
+    };
+  }
+  const effectiveStep: StoryboardStep = resolvedTask === step.task ? step : { ...step, task: resolvedTask };
+
+  // Check requires_tool — skip if agent doesn't have it
+  if (step.requires_tool && options.agentTools && !options.agentTools.includes(step.requires_tool)) {
+    const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+    const reason: RunnerSkipReason =
+      step.requires_tool === 'comply_test_controller' ? 'missing_test_controller' : 'missing_tool';
+    const detail =
+      reason === 'missing_test_controller'
+        ? `Deterministic-testing phase requires comply_test_controller; agent tools: [${(options.agentTools ?? []).join(', ')}].`
+        : `Required tool "${step.requires_tool}" not advertised; agent tools: [${(options.agentTools ?? []).join(', ')}].`;
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      passed: true,
+      skipped: true,
+      skip_reason: reason,
+      skip: buildSkip(reason, detail),
+      duration_ms: 0,
+      validations: [],
+      context,
+      next,
+      extraction: { path: 'none' },
+    };
+  }
+
+  // The MCP session-probe sentinel is the one `$test_kit.*` resolution that
+  // names a runner-native probe rather than an agent tool (adcp-client#2940).
+  // Routed after `requires_tool` (an explicit tool prerequisite still gates
+  // the step) but before the tool-advertisement checks below — by construction
+  // no agent advertises a tool by this name.
+  //
+  // Deliberately an equality check, NOT `PROBE_TASKS.has(effectiveStep.task)`:
+  // most `$test_kit.*` task references read free-form kit fields that
+  // `validateTestKit` does not constrain (e.g. webhook-emission's
+  // `$test_kit.operations.primary_webhook_emitter`). Routing any resolved
+  // probe name here would let a kit steer a step onto `assert_contribution`'s
+  // no-network path, where an empty validation list grades `passed` and mints
+  // the step's `contributes_to` flag without the agent ever being contacted.
+  if (effectiveStep.task === MCP_SESSION_PROBE_TASK) {
+    return executeProbeStep(client, effectiveStep, phaseId, context, allSteps, options, runState);
+  }
+
+  // Account-mode capability gate: when the seller declared an account-id
+  // namespace (require_operator_auth: true) and does not advertise sync_accounts,
+  // sync_accounts does not apply — grade not_applicable rather than
+  // missing_tool so adopters can distinguish "your capability declaration
+  // says this path isn't yours" from "you forgot to implement a required
+  // tool." If the seller explicitly advertises sync_accounts, run it: account
+  // discovery mode and account-level write surfaces such as notification
+  // config registration are orthogonal.
+  //
+  // list_accounts is NOT gated here: it appears in audience_sync and other
+  // storyboard flows regardless of account mode, so it is always applicable.
+  //
+  // Requires _profile threaded from the discovery block in
+  // executeStoryboardPass or runStoryboardStep.
+  if (effectiveStep.task === 'sync_accounts') {
+    const rawCaps = options._profile?.raw_capabilities;
+    if (rawCaps !== undefined) {
+      const requireOperatorAuth = resolveCapabilityPath(rawCaps, 'account.require_operator_auth');
+      const syncAccountsAdvertised = options.agentTools?.includes('sync_accounts') === true;
+      if (requireOperatorAuth === true && !syncAccountsAdvertised) {
+        const detail =
+          `Agent declared an account-id namespace (require_operator_auth: true); ` +
+          `sync_accounts is not applicable — list_accounts is the correct tool for this account shape.`;
+        const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+        return {
+          step_id: step.id,
+          phase_id: phaseId,
+          title: step.title,
+          task: step.task,
+          passed: true,
+          skipped: true,
+          skip_reason: 'not_applicable',
+          skip: buildSkip('not_applicable', detail),
+          duration_ms: 0,
+          validations: [],
+          context,
+          next,
+          extraction: { path: 'none' },
+        };
+      }
+    }
+  }
+
+  // Skip if agent doesn't implement the tool this step calls.
+  if (options.agentTools && !options.agentTools.includes(effectiveStep.task)) {
+    const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+    const detail = `Agent did not advertise tool "${effectiveStep.task}"; agent tools: [${(options.agentTools ?? []).join(', ')}].`;
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: effectiveStep.task,
+      passed: true,
+      skipped: true,
+      skip_reason: 'missing_tool',
+      skip: buildSkip('missing_tool', detail),
+      duration_ms: 0,
+      validations: [],
+      context,
+      next,
+      extraction: { path: 'none' },
+    };
+  }
+
+  let request = buildStepRequest(step, effectiveStep, context, options, runState.runnerVars);
+
+  // Fixture handles are replaced only at request-schema fields carrying the
+  // matching x-entity annotation. This applies equally to ordinary AdCP calls
+  // and comply_test_controller force/simulate requests.
+  const fixtureBinding = applyFixtureBindingsSafely(request, effectiveStep.task, options, runState);
+  if (!fixtureBinding.ok) {
+    const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: effectiveStep.task,
+      passed: false,
+      duration_ms: 0,
+      validations: [
+        {
+          check: 'unresolved_substitution',
+          passed: false,
+          description: `Fixture handle substitution failed: ${fixtureBinding.error}`,
+          json_pointer: null,
+          expected: 'an unambiguous fixture handle binding',
+          actual: fixtureBinding.error,
+          schema_id: null,
+          schema_url: null,
+        },
+      ],
+      context,
+      error: fixtureBinding.error,
+      next,
+      extraction: { path: 'none' },
+    };
+  }
+  request = fixtureBinding.request;
+
+  // Assemble seller-required creative slots from the selected format and
+  // active test kit after all other nested request construction is complete.
+  const creativeAssetExpansion = expandCreativeAssetDirectivesWithDiagnostics(request, context, options.test_kit);
+  request = creativeAssetExpansion.value as Record<string, unknown>;
+  if (!creativeAssetExpansion.ok && creativeAssetExpansion.failure.reason === 'fixture_unavailable') {
+    return buildCreativeAssetFixtureUnavailableStep(
+      step,
+      phaseId,
+      context,
+      allSteps,
+      runState,
+      creativeAssetExpansion.failure,
+      effectiveStep.task
+    );
+  }
+
+  // Detect unresolved $context placeholders — a prior step likely failed
+  // and didn't produce the expected output. Skip rather than sending garbage.
+  // Classify explicit inputs together with tokens after request normalization.
+  // An early neutral input return must not conceal a hard missing token, and
+  // tokens replaced by normalizers are no longer missing prerequisites.
+  const unresolvedContextVars = unresolvedStepContextVars(step, request, context, runState);
+  const unresolvedAssetDirectives = findUnresolvedCreativeAssetDirectives(request).map(path => ({
+    key: path,
+    token: BUILD_ASSETS_FROM_FORMAT_DIRECTIVE,
+  }));
+  const unresolvedVars = [...unresolvedContextVars, ...unresolvedAssetDirectives];
+  // Keep expect_error's intentional malformed-vector behavior, except when
+  // the unresolved token belongs to an unavailable producer this step
+  // depends on. That token is runner state that cannot materialize and must
+  // never cross the wire.
+  const hasCapabilityUnavailableContext = unresolvedContextVars.some(
+    v => runState.capabilityUnavailableContextKeys?.has(v.key) === true
+  );
+  const hasMissingToolUnavailableContext = unresolvedContextVars.some(
+    v => runState.missingPrerequisiteContextKeys?.has(v.key) === true
+  );
+  if (
+    unresolvedAssetDirectives.length > 0 ||
+    (unresolvedContextVars.length > 0 &&
+      (!step.expect_error || hasCapabilityUnavailableContext || hasMissingToolUnavailableContext))
+  ) {
+    const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+    const responseDerivedDetails = unresolvedVars
+      .map(v => runState.responseDerivedNotApplicableContextKeys?.get(v.key))
+      .filter((d): d is string => typeof d === 'string');
+    const allResponseDerived =
+      !hasMissingToolUnavailableContext &&
+      responseDerivedDetails.length === unresolvedVars.length &&
+      responseDerivedDetails.length > 0;
+    const allCapabilityUnavailable =
+      !hasMissingToolUnavailableContext &&
+      unresolvedContextVars.length === unresolvedVars.length &&
+      unresolvedContextVars.length > 0 &&
+      unresolvedContextVars.every(v => runState.capabilityUnavailableContextKeys?.has(v.key) === true);
+    const detail = allResponseDerived
+      ? [...new Set(responseDerivedDetails)].join('; ')
+      : allCapabilityUnavailable
+        ? `Skipped: context required by a capability-gated phase is unavailable: ${unresolvedVars.map(v => v.key).join(', ')}.`
+        : `Skipped: unresolved context variables from prior steps: ${unresolvedVars.map(v => v.key).join(', ')}.`;
+    // Normal unresolved substitutions carry one validation result per missing
+    // token. Response-derived terminal-page skips are already successful
+    // not_applicable rows, so their downstream cursor consumers stay validation
+    // empty to avoid inventing a failing-looking check for an expected skip.
+    const synthesized: ValidationResult[] = [];
+    if (!allResponseDerived && !allCapabilityUnavailable) {
+      const seenTokens = new Set<string>();
+      for (const v of unresolvedVars) {
+        if (seenTokens.has(v.token)) continue;
+        seenTokens.add(v.token);
+        synthesized.push({
+          check: 'unresolved_substitution',
+          passed: false,
+          description:
+            v.token === BUILD_ASSETS_FROM_FORMAT_DIRECTIVE
+              ? `request directive "${v.token}" did not resolve — the test kit could not populate every seller-required asset at ${v.key}`
+              : DOTTED_CONTEXT_TOKEN_RE.test(v.token)
+                ? `request token "${v.token}" is not a supported substitution — $context.<key> matches a whole key only and cannot drill into a captured object. Capture the field directly with context_outputs: [{ key: ..., path: ${suggestedCapturePath(v.token)} }], or branch on the snapshot with a phase skip_if.`
+                : `request token "${v.token}" did not resolve — prior step did not populate context.${v.key}`,
+          json_pointer: null,
+          expected: v.token,
+          actual: null,
+          schema_id: null,
+          schema_url: null,
+        });
+      }
+    }
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      passed: allResponseDerived || allCapabilityUnavailable,
+      skipped: true,
+      skip_reason: allCapabilityUnavailable
+        ? 'capability_prerequisite_unavailable'
+        : allResponseDerived
+          ? 'not_applicable'
+          : 'prerequisite_failed',
+      skip: buildSkip(
+        allResponseDerived || allCapabilityUnavailable ? 'not_applicable' : 'prerequisite_failed',
+        detail
+      ),
+      duration_ms: 0,
+      validations: synthesized,
+      context,
+      ...responseDerivedContextResult(runState),
+      ...(!allResponseDerived && !allCapabilityUnavailable && { error: detail }),
+      next,
+      extraction: { path: 'none' },
+    };
+  }
+
+  const unresolvedRunnerTokens = findUnresolvedRunnerTokens(request);
+  if (unresolvedRunnerTokens.length > 0) {
+    const isPrerequisiteFailure = hasUnresolvedPriorStepToken(unresolvedRunnerTokens);
+    const skipReason = isPrerequisiteFailure ? 'prerequisite_failed' : 'not_applicable';
+    const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+    const detail =
+      'Skipped: storyboard request references unresolved runner placeholders. ' +
+      `Unresolved token(s): ${unresolvedRunnerTokens.join(', ')}.`;
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: effectiveStep.task,
+      passed: !isPrerequisiteFailure,
+      skipped: true,
+      skip_reason: skipReason,
+      skip: buildSkip(skipReason, detail),
+      duration_ms: 0,
+      validations: [],
+      context,
+      next,
+      ...(isPrerequisiteFailure ? { error: detail } : {}),
+      request: {
+        transport: options.protocol === 'a2a' ? 'a2a' : 'mcp',
+        operation: effectiveStep.task,
+        payload: redactSecrets(request),
+        ...(runState.agentUrl ? { url: redactOAuthUrlForOutput(runState.agentUrl) } : {}),
+      },
+      extraction: { path: 'none' },
+    };
+  }
+
+  // Execute the task. MCP security probes use the raw MCP probe so the runner
+  // can control credentials while still completing the Streamable HTTP
+  // handshake. A2A security probes use a one-shot TestClient instead: this
+  // keeps agent-card discovery and message dispatch on the official A2A SDK
+  // path, including `supportedInterfaces` endpoint selection. The existing
+  // guarded A2A fetch boundary is wrapped with raw-response capture below so
+  // http_* validations still observe status + `WWW-Authenticate`.
+  //
+  // Idempotency omission scenarios suppress both the runner and SDK defaults.
+  // A governed request with no authored key must do the same: minting a key
+  // after check_governance approved the payload would change its wire hash.
+  const governedRequest =
+    isAdcpVersionAtLeast(options.adcpVersion ?? ADCP_VERSION, '3.2.0-beta.1') &&
+    effectiveStep.task !== 'check_governance' &&
+    effectiveStep.task !== 'report_plan_outcome' &&
+    Object.prototype.hasOwnProperty.call(request, 'governance_context');
+  // The raw method keeps both the request and response on the graded wire
+  // shape; canonical creative methods can transform approved request fields.
+  const responseProjection = governedRequest
+    ? 'raw'
+    : (effectiveStep.response_projection ??
+      defaultStoryboardResponseProjection(effectiveStep.task, effectiveStep.comply_scenario));
+  if (
+    governedRequest &&
+    !step.expect_error &&
+    step.omit_idempotency_key !== true &&
+    requestUsesIdempotency(effectiveStep.task, request) &&
+    (typeof request.idempotency_key !== 'string' || request.idempotency_key.length === 0)
+  ) {
+    const detail =
+      `Governed ${effectiveStep.task} must author the idempotency_key approved by check_governance; ` +
+      'the runner cannot mint one after approval.';
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: effectiveStep.task,
+      passed: false,
+      duration_ms: 0,
+      validations: [
+        {
+          check: 'governed_payload',
+          passed: false,
+          description: detail,
+          json_pointer: '/idempotency_key',
+          expected: 'the key authorized by check_governance',
+          actual: request.idempotency_key ?? null,
+          schema_id: null,
+          schema_url: null,
+        },
+      ],
+      context,
+      error: detail,
+      next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+      request: {
+        transport: options.protocol === 'a2a' ? 'a2a' : 'mcp',
+        operation: effectiveStep.task,
+        payload: redactSecrets(request),
+        ...(runState.agentUrl ? { url: redactOAuthUrlForOutput(runState.agentUrl) } : {}),
+      },
+      extraction: { path: 'none' },
+    };
+  }
+  const testsIdempotencyKeyOmission =
+    (step.omit_idempotency_key === true ||
+      (governedRequest && (typeof request.idempotency_key !== 'string' || request.idempotency_key.length === 0))) &&
+    requestUsesIdempotency(effectiveStep.task, request);
+
+  // Missing-account probes and governed requests without an approved account
+  // also bypass the SDK's account requirement. A governed request must reach
+  // the seller as approved, even when the seller will reject it as invalid.
+  const testsMissingAccount =
+    effectiveStep.task === 'create_media_buy' &&
+    (step.omit_account === true || (governedRequest && !Object.prototype.hasOwnProperty.call(request, 'account')));
+
+  // The storyboard contract defines schema-invalid negative paths as seller
+  // validation probes: the malformed sample_request must reach the agent.
+  // Omitted negative_path retains the contract's backwards-compatible
+  // `schema_invalid` default for expect_error steps.
+  const testsSchemaInvalidRequest = step.expect_error === true && step.negative_path !== 'payload_well_formed';
+
+  // Isolated auth-override dispatch is reserved for steps that explicitly
+  // override auth. Missing-field vectors stay on the shared SDK transport
+  // with the skip flags below so transport setup completes before the
+  // malformed tool call reaches the seller handler.
+  // Credentialed functional steps use the configured official protocol client.
+  // Raw probes remain necessary for negative auth and HTTP-envelope assertions.
+  const useSdkAuthOverride =
+    typeof step.auth === 'object' &&
+    step.auth.type === 'api_key' &&
+    step.auth.from_test_kit === true &&
+    step.auth.value_strategy === undefined &&
+    step.expect_error !== true &&
+    !(step.validations ?? []).some(validation => HTTP_PROBE_ONLY_CHECKS.has(validation.check));
+  let rawProbeHeaders: Record<string, string> | undefined;
+  let authOverrideClient: TestClient | undefined;
+  try {
+    rawProbeHeaders = step.auth !== undefined ? authHeadersForStep(step.auth, options) : undefined;
+    if (useSdkAuthOverride) {
+      if (rawProbeHeaders === undefined) throw new Error('Step auth override credentials were not resolved');
+      // Resolve configuration inside the same guard for both ordinary and
+      // parallel dispatch. A routing collision must become a step error.
+      authOverrideClient = createAuthOverrideClient(
+        runState.agentUrl,
+        options.protocol ?? 'mcp',
+        options,
+        rawProbeHeaders
+      );
+    }
+  } catch (err) {
+    // adcp#6735 — an unresolvable from_test_kit credential is a step-level
+    // configuration failure with an explicit message, never a silent
+    // unauthenticated probe (and never a whole-run crash).
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      passed: false,
+      duration_ms: 0,
+      validations: [],
+      context,
+      error: `Step auth configuration error: ${err instanceof Error ? err.message : String(err)}`,
+      extraction: { path: 'none' },
+    };
+  }
+  const useRawProbe = rawProbeHeaders !== undefined && !useSdkAuthOverride;
+  const stepClient = () => authOverrideClient ?? client;
+
+  let taskResult: TaskResult | undefined;
+  let stepResult: { duration_ms: number; error?: string; passed: boolean };
+  // Raw caught error from the dispatch fn — preserved as `unknown` so the
+  // schema-validation attribution path below can `instanceof` it against
+  // `ResponseSchemaValidationError`. Undefined when the step succeeded or
+  // failed for a non-typed reason. Spec: adcp-client#1709.
+  let caughtError: unknown;
+  let httpResult: HttpProbeResult | undefined;
+  let responseRecord: RunnerResponseRecord | undefined;
+  let requestUrl: string | undefined;
+  let a2aEnvelope: A2ATaskEnvelope | undefined;
+  let crossResponses: CrossResponseSet | undefined;
+
+  // Parallel-dispatch fan-out: when the storyboard step declares
+  // `parallel_dispatch`, the runner fires N concurrent dispatches against
+  // the same agent with the same idempotency_key (default) and grades the
+  // cross-response set instead of a single response. Gated on the
+  // `parallel_dispatch_runner` test-kit contract — runners (or runs) without
+  // it grade the step `not_applicable` so older runners don't fail on
+  // newer storyboard contracts.
+  if (step.parallel_dispatch && !useRawProbe) {
+    const contractsInScope = new Set(options.contracts ?? []);
+    if (!contractsInScope.has(PARALLEL_DISPATCH_CONTRACT)) {
+      const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+      const detail = `Test-kit contract "${PARALLEL_DISPATCH_CONTRACT}" is not configured on this runner; concurrent-retry grading requires it.`;
+      return {
+        step_id: step.id,
+        phase_id: phaseId,
+        title: step.title,
+        task: step.task,
+        passed: true,
+        skipped: true,
+        skip_reason: 'not_applicable',
+        skip: buildSkip('not_applicable', detail),
+        duration_ms: 0,
+        validations: [],
+        context,
+        next,
+        extraction: { path: 'none' },
+      };
+    }
+    const specError = validateParallelDispatchSpec(step.parallel_dispatch);
+    if (specError) {
+      const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+      return {
+        step_id: step.id,
+        phase_id: phaseId,
+        title: step.title,
+        task: step.task,
+        passed: false,
+        duration_ms: 0,
+        validations: [
+          {
+            check: 'parallel_dispatch_misconfigured',
+            passed: false,
+            description: specError,
+            json_pointer: null,
+            expected: 'a well-formed parallel_dispatch spec',
+            actual: step.parallel_dispatch,
+            schema_id: null,
+            schema_url: null,
+          },
+        ],
+        context,
+        error: specError,
+        next,
+        extraction: { path: 'none' },
+      };
+    }
+    if (step.parallel_dispatch.mode === 'distributed') {
+      const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+      const detail =
+        'parallel_dispatch.mode: distributed is not implemented in @adcp/sdk; use process_local for in-process grading.';
+      return {
+        step_id: step.id,
+        phase_id: phaseId,
+        title: step.title,
+        task: step.task,
+        passed: true,
+        skipped: true,
+        skip_reason: 'not_applicable',
+        skip: buildSkip('not_applicable', detail),
+        duration_ms: 0,
+        validations: [],
+        context,
+        next,
+        extraction: { path: 'none' },
+      };
+    }
+  }
+
+  // Capture the ISO timestamp immediately before the step's AdCP request
+  // dispatch. `upstream_traffic` validations use this as the default
+  // `since_timestamp` window bound when querying the controller. Recorded
+  // on `runState.stepRequestStarts` so a later step's `since: prior_step_id`
+  // reference can resolve back to it.
+  const requestStartIso = new Date().toISOString();
+  if (runState.stepRequestStarts) runState.stepRequestStarts.set(step.id, requestStartIso);
+
+  if (useRawProbe) {
+    const started = Date.now();
+    try {
+      if (options.protocol === 'a2a') {
+        const probeClient = createAuthOverrideClient(runState.agentUrl, 'a2a', options, rawProbeHeaders ?? {});
+        const captured = await withRawResponseCapture(() =>
+          runStep(step.title, effectiveStep.task, () =>
+            executeStoryboardTask(probeClient, effectiveStep.task, request, {
+              skipIdempotencyAutoInject: testsIdempotencyKeyOmission,
+              skipAccountValidation: testsMissingAccount,
+              skipRequestValidation: testsSchemaInvalidRequest,
+              preserveGovernedPayload: governedRequest,
+              responseProjection,
+              mediaBuyLifecycleCompatibility: options.mediaBuyLifecycleCompatibility,
+              signal: options.signal,
+            })
+          )
+        );
+        taskResult = captured.result.result;
+        stepResult = captured.result.step;
+        caughtError = captured.result.caughtError;
+        if (caughtError !== undefined && options.signal?.aborted) {
+          throw caughtError;
+        }
+
+        const rpcCapture = findA2aAuthProbeCapture(captured.captures, effectiveStep.task);
+        const crossOriginRpcCapture =
+          rpcCapture !== undefined && new URL(rpcCapture.url).origin !== new URL(runState.agentUrl).origin;
+        if (rpcCapture && !crossOriginRpcCapture) {
+          httpResult = httpProbeResultFromCapture(rpcCapture);
+          requestUrl = rpcCapture.url;
+          const filteredHeaders = filterResponseHeaders(httpResult.headers);
+          responseRecord = {
+            transport: 'a2a',
+            payload: redactSecrets(httpResult.body),
+            status: httpResult.status,
+            ...(filteredHeaders && { headers: filteredHeaders }),
+            duration_ms: rpcCapture.latencyMs,
+          };
+        } else {
+          const error = crossOriginRpcCapture
+            ? 'A2A auth probe selected a cross-origin RPC endpoint; credential-isolated responses cannot be graded'
+            : (stepResult.error ?? taskResult?.error ?? 'A2A auth probe produced no HTTP response');
+          const failureUrl = rpcCapture?.url ?? runState.agentUrl;
+          httpResult = {
+            url: failureUrl,
+            status: 0,
+            headers: {},
+            body: null,
+            error,
+          };
+          stepResult.error ??= error;
+          stepResult.passed = false;
+          requestUrl = failureUrl;
+          responseRecord = {
+            transport: 'a2a',
+            payload: null,
+            status: 0,
+            duration_ms: stepResult.duration_ms,
+          };
+        }
+        a2aEnvelope = rpcCapture && !crossOriginRpcCapture ? parseLastA2aMessageSendCapture([rpcCapture]) : undefined;
+      } else {
+        const probe = await rawMcpProbe({
+          agentUrl: runState.agentUrl,
+          toolName: effectiveStep.task,
+          args: governedRequest
+            ? prepareGovernedStoryboardWireArgs(request, effectiveStep.task, runState.agentUrl, options)
+            : request,
+          headers: rawProbeHeaders,
+          allowPrivateIp: options.allow_http === true,
+          fetchFn: options.transport?.trustedFetchFn,
+        });
+        httpResult = probe.httpResult;
+        taskResult = probe.taskResult;
+        const durationMs = Date.now() - started;
+        stepResult = {
+          duration_ms: durationMs,
+          passed: !httpResult.error,
+          error: httpResult.error,
+        };
+        const filteredHeaders = filterResponseHeaders(httpResult.headers);
+        responseRecord = {
+          transport: 'mcp',
+          payload: redactSecrets(httpResult.body),
+          ...(typeof httpResult.status === 'number' ? { status: httpResult.status } : {}),
+          ...(filteredHeaders && { headers: filteredHeaders }),
+          duration_ms: durationMs,
+        };
+      }
+    } catch (err) {
+      if (options.signal?.aborted) throw err;
+      stepResult = {
+        duration_ms: Date.now() - started,
+        passed: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  } else {
+    // For A2A runs, wrap the SDK dispatch in `withRawResponseCapture`
+    // so storyboard validations can assert on the JSON-RPC `Task`
+    // envelope the seller emitted (e.g. `a2a_submitted_artifact`
+    // checks `Task.state` + `artifact.metadata.adcp_task_id` placement).
+    // MCP path stays unwrapped — the SDK envelope is reconstructed from
+    // `taskResult` already and capture would only add overhead.
+    //
+    // Selection note: gate on `options.protocol === 'a2a'` because
+    // that's the only signal available at this point — discovery
+    // hasn't run yet in `runStoryboardStep` (the runner branches off
+    // `agentTools` later). If a future "auto-detect protocol" flow
+    // lands, key the capture off the negotiated transport instead.
+    const captureA2a = options.protocol === 'a2a';
+    let a2aCaptures: RawHttpCapture[] | undefined;
+    if (step.parallel_dispatch) {
+      // Fan out N concurrent dispatches via the SDK client. All dispatches
+      // share the runner-minted idempotency_key (default) so the seller
+      // sees one logical request and resolves the race deterministically.
+      //
+      // Known limitation: `dispatchWithBarrier` uses `Promise.race` against a
+      // timer; when the barrier wins, the underlying SDK request is NOT
+      // aborted — it continues to completion against the seller. The runner
+      // reports the dispatch as `timed_out`, but a late-arriving success
+      // can still land on the seller's idempotency cache. Storyboard
+      // authors writing follow-up steps that observe seller state after a
+      // barrier timeout should account for this race.
+      const started = Date.now();
+      crossResponses = await runParallelDispatches(stepClient(), effectiveStep.task, request, {
+        spec: step.parallel_dispatch,
+        keyMinter: generateIdempotencyKey,
+        correlationPrefix: step.id,
+        taskOptions: {
+          skipIdempotencyAutoInject: testsIdempotencyKeyOmission,
+          skipAccountValidation: testsMissingAccount,
+          skipRequestValidation: testsSchemaInvalidRequest,
+          preserveGovernedPayload: governedRequest,
+          responseProjection,
+          mediaBuyLifecycleCompatibility: options.mediaBuyLifecycleCompatibility,
+          signal: options.signal,
+        },
+      });
+      const durationMs = Date.now() - started;
+      // Representative TaskResult is ALWAYS `dispatches[0]` — pinning the
+      // representative to a fixed index keeps the aggregation loop's `i=1`
+      // start aligned (every dispatch graded exactly once). Picking the
+      // "best" resolved arm would double-count whichever dispatch won and
+      // skip dispatches[0] from per-response grading entirely.
+      const firstDispatch = crossResponses.dispatches[0];
+      const allTimedOut = crossResponses.dispatches.every(d => d.timed_out);
+      const barrierTimeoutError = 'parallel_dispatch_barrier_timeout: no dispatch resolved within barrier_timeout_ms';
+      taskResult = firstDispatch?.taskResult ?? {
+        success: false,
+        ...(allTimedOut && { error: barrierTimeoutError }),
+      };
+      // Pass/fail is derived from the cross-response set rather than any
+      // single arm: the step passes when at least one dispatch resolved
+      // (cross-response validations then grade the race outcome). All-
+      // timed-out is a hard failure regardless of validations.
+      stepResult = {
+        duration_ms: durationMs,
+        passed: !allTimedOut && crossResponses.resolved.length > 0,
+        ...(allTimedOut && { error: barrierTimeoutError }),
+      };
+      if (taskResult) {
+        responseRecord = {
+          transport: options.protocol === 'a2a' ? 'a2a' : 'mcp',
+          payload: redactSecrets(
+            taskResult.data ??
+              (taskResult.adcp_error ? { adcp_error: taskResult.adcp_error } : undefined) ??
+              taskResult.error ??
+              null
+          ),
+          duration_ms: durationMs,
+        };
+      }
+    } else {
+      const dispatch = () =>
+        executeStoryboardTask(stepClient(), effectiveStep.task, request, {
+          skipIdempotencyAutoInject: testsIdempotencyKeyOmission,
+          skipAccountValidation: testsMissingAccount,
+          skipRequestValidation: testsSchemaInvalidRequest,
+          preserveGovernedPayload: governedRequest,
+          responseProjection,
+          mediaBuyLifecycleCompatibility: options.mediaBuyLifecycleCompatibility,
+          signal: options.signal,
+        });
+      const run = await runStep(step.title, effectiveStep.task, async () => {
+        if (!captureA2a) return dispatch();
+        try {
+          const { result: dispatchResult, captures } = await withRawResponseCapture(dispatch);
+          a2aCaptures = captures;
+          return dispatchResult;
+        } catch (err) {
+          // `withRawResponseCapture` attaches partial captures to the
+          // thrown error so we still get the wire-shape envelope when
+          // the SDK threw mid-parse (e.g. agent emitted malformed JSON).
+          // Bare-throw cases (network errors, no captures attached)
+          // leave `a2aCaptures` undefined and the validator self-skips.
+          const partial = getCapturesFromError(err);
+          if (partial) a2aCaptures = partial;
+          throw err;
+        }
+      });
+      taskResult = run.result;
+      stepResult = run.step;
+      caughtError = run.caughtError;
+      if (caughtError !== undefined && options.signal?.aborted) {
+        throw caughtError;
+      }
+      if (captureA2a && a2aCaptures) {
+        a2aEnvelope = parseLastA2aMessageSendCapture(a2aCaptures);
+      }
+      if (taskResult) {
+        responseRecord = {
+          transport: options.protocol === 'a2a' ? 'a2a' : 'mcp',
+          payload: redactSecrets(
+            taskResult.data ??
+              (taskResult.adcp_error ? { adcp_error: taskResult.adcp_error } : undefined) ??
+              taskResult.error ??
+              null
+          ),
+          duration_ms: stepResult.duration_ms,
+        };
+      }
+    }
+  }
+
+  const effectiveRequestUrl = requestUrl ?? runState.agentUrl;
+  rememberPropertyListCredentials(
+    taskResult?.data ?? (caughtError instanceof ResponseSchemaValidationError ? caughtError.data : undefined),
+    (step.validations ?? []).flatMap(validation => (validation.auth_token_path ? [validation.auth_token_path] : []))
+  );
+  const requestRecord: RunnerRequestRecord = {
+    transport: options.protocol === 'a2a' ? 'a2a' : 'mcp',
+    operation: effectiveStep.task,
+    payload: redactSecrets(request),
+    ...(effectiveRequestUrl ? { url: redactOAuthUrlForOutput(effectiveRequestUrl) } : {}),
+  };
+  const inputSchemaStripNotices = collectInputSchemaFieldStripNotices(
+    (taskResult as { debug_logs?: unknown } | undefined)?.debug_logs,
+    storyboardId
+  );
+
+  // Until functional storyboards can sign individual mutating requests,
+  // a seller that correctly requires signatures would otherwise receive a
+  // false-negative grade. Convert only the capability-declared rejection:
+  // the response code, dispatched task, and unsigned-storyboard state must
+  // all agree before authored validations are bypassed.
+  const requiredForSigning = resolveCapabilityPath(
+    runState.agentProfile?.raw_capabilities,
+    'request_signing.required_for'
+  );
+  if (
+    taskResult?.adcp_error?.code === 'request_signature_required' &&
+    Array.isArray(requiredForSigning) &&
+    requiredForSigning.includes(effectiveStep.task) &&
+    options.functional_request_signing === undefined &&
+    runState.storyboardRequiresRequestSigner !== true
+  ) {
+    const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+    const detail =
+      `Agent declared request_signing.required_for includes "${effectiveStep.task}" and rejected the unsigned ` +
+      `request with request_signature_required; storyboard "${storyboardId}" does not require request_signer.`;
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      passed: true,
+      skipped: true,
+      skip_reason: 'not_applicable',
+      skip: buildSkip('not_applicable', detail),
+      duration_ms: stepResult.duration_ms,
+      validations: [],
+      context,
+      response: redactSecrets(taskResult.data),
+      next,
+      request: requestRecord,
+      ...(responseRecord && { response_record: responseRecord }),
+      extraction: extractionFromTaskResult(taskResult),
+      ...(inputSchemaStripNotices.length > 0 && { notices: inputSchemaStripNotices }),
+    };
+  }
+
+  // AdCP 3.0.12 runner-output-contract `force_scenario_unsupported`: when a
+  // comply_test_controller step calls a force_* scenario that the agent
+  // advertises the controller for but does not implement, the agent returns
+  // `{success: false, error: 'UNKNOWN_SCENARIO'}`. Runners MUST grade the
+  // step `not_applicable` with detail `force_scenario_unsupported` BEFORE
+  // applying the step's authored validations — without this, the failing
+  // pass/fail check would mask the coverage gap as a real agent fault.
+  //
+  // Companion to `fixture_seed_unsupported` (seeding.ts) — same shape but
+  // for force_* in step phases rather than seed_* in the fixtures phase.
+  // Spec: compliance/cache/<ver>/universal/runner-output-contract.yaml >
+  // skip_result.reasons.force_scenario_unsupported.
+  //
+  // Spec gate "comply_test_controller advertised" is enforced upstream by
+  // the phase cascade at the `seedingMissingController` check (~line 1893);
+  // by the time per-step grading reaches this detector, the controller has
+  // already been confirmed present. The `step.task === 'comply_test_controller'`
+  // gate below is the per-step subset — it ensures we don't bleed the skip
+  // into other tools that happen to carry a `scenario` argument.
+  {
+    const controllerData = taskResult?.data as { success?: unknown; error?: unknown } | undefined;
+    const requestScenario = (request as { scenario?: unknown }).scenario;
+    if (
+      effectiveStep.task === 'comply_test_controller' &&
+      typeof requestScenario === 'string' &&
+      requestScenario.startsWith('force_') &&
+      controllerData?.success === false &&
+      controllerData.error === 'UNKNOWN_SCENARIO'
+    ) {
+      const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+      const detail = `force_scenario_unsupported: agent advertised comply_test_controller but does not implement scenario "${requestScenario}"`;
+      return {
+        step_id: step.id,
+        phase_id: phaseId,
+        title: step.title,
+        task: step.task,
+        passed: true,
+        skipped: true,
+        skip_reason: 'force_scenario_unsupported',
+        skip: { reason: 'not_applicable', detail },
+        duration_ms: stepResult.duration_ms,
+        validations: [],
+        context,
+        next,
+        extraction: extractionFromTaskResult(taskResult),
+        ...(inputSchemaStripNotices.length > 0 && { notices: inputSchemaStripNotices }),
+      };
+    }
+  }
+
+  // Feature-unsupported or unknown-tool errors → treat as skip
+  const isUnsupported = stepResult.error?.includes('does not support:');
+  const isUnknownTool = stepResult.error && /Unknown tool[:\s]/i.test(stepResult.error);
+  if (!taskResult && (isUnsupported || isUnknownTool)) {
+    const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+    const reason: RunnerSkipReason = isUnknownTool ? 'missing_tool' : 'not_applicable';
+    const detail = isUnknownTool
+      ? `Agent rejected tool "${effectiveStep.task}" as unknown: ${stepResult.error}`
+      : `Agent reported feature not supported: ${stepResult.error}`;
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      passed: true,
+      skipped: true,
+      skip_reason: reason,
+      skip: buildSkip(reason, detail),
+      duration_ms: stepResult.duration_ms,
+      validations: [],
+      context,
+      error: stepResult.error,
+      next,
+      extraction: { path: 'none' },
+      ...(inputSchemaStripNotices.length > 0 && { notices: inputSchemaStripNotices }),
+    };
+  }
+
+  // Schema-invalid vectors should reach the seller through the bypass above.
+  // An injected or older client can still reject locally, however, so detect
+  // that narrow legacy path without presenting runner-authored evidence as a
+  // seller response that storyboard validations can grade.
+  const unstructuredStepError = taskResult?.error ?? (taskResult === undefined ? stepResult.error : undefined);
+  if (step.expect_error && !taskResult?.data && unstructuredStepError) {
+    const localSchemaRejection =
+      step.negative_path !== 'payload_well_formed' &&
+      /^(?:Request validation failed for\b|Validation failed for field\b)/.test(unstructuredStepError);
+    if (localSchemaRejection) {
+      // The standard runner path disables request validation above, but an
+      // injected/older client may ignore the internal bypass and still reject
+      // locally. Preserve that diagnostic without grading any seller-facing
+      // validation against runner-authored evidence.
+      const syntheticResponse = {
+        errors: [{ code: 'INVALID_REQUEST', message: unstructuredStepError }],
+        synthetic: true,
+      };
+      const detail = 'Seller was not reached; validations are not gradeable on a locally-synthesized response';
+      const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+      return {
+        step_id: step.id,
+        phase_id: phaseId,
+        title: step.title,
+        task: step.task,
+        passed: true,
+        skipped: true,
+        skip_reason: 'not_applicable',
+        skip: buildSkip('not_applicable', detail),
+        expect_error: true,
+        duration_ms: stepResult.duration_ms,
+        validations: [],
+        context,
+        response: syntheticResponse,
+        request: requestRecord,
+        next,
+        extraction: { path: 'none' },
+        ...(inputSchemaStripNotices.length > 0 && { notices: inputSchemaStripNotices }),
+      };
+    }
+    if (taskResult) {
+      taskResult = {
+        ...taskResult,
+        error: unstructuredStepError,
+        data: { error: unstructuredStepError },
+      };
+    }
+  }
+
+  const responseDerivedSkip = detectResponseDerivedNotApplicable(
+    effectiveStep,
+    request,
+    taskResult?.data,
+    runState,
+    allSteps
+  );
+  if (responseDerivedSkip && !step.expect_error) {
+    // Marking a key unavailable is a metadata write against the same
+    // namespace, so it goes through the funnel rather than straight into the
+    // sink. Authored `not_applicable_if[].context_keys` are load-rejected for
+    // reserved names; this is the independent runtime enforcement.
+    const unavailableViolation = tryProtectedContextPatch(
+      context,
+      {
+        markUnavailable: Object.fromEntries(
+          responseDerivedSkip.contextKeys.map(key => [key, responseDerivedSkip.detail])
+        ),
+      },
+      {
+        ...(runState.responseDerivedNotApplicableContextKeys && {
+          sinks: { unavailable: runState.responseDerivedNotApplicableContextKeys },
+        }),
+        origin: `step '${step.id}' not_applicable_if response gate`,
+      }
+    );
+    const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      // A refused metadata write is a failure, not a skip: the gate did not
+      // actually mark anything unavailable, so reporting `not_applicable`
+      // would claim a disposition the runner never reached.
+      passed: unavailableViolation === undefined,
+      ...(unavailableViolation === undefined && {
+        skipped: true as const,
+        skip_reason: 'not_applicable' as const,
+        skip: buildSkip('not_applicable', responseDerivedSkip.detail),
+      }),
+      duration_ms: stepResult.duration_ms,
+      validations: unavailableViolation ? [unavailableViolation] : [],
+      ...(unavailableViolation && { error: unavailableViolation.error }),
+      context,
+      ...responseDerivedContextResult(runState),
+      response: redactSecrets(taskResult?.data),
+      next,
+      request: requestRecord,
+      ...(responseRecord && { response_record: responseRecord }),
+      extraction: extractionFromTaskResult(taskResult),
+      ...(inputSchemaStripNotices.length > 0 && { notices: inputSchemaStripNotices }),
+    };
+  }
+
+  // Determine pass/fail — inverted when expect_error is set
+  let passed: boolean;
+  if (step.expect_error) {
+    // Raw protocol probes can succeed at the transport layer while carrying
+    // a controller-level rejection in their structured payload. Treat the
+    // payload's explicit failure signal as the expected error; authored
+    // validations below still verify that it is the *right* rejection.
+    const responsePayload = taskResult?.data as { success?: unknown } | undefined;
+    const payloadReportsFailure = responsePayload?.success === false;
+    passed = !taskResult?.success || !!stepResult.error || payloadReportsFailure;
+  } else if (crossResponses) {
+    // Parallel-dispatch step: pass/fail is driven by the cross-response
+    // set, not the representative arm. The representative is pinned to
+    // `dispatches[0]` (which may itself have failed under the race) so
+    // gating on its `.success` would false-fail steps where later arms
+    // resolved correctly. Validations grade the actual race outcome.
+    passed = stepResult.passed;
+  } else {
+    passed = stepResult.passed && (taskResult?.success ?? false);
+  }
+
+  const schemaValidationError = caughtError instanceof ResponseSchemaValidationError ? caughtError : undefined;
+  // The response unwrapper preserves the rejected payload on its typed error.
+  // Grade every authored validation against that payload even though no normal
+  // TaskResult was returned; otherwise an advisory response_schema check could
+  // hide a required field validation and false-green the step.
+  const validationTaskResult: TaskResult | undefined =
+    taskResult ??
+    (schemaValidationError
+      ? {
+          // ResponseSchemaValidationError is thrown while validating a
+          // successful response arm. Preserve that terminal state so
+          // status_code/error_code checks retain their authored semantics.
+          success: true,
+          data: schemaValidationError.data,
+        }
+      : undefined);
+  let validations: ValidationResult[] = [];
+  // Run validations. Resolve `$context.<key>` placeholders in `value` and
+  // `allowed_values` fields so expected values can reference prior steps
+  // (e.g., replay tests assert `media_buy_id === $context.initial_media_buy_id`).
+  if (step.validations?.length && (validationTaskResult || httpResult)) {
+    const resolvedValidations = step.validations.map(v => {
+      const resolved = { ...v };
+      if (resolved.value !== undefined) {
+        resolved.value = injectContext({ __v: resolved.value }, context, runState.runnerVars).__v;
+      }
+      if (Array.isArray(resolved.allowed_values)) {
+        resolved.allowed_values = resolved.allowed_values.map(
+          av => injectContext({ __v: av }, context, runState.runnerVars).__v
+        );
+      }
+      if (resolved.denied_list_id !== undefined) {
+        resolved.denied_list_id = injectContext({ value: resolved.denied_list_id }, context, runState.runnerVars)
+          .value as string;
+      }
+      return resolved;
+    });
+    // Pre-fetch upstream_traffic data: any `check: upstream_traffic`
+    // validation needs the controller's `query_upstream_traffic` response,
+    // but the validation dispatcher is synchronous. Async-fetch here once
+    // per unique `since_timestamp` window so the validator can grade
+    // synchronously. Adopters who don't advertise the scenario short-
+    // circuit to a single `advertised: false` marker and every
+    // upstream_traffic check on the step grades not_applicable.
+    const upstreamTraffic = await prefetchUpstreamTraffic(
+      step.id,
+      resolvedValidations,
+      client,
+      options,
+      runState,
+      requestStartIso,
+      requestRecord.payload,
+      step.sample_request
+    );
+
+    const vctx: ValidationContext = {
+      taskName: effectiveStep.task,
+      ...(options.adcpVersion && { adcpVersion: options.adcpVersion }),
+      ...(options._serverAdcpVersion && { responseAdcpVersion: options._serverAdcpVersion }),
+      strictResponseSchemaValidation: options.strictResponseSchemaValidation !== false,
+      ...(validationTaskResult && { taskResult: validationTaskResult }),
+      ...(httpResult && { httpResult }),
+      agentUrl: runState.agentUrl,
+      contributions: runState.contributions,
+      ...(effectiveStep.response_schema_ref && { responseSchemaRef: effectiveStep.response_schema_ref }),
+      request: requestRecord,
+      ...(responseRecord && { response: responseRecord }),
+      storyboardContext: context,
+      ...(a2aEnvelope && { a2aEnvelope }),
+      ...(upstreamTraffic && { upstreamTraffic }),
+      ...(step.sample_request && { storyboardStep: { sample_request: step.sample_request } }),
+      ...(crossResponses && { crossResponses }),
+      ...(() => {
+        // Walk back through the run's captured A2A envelopes and use
+        // the most recent prior step's envelope as the comparison
+        // baseline. The map preserves insertion order, so the last
+        // entry is the most recent prior step's capture.
+        const map = runState.priorA2aEnvelopes;
+        if (!map || map.size === 0) return {};
+        let priorStepId: string | undefined;
+        let priorEnv: A2ATaskEnvelope | undefined;
+        for (const [stepId, env] of map) {
+          priorStepId = stepId;
+          priorEnv = env;
+        }
+        return {
+          ...(priorEnv && { priorA2aEnvelope: priorEnv }),
+          ...(priorStepId && { priorA2aStepId: priorStepId }),
+        };
+      })(),
+    };
+    validations = runValidations(
+      resolvedValidations.filter(validation => validation.check !== 'property_list_reference'),
+      vctx
+    );
+    for (const validation of resolvedValidations.filter(validation => validation.check === 'property_list_reference')) {
+      const result =
+        effectiveStep.task !== 'create_property_list' || !validationTaskResult?.success
+          ? {
+              check: validation.check,
+              passed: false,
+              description: validation.description,
+              error: 'property_list_reference requires a successful create_property_list response.',
+            }
+          : options.protocol === 'a2a'
+            ? {
+                check: validation.check,
+                passed: false,
+                description: validation.description,
+                error: 'Credential-isolated reference resolution requires MCP.',
+              }
+            : await verifyPropertyListReference(validation, validationTaskResult.data, {
+                agentUrl: client.getDiscoveredMcpEndpoint?.() ?? runState.agentUrl,
+                version: options.adcpVersion ?? options._serverAdcpVersion,
+                signal: options.signal,
+                allowHttp: options.allow_http,
+                redactValues: runCredentialValues(options),
+              });
+      validations.push(decorateValidationResult(result, vctx, validation));
+    }
+
+    // Parallel-dispatch aggregation: per-response checks (`response_schema`,
+    // `field_present`, `error_code`, etc.) declared by the storyboard MUST
+    // grade against every dispatch's resolved response, not just the
+    // representative one. Re-run each non-cross-response validation against
+    // each dispatch's TaskResult and append the additional results so the
+    // step's overall pass/fail reflects the full fan-out. The first run
+    // (above) already covers dispatch[0]; this loop covers dispatches[1..N].
+    if (crossResponses && crossResponses.dispatches.length > 1) {
+      const perResponseValidations = resolvedValidations.filter(
+        v => v.check !== 'cross_response_field_equal' && v.check !== 'cross_response_count_distinct'
+      );
+      for (let i = 1; i < crossResponses.dispatches.length; i++) {
+        const d = crossResponses.dispatches[i];
+        if (!d || !d.taskResult) continue;
+        const dispatchCtx: ValidationContext = {
+          ...vctx,
+          taskResult: d.taskResult,
+          // Per-dispatch responseRecord stays minimal — the redacted payload
+          // captures enough for failure attribution without bloating success.
+          ...(responseRecord && {
+            response: {
+              ...responseRecord,
+              payload: redactSecrets(d.taskResult.data ?? d.taskResult.error ?? null),
+              duration_ms: d.duration_ms,
+            },
+          }),
+        };
+        // Drop crossResponses on the per-dispatch context so cross-response
+        // checks don't re-fire here (they already ran once above on the
+        // representative dispatch and produced their single result).
+        delete dispatchCtx.crossResponses;
+        const dispatchResults = runValidations(perResponseValidations, dispatchCtx).map(r => ({
+          ...r,
+          description: `[dispatch ${d.correlation_id}] ${r.description}`,
+        }));
+        validations.push(...dispatchResults);
+      }
+    }
+  }
+
+  // Schema-validation attribution (adcp-client#1709). When the response
+  // unwrapper rejected the agent's response against the SDK's Zod schema
+  // for the tool, it threw a typed `ResponseSchemaValidationError` that
+  // surfaced on `caughtError`. Without this attribution, the rejection
+  // would silently propagate into whichever step-scope invariant (e.g.
+  // `context.no_secret_echo`) happened to fire next — the BidMachine
+  // misdiagnosis trace from adcp-client#1709 / adcp#4419 ate 10+ deploys
+  // chasing the wrong cause.
+  //
+  // Synthesize a canonical `response_schema` ValidationResult and prepend
+  // it so `extractFailures.find(v => !v.passed)` resolves it before any
+  // invariant entry. Step-scope invariants downstream of this point will
+  // short-circuit on the schema-invalid response (see the invariant
+  // dispatch loop in `executeStoryboardPass`).
+  let schemaRejectionIsAdvisory = false;
+  if (schemaValidationError) {
+    const issues = schemaValidationError.issues
+      .slice(0, 5)
+      .map(i => `${i.path.join('.') || '(root)'}: ${i.message}`)
+      .join('; ');
+    const firstIssue = schemaValidationError.issues[0];
+    const jsonPointer = firstIssue ? '/' + firstIssue.path.map(s => String(s)).join('/') : null;
+    const baseSchemaResult: ValidationResult = {
+      check: 'response_schema',
+      passed: false,
+      description: `Response schema validation for ${schemaValidationError.toolName}`,
+      error: issues,
+      json_pointer: jsonPointer,
+      expected: `response schema for ${schemaValidationError.toolName}`,
+      actual: schemaValidationError.issues,
+    };
+    const authoredSchemaValidations = (step.validations ?? []).filter(v => v.check === 'response_schema');
+    const schemaValidationContext: ValidationContext = {
+      taskName: effectiveStep.task,
+      ...(options.adcpVersion && { adcpVersion: options.adcpVersion }),
+      ...(options._serverAdcpVersion && { responseAdcpVersion: options._serverAdcpVersion }),
+      strictResponseSchemaValidation: options.strictResponseSchemaValidation !== false,
+      ...(validationTaskResult && { taskResult: validationTaskResult }),
+      agentUrl: runState.agentUrl,
+      contributions: runState.contributions,
+      ...(effectiveStep.response_schema_ref && { responseSchemaRef: effectiveStep.response_schema_ref }),
+      request: requestRecord,
+      ...(responseRecord && { response: responseRecord }),
+    };
+    if (isExternalResponseSchemaAuthoritative(schemaValidationContext)) {
+      // The installed SDK's generated Zod snapshot can reject a response that
+      // the caller's current-source schemaRoot accepts. Re-grade the raw
+      // payload preserved on ResponseSchemaValidationError through that
+      // authoritative bundle instead of replacing its verdict with the stale
+      // packaged rejection.
+      const authoredExternalResults = validations.filter(result => result.check === 'response_schema');
+      const externalSchemaResults =
+        authoredExternalResults.length > 0
+          ? authoredExternalResults
+          : runValidations(
+              [
+                {
+                  check: 'response_schema',
+                  description: `Response schema validation for ${schemaValidationError.toolName}`,
+                },
+              ],
+              schemaValidationContext
+            );
+      const externalPayloadAccepted =
+        externalSchemaResults.length > 0 && externalSchemaResults.every(result => result.passed);
+      schemaRejectionIsAdvisory = externalSchemaResults.every(result => !validationFailsStep(result));
+      if (externalPayloadAccepted && validationTaskResult) {
+        taskResult = validationTaskResult;
+        passed = !step.expect_error;
+        responseRecord ??= {
+          transport: options.protocol === 'a2a' ? 'a2a' : 'mcp',
+          payload: redactSecrets(validationTaskResult.data),
+          duration_ms: stepResult.duration_ms,
+        };
+      } else if (schemaRejectionIsAdvisory && !step.expect_error) {
+        passed = true;
+      }
+      validations = [...externalSchemaResults, ...validations.filter(result => result.check !== 'response_schema')];
+    } else {
+      const decoratedCandidates = authoredSchemaValidations.map(validation =>
+        decorateValidationResult(baseSchemaResult, schemaValidationContext, validation)
+      );
+      const schemaResults = decoratedCandidates.length
+        ? decoratedCandidates
+        : [{ ...baseSchemaResult, severity: 'required' } satisfies ValidationResult];
+      schemaRejectionIsAdvisory = schemaResults.every(result => !validationFailsStep(result));
+      if (schemaRejectionIsAdvisory && !step.expect_error) passed = true;
+      // Prepend so extractFailures picks it up before any inline validation
+      // entry that may also be failing (e.g. `field_present` checks that
+      // legitimately can't observe their target against an unparsed payload).
+      validations = [...schemaResults, ...validations.filter(result => result.check !== 'response_schema')];
+    }
+  }
+
+  const responseSchemaFailed = validations.some(
+    result => result.check === 'response_schema' && validationFailsStep(result)
+  );
+  if (taskResult?.success && !responseSchemaFailed) {
+    const discoveryAdcpVersion = options._serverAdcpVersion ?? options.adcpVersion;
+    const discoveryResults = await verifyAcceptancePolicyDiscoveryStep({
+      storyboardId,
+      stepId: step.id,
+      taskResult,
+      state: (runState.acceptancePolicyDiscovery ??= {}),
+      ...(discoveryAdcpVersion !== undefined && { adcpVersion: discoveryAdcpVersion }),
+      ...(options.signal !== undefined && { signal: options.signal }),
+      dependencies: {
+        ...options._acceptancePolicyDiscoveryDependencies,
+        ...(options.acceptancePolicyDiscovery?.enabled !== undefined && {
+          enabled: options.acceptancePolicyDiscovery.enabled,
+        }),
+        ...(options.acceptancePolicyDiscovery?.registryResolver !== undefined && {
+          registryResolver: options.acceptancePolicyDiscovery.registryResolver,
+        }),
+      },
+    });
+    validations.push(
+      ...discoveryResults.map(result =>
+        result.passed
+          ? result
+          : {
+              ...result,
+              request: requestRecord,
+              ...(responseRecord && { response: responseRecord }),
+            }
+      )
+    );
+  }
+
+  // Persist the captured A2A envelope keyed by step id so cross-step
+  // validators (`a2a_context_continuity`) on subsequent steps can
+  // compare against it. Only fires when this step actually captured
+  // an envelope — probe steps, MCP steps, and capture-bypass paths
+  // don't insert, so cross-step comparisons walk back to the most
+  // recent A2A step automatically via insertion-order iteration.
+  if (a2aEnvelope && runState.priorA2aEnvelopes) {
+    runState.priorA2aEnvelopes.set(step.id, a2aEnvelope);
+  }
+
+  // Extract context from responses. Forward the alias cache so
+  // `$generate:uuid_v4#<alias>` placeholders in subsequent steps resolve
+  // to the same UUID as prior steps with the same alias.
+  const updatedContext = { ...context };
+  forwardAliasCache(context, updatedContext);
+  // Protection follows the context object identity, exactly like the alias
+  // cache. A shallow spread that forgot this would silently become a new
+  // source of write authority.
+  forwardProtectedContext(context, updatedContext);
+  const protectedSinks: ProtectedContextSinks = {
+    ...(runState.contextProvenance && { provenance: runState.contextProvenance }),
+    ...(runState.responseDerivedNotApplicableContextKeys && {
+      unavailable: runState.responseDerivedNotApplicableContextKeys,
+    }),
+  };
+  const protectedViolations: ValidationResult[] = [];
+  /**
+   * Commit one patch, converting a namespace violation into a visible failed
+   * validation on THIS step. A rejected patch applies nothing, so the run
+   * continues with the prepared state intact and the attempt recorded where
+   * it happened — not swallowed, and not degraded into a skip.
+   */
+  const commitContextPatch = (patch: Parameters<typeof applyProtectedContextPatch>[1], origin: string): void => {
+    try {
+      applyProtectedContextPatch(updatedContext, patch, { sinks: protectedSinks, origin });
+    } catch (error) {
+      if (!(error instanceof ProtectedContextViolation)) throw error;
+      protectedViolations.push({
+        check: 'protected_context_violation',
+        passed: false,
+        description: 'Reserved fixture-preparation context keys are immutable for the rest of the run',
+        error: error.message,
+        json_pointer: null,
+        expected: 'no write, delete or metadata change to the __adcp_fixture_ namespace',
+        actual: error.keys.join(', '),
+        schema_id: null,
+        schema_url: null,
+      });
+    }
+  };
+  const hasData = taskResult?.data !== undefined && taskResult?.data !== null;
+
+  // Convention-based extraction (for non-error steps, or when expect_error succeeded)
+  if (passed && hasData && taskResult && !(effectiveStep.task === 'sync_accounts' && request.dry_run === true)) {
+    const extracted = extractContextWithProvenance(
+      effectiveStep.task,
+      taskResult.data,
+      step.id,
+      options._serverAdcpVersion ?? options.adcpVersion
+    );
+    const conventionUnset: string[] = [];
+    for (const group of extracted.clearGroups ?? []) {
+      if (group.when && !group.when.values.includes(updatedContext[group.when.key])) continue;
+      for (const key of group.keys) {
+        const provenance = runState.contextProvenance?.get(key);
+        // `source_kind !== 'convention'` is an ownership check between
+        // ordinary writers; it is NOT an immutable-namespace check, so the
+        // reserved keys still go through the funnel below.
+        if (provenance && provenance.source_kind !== 'convention') continue;
+        conventionUnset.push(key);
+      }
+    }
+    // Deletions, values, provenance and availability markers commit as one
+    // atomic patch: a rejected convention write must not be able to leave a
+    // prepared capture deleted or its provenance rewritten.
+    // No writer is supplied: convention extraction is an ordinary, untrusted
+    // writer with respect to the reserved namespace.
+    commitContextPatch(
+      {
+        set: extracted.values,
+        unset: conventionUnset,
+        setProvenance: extracted.provenance,
+        unsetProvenance: conventionUnset,
+        clearUnavailable: [...conventionUnset, ...Object.keys(extracted.values)],
+      },
+      `step '${step.id}' convention extraction for ${effectiveStep.task}`
+    );
+  }
+
+  // Explicit context_outputs. `generate:` entries fire unconditionally —
+  // including on failed steps — because the generated ID was already
+  // determined (and may already be inline-substituted via $generate:…#<key>)
+  // before the request went out. Propagating it even on failure lets the
+  // next step use the same ID for a forced-completion or tasks/get follow-up.
+  // `path:` entries are gated on a non-null response and skip silently when
+  // data is absent. Both paths write into updatedContext and receive
+  // updatedContext for alias-cache coherence — forwardAliasCache above
+  // ensures the minted value from any same-step $generate:…#<key> inline
+  // substitution is visible here.
+  if (step.context_outputs?.length) {
+    // Clearing an unavailable marker is itself a metadata write: a step that
+    // could clear the marker on a prepared capture could suppress the
+    // consumer gate that depends on it.
+    commitContextPatch(
+      { clearUnavailable: step.context_outputs.map(output => output.key).filter(key => typeof key === 'string') },
+      `step '${step.id}' context_outputs availability reset`
+    );
+    // Resolve `task_completion.<path>` outputs against the eventual task
+    // artifact rather than the immediate response. When the immediate
+    // response is a submitted-arm envelope (HITL / async-signed-IO flows),
+    // the seller-assigned IDs only exist on the completion artifact — the
+    // sync-shape path resolves to nothing and the storyboard fails on
+    // `capture_path_not_resolvable` for a value the seller correctly
+    // produces, just on a later message. The `task_completion.` prefix is
+    // an explicit author-side opt-in: "poll tasks/get for terminal status,
+    // then resolve the rest of the path against the artifact data."
+    //
+    // Polling failures (timeout, terminal failed/canceled/rejected) emit
+    // `capture_poll_timeout` instead of recycling
+    // `capture_path_not_resolvable` so the failure-class is distinct from
+    // the original "field absent in immediate response" diagnostic.
+    const taskCompletionResolution = await resolveTaskCompletionOutputs(
+      taskResult,
+      step.context_outputs,
+      client,
+      runState.webhookReceiver,
+      effectiveStep.task,
+      options._serverAdcpVersion ?? options.adcpVersion
+    );
+    // `'data' in resolution` distinguishes "polled, artifact had no data"
+    // (use undefined → outputs fail with capture_path_not_resolvable) from
+    // "did not poll" (fall back to the immediate response data).
+    const extractionData =
+      'data' in taskCompletionResolution
+        ? taskCompletionResolution.data
+        : hasData && taskResult
+          ? taskResult.data
+          : undefined;
+    const remappedOutputs = remapTaskCompletionOutputs(step.context_outputs);
+    const explicit = applyContextOutputsWithProvenance(
+      extractionData,
+      remappedOutputs,
+      step.id,
+      effectiveStep.task,
+      updatedContext
+    );
+    commitContextPatch(
+      {
+        set: explicit.values,
+        setProvenance: explicit.provenance,
+        clearUnavailable: Object.keys(explicit.values),
+      },
+      `step '${step.id}' context_outputs capture`
+    );
+    // Per runner-output-contract.yaml v2.0.0, a `context_outputs.path` that
+    // resolves to absent / null / "" is a producer-side conformance failure
+    // on THIS step (capture_path_not_resolvable), not on a downstream
+    // consumer. Synthesize a failed validation_result so the failure is
+    // attributed where it actually originated. Emitted regardless of whether
+    // the step's authored validations passed — a clean response_schema with
+    // a failed capture is the exact case adcp#3796 set out to fix.
+    if (explicit.failures && explicit.failures.length > 0) {
+      for (const failure of explicit.failures) {
+        const wasTaskCompletion = step.context_outputs.some(
+          o => o.key === failure.key && typeof o.path === 'string' && o.path.startsWith(TASK_COMPLETION_PATH_PREFIX)
+        );
+        const pollTimedOut = wasTaskCompletion && taskCompletionResolution.timedOut === true;
+        const taskFailed = wasTaskCompletion && taskCompletionResolution.taskFailed === true;
+        const originalPath = wasTaskCompletion ? `${TASK_COMPLETION_PATH_PREFIX}${failure.path}` : failure.path;
+        let check: string;
+        let description: string;
+        if (pollTimedOut) {
+          check = 'capture_poll_timeout';
+          description = `context_outputs path "${originalPath}" (key "${failure.key}") did not resolve before tasks/get poll timed out (${taskCompletionResolution.pollTimeoutMs}ms)`;
+        } else if (taskFailed) {
+          check = 'capture_task_failed';
+          description = `context_outputs path "${originalPath}" (key "${failure.key}") did not resolve because the task reached a terminal failed/canceled/rejected state`;
+        } else {
+          check = 'capture_path_not_resolvable';
+          description = `context_outputs path "${originalPath}" (key "${failure.key}") did not resolve to a usable value`;
+        }
+        const synthetic: ValidationResult = {
+          check,
+          passed: false,
+          description,
+          json_pointer: toJsonPointer(failure.path),
+          expected: originalPath,
+          actual: failure.resolved,
+          schema_id: null,
+          schema_url: null,
+          ...(requestRecord && { request: requestRecord }),
+          ...(responseRecord && { response: responseRecord }),
+        };
+        validations.push(synthetic);
+      }
+    }
+  }
+  // Re-evaluate after any synthesized capture-failure validations are
+  // appended — the step's overall pass/fail must reflect them.
+  if (protectedViolations.length > 0) validations.push(...protectedViolations);
+  const allValidationsPassedFinal = validations.every(v => !validationFailsStep(v));
+
+  // Emit context-value-rejected hints when the seller's error lists the
+  // values it would have accepted and the rejected request value traces
+  // back to a prior-step $context.* write. Non-fatal: doesn't flip
+  // pass/fail; collapses "SDK bug vs seller bug" triage to one line.
+  //
+  // Gate fires on any step-level failure — task-level failure OR a
+  // validation failure on a 200-OK response. Some sellers return 200 with
+  // an advisory `errors[]` + `available:` list (success envelope with
+  // warnings), and the hint is most useful on exactly that shape. Before
+  // adcp-client#883 the gate was task-level only and missed schema-
+  // rejected-but-200 flows.
+  //
+  //   - Normal steps: hints fire whenever the step failed.
+  //   - `expect_error` steps: `passed` is inverted (true when the task
+  //     failed), so a genuinely-failing `expect_error` step has
+  //     `passed && allValidationsPassed === true`, gate stays shut —
+  //     expected rejections don't chatter hints by design. When the
+  //     validations DO fail (the caller's assertion about the error
+  //     shape was wrong), hints fire and can point them at the source
+  //     step that supplied the rejected value.
+  //
+  // Hints trace to context that existed BEFORE this step's own writes,
+  // since the rejected value can't have come from this step's own
+  // extraction.
+  const stepFailed = !(passed && allValidationsPassedFinal);
+  const contextRejectionHints =
+    stepFailed && runState.contextProvenance
+      ? detectContextRejectionHints(taskResult, request, context, runState.contextProvenance, effectiveStep.task)
+      : [];
+
+  // Shape-drift and strict-AJV hints fire on any step that has a parsed
+  // payload, regardless of pass/fail — issue #935 widened the gate so
+  // these structured diagnostics surface alongside the runner's existing
+  // `ValidationResult.warning` prose without depending on Zod rejection.
+  // Pre-process identically to validateResponseSchema: bare-array payloads
+  // pass through; object payloads have the SDK-internal `_message` field
+  // stripped so the detector sees what AJV does.
+  const driftPayload = (() => {
+    if (!hasData || !taskResult) return undefined;
+    const raw = taskResult.data;
+    if (Array.isArray(raw)) return raw;
+    if (raw && typeof raw === 'object') {
+      const { _message, ...rest } = raw as Record<string, unknown>;
+      return rest;
+    }
+    return raw;
+  })();
+  const shapeDriftHints =
+    driftPayload === undefined
+      ? []
+      : detectShapeDriftHints(effectiveStep.task, driftPayload, runState.agentLibraryVersion);
+  const strictHints = detectStrictValidationHints(effectiveStep.task, validations);
+  // Same root cause MAY produce both a `shape_drift` hint and a
+  // `format_mismatch` (keyword: 'type') hint — e.g. `list_creatives`
+  // returning a bare array. That's intentional co-emission, not a bug:
+  // shape_drift carries the fix recipe ("use listCreativesResponse() to
+  // wrap"); format_mismatch carries the structured RFC 6901 pointer +
+  // AJV schema_path so renderers can deep-link into the schema.
+  // Complementary fix lenses on the same fault.
+  const hints = [...contextRejectionHints, ...shapeDriftHints, ...strictHints];
+
+  // Build next step preview
+  const next = getNextStepPreview(step.id, allSteps, updatedContext, runState.runnerVars);
+
+  return {
+    step_id: step.id,
+    phase_id: phaseId,
+    title: step.title,
+    task: step.task,
+    passed: passed && allValidationsPassedFinal,
+    expect_error: step.expect_error,
+    duration_ms: stepResult.duration_ms,
+    // Legacy `response` field (new code reads `response_record`).
+    // Redact in case a downstream consumer still keys off it; the
+    // modern `response_record.payload` path is already redacted.
+    response: redactSecrets(taskResult?.data),
+    validations,
+    // NOT projected here: the full runner threads this map from step to
+    // step, so stripping the reserved namespace would break the very
+    // substitution the captures exist for. The STANDALONE entry point
+    // projects it on the way out — see `runStoryboardStepBody` — because
+    // there the map is a thread-back channel the next call refuses.
+    context: updatedContext,
+    ...(runState.contextProvenance &&
+      runState.contextProvenance.size > 0 && {
+        // Reserved-namespace provenance is withheld from the echo: the
+        // standalone contract threads this map back in on the NEXT call,
+        // where `assertUnreservedCallerMetadata` refuses it. Emitting
+        // something we then reject would break the hosted step loop this
+        // feature exists for.
+        context_provenance: Object.fromEntries(
+          [...runState.contextProvenance].filter(([key]) => !isProtectedContextKey(key))
+        ),
+      }),
+    ...responseDerivedContextResult(runState),
+    error:
+      step.expect_error || schemaRejectionIsAdvisory ? undefined : truncateError(stepResult.error || taskResult?.error),
+    ...(!step.expect_error && taskResult?.adcp_error && { adcp_error: taskResult.adcp_error }),
+    next,
+    request: requestRecord,
+    ...(responseRecord && { response_record: responseRecord }),
+    extraction: extractionFromTaskResult(taskResult),
+    ...(inputSchemaStripNotices.length > 0 && { notices: inputSchemaStripNotices }),
+    ...(hints.length > 0 && { hints }),
+  };
+}
+
+function validationOnlyCoverageGap(
+  step: StoryboardStep,
+  phaseId: string,
+  context: StoryboardContext,
+  allSteps: FlatStep[],
+  runnerVars: RunnerVariables | undefined,
+  storyboardId?: string
+): StoryboardStepResult {
+  const detail =
+    'Validation-only agent output requires an orchestrator output adapter and is not dispatched as an AdCP tool.';
+  return {
+    ...(storyboardId ? { storyboard_id: storyboardId } : {}),
+    step_id: step.id,
+    phase_id: phaseId,
+    title: step.title,
+    task: step.task,
+    passed: true,
+    skipped: true,
+    skip_reason: 'fixture_unavailable',
+    skip: buildSkip('fixture_unavailable', detail),
+    duration_ms: 0,
+    validations: [],
+    context,
+    next: getNextStepPreview(step.id, allSteps, context, runnerVars),
+    extraction: { path: 'none', note: detail },
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// Probe dispatch (raw HTTP tasks)
+// ────────────────────────────────────────────────────────────
+
+function invalidTrustedMatchPublisherAuthTask(
+  step: StoryboardStep,
+  phaseId: string,
+  context: StoryboardContext,
+  allSteps: FlatStep[],
+  runState: ExecutionState
+): StoryboardStepResult {
+  const detail =
+    `Pseudo-task "${step.task}" is valid only in a storyboard declaring ` +
+    '`requires: [trusted_match_publisher_auth_runner]`; it was not dispatched over MCP or A2A.';
+  return {
+    step_id: step.id,
+    phase_id: phaseId,
+    title: step.title,
+    task: step.task,
+    passed: false,
+    duration_ms: 0,
+    validations: [],
+    context,
+    error: detail,
+    next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+    extraction: { path: 'none' },
+  };
+}
+
+function trustedMatchPublisherAuthRequirementUnmetStep(
+  step: StoryboardStep,
+  phaseId: string,
+  context: StoryboardContext,
+  allSteps: FlatStep[],
+  runState: ExecutionState,
+  detail: string
+): StoryboardStepResult {
+  return {
+    step_id: step.id,
+    phase_id: phaseId,
+    title: step.title,
+    task: step.task,
+    passed: true,
+    skipped: true,
+    skip_reason: 'requirement_unmet',
+    skip: { reason: 'requirement_unmet', requirement: 'trusted_match_publisher_auth_runner', detail },
+    duration_ms: 0,
+    validations: [],
+    context,
+    next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+    extraction: { path: 'none', note: 'publisher-auth runner requirement unavailable' },
+  };
+}
+
+async function executeProbeStep(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- client type varies (TestClient)
+  client: any,
+  step: StoryboardStep,
+  phaseId: string,
+  context: StoryboardContext,
+  allSteps: FlatStep[],
+  options: StoryboardRunOptions,
+  runState: ExecutionState
+): Promise<StoryboardStepResult> {
+  const start = Date.now();
+  let httpResult: HttpProbeResult | undefined;
+  let oauthMetadataGraph: OAuthMetadataGraphGrade | undefined;
+  const probeOpts = {
+    allowPrivateIp: options.allow_http === true,
+    fetchFn: options.transport?.trustedFetchFn,
+  };
+  let requestRecordOverride: RunnerRequestRecord | undefined;
+  // Lifecycle stage the MCP session probe's verdict landed on. Surfaced in the
+  // step's extraction note so operators can tell session-boundary enforcement
+  // from per-operation enforcement.
+  let sessionProbeStage: McpSessionStage | undefined;
+  /** Fixed-vocabulary verdict description from the session probe. */
+  let sessionProbeDetail: string | undefined;
+  /** Exact canonical tool the session probe graded, for auditability. */
+  let sessionProbeTool: string | undefined;
+
+  const contractsInScope = new Set(options.contracts ?? []);
+  if (step.requires_contract) {
+    if (!contractsInScope.has(step.requires_contract)) {
+      httpResult = {
+        url: runState.agentUrl,
+        status: 0,
+        headers: {},
+        body: null,
+        skipped: true,
+        skip_reason: 'missing_test_kit_contract',
+        error: `Test-kit contract "${step.requires_contract}" is not configured on this runner.`,
+      };
+    }
+  }
+  if (
+    !httpResult &&
+    step.task === 'expect_rate_limit_not_replayed' &&
+    !contractsInScope.has(RATE_LIMIT_TRIP_CONTRACT)
+  ) {
+    httpResult = {
+      url: runState.agentUrl,
+      status: 0,
+      headers: {},
+      body: null,
+      skipped: true,
+      skip_reason: 'missing_test_kit_contract',
+      error: `Test-kit contract "${RATE_LIMIT_TRIP_CONTRACT}" is not configured on this runner.`,
+    };
+  }
+
+  if (httpResult) {
+    // Contract-gated synthetic probes self-skip before doing any network work.
+  } else if (TRUSTED_MATCH_PUBLISHER_AUTH_TASKS.has(step.task)) {
+    const task = step.task as TrustedMatchPublisherAuthTask;
+    let prepared = getPreparedTrustedMatchPublisherAuth(options);
+    if (!prepared) {
+      const runner = options.trusted_match_publisher_auth_runner;
+      if (!runner) {
+        return trustedMatchPublisherAuthRequirementUnmetStep(
+          step,
+          phaseId,
+          context,
+          allSteps,
+          runState,
+          'No trusted_match_publisher_auth_runner is configured.'
+        );
+      }
+      try {
+        prepared = await prepareTrustedMatchPublisherAuthProbes(runner);
+      } catch (error) {
+        return trustedMatchPublisherAuthRequirementUnmetStep(
+          step,
+          phaseId,
+          context,
+          allSteps,
+          runState,
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+    // These contract-owned raw requests must remain byte-shape faithful to
+    // the storyboard. Generic run-level request overrides are intentionally
+    // ignored; only authored placeholder substitution is allowed.
+    const request = step.sample_request ? injectContext({ ...step.sample_request }, context, runState.runnerVars) : {};
+    httpResult = await probeTrustedMatchPublisherAuth(prepared[task], request, {
+      allowPrivateIp: options.allow_http === true,
+      ...(options.signal && { signal: options.signal }),
+    });
+    requestRecordOverride = {
+      transport: 'http',
+      operation: step.task,
+      payload: redactSecrets(request),
+      url: redactOAuthUrlForOutput(prepared[task].endpoint),
+    };
+  } else if (step.task === 'protected_resource_metadata') {
+    if (step.validations?.some(validation => validation.check === 'oauth_metadata_graph')) {
+      oauthMetadataGraph = await gradeOAuthMetadataGraph(runState.agentUrl, {
+        allowHttp: options.allow_http === true,
+        signal: options.signal,
+        trustedFetchFn: options.transport?.trustedFetchFn,
+      });
+      httpResult = oauthMetadataGraph.protected_resource_result;
+    } else {
+      httpResult = await probeProtectedResourceMetadata(runState.agentUrl, probeOpts);
+    }
+    // RFC 9728 presence semantics (adcp-client#677): a 404 means the agent is
+    // honestly not advertising OAuth. Convert to a clean step skip so the
+    // phase loop can cascade-skip the rest of oauth_discovery instead of
+    // failing the http_status:200 validation. Any other status (including
+    // 200) runs validations unchanged — an agent that serves PRM MUST serve
+    // it correctly, regardless of whether the test kit also declared an
+    // API key. Fetch errors (status 0) fall through to the normal failure
+    // path since we can't distinguish "agent down" from "misconfigured".
+    if (!oauthMetadataGraph && !httpResult.error && httpResult.status === 404) {
+      httpResult.skipped = true;
+      httpResult.skip_reason = 'oauth_not_advertised';
+    }
+  } else if (step.task === 'oauth_auth_server_metadata') {
+    const prior =
+      runState.priorProbes.get('protected_resource_metadata') ??
+      (runState.allowPriorProbeFallback !== false ? findPriorProbe(runState.priorStepResults) : undefined);
+    httpResult = await probeOauthAuthServerMetadata(prior, probeOpts);
+  } else if (step.task === 'assert_contribution') {
+    // Synthetic: evaluate only through validations (any_of). No network call.
+    httpResult = undefined;
+  } else if (step.task === MCP_SESSION_PROBE_TASK) {
+    // MCP session auth probe: the no-allowlist fallback for
+    // `$test_kit.auth.probe_task` (adcp-client#2940). See
+    // `planMcpSessionSentinel` for which steps it can honestly grade.
+    const plan = planMcpSessionSentinel(step, options, client, runState.agentUrl);
+    if (plan.kind === 'error') {
+      httpResult = { url: runState.agentUrl, status: 0, headers: {}, body: null, error: plan.error };
+    } else if (plan.kind === 'skip') {
+      httpResult = {
+        url: runState.agentUrl,
+        status: 0,
+        headers: {},
+        body: null,
+        skipped: true,
+        skip_reason: plan.reason,
+        error: plan.detail,
+      };
+    } else {
+      const probe = await rawMcpSessionProbe({
+        agentUrl: runState.agentUrl,
+        headers: plan.headers,
+        toolName: plan.toolNames,
+        control: plan.control,
+        // Values the probe withholds but the run's ordinary steps do send, so
+        // a stateful agent's echo cannot land them in this step's evidence.
+        redactValues: runCredentialValues(options),
+        allowPrivateIp: options.allow_http === true,
+        // Honour run cancellation and cap each request well under the shared
+        // 10 s `ssrfSafeFetch` default. The probe additionally bounds the
+        // whole step — candidate walk included — with one shared request /
+        // byte / wall-clock budget, so a tarpitting agent cannot multiply this
+        // per-request cap by the length of its own tool list.
+        ...(options.signal && { signal: options.signal }),
+        timeoutMs: MCP_SESSION_PROBE_REQUEST_TIMEOUT_MS,
+        ...(options.transport?.trustedFetchFn && { fetchFn: options.transport.trustedFetchFn }),
+      });
+      // Left on the default `http` request/response record shape so
+      // `http_status*` validations keep seeing the raw status. Request
+      // payloads are the protocol-defined lifecycle envelopes and the
+      // credential lives in headers, so nothing about them is recorded.
+      httpResult = probe.httpResult;
+      sessionProbeStage = probe.stage;
+      sessionProbeDetail = probe.detail;
+      sessionProbeTool = probe.gradedTool;
+    }
+  } else if (step.task === 'request_signing_probe') {
+    httpResult = await probeRequestSigningVector(step.id, runState.agentUrl, options);
+  } else if (step.task === 'fetch_brand_jwks') {
+    httpResult = await probeBrandJwks(options._profile?.raw_capabilities, runState.agentUrl, {
+      ...probeOpts,
+      protocol: options.protocol,
+    });
+  } else if (step.task === 'assert_jwks_purpose') {
+    // Webhook delivery is signed with the agent's request-signing key; the
+    // deprecated webhook-signing purpose is still accepted (adcontextprotocol/adcp#5555).
+    httpResult = assertJwksPurpose(runState.priorProbes.get('fetch_brand_jwks'), [
+      'request-signing',
+      'webhook-signing',
+    ]);
+  } else if (step.task === 'expect_rate_limit_not_replayed') {
+    const specError = validateRateLimitTripSpec(step.rate_limit_trip);
+    if (specError) {
+      httpResult = {
+        url: runState.agentUrl,
+        status: 0,
+        headers: {},
+        body: { attempts: 0, error: 'rate_limit_trip_misconfigured' },
+        error: specError,
+      };
+    } else if (options.allowLiveSideEffects !== true) {
+      httpResult = {
+        url: runState.agentUrl,
+        status: 0,
+        headers: {},
+        body: null,
+        skipped: true,
+        skip_reason: 'live_side_effect_opt_in_required',
+        error:
+          'The rate-limit trip probe can send hundreds of mutating requests. ' +
+          'Pass allowLiveSideEffects: true to authorize it explicitly.',
+      };
+    } else {
+      const rateLimitTrip = step.rate_limit_trip!;
+      const targetStep: StoryboardStep = {
+        ...step,
+        task: rateLimitTrip.trip_target_task,
+        sample_request: rateLimitTrip.trip_target_sample_request,
+        omit_idempotency_key: true,
+      };
+      const targetRequestResult = buildEffectiveStepRequest(targetStep, context, options, runState);
+      if (!targetRequestResult.ok) {
+        if ('creativeAssetFailure' in targetRequestResult) {
+          return buildCreativeAssetFixtureUnavailableStep(
+            step,
+            phaseId,
+            context,
+            allSteps,
+            runState,
+            targetRequestResult.creativeAssetFailure
+          );
+        }
+        const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+        return {
+          step_id: step.id,
+          phase_id: phaseId,
+          title: step.title,
+          task: step.task,
+          passed: false,
+          duration_ms: Date.now() - start,
+          validations: [
+            {
+              check: 'unresolved_substitution',
+              passed: false,
+              description: `Fixture handle substitution failed: ${targetRequestResult.error}`,
+              json_pointer: null,
+              expected: 'an unambiguous fixture handle binding',
+              actual: targetRequestResult.error,
+              schema_id: null,
+              schema_url: null,
+            },
+          ],
+          context,
+          next,
+          extraction: { path: 'none' },
+          error: targetRequestResult.error,
+        };
+      }
+      const resolvedTargetRequest = targetRequestResult.request;
+      const advertisedTools = resolveAdvertisedTools(options);
+      // Preserve the native target's existing missing-tool disposition when
+      // expect_error would otherwise bypass unresolved-token validation.
+      const routedPrerequisites =
+        runState.missingPrerequisiteContextKeys !== undefined &&
+        (!advertisedTools || advertisedTools.includes(rateLimitTrip.trip_target_task));
+      const unresolvedContextVars = routedPrerequisites
+        ? unresolvedStepContextVars(targetStep, resolvedTargetRequest, context, runState)
+        : findUnresolvedContextVars(resolvedTargetRequest);
+      const unresolvedAssetDirectives = findUnresolvedCreativeAssetDirectives(resolvedTargetRequest).map(path => ({
+        key: path,
+        token: BUILD_ASSETS_FROM_FORMAT_DIRECTIVE,
+      }));
+      const unresolvedVars = [...unresolvedContextVars, ...unresolvedAssetDirectives];
+      const hardUnavailable =
+        routedPrerequisites && unresolvedContextVars.some(v => runState.missingPrerequisiteContextKeys?.has(v.key));
+      const capabilityUnavailable =
+        routedPrerequisites && unresolvedContextVars.some(v => runState.capabilityUnavailableContextKeys?.has(v.key));
+      if (
+        unresolvedAssetDirectives.length > 0 ||
+        (unresolvedContextVars.length > 0 && (!targetStep.expect_error || hardUnavailable || capabilityUnavailable))
+      ) {
+        const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+        const allCapabilityUnavailable =
+          capabilityUnavailable &&
+          !hardUnavailable &&
+          unresolvedAssetDirectives.length === 0 &&
+          unresolvedContextVars.every(v => runState.capabilityUnavailableContextKeys?.has(v.key));
+        const detail = allCapabilityUnavailable
+          ? `Skipped: context required by a capability-gated phase is unavailable: ${unresolvedVars.map(v => v.key).join(', ')}.`
+          : `Skipped: unresolved context variables from rate_limit_trip.trip_target_sample_request: ${unresolvedVars.map(v => v.key).join(', ')}.`;
+        return {
+          step_id: step.id,
+          phase_id: phaseId,
+          title: step.title,
+          task: step.task,
+          passed: allCapabilityUnavailable,
+          skipped: true,
+          skip_reason: allCapabilityUnavailable ? 'capability_prerequisite_unavailable' : 'prerequisite_failed',
+          skip: buildSkip(allCapabilityUnavailable ? 'not_applicable' : 'prerequisite_failed', detail),
+          duration_ms: Date.now() - start,
+          validations: [],
+          context,
+          next,
+          extraction: { path: 'none' },
+          ...(!allCapabilityUnavailable && { error: detail }),
+        };
+      }
+      const unresolvedRunnerTokens = findUnresolvedRunnerTokens(resolvedTargetRequest);
+      if (unresolvedRunnerTokens.length > 0) {
+        const isPrerequisiteFailure = hasUnresolvedPriorStepToken(unresolvedRunnerTokens);
+        const skipReason = isPrerequisiteFailure ? 'prerequisite_failed' : 'not_applicable';
+        const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+        const detail =
+          'Skipped: rate_limit_trip target request references unresolved runner placeholders. ' +
+          `Unresolved token(s): ${unresolvedRunnerTokens.join(', ')}.`;
+        return {
+          step_id: step.id,
+          phase_id: phaseId,
+          title: step.title,
+          task: step.task,
+          passed: !isPrerequisiteFailure,
+          skipped: true,
+          skip_reason: skipReason,
+          skip: buildSkip(skipReason, detail),
+          duration_ms: Date.now() - start,
+          validations: [],
+          context,
+          next,
+          extraction: { path: 'none' },
+          ...(isPrerequisiteFailure ? { error: detail } : {}),
+        };
+      }
+      if (advertisedTools && !advertisedTools.includes(rateLimitTrip.trip_target_task)) {
+        const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+        const detail = `Agent did not advertise tool "${rateLimitTrip.trip_target_task}"; agent tools: [${advertisedTools.join(', ')}].`;
+        return {
+          step_id: step.id,
+          phase_id: phaseId,
+          title: step.title,
+          task: step.task,
+          passed: true,
+          skipped: true,
+          skip_reason: 'missing_tool',
+          skip: buildSkip('missing_tool', detail),
+          duration_ms: Date.now() - start,
+          validations: [],
+          context,
+          next,
+          extraction: { path: 'none' },
+        };
+      }
+      const resolvedSpec = {
+        ...rateLimitTrip,
+        trip_target_sample_request: resolvedTargetRequest,
+      };
+      const targetTransport: Extract<RunnerTransport, 'mcp' | 'a2a'> = options.protocol === 'a2a' ? 'a2a' : 'mcp';
+      const observer = new RateLimitTripObserver(client, {
+        keyMinter: generateIdempotencyKey,
+        correlationPrefix: step.id,
+        transport: targetTransport,
+      });
+      const observation = await observer.run(resolvedSpec);
+      httpResult = rateLimitTripObservationToProbeResult(runState.agentUrl, observation);
+      const observedRequest = observation.body.replay_request ?? observation.body.trip_request ?? resolvedTargetRequest;
+      requestRecordOverride = {
+        transport: targetTransport,
+        operation: rateLimitTrip.trip_target_task,
+        payload: redactSecrets(observedRequest),
+        ...(runState.agentUrl ? { url: redactOAuthUrlForOutput(runState.agentUrl) } : {}),
+      };
+    }
+  } else if (step.task === REPLAY_TRUSTED_MATCH_CONTEXT_VECTOR_TASK) {
+    const routerRunner = options.trusted_match_context_router_runner;
+    if (!routerRunner?.router_url || typeof routerRunner.registerProviders !== 'function') {
+      httpResult = {
+        url: routerRunner?.router_url ?? runState.agentUrl,
+        status: 0,
+        headers: {},
+        body: null,
+        skipped: true,
+        skip_reason: 'grader_skipped',
+        error:
+          'No Trusted Match Context router harness configured. Pass trusted_match_context_router_runner ' +
+          'with router_url and registerProviders; the runner will not dispatch this pseudo-task over MCP/A2A.',
+      };
+    } else {
+      const requestOverride = options.request
+        ? injectContext({ ...options.request }, context, runState.runnerVars)
+        : step.sample_request
+          ? injectContext({ ...step.sample_request }, context, runState.runnerVars)
+          : undefined;
+      const replay = await replayTrustedMatchContextVector(step, routerRunner, {
+        ...(requestOverride && { requestOverride }),
+        ...(options.adcpVersion && { adcpVersion: options.adcpVersion }),
+        ...(options.signal && { signal: options.signal }),
+      });
+      httpResult = replay.httpResult;
+      requestRecordOverride = {
+        transport: 'http',
+        operation: step.task,
+        payload: redactSecrets(replay.request),
+        url: redactOAuthUrlForOutput(replay.httpResult.url),
+      };
+    }
+  }
+
+  if (httpResult) runState.priorProbes.set(step.task, httpResult);
+
+  const duration = Date.now() - start;
+  const requestRecord: RunnerRequestRecord = requestRecordOverride ?? {
+    transport: 'http',
+    operation: step.task,
+    payload: null,
+    ...(httpResult?.url
+      ? { url: redactOAuthUrlForOutput(httpResult.url) }
+      : runState.agentUrl
+        ? { url: redactOAuthUrlForOutput(runState.agentUrl) }
+        : {}),
+  };
+  const filteredProbeHeaders = filterResponseHeaders(httpResult?.headers);
+  const responseTransport = requestRecordOverride?.transport ?? 'http';
+  const responseRecord: RunnerResponseRecord | undefined = httpResult
+    ? {
+        transport: responseTransport,
+        payload: redactSecrets(httpResult.body),
+        ...(responseTransport === 'http' && { status: httpResult.status }),
+        ...(filteredProbeHeaders && { headers: filteredProbeHeaders }),
+        duration_ms: duration,
+      }
+    : undefined;
+  const redactedHttpResult = httpResult
+    ? {
+        ...httpResult,
+        url: redactOAuthUrlForOutput(httpResult.url),
+        headers: filteredProbeHeaders ?? {},
+        body: redactSecrets(httpResult.body),
+        ...(httpResult.error && { error: redactOAuthUrlsInText(httpResult.error) }),
+        ...(responseTransport !== 'http' && { status: undefined }),
+      }
+    : undefined;
+
+  // Probe may self-skip (request_signing_probe uses this for operator opt-outs
+  // and capability-profile mismatches). Surface as a skipped step without
+  // running validations — skip ≠ fail. The detailed reason goes on
+  // `skip_reason`; the canonical spec reason goes on `skip` so contract
+  // consumers see a stable enum.
+  if (httpResult?.skipped) {
+    const detailedReason = (httpResult.skip_reason ?? 'probe_skipped') as RunnerDetailedSkipReason;
+    const canonicalReason = DETAILED_SKIP_TO_CANONICAL[detailedReason] ?? 'not_applicable';
+    // Read the probe's error from the redacted copy: `skip.detail` is report
+    // surface, and a probe error can carry an agent URL with OAuth params. The
+    // detail strings the dispatch supplies today are constants, but this is
+    // the seam where an adopter-supplied one would land unredacted.
+    const detail =
+      CANONICAL_SKIP_DETAILS[detailedReason] ??
+      redactedHttpResult?.error ??
+      DETAILED_SKIP_DETAILS[detailedReason] ??
+      SKIP_DETAILS[canonicalReason];
+    const selectionResult = selectionForProbeSkip(detailedReason, detail);
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      passed: true,
+      skipped: true,
+      skip_reason: detailedReason,
+      skip: { reason: canonicalReason, detail },
+      ...(selectionResult && { selection_result: selectionResult }),
+      duration_ms: duration,
+      response: redactedHttpResult,
+      validations: [],
+      context,
+      next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+      request: requestRecord,
+      ...(responseRecord && { response_record: responseRecord }),
+      extraction: { path: 'none', note: 'probe self-skipped' },
+    };
+  }
+
+  const vctx: ValidationContext = {
+    taskName: step.task === REPLAY_TRUSTED_MATCH_CONTEXT_VECTOR_TASK ? 'context_match' : step.task,
+    ...(options.adcpVersion && { adcpVersion: options.adcpVersion }),
+    ...(options._serverAdcpVersion && { responseAdcpVersion: options._serverAdcpVersion }),
+    strictResponseSchemaValidation: options.strictResponseSchemaValidation !== false,
+    httpResult: redactedHttpResult,
+    ...(step.task === REPLAY_TRUSTED_MATCH_CONTEXT_VECTOR_TASK &&
+      redactedHttpResult && {
+        taskResult: {
+          success: !redactedHttpResult.error && redactedHttpResult.status >= 200 && redactedHttpResult.status < 300,
+          data: redactedHttpResult.body,
+          ...(redactedHttpResult.error && { error: redactedHttpResult.error }),
+        },
+      }),
+    agentUrl: runState.agentUrl,
+    contributions: runState.contributions,
+    ...(step.response_schema_ref && { responseSchemaRef: step.response_schema_ref }),
+    request: requestRecord,
+    ...(responseRecord && { response: responseRecord }),
+    storyboardContext: context,
+    ...(oauthMetadataGraph && { oauthMetadataGraph }),
+  };
+  const validations = step.validations?.length ? runValidations(step.validations, vctx) : [];
+  const allValidationsPassed = validations.every(v => !validationFailsStep(v));
+
+  // For probes, the "task passed" proxy is: fetch returned without error AND
+  // all validations passed. For assert_contribution (no httpResult), we lean
+  // on validations alone.
+  const fetchOk = httpResult ? !httpResult.error : true;
+  const passed = fetchOk && allValidationsPassed;
+
+  const probeNote =
+    sessionProbeStage !== undefined
+      ? `MCP session probe graded ${sessionProbeTool ?? 'unknown tool'} at ${sessionProbeStage} ` +
+        `(${sessionProbeDetail ?? 'no detail'})`
+      : 'http-probe body parsed as JSON';
+  const extraction: RunnerExtractionRecord = httpResult
+    ? httpResult.error
+      ? { path: 'error' }
+      : { path: 'structured_content', note: probeNote }
+    : { path: 'none' };
+
+  return {
+    step_id: step.id,
+    phase_id: phaseId,
+    title: step.title,
+    task: step.task,
+    passed,
+    duration_ms: duration,
+    response: redactedHttpResult ?? undefined,
+    validations,
+    context,
+    // Redacted copy on both branches: the sibling skip branch reads the same
+    // seam, and a probe error can carry an agent URL with OAuth params.
+    error: redactedHttpResult?.error ?? (passed ? undefined : 'Probe validations failed.'),
+    next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+    request: requestRecord,
+    ...(responseRecord && { response_record: responseRecord }),
+    extraction,
+  };
+}
+
+type FixtureBindingApplicationResult = { ok: true; request: Record<string, unknown> } | { ok: false; error: string };
+
+type EffectiveStepRequestResult =
+  | FixtureBindingApplicationResult
+  | { ok: false; creativeAssetFailure: CreativeAssetFixtureUnavailableFailure };
+
+/** @internal Apply schema-scoped fixture handles to the sent request. */
+export function applyFixtureBindingsSafely(
+  request: Record<string, unknown>,
+  task: string,
+  options: StoryboardRunOptions,
+  runState: ExecutionState
+): FixtureBindingApplicationResult {
+  try {
+    const boundRequest = applyFixtureBindingsToRequest(
+      request,
+      task,
+      runState.fixtureBindings,
+      options.adcpVersion ?? ADCP_VERSION
+    );
+    // check_governance.payload is schema-opaque, so its fixture handles need
+    // the downstream tool schema that will also bind the governed request.
+    if (
+      task === 'check_governance' &&
+      boundRequest.phase !== 'delivery' &&
+      typeof boundRequest.tool === 'string' &&
+      boundRequest.payload !== null &&
+      typeof boundRequest.payload === 'object' &&
+      !Array.isArray(boundRequest.payload)
+    ) {
+      return {
+        ok: true,
+        request: {
+          ...boundRequest,
+          payload: applyFixtureBindingsToRequest(
+            boundRequest.payload as Record<string, unknown>,
+            boundRequest.tool,
+            runState.fixtureBindings,
+            options.adcpVersion ?? ADCP_VERSION
+          ),
+        },
+      };
+    }
+    return {
+      ok: true,
+      request: boundRequest,
+    };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function buildEffectiveStepRequest(
+  step: StoryboardStep,
+  context: StoryboardContext,
+  options: StoryboardRunOptions,
+  runState: ExecutionState
+): EffectiveStepRequestResult {
+  const request = buildStepRequest(step, step, context, options, runState.runnerVars);
+  const fixtureBinding = applyFixtureBindingsSafely(request, step.task, options, runState);
+  if (!fixtureBinding.ok) return fixtureBinding;
+  const creativeAssetExpansion = expandCreativeAssetDirectivesWithDiagnostics(
+    fixtureBinding.request,
+    context,
+    options.test_kit
+  );
+  if (!creativeAssetExpansion.ok && creativeAssetExpansion.failure.reason === 'fixture_unavailable') {
+    return { ok: false, creativeAssetFailure: creativeAssetExpansion.failure };
+  }
+  return {
+    ok: true,
+    request: creativeAssetExpansion.value as Record<string, unknown>,
+  };
+}
+
+interface CreativeAssetPreflightGap {
+  target: FlatStep;
+  failure: CreativeAssetFixtureUnavailableFailure;
+}
+
+/**
+ * Preflight future creative directives as soon as their seller format enters
+ * context. Missing context and malformed directives stay on their ordinary
+ * execution paths; only a proven test-kit coverage gap terminates the run.
+ */
+function preflightRemainingCreativeAssetDirectives(
+  allSteps: FlatStep[],
+  afterGlobalIndex: number,
+  context: StoryboardContext,
+  options: StoryboardRunOptions,
+  runState: ExecutionState,
+  excludedPhaseIds: ReadonlySet<string> = new Set(),
+  resolveAssignment?: (step: StoryboardStep) => StepAssignment | undefined
+): CreativeAssetPreflightGap | undefined {
+  const contractsInScope = new Set(options.contracts ?? []);
+  for (const target of allSteps) {
+    if (target.globalIndex <= afterGlobalIndex) continue;
+    if (excludedPhaseIds.has(target.phaseId)) continue;
+
+    const assignment = resolveAssignment?.(target.step);
+    if (resolveAssignment && !assignment) continue;
+    const selectedOptions = assignment?.options ?? options;
+    const selectedState = assignment
+      ? {
+          ...runState,
+          agentUrl: assignment.agentUrl,
+          agentProfile: assignment.profile,
+          agentLibraryVersion: assignment.profile?.library_version,
+        }
+      : runState;
+
+    const resolvedTask = resolveTaskName(target.step, selectedOptions);
+    if (!resolvedTask) continue;
+    if (
+      target.step.requires_tool &&
+      selectedOptions.agentTools &&
+      !selectedOptions.agentTools.includes(target.step.requires_tool)
+    ) {
+      continue;
+    }
+    if (target.step.requires_contract && !contractsInScope.has(target.step.requires_contract)) {
+      continue;
+    }
+    if (
+      target.step.task === 'expect_rate_limit_not_replayed' &&
+      (!contractsInScope.has(RATE_LIMIT_TRIP_CONTRACT) || selectedOptions.allowLiveSideEffects !== true)
+    ) {
+      continue;
+    }
+    if (
+      !PROBE_TASKS.has(target.step.task) &&
+      selectedOptions.agentTools &&
+      !selectedOptions.agentTools.includes(resolvedTask)
+    ) {
+      continue;
+    }
+    let requestStep = resolvedTask === target.step.task ? target.step : { ...target.step, task: resolvedTask };
+
+    if (target.step.task === 'expect_rate_limit_not_replayed') {
+      const rateLimitTrip = target.step.rate_limit_trip;
+      if (validateRateLimitTripSpec(rateLimitTrip) || !rateLimitTrip) continue;
+      requestStep = {
+        ...target.step,
+        task: rateLimitTrip.trip_target_task,
+        sample_request: rateLimitTrip.trip_target_sample_request,
+        omit_idempotency_key: true,
+      };
+    }
+
+    const request = buildEffectiveStepRequest(requestStep, context, selectedOptions, selectedState);
+    if (!request.ok && 'creativeAssetFailure' in request) {
+      return { target, failure: request.creativeAssetFailure };
+    }
+  }
+  return undefined;
+}
+
+interface ResolvedWebhookReplayVector {
+  id: string;
+  description?: string;
+  expected: 'accept' | 'reject';
+  expected_error?: string;
+  same_event_as?: string;
+  payload: Record<string, unknown>;
+  source: string;
+}
+
+async function executeReplayWebhookVectorStep(
+  step: StoryboardStep,
+  phaseId: string,
+  context: StoryboardContext,
+  allSteps: FlatStep[],
+  options: StoryboardRunOptions,
+  runState: ExecutionState
+): Promise<StoryboardStepResult> {
+  const start = Date.now();
+  if (step.requires_contract && !new Set(options.contracts ?? []).has(step.requires_contract)) {
+    const detail = `Test-kit contract "${step.requires_contract}" is not configured on this runner.`;
+    const reason: RunnerDetailedSkipReason = 'missing_test_kit_contract';
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      passed: true,
+      skipped: true,
+      skip_reason: reason,
+      skip: buildSkip(DETAILED_SKIP_TO_CANONICAL[reason], detail),
+      duration_ms: Date.now() - start,
+      validations: [],
+      context,
+      next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+      extraction: { path: 'none', note: 'test-kit contract not configured' },
+    };
+  }
+
+  const receiver = options.webhook_replay_receiver;
+  if (!receiver?.url) {
+    const detail =
+      'No webhook replay receiver URL configured. Pass `webhook_replay_receiver.url` in StoryboardRunOptions to run inbound receiver conformance.';
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      passed: true,
+      skipped: true,
+      skip_reason: 'grader_skipped',
+      skip: buildSkip('not_applicable', detail),
+      duration_ms: Date.now() - start,
+      validations: [],
+      context,
+      next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+      extraction: { path: 'none', note: 'webhook replay receiver not configured' },
+    };
+  }
+
+  const vector = resolveWebhookReplayVector(step, options);
+  if ('error' in vector) {
+    return failedWebhookReplayStep(step, phaseId, context, allSteps, runState, start, vector.error);
+  }
+
+  const body = JSON.stringify(vector.payload);
+  let headers: Record<string, string>;
+  try {
+    headers = buildWebhookReplayHeaders(receiver.url, body, receiver);
+  } catch (error) {
+    return failedWebhookReplayStep(
+      step,
+      phaseId,
+      context,
+      allSteps,
+      runState,
+      start,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+
+  const requestRecord: RunnerRequestRecord = {
+    transport: 'http',
+    operation: step.task,
+    payload: {
+      vector_ref: step.vector_ref,
+      vector_id: vector.id,
+      expected: vector.expected,
+      body: redactSecrets(vector.payload),
+    },
+    url: receiver.url,
+  };
+
+  let httpResult: HttpProbeResult;
+  try {
+    httpResult = await postWebhookReplayVector(
+      receiver.url,
+      body,
+      headers,
+      receiver.fetchImpl ?? fetch,
+      receiver.timeoutMs ?? WEBHOOK_REPLAY_DEFAULT_TIMEOUT_MS,
+      options.signal
+    );
+  } catch (error) {
+    httpResult = {
+      url: receiver.url,
+      status: 0,
+      headers: {},
+      body: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  const duration = Date.now() - start;
+  const filteredProbeHeaders = filterResponseHeaders(httpResult.headers);
+  const responseRecord: RunnerResponseRecord = {
+    transport: 'http',
+    payload: redactSecrets(httpResult.body),
+    status: httpResult.status,
+    ...(filteredProbeHeaders && { headers: filteredProbeHeaders }),
+    duration_ms: duration,
+  };
+  const redactedHttpResult: HttpProbeResult = {
+    ...httpResult,
+    body: redactSecrets(httpResult.body),
+  };
+
+  const validations = buildWebhookReplayValidations(step, vector, allSteps, options, requestRecord, responseRecord);
+  const allValidationsPassed = validations.every(v => !validationFailsStep(v));
+  const fetchOk = !httpResult.error;
+  const passed = fetchOk && allValidationsPassed;
+
+  return {
+    step_id: step.id,
+    phase_id: phaseId,
+    title: step.title,
+    task: step.task,
+    passed,
+    expect_error: step.expect_error,
+    duration_ms: duration,
+    response: redactedHttpResult,
+    validations,
+    context,
+    error: httpResult.error ?? (passed ? undefined : 'Webhook replay validations failed.'),
+    next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+    request: requestRecord,
+    response_record: responseRecord,
+    extraction: httpResult.error
+      ? { path: 'error' }
+      : { path: 'structured_content', note: 'webhook receiver HTTP response parsed' },
+  };
+}
+
+function failedWebhookReplayStep(
+  step: StoryboardStep,
+  phaseId: string,
+  context: StoryboardContext,
+  allSteps: FlatStep[],
+  runState: ExecutionState,
+  start: number,
+  error: string
+): StoryboardStepResult {
+  return {
+    step_id: step.id,
+    phase_id: phaseId,
+    title: step.title,
+    task: step.task,
+    passed: false,
+    duration_ms: Date.now() - start,
+    validations: [
+      {
+        check: 'webhook_replay_vector_resolved',
+        passed: false,
+        description: 'Resolve webhook replay vector before dispatch.',
+        expected: step.vector_ref ?? 'vector_ref',
+        actual: null,
+        error,
+        json_pointer: null,
+      },
+    ],
+    context,
+    error,
+    next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+    extraction: { path: 'none' },
+  };
+}
+
+function buildWebhookReplayValidations(
+  step: StoryboardStep,
+  vector: ResolvedWebhookReplayVector,
+  allSteps: FlatStep[],
+  options: StoryboardRunOptions,
+  request: RunnerRequestRecord,
+  response: RunnerResponseRecord
+): ValidationResult[] {
+  const expectedReject = step.expect_error === true || vector.expected === 'reject';
+  const status = typeof response.status === 'number' ? response.status : 0;
+  const accepted = status >= 200 && status < 300;
+  const validations: ValidationResult[] = [
+    {
+      check: 'webhook_replay_http_status',
+      passed: expectedReject ? !accepted : accepted,
+      description: expectedReject
+        ? 'Receiver rejects malformed webhook replay vectors with a non-2xx status.'
+        : 'Receiver accepts canonical webhook replay vectors with a 2xx status.',
+      expected: expectedReject ? 'non-2xx' : '2xx',
+      actual: status,
+      json_pointer: null,
+      request,
+      response,
+    },
+  ];
+
+  if (step.webhook_payload_schema_ref) {
+    const validator = getSchemaValidatorByRef(step.webhook_payload_schema_ref, options.adcpVersion);
+    const schemaValid = validator ? validator(vector.payload) : false;
+    validations.push({
+      check: 'webhook_replay_payload_schema',
+      passed: expectedReject ? !schemaValid : schemaValid,
+      description: expectedReject
+        ? 'Malformed replay vector is rejected by the webhook payload schema.'
+        : 'Canonical replay vector validates against the webhook payload schema.',
+      expected: expectedReject ? 'schema invalid' : 'schema valid',
+      actual: schemaValid
+        ? 'schema valid'
+        : validator
+          ? validator.errors
+          : `schema not found: ${step.webhook_payload_schema_ref}`,
+      schema_id: step.webhook_payload_schema_ref,
+      schema_url: null,
+      json_pointer: null,
+      request,
+    });
+  }
+
+  const sameEventAs = step.same_event_as ?? vector.same_event_as;
+  if (sameEventAs) {
+    const priorStep = findWebhookReplaySameEventStep(allSteps, sameEventAs);
+    const priorVector = priorStep ? resolveWebhookReplayVector(priorStep, options) : undefined;
+    const currentKey = readStringField(vector.payload, 'idempotency_key');
+    const priorKey =
+      priorVector && !('error' in priorVector) ? readStringField(priorVector.payload, 'idempotency_key') : undefined;
+    validations.push({
+      check: 'webhook_replay_same_event_idempotency_key',
+      passed: Boolean(currentKey && priorKey && currentKey === priorKey),
+      description: 'Retry replay vectors for the same logical event preserve idempotency_key.',
+      expected: priorKey ?? `prior vector for step ${sameEventAs}`,
+      actual: currentKey ?? null,
+      json_pointer: '/idempotency_key',
+      request,
+    });
+  }
+
+  return validations;
+}
+
+function findWebhookReplaySameEventStep(allSteps: FlatStep[], sameEventAs: string): StoryboardStep | undefined {
+  return (
+    allSteps.find(item => item.step.id === sameEventAs)?.step ??
+    allSteps.find(item => vectorRefId(item.step.vector_ref) === sameEventAs)?.step
+  );
+}
+
+function vectorRefId(ref: string | undefined): string | undefined {
+  return ref ? parseWebhookVectorRef(ref)?.id : undefined;
+}
+
+function resolveWebhookReplayVector(
+  step: StoryboardStep,
+  options: StoryboardRunOptions
+): ResolvedWebhookReplayVector | { error: string } {
+  if (!step.vector_ref) {
+    return { error: '`replay_webhook_vector` step requires vector_ref.' };
+  }
+  const parsed = parseWebhookVectorRef(step.vector_ref);
+  if (!parsed) {
+    return { error: `Invalid webhook vector_ref: ${step.vector_ref}` };
+  }
+
+  const vectorFile = readWebhookVectorFile(parsed.path, options);
+  if ('error' in vectorFile) {
+    const fallback = fallbackWebhookReplayVector(parsed, step);
+    if (fallback) return fallback;
+    return vectorFile;
+  }
+
+  const selected = selectWebhookReplayVector(vectorFile.body, parsed.section, parsed.id);
+  if (!selected) {
+    return { error: `Webhook replay vector not found: ${step.vector_ref}` };
+  }
+  return {
+    id: selected.id,
+    description: selected.description,
+    expected: parsed.section === 'negative' || step.expect_error === true ? 'reject' : 'accept',
+    ...(selected.expected_error && { expected_error: selected.expected_error }),
+    ...(selected.same_event_as && { same_event_as: selected.same_event_as }),
+    payload: selected.payload,
+    source: vectorFile.path,
+  };
+}
+
+function parseWebhookVectorRef(ref: string): { path: string; section: string; id: string } | undefined {
+  const [pathPart, fragment] = ref.split('#');
+  if (!pathPart || !fragment) return undefined;
+  const parts = fragment.split('/').filter(Boolean);
+  if (parts.length !== 2) return undefined;
+  return { path: pathPart, section: parts[0]!, id: parts[1]! };
+}
+
+function readWebhookVectorFile(
+  refPath: string,
+  options: StoryboardRunOptions
+): { path: string; body: unknown } | { error: string } {
+  for (const candidate of webhookVectorFileCandidates(refPath, options)) {
+    if (!existsSync(candidate)) continue;
+    try {
+      return { path: candidate, body: JSON.parse(readFileSync(candidate, 'utf8')) };
+    } catch (error) {
+      return {
+        error: `Failed to read webhook replay vector file ${candidate}: ${error instanceof Error ? error.message : error}`,
+      };
+    }
+  }
+  return { error: `Webhook replay vector file not found for ${refPath}` };
+}
+
+function webhookVectorFileCandidates(refPath: string, options: StoryboardRunOptions): string[] {
+  const withoutStatic = refPath.replace(/^static\//, '');
+  const baseName = basename(refPath);
+  const candidates: string[] = [];
+  if (options.webhook_replay_receiver?.vectorsRoot) {
+    candidates.push(join(options.webhook_replay_receiver.vectorsRoot, refPath));
+    candidates.push(join(options.webhook_replay_receiver.vectorsRoot, withoutStatic));
+    candidates.push(join(options.webhook_replay_receiver.vectorsRoot, baseName));
+  }
+  const complianceDir = getComplianceCacheDir({ version: options.adcpVersion, complianceDir: options.complianceDir });
+  candidates.push(join(complianceDir, withoutStatic));
+  candidates.push(join(complianceDir, refPath));
+  candidates.push(join(process.cwd(), refPath));
+  candidates.push(join(process.cwd(), withoutStatic));
+  return [...new Set(candidates)];
+}
+
+function selectWebhookReplayVector(
+  body: unknown,
+  section: string,
+  id: string
+):
+  | {
+      id: string;
+      description?: string;
+      expected_error?: string;
+      same_event_as?: string;
+      payload: Record<string, unknown>;
+    }
+  | undefined {
+  if (!body || typeof body !== 'object') return undefined;
+  const bucket = (body as Record<string, unknown>)[section];
+  if (!Array.isArray(bucket)) return undefined;
+  for (const item of bucket) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Record<string, unknown>;
+    if (rec.id !== id || !rec.payload || typeof rec.payload !== 'object' || Array.isArray(rec.payload)) continue;
+    return {
+      id,
+      ...(typeof rec.description === 'string' && { description: rec.description }),
+      ...(typeof rec.expected_error === 'string' && { expected_error: rec.expected_error }),
+      ...(typeof rec.same_event_as === 'string' && { same_event_as: rec.same_event_as }),
+      payload: rec.payload as Record<string, unknown>,
+    };
+  }
+  return undefined;
+}
+
+function fallbackWebhookReplayVector(
+  parsed: { path: string; section: string; id: string },
+  step: StoryboardStep
+): ResolvedWebhookReplayVector | undefined {
+  if (basename(parsed.path) !== 'webhook-receiver-envelope.json') return undefined;
+  const canonical = fallbackWebhookDeliveryEnvelope('whk_20260526_example_000031');
+  const byId: Record<string, Record<string, unknown>> = {
+    'mcp-delivery-report-envelope': canonical,
+    'mcp-delivery-report-retry-same-idempotency-key': {
+      ...canonical,
+      timestamp: '2026-05-26T09:00:45.582Z',
+    },
+    'bare-delivery-result': canonical.result as Record<string, unknown>,
+    'missing-idempotency-key': omitKey(canonical, 'idempotency_key'),
+    'unsupported-top-level-status': {
+      ...canonical,
+      idempotency_key: 'whk_20260526_example_000032',
+      task_id: 'delivery_report_67_2026_04_000032',
+      status: 'active',
+    },
+  };
+  const payload = byId[parsed.id];
+  if (!payload) return undefined;
+  return {
+    id: parsed.id,
+    expected: parsed.section === 'negative' || step.expect_error === true ? 'reject' : 'accept',
+    ...(parsed.id === 'mcp-delivery-report-retry-same-idempotency-key' && {
+      same_event_as: 'mcp-delivery-report-envelope',
+    }),
+    ...(parsed.id === 'bare-delivery-result' && { expected_error: 'missing_envelope_fields' }),
+    ...(parsed.id === 'missing-idempotency-key' && { expected_error: 'missing_idempotency_key' }),
+    ...(parsed.id === 'unsupported-top-level-status' && { expected_error: 'invalid_envelope_status' }),
+    payload,
+    source: 'built-in:webhook-receiver-envelope',
+  };
+}
+
+function fallbackWebhookDeliveryEnvelope(idempotencyKey: string): Record<string, unknown> {
+  return {
+    idempotency_key: idempotencyKey,
+    operation_id: 'delivery_report_67_2026_04',
+    task_id: 'delivery_report_67_2026_04_000031',
+    task_type: 'media_buy_delivery',
+    status: 'completed',
+    timestamp: '2026-05-26T09:00:44.582Z',
+    message: 'Scheduled media buy delivery report available',
+    result: {
+      notification_type: 'scheduled',
+      sequence_number: 31,
+      reporting_period: {
+        start: '2026-05-25T00:00:00Z',
+        end: '2026-05-25T23:59:00Z',
+      },
+      currency: 'USD',
+      media_buy_deliveries: [],
+    },
+  };
+}
+
+function omitKey(input: Record<string, unknown>, key: string): Record<string, unknown> {
+  const out = { ...input };
+  delete out[key];
+  return out;
+}
+
+function readStringField(input: Record<string, unknown>, key: string): string | undefined {
+  const value = input[key];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function buildWebhookReplayHeaders(
+  receiverUrl: string,
+  body: string,
+  receiver: NonNullable<StoryboardRunOptions['webhook_replay_receiver']>
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    ...(receiver.headers ?? {}),
+  };
+  const signing = receiver.signing ?? { mode: 'none' as const };
+  if (signing.mode === 'none') return headers;
+  if (signing.mode === 'hmac') {
+    const timestamp = signing.now ? signing.now() : Math.floor(Date.now() / 1000);
+    const hmac = createHmac('sha256', signing.secret);
+    hmac.update(String(timestamp), 'utf8');
+    hmac.update('.', 'utf8');
+    hmac.update(body, 'utf8');
+    return {
+      ...headers,
+      'x-adcp-timestamp': String(timestamp),
+      'x-adcp-signature': `sha256=${hmac.digest('hex')}`,
+    };
+  }
+  if (!signing.key) {
+    throw new Error('webhook_replay_receiver.signing.key is required when signing.mode is "rfc9421".');
+  }
+  const request: RequestLike = {
+    method: 'POST',
+    url: signing.targetUrl ?? receiverUrl,
+    headers,
+    body,
+  };
+  return { ...headers, ...signWebhook(request, signing.key, { now: signing.now }).headers };
+}
+
+async function postWebhookReplayVector(
+  url: string,
+  body: string,
+  headers: Record<string, string>,
+  fetchImpl: typeof fetch,
+  timeoutMs: number,
+  parentSignal?: AbortSignal
+): Promise<HttpProbeResult> {
+  const controller = new AbortController();
+  const abort = () => controller.abort(parentSignal?.reason);
+  if (parentSignal?.aborted) abort();
+  parentSignal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(
+    () => controller.abort(new Error(`webhook replay timed out after ${timeoutMs}ms`)),
+    timeoutMs
+  );
+  try {
+    const response = await fetchImpl(url, {
+      method: 'POST',
+      headers,
+      body,
+      signal: controller.signal,
+    });
+    const responseBody = await readWebhookReplayResponseBody(response);
+    return {
+      url,
+      status: response.status,
+      headers: lowerCaseHeaders(response.headers),
+      body: responseBody,
+    };
+  } finally {
+    clearTimeout(timer);
+    parentSignal?.removeEventListener('abort', abort);
+  }
+}
+
+async function readWebhookReplayResponseBody(response: Response): Promise<unknown> {
+  const text = await response.text();
+  if (!text) return null;
+  const contentType = response.headers.get('content-type') ?? '';
+  if (contentType.toLowerCase().includes('application/json')) {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  }
+  return text;
+}
+
+function lowerCaseHeaders(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    out[key.toLowerCase()] = value;
+  });
+  return out;
+}
+
+function resolveAdvertisedTools(options: StoryboardRunOptions): string[] | undefined {
+  return options.agentTools ?? normalizeAgentToolNames(options._profile?.tools);
+}
+
+function rateLimitTripObservationToProbeResult(
+  agentUrl: string,
+  observation: RateLimitTripObservation
+): HttpProbeResult {
+  if (observation.status === 'not_applicable') {
+    return {
+      url: agentUrl,
+      status: 0,
+      headers: {},
+      body: observation.body,
+      skipped: true,
+      skip_reason: observation.skip_reason,
+      error: observation.message,
+    };
+  }
+  if (observation.status === 'failed') {
+    return {
+      url: agentUrl,
+      status: 0,
+      headers: {},
+      body: { ...observation.body, error: observation.error },
+      error: observation.message,
+    };
+  }
+  return {
+    url: agentUrl,
+    status: 200,
+    headers: {},
+    body: observation.body,
+  };
+}
+
+/**
+ * The A2A protocol endpoint the agent card names, or *fallback* when it cannot be read.
+ *
+ * Falls back rather than throwing: an unresolvable card is already reported by the A2A
+ * dispatch path with its own reason, and turning it into a brand.json error here would
+ * relabel one failure as another.
+ */
+async function resolveA2aProtocolEndpoint(
+  agentUrl: string,
+  fallback: string,
+  options: { allowPrivateIp?: boolean; fetchFn?: typeof fetch }
+): Promise<string> {
+  try {
+    const { resolveA2aDispatchTarget } = await import('./request-signing/a2a-dispatch');
+    const { endpoint } = await resolveA2aDispatchTarget(agentUrl, {
+      allowPrivateIp: options.allowPrivateIp === true,
+      ...(options.fetchFn ? { cardFetch: options.fetchFn } : {}),
+    });
+    return endpoint || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function probeBrandJwks(
+  rawCapabilities: unknown,
+  agentUrl: string,
+  options: { allowPrivateIp?: boolean; fetchFn?: typeof fetch; protocol?: 'mcp' | 'a2a' }
+): Promise<HttpProbeResult> {
+  const brandJsonUrl = readBrandJsonUrl(rawCapabilities);
+  if (!brandJsonUrl) {
+    return {
+      url: '',
+      status: 0,
+      headers: {},
+      body: null,
+      error: 'identity.brand_json_url missing from get_adcp_capabilities; cannot fetch brand JWKS',
+    };
+  }
+
+  const brand = await fetchProbe(brandJsonUrl, options);
+  if (brand.error || brand.status < 200 || brand.status >= 300) {
+    return {
+      ...brand,
+      error: brand.error ?? `brand.json fetch returned HTTP ${brand.status}`,
+    };
+  }
+
+  // `A` FOR THE brand.json WALK IS THE PROTOCOL ENDPOINT, not the URL this runner was
+  // handed. security.mdx @ 3.1.1 :1142 step 1: "invoke `get_adcp_capabilities` via the
+  // agent's declared transport (MCP `tools/call` or A2A skill invocation) ... The agent
+  // URL is the protocol endpoint, not a JSON capabilities document." Step 5 then
+  // canonically matches `agents[].url` against that same `A`.
+  //
+  // On MCP the two are the same string, so this changed nothing there. On A2A they are
+  // NOT: the runner must be given the card's BASE (the card lives at
+  // `<base>/.well-known/agent-card.json`, so passing the RPC endpoint asks for
+  // `/a2a/.well-known/...` and 404s), while the endpoint `A` names is the one the card
+  // resolves to. Matching the base produced zero canonical hits against a conformant
+  // brand.json publishing the RPC endpoint — the agent was graded non-conformant for
+  // publishing exactly what the spec asks for.
+  const matchUrl =
+    options.protocol === 'a2a' ? await resolveA2aProtocolEndpoint(agentUrl, agentUrl, options) : agentUrl;
+
+  let jwksUri: string | undefined;
+  try {
+    const agent = selectAgentByUrl(brand.body, matchUrl);
+    jwksUri = typeof agent.jwks_uri === 'string' && agent.jwks_uri.length > 0 ? agent.jwks_uri : undefined;
+  } catch {
+    return {
+      url: brandJsonUrl,
+      status: 0,
+      headers: {},
+      body: brand.body,
+      error: 'brand.json agent portfolio did not uniquely match the agent under test',
+    };
+  }
+  if (!jwksUri) {
+    return {
+      url: brandJsonUrl,
+      status: 0,
+      headers: {},
+      body: brand.body,
+      error: 'brand.json agent entry for the agent under test did not contain a jwks_uri',
+    };
+  }
+
+  const jwks = await fetchProbe(jwksUri, options);
+  if (jwks.error || jwks.status < 200 || jwks.status >= 300) {
+    return {
+      ...jwks,
+      error: jwks.error ?? `JWKS fetch returned HTTP ${jwks.status}`,
+    };
+  }
+  return jwks;
+}
+
+function assertJwksPurpose(prior: HttpProbeResult | undefined, purposes: string | readonly string[]): HttpProbeResult {
+  const accepted = typeof purposes === 'string' ? [purposes] : purposes;
+  if (!prior || prior.error) {
+    return {
+      url: prior?.url ?? '',
+      status: prior?.status ?? 0,
+      headers: prior?.headers ?? {},
+      body: prior?.body ?? null,
+      error: prior?.error ?? 'fetch_brand_jwks step missing; cannot assert JWKS purpose',
+    };
+  }
+  const keys = prior.body && typeof prior.body === 'object' ? (prior.body as { keys?: unknown }).keys : undefined;
+  if (!Array.isArray(keys)) {
+    return {
+      url: prior.url,
+      status: 0,
+      headers: {},
+      body: prior.body,
+      error: 'JWKS body does not contain keys[]',
+    };
+  }
+  const matching = keys.filter(key => {
+    if (!key || typeof key !== 'object') return false;
+    const rec = key as { adcp_use?: unknown; status?: unknown; revoked?: unknown };
+    return (
+      typeof rec.adcp_use === 'string' &&
+      accepted.includes(rec.adcp_use) &&
+      rec.status !== 'revoked' &&
+      rec.revoked !== true
+    );
+  });
+  if (matching.length === 0) {
+    return {
+      url: prior.url,
+      status: 0,
+      headers: {},
+      body: prior.body,
+      error: `JWKS contains no active key with adcp_use in {${accepted.join(', ')}}`,
+    };
+  }
+  return {
+    url: prior.url,
+    status: 200,
+    headers: prior.headers,
+    body: { accepted_purposes: accepted, matching_key_count: matching.length },
+  };
+}
+
+function findPriorProbe(priorStepResults: Map<string, StoryboardStepResult>): HttpProbeResult | undefined {
+  // Fallback for runStoryboardStep where priorProbes isn't populated — reach
+  // into the step result's response, which we set to the HttpProbeResult above.
+  for (const r of priorStepResults.values()) {
+    const resp = r.response as HttpProbeResult | undefined;
+    if (resp && typeof resp === 'object' && 'url' in resp && 'status' in resp) return resp;
+  }
+  return undefined;
+}
+
+/**
+ * Reduce the captured fetch traffic for an A2A step into the
+ * `A2ATaskEnvelope` validations consume. The A2A SDK fires multiple
+ * requests per call (`/.well-known/agent-card.json` discovery on
+ * fresh clients, then a `SendMessage` POST), and a single dispatch
+ * may also poll `GetTask` afterwards. We prefer a response carrying
+ * an A2A Task; if none does, we fall back to the last POST with a
+ * JSON-RPC-shaped body. GET captures and non-JSON bodies are
+ * skipped — `undefined` here surfaces as `not_applicable` in the
+ * validator, which is more useful than a garbage envelope.
+ *
+ * Captured response bodies pass through `redactSecrets` before
+ * landing in `ValidationContext.a2aEnvelope`. The bearer-token
+ * regex in `wrapFetchWithCapture` only catches `Bearer <token>`
+ * substrings; AdCP-style secret-shaped fields (`api_key`,
+ * `client_secret`, `access_token`) inside a DataPart payload only
+ * get redacted here. Failure paths thread the envelope into
+ * `ValidationResult.actual.failures[].actual` which lands in
+ * persisted compliance reports — redacting at capture parse time
+ * keeps that surface consistent with `responseRecord.payload`,
+ * which the runner already redacts on the success path.
+ */
+function parseLastA2aMessageSendCapture(captures: readonly RawHttpCapture[]): A2ATaskEnvelope | undefined {
+  let messageSendIdx = -1;
+  let lastPostIdx = -1;
+  for (let i = captures.length - 1; i >= 0; i--) {
+    const cap = captures[i];
+    if (!cap || cap.method !== 'POST') continue;
+    if (lastPostIdx === -1) lastPostIdx = i;
+    // The fetch wrapper doesn't capture the request body, so disambiguate
+    // by parsing the response and checking for an A2A `Task` shape on
+    // the result. `GetTask` and `SendMessage` both return tasks, but
+    // only `SendMessage` is the immediate response we want to assert
+    // on for submitted-arm shape checks. When the runner adds polling,
+    // we'd need request-body capture to distinguish reliably; currently
+    // the last POST is `SendMessage` because the SDK doesn't poll
+    // synchronously after a Task with terminal state.
+    if (messageSendIdx === -1) {
+      const env = tryParseJsonRpcEnvelope(cap.body);
+      if (env && env.result !== undefined && isTaskShape(env.result)) {
+        messageSendIdx = i;
+      }
+    }
+  }
+  const idx = messageSendIdx !== -1 ? messageSendIdx : lastPostIdx;
+  if (idx === -1) return undefined;
+  const cap = captures[idx]!;
+  const envelope = tryParseJsonRpcEnvelope(cap.body);
+  if (!envelope) return undefined;
+  // `envelope.result` mirrors the JSON-RPC envelope as observed —
+  // present when the response carried a `result`, absent when it
+  // carried `error`. The convenience `result` field at the top level
+  // coalesces undefined to `null` so validators reading the typed
+  // `A2ATaskEnvelope.result` get a stable shape; the inner
+  // `envelope.result` keeps presence-of-key fidelity for validators
+  // that need to distinguish "result was null" from "result was
+  // omitted". Both paths run through `redactSecrets`.
+  const redactedWireResult = envelope.result !== undefined ? redactSecrets(envelope.result) : null;
+  const redactedResult = normalizeCapturedA2AResult(redactedWireResult);
+  return {
+    result: redactedResult,
+    envelope: {
+      ...(envelope.jsonrpc !== undefined && { jsonrpc: envelope.jsonrpc }),
+      ...(envelope.id !== undefined && { id: envelope.id }),
+      ...(envelope.result !== undefined && { result: redactedWireResult }),
+      ...(envelope.error !== undefined && { error: redactSecrets(envelope.error) }),
+    },
+    http_status: cap.status,
+  };
+}
+
+/**
+ * Select the A2A RPC response for the authored storyboard task. A fresh client
+ * can issue both agent-card discovery and a `get_adcp_capabilities` SendMessage
+ * before the requested tool. Correlating on the safely captured skill name
+ * prevents either discovery response from being graded as the auth probe.
+ */
+function findA2aAuthProbeCapture(captures: readonly RawHttpCapture[], taskName: string): RawHttpCapture | undefined {
+  for (const capture of captures) {
+    if (capture.method === 'POST' && capture.requestAdcpSkill === taskName) return capture;
+  }
+  return undefined;
+}
+
+function httpProbeResultFromCapture(capture: RawHttpCapture): HttpProbeResult {
+  let body: unknown = capture.body;
+  const contentType = Object.entries(capture.headers).find(([name]) => name.toLowerCase() === 'content-type')?.[1];
+  if (contentType?.toLowerCase().includes('json')) {
+    try {
+      body = JSON.parse(capture.body);
+    } catch {
+      // Preserve malformed JSON bodies verbatim for diagnostics.
+    }
+  }
+  return {
+    url: capture.url,
+    status: capture.status,
+    headers: Object.fromEntries(Object.entries(capture.headers).map(([name, value]) => [name.toLowerCase(), value])),
+    body,
+  };
+}
+
+function tryParseJsonRpcEnvelope(
+  body: string
+): { jsonrpc?: unknown; id?: unknown; result?: unknown; error?: unknown } | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  const envelope = parsed as { jsonrpc?: unknown; id?: unknown; result?: unknown; error?: unknown };
+  if (envelope.jsonrpc !== '2.0') return undefined;
+  if (envelope.result === undefined && envelope.error === undefined) return undefined;
+  return envelope;
+}
+
+function isTaskShape(result: unknown): boolean {
+  if (result == null || typeof result !== 'object' || Array.isArray(result)) return false;
+  const record = result as Record<string, unknown>;
+  if (record.kind === 'task') return true;
+  if (record.task != null && typeof record.task === 'object' && !Array.isArray(record.task)) return true;
+  return typeof record.id === 'string' && record.status != null && typeof record.status === 'object';
+}
+
+function normalizeCapturedA2AResult(result: unknown): unknown {
+  if (result == null || typeof result !== 'object' || Array.isArray(result)) return result;
+  const record = result as Record<string, unknown>;
+  return record.task != null && typeof record.task === 'object' && !Array.isArray(record.task) ? record.task : result;
+}
+
+// ────────────────────────────────────────────────────────────
+// Phase / step skip predicates
+// ────────────────────────────────────────────────────────────
+
+/**
+ * True when the phase contains an OAuth-metadata probe step
+ * (`protected_resource_metadata` or `oauth_auth_server_metadata`). Used
+ * to pre-emptively trigger the existing `phaseAbsent` cascade when the
+ * agent's capabilities never advertised OAuth in the first place, so we
+ * don't burn step failures probing a well-known path the agent doesn't
+ * claim. Spec: adcp-client#1702.
+ */
+function phaseContainsOauthMetadataProbe(phase: StoryboardPhase): boolean {
+  return phase.steps.some(s => s.task === 'protected_resource_metadata' || s.task === 'oauth_auth_server_metadata');
+}
+
+/**
+ * True when the agent's `get_adcp_capabilities` response declares an
+ * OAuth issuer (today: `account.authorization_endpoint`). When the
+ * profile or its capabilities aren't available — e.g. external
+ * `_client` mode — we conservatively return `true` so the runner falls
+ * through to the existing reactive cascade (`phaseAbsent` flips on a
+ * 404 from the PRM probe). That keeps backward compatibility for
+ * callers that haven't threaded a profile through. Spec: adcp-client#1702.
+ */
+function agentAdvertisesOauth(profile: AgentProfile | undefined): boolean {
+  const rawCaps = profile?.raw_capabilities;
+  if (rawCaps === undefined) return true;
+  const oauthSupported = resolveCapabilityPath(rawCaps, 'oauth.supported');
+  if (oauthSupported === true) return true;
+  if (oauthSupported === false) return false;
+  const endpoint = resolveCapabilityPath(rawCaps, 'account.authorization_endpoint');
+  return typeof endpoint === 'string' && endpoint.length > 0;
+}
+
+/** Evaluate a phase guard against the context available at its boundary. */
+function shouldSkipPhase(phase: StoryboardPhase, options: StoryboardRunOptions, context: StoryboardContext): boolean {
+  const expr = phase.skip_if?.trim();
+  if (!expr) return false;
+  return evaluatePhaseCondition(expr, { context, test_kit: options.test_kit });
+}
+
+/**
+ * Preflight only guards whose inputs cannot change during the run. Runtime
+ * context guards are deliberately deferred to their phase boundary.
+ */
+function shouldSkipPhaseBeforeRun(phase: StoryboardPhase, options: StoryboardRunOptions): boolean {
+  const expr = phase.skip_if?.trim();
+  if (!expr || phaseConditionUsesContext(expr)) return false;
+  return evaluatePhaseCondition(expr, { test_kit: options.test_kit });
+}
+
+function phaseUsesRuntimeContext(phase: StoryboardPhase): boolean {
+  const expr = phase.skip_if?.trim();
+  return expr ? phaseConditionUsesContext(expr) : false;
+}
+
+/**
+ * Build SDK-equivalent default headers for raw MCP probe tests. Runtime raw
+ * probe dispatch is reserved for explicit per-step `auth` overrides; ordinary
+ * missing-field vectors stay on the SDK path so Streamable HTTP sessions are
+ * initialized before the malformed tool call.
+ */
+function defaultAuthHeadersForRawProbe(options: StoryboardRunOptions): Record<string, string> | undefined {
+  const headers: Record<string, string> = {};
+  if (options.auth) {
+    if (options.auth.type === 'bearer') {
+      if (!options.auth.token) throw new Error('options.auth.token is required for bearer auth');
+      assertSafeAuthHeaderPart(options.auth.token, 'options.auth.token');
+      headers.authorization = `Bearer ${options.auth.token}`;
+    } else if (options.auth.type === 'basic') {
+      headers.authorization = encodeBasicAuthHeader(options.auth, 'options.auth');
+    } else {
+      return undefined;
+    }
+  }
+  // Match SDK header casing so a raw-probe request is byte-indistinguishable
+  // from an SDK-shaped one at the transport boundary. HTTP is case-insensitive;
+  // this is purely for parity with capture/diff tooling.
+  if (options.test_session_id) {
+    assertSafeAuthHeaderPart(options.test_session_id, 'options.test_session_id');
+    headers['X-Test-Session-ID'] = options.test_session_id;
+  }
+  if (options.userAgent) {
+    assertSafeAuthHeaderPart(options.userAgent, 'options.userAgent');
+    headers['User-Agent'] = options.userAgent;
+  }
+  return headers;
+}
+
+/**
+ * Headers every MCP session-probe request must carry, derived from what the
+ * normal SDK transport would send rather than from a name allowlist.
+ *
+ * A multi-tenant agent routes on headers. `createTestClient` forwards
+ * `options.headers` verbatim to the transport, so the probe must forward the
+ * same set — otherwise the graded attempt and its acceptance control reach a
+ * *different tenant* than the run does, where a rejection says nothing about
+ * the tenant under test and an acceptance by some default tenant would let
+ * `security_baseline` pass on evidence from the wrong agent.
+ *
+ * Exclusion is **by value, not by name**. `isCredentialHeaderName`'s regex
+ * treats any `…-key…` segment as a credential, which drops legitimate routing
+ * headers (`x-routing-key`, `x-partition-key`, `x-idempotency-key`) and
+ * silently reroutes the probe. Instead:
+ *
+ *   - the exact credential-carrying header names this transport injects
+ *     (`AUTH_OVERRIDE_HEADER_NAMES`) are dropped, because the step's own
+ *     `auth` directive is the only credential the probe may present — an
+ *     `auth: none` probe must really be unauthenticated; and
+ *   - any header whose *value* matches a credential the run holds is dropped,
+ *     which catches a secret parked under a custom name (`x-my-token`)
+ *     without guessing from the name.
+ */
+function sessionProbeRoutingHeaders(options: StoryboardRunOptions): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const runSecrets = runCredentialValues(options);
+  for (const [name, value] of Object.entries(options.headers ?? {})) {
+    if (!SESSION_PROBE_ROUTING_HEADERS.has(name.toLowerCase())) continue;
+    if (runSecrets.some(secret => value.includes(secret))) continue; // Refused as ungradable upstream.
+    try {
+      assertSafeAuthHeaderPart(value, `options.headers.${name}`);
+    } catch {
+      continue; // Refused upstream by `unroutableProbeHeader`.
+    }
+    headers[name] = value;
+  }
+  // Match the SDK transport's own non-credential headers — but only where the
+  // operator did not already set them. `options.headers` keys are arbitrary
+  // case (`x-test-session-id` from `-H`, `X-Test-Session-ID` here) and are
+  // distinct object properties, so an unconditional assignment emits the
+  // header *twice*. Explicit precedence: an operator's own value wins, and the
+  // runner's derived value only fills a gap.
+  setHeaderIfAbsent(headers, 'X-Test-Session-ID', options.test_session_id, 'options.test_session_id');
+  setHeaderIfAbsent(headers, 'User-Agent', options.userAgent, 'options.userAgent');
+  return headers;
+}
+
+/**
+ * Set a runner-derived header only when the operator has not already supplied
+ * it under any capitalisation. Malformed values are dropped here; the
+ * transport that owns them reports them.
+ */
+function setHeaderIfAbsent(
+  headers: Record<string, string>,
+  name: string,
+  value: string | undefined,
+  label: string
+): void {
+  if (!value) return;
+  const lower = name.toLowerCase();
+  if (Object.keys(headers).some(existing => existing.toLowerCase() === lower)) return;
+  try {
+    assertSafeAuthHeaderPart(value, label);
+  } catch {
+    return;
+  }
+  headers[name] = value;
+}
+
+/**
+ * Credential values this run holds, for value-based header exclusion and for
+ * scrubbing evidence.
+ *
+ * **Basic usernames are deliberately absent.** The password is the secret
+ * half; the username is usually an account or tenant identifier that appears
+ * legitimately in a `WWW-Authenticate` realm, a routing header and the
+ * agent's own diagnostics. Redacting it corrupts exactly the evidence an
+ * operator needs, for no secrecy gain — `probes.ts` draws the same line when
+ * it decodes a Basic header. The full `user:password` pair and the password
+ * alone are both covered.
+ */
+function runCredentialValues(options: StoryboardRunOptions): string[] {
+  const values: string[] = [];
+  const pushHeaderToken = (value: string) => {
+    // HTTP normalizes surrounding optional whitespace in header values.
+    // Basic plaintext passwords do not pass through this helper: their
+    // whitespace is meaningful inside the encoded user/password pair.
+    values.push(value, value.replace(/^[\t ]+|[\t ]+$/g, ''));
+  };
+  // A `user:password` pair is also a credential in its on-the-wire Base64
+  // form. Without this, a pair the run holds structurally is unrecognisable
+  // once an opaque header carries it as `Basic dXNlcjpwYXNz`.
+  const pushUserPass = (userpass: string) => {
+    values.push(userpass, Buffer.from(userpass).toString('base64'));
+    const separator = userpass.indexOf(':');
+    if (separator >= 0) values.push(userpass.slice(separator + 1));
+  };
+  const auth = options.auth;
+  if (auth?.type === 'bearer' && typeof auth.token === 'string') pushHeaderToken(auth.token);
+  if (auth?.type === 'basic') {
+    if (typeof auth.password === 'string') values.push(auth.password);
+    if (typeof auth.username === 'string' && typeof auth.password === 'string') {
+      pushUserPass(`${auth.username}:${auth.password}`);
+    }
+  }
+  if (auth?.type === 'oauth' || auth?.type === 'oauth_client_credentials') {
+    const token = auth.tokens?.access_token;
+    if (typeof token === 'string') pushHeaderToken(token);
+  }
+  const kit = options.test_kit?.auth;
+  if (typeof kit?.api_key === 'string') pushHeaderToken(kit.api_key);
+  const basic = kit?.basic;
+  if (typeof basic?.password === 'string') values.push(basic.password);
+  if (typeof basic?.username === 'string' && typeof basic?.password === 'string') {
+    pushUserPass(`${basic.username}:${basic.password}`);
+  }
+  // `basic.credentials` is validated as unencoded `username:password`
+  // (`normalizeBasicCredentials`), so it is a pair, not an opaque blob.
+  if (typeof basic?.credentials === 'string') pushUserPass(basic.credentials);
+  // Custom `options.headers` values are credentials too whenever the header
+  // name says so — an adopter's `x-gateway-token` is as much a secret as a
+  // bearer, and it must be redactable even though the probe refuses to forward
+  // it. No length floor: a short credential is still a credential, and the
+  // caller configured it deliberately.
+  //
+  // Record the scheme-stripped payload alongside the whole header value. A
+  // custom `Authorization: Bearer <tok>` otherwise teaches the run only the
+  // full `Bearer <tok>` string, so the same `<tok>` re-parked under an opaque
+  // name stays unrecognised.
+  for (const [name, value] of Object.entries(options.headers ?? {})) {
+    if (typeof value !== 'string' || value.length === 0) continue;
+    if (!AUTH_OVERRIDE_HEADER_NAMES.has(name.toLowerCase()) && !isCredentialHeaderName(name)) continue;
+    pushHeaderToken(value);
+    const scheme = /^(Bearer|Basic|Token|ApiKey)\s+(.+)$/i.exec(value.trim());
+    if (scheme?.[1] !== undefined && scheme[2] !== undefined) {
+      const payload = scheme[2].trim();
+      values.push(payload);
+      // A Base64 Basic payload also yields the pair it encodes, so a later
+      // header carrying the pair unencoded is still recognised.
+      if (/^Basic$/i.test(scheme[1]) && /^[A-Za-z0-9+/]+={0,2}$/.test(payload)) {
+        const bytes = Buffer.from(payload, 'base64');
+        const decoded = bytes.toString('utf8');
+        // Buffer's decoder tolerates malformed input. Only learn decoded
+        // passwords from valid Base64/UTF-8 pairs, not arbitrary byte tails.
+        if (
+          bytes.toString('base64').replace(/=+$/, '') === payload.replace(/=+$/, '') &&
+          Buffer.from(decoded, 'utf8').equals(bytes) &&
+          !/[\x00-\x1f\x7f]/.test(decoded) &&
+          decoded.includes(':')
+        ) {
+          pushUserPass(decoded);
+        }
+      }
+    }
+  }
+  return values.filter(value => value.trim().length > 0);
+}
+
+/**
+ * Run headers the session probe will carry, by **explicit allowlist**.
+ *
+ * A denylist cannot work here: the runner has to decide, for a header it has
+ * never seen, whether forwarding it would make an `auth: none` probe
+ * authenticated or whether dropping it would send the probe to a different
+ * tenant. Guessing from the name is what dropped legitimate `x-routing-key`
+ * headers, and guessing the other way forwards an opaque gateway credential
+ * into the unauthenticated probe. So: known routing headers ride along, and
+ * anything else fails the step with the header named.
+ */
+const SESSION_PROBE_ROUTING_HEADERS: ReadonlySet<string> = new Set([
+  'x-tenant-id',
+  'x-tenant',
+  // AdCP's own tenant-routing header (`src/lib/testing/types.ts` names it as
+  // the canonical example). Omitting it meant a run that routes on it had the
+  // header classified as unknown: dropped from session probes, and — once the
+  // isolated-client value test landed — silently strippable on a credential
+  // collision, which reroutes the step to another tenant.
+  'x-adcp-tenant',
+  'x-account',
+  'x-account-id',
+  'x-routing-key',
+  'x-partition-key',
+  'x-region',
+  'x-environment',
+  'x-request-id',
+  'x-correlation-id',
+  'x-idempotency-key',
+  'x-test-session-id',
+  'user-agent',
+  'accept-language',
+]);
+
+/**
+ * A run header the probe can neither forward nor drop safely.
+ *
+ * Returns the offending header name so the caller can fail the step with an
+ * actionable message instead of silently choosing one of two wrong answers.
+ * Known credential names and values matching a configured run credential are
+ * dropped deliberately (they must not reach an `auth: none` probe). A known
+ * secret in a routing header is reported instead: dropping it would reroute.
+ */
+function unroutableProbeHeader(
+  options: StoryboardRunOptions
+): { name: string; reason: 'credential_collision' | 'malformed' | 'unknown' } | undefined {
+  const runSecrets = runCredentialValues(options);
+  for (const [name, value] of Object.entries(options.headers ?? {})) {
+    const lower = name.toLowerCase();
+    if (SESSION_PROBE_ROUTING_HEADERS.has(lower)) {
+      if (runSecrets.some(secret => value.includes(secret))) return { name, reason: 'credential_collision' };
+      try {
+        assertSafeAuthHeaderPart(value, `options.headers.${name}`);
+      } catch {
+        // Dropping a malformed routing header can reroute the tenant.
+        return { name, reason: 'malformed' };
+      }
+      continue;
+    }
+    if (AUTH_OVERRIDE_HEADER_NAMES.has(lower)) continue; // Known credential: dropped.
+    if (runSecrets.some(secret => value.includes(secret))) continue; // Known secret value: dropped.
+    return { name, reason: 'unknown' };
+  }
+  return undefined;
+}
+
+/**
+ * OAuth access token this run would actually present, preferring the live one.
+ *
+ * `MCPOAuthProvider.saveTokens` writes refreshed / newly-acquired tokens back
+ * onto the client's `AgentConfig`, not onto `StoryboardRunOptions`. A run that
+ * started with no tokens and completed the flow during discovery (`--oauth`),
+ * or whose token was refreshed mid-run, therefore has a live credential the
+ * original options never see — reading options alone would report "no OAuth
+ * access token" for exactly the OAuth/PRM agents this probe exists to verify.
+ */
+function effectiveOAuthAccessToken(
+  client: unknown,
+  options: StoryboardRunOptions,
+  agentUrl: string | undefined
+): string | undefined {
+  const live = liveAgentOAuthAccessToken(client, agentUrl);
+  if (live !== undefined) return live;
+  const auth = options.auth;
+  if (auth?.type !== 'oauth' && auth?.type !== 'oauth_client_credentials') return undefined;
+  const configured = auth.tokens?.access_token;
+  return typeof configured === 'string' && configured.length > 0 ? configured : undefined;
+}
+
+/**
+ * Best-effort read of the client's live `oauth_tokens.access_token`.
+ *
+ * Two shapes are accepted because the runner is handed both:
+ * `createTestClient`'s client returns the `AgentConfig` **directly** from
+ * `getAgent('test')`, while a raw `ADCPMultiAgentClient` returns an
+ * `AgentClient` whose own `getAgent()` yields the config. Requiring the
+ * nested call made a valid OAuth / client-credentials run report "no OAuth
+ * access token" and denied a conformant agent its contribution.
+ *
+ * Read live rather than from `options.auth` on purpose:
+ * `MCPOAuthProvider.saveTokens` mutates this same config object, so a token
+ * acquired during discovery or refreshed mid-run is visible here and nowhere
+ * else.
+ */
+function liveAgentOAuthAccessToken(client: unknown, agentUrl: string | undefined): string | undefined {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- narrow probe of a structural client
+    const resolved = (client as any)?.getAgent?.(TEST_CLIENT_AGENT_ID);
+    if (resolved == null) return undefined;
+    const candidates = [resolved];
+    if (typeof resolved.getAgent === 'function') candidates.push(resolved.getAgent());
+    for (const candidate of candidates) {
+      const token = candidate?.oauth_tokens?.access_token;
+      if (typeof token !== 'string' || token.length === 0) continue;
+      // Fail closed on identity: in a routed multi-tenant run, handing one
+      // tenant's token to another tenant's probe would both leak the
+      // credential and grade the wrong agent. Only use it when the config we
+      // read is demonstrably the agent under test.
+      const configuredUri = candidate?.agent_uri;
+      if (agentUrl !== undefined && typeof configuredUri === 'string' && configuredUri !== agentUrl) continue;
+      if (agentUrl !== undefined && typeof configuredUri !== 'string') continue;
+      return token;
+    }
+  } catch {
+    // Test doubles and non-MCP clients do not expose an agent config.
+  }
+  return undefined;
+}
+
+/** Agent id `createTestClient` registers its single agent under. */
+const TEST_CLIENT_AGENT_ID = 'test';
+
+/**
+ * Credential mechanism a sentinel step is exercising, derived from
+ * `step.auth.type`. The acceptance control must be the *same kind* of
+ * credential, because the storyboard's branches certify different claims:
+ *
+ * - `oauth_bearer` → `oauth_discovery` certifies "the agent validates inbound
+ *   OAuth tokens". A static API key accepted at the endpoint is no evidence
+ *   about that path, so it cannot stand in as the control — otherwise correct
+ *   PRM plus an unrelated shared secret would launder into
+ *   `auth_mechanism_verified`, which is the advertised-but-unserved failure
+ *   mode `security_baseline` exists to catch. Note the bound on the positive
+ *   claim too: an accepted OAuth control shows the endpoint accepted the
+ *   credential the runner was *configured with* as an OAuth token. The runner
+ *   does not verify that token's issuer cryptographically.
+ * - `api_key` / `basic` → the matching static-credential branch.
+ * - `any` → `auth: none` (the unauthenticated probe), which asserts only that
+ *   *some* credential is required, so any valid credential discriminates.
+ */
+type SessionControlMechanism = 'any' | 'oauth_bearer' | 'api_key' | 'basic';
+
+interface SessionControlUnavailable {
+  reason: string;
+  remedy: string;
+}
+
+type SessionControlResolution = { headers: Record<string, string> } | { unavailable: SessionControlUnavailable };
+
+/**
+ * Present a bearer credential the way an ordinary MCP dispatch does.
+ *
+ * `createMCPAuthHeaders` (`src/lib/auth/index.ts`) sends the token **twice**:
+ * `Authorization: Bearer <token>` and `x-adcp-auth: <token>`. An agent is
+ * conformant if it reads either one, so a control that sent only
+ * `Authorization` could be refused by an `x-adcp-auth`-only agent — which
+ * would report a correctly configured agent as inconclusive — and a negative
+ * probe that sent only `Authorization` would be rejected for a *missing*
+ * credential rather than the bogus one under test.
+ *
+ * Basic credentials are untouched: the normal transport sends those as
+ * `Authorization` alone.
+ */
+function withMcpBearerParity(headers: Record<string, string>): Record<string, string> {
+  const authorization = headers.authorization;
+  if (authorization === undefined || !authorization.startsWith('Bearer ')) return headers;
+  const token = authorization.slice('Bearer '.length);
+  if (token.length === 0) return headers;
+  return { ...headers, 'x-adcp-auth': token };
+}
+
+/** Authorization header from an OAuth access token held by the run, if any. */
+function oauthAccessTokenHeaders(
+  options: StoryboardRunOptions,
+  client: unknown,
+  agentUrl: string | undefined
+): Record<string, string> | undefined {
+  const token = effectiveOAuthAccessToken(client, options, agentUrl);
+  if (token === undefined) return undefined;
+  try {
+    assertSafeAuthHeaderPart(token, 'options.auth.tokens.access_token');
+  } catch {
+    return undefined;
+  }
+  return { authorization: `Bearer ${token}` };
+}
+
+/** Authorization header from a static credential, per a step-auth directive. */
+function staticCredentialHeaders(
+  directive: StepAuthDirective,
+  options: StoryboardRunOptions
+): Record<string, string> | undefined {
+  try {
+    const headers = authHeadersForStep(directive, options);
+    return headers.authorization !== undefined ? { authorization: headers.authorization } : undefined;
+  } catch {
+    // A malformed kit credential is already reported by the steps that declare
+    // `from_test_kit`; the control degrades to absent rather than failing an
+    // unrelated step with a duplicate error.
+  }
+  return undefined;
+}
+
+/**
+ * Credentials the run would present on a normally authenticated MCP session,
+ * used as the acceptance control for the `mcp_session_probe` sentinel.
+ *
+ * **Precedence within a mechanism matches `withTestKitAuthDefaults`
+ * (`testing/client.ts`)**, which is what actually authenticates the SDK
+ * transport: an explicit `options.auth` wins outright, and the test kit's
+ * `auth.api_key` / `auth.basic` are only defaults for when it is absent.
+ * Deriving the control in the other order would probe a stale kit key on a run
+ * that authenticates with an explicit bearer — the control would fail, and a
+ * conformant agent would be denied its contribution.
+ *
+ * Returns `{ unavailable }` when the run holds no credential of the required
+ * kind. The caller must then treat the probe as inconclusive, never
+ * conclusive.
+ */
+function sessionControlCredentials(
+  mechanism: SessionControlMechanism,
+  options: StoryboardRunOptions,
+  client: unknown,
+  agentUrl: string | undefined
+): SessionControlResolution {
+  const oauth = oauthAccessTokenHeaders(options, client, agentUrl);
+  const bearer =
+    options.auth?.type === 'bearer'
+      ? staticCredentialHeaders({ type: 'api_key', value: options.auth.token }, options)
+      : undefined;
+  const basicFromOptions =
+    options.auth?.type === 'basic'
+      ? staticCredentialHeaders(
+          { type: 'basic', username: options.auth.username, password: options.auth.password },
+          options
+        )
+      : undefined;
+  const kitApiKey =
+    typeof options.test_kit?.auth?.api_key === 'string' && options.test_kit.auth.api_key.length > 0
+      ? staticCredentialHeaders({ type: 'api_key', from_test_kit: true }, options)
+      : undefined;
+  const kitBasic =
+    options.test_kit?.auth?.basic !== undefined
+      ? staticCredentialHeaders({ type: 'basic', from_test_kit: true }, options)
+      : undefined;
+
+  switch (mechanism) {
+    case 'oauth_bearer': {
+      if (oauth) return { headers: oauth };
+      return {
+        unavailable: {
+          reason:
+            `this run holds no OAuth access token, and a static API key or Basic credential is not evidence ` +
+            `about the OAuth path at all — accepting a shared secret says nothing about whether tokens from the ` +
+            `issuer advertised in your protected-resource metadata are what gates this resource`,
+          remedy:
+            `Run the storyboard with OAuth so the runner holds a token minted by that issuer ` +
+            `(\`adcp --save-auth <alias> <url> --oauth\`, or pass \`--oauth\` to \`storyboard run\`).`,
+        },
+      };
+    }
+    case 'api_key': {
+      const headers = bearer ?? kitApiKey;
+      if (headers) return { headers };
+      return {
+        unavailable: {
+          reason: `this run holds no valid API key to prove the endpoint accepts one`,
+          remedy: 'Declare `auth.api_key` in the test kit, or pass a bearer `options.auth` (CLI: `--auth`).',
+        },
+      };
+    }
+    case 'basic': {
+      const headers = basicFromOptions ?? kitBasic;
+      if (headers) return { headers };
+      return {
+        unavailable: {
+          reason: `this run holds no valid Basic credential to prove the endpoint accepts one`,
+          remedy: 'Declare `auth.basic` in the test kit, or pass a basic `options.auth`.',
+        },
+      };
+    }
+    case 'any': {
+      const headers = oauth ?? bearer ?? basicFromOptions ?? kitApiKey ?? kitBasic;
+      if (headers) return { headers };
+      return {
+        unavailable: {
+          reason:
+            `this run holds no valid credential, so a rejection cannot be told apart from an endpoint that ` +
+            `refuses every request`,
+          remedy: 'Declare `auth.api_key` or `auth.basic` in the test kit, pass `options.auth`, or run with `--oauth`.',
+        },
+      };
+    }
+  }
+}
+
+/**
+ * Bound and sanitize an agent-supplied tool list before it enters a compliance
+ * report. `tools/list` names are unbounded in count and length, and
+ * `skip.detail` is rendered straight into terminals, CI logs and JUnit XML —
+ * so an embedded ESC, CR or NUL could rewrite surrounding output. Control
+ * characters are escaped rather than dropped so the original bytes stay
+ * diagnosable. The CLI escapes again at print time via
+ * `escapeTerminalControlChars`, but JSON reports and JUnit XML are rendered
+ * without it — and C0 controls are not even legal in XML 1.0 — so the bytes
+ * must be neutralised here, at the point the detail is built.
+ */
+function summarizeAdvertisedTools(tools: readonly string[] | undefined): string {
+  const names = (tools ?? []).slice(0, 20).map(name => escapeControlChars(name.slice(0, 64)));
+  const overflow = (tools?.length ?? 0) - names.length;
+  return overflow > 0 ? `${names.join(', ')}, …${overflow} more` : names.join(', ');
+}
+
+/** Escape C0/C1 control characters (ESC, CR, LF, NUL, …) as \uXXXX. */
+function escapeControlChars(value: string): string {
+  // eslint-disable-next-line no-control-regex -- escaping control chars is the point
+  return value.replace(
+    /[\u0000-\u001f\u007f-\u009f]/g,
+    char => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`
+  );
+}
+
+/**
+ * AdCP tools that are public by protocol and therefore useless as a protected
+ * probe target. `get_adcp_capabilities` is mandatory-public; `get_products`
+ * (without pricing), `list_products` and `list_creative_formats` are discovery
+ * surfaces an agent is expected to serve unauthenticated.
+ */
+const SESSION_PROBE_PUBLIC_TIER: ReadonlySet<string> = new Set([
+  'get_adcp_capabilities',
+  'get_products',
+  'list_products',
+  'list_creative_formats',
+]);
+
+/**
+ * Every tool name the protocol defines, unioned from the exported per-protocol
+ * registries. An agent names its own tools, so this is the boundary between
+ * "a task AdCP defines" and "a string the agent made up".
+ */
+const CANONICAL_ADCP_TOOLS: ReadonlySet<string> = new Set([
+  ...MEDIA_BUY_TOOLS,
+  ...CREATIVE_TOOLS,
+  ...SIGNALS_TOOLS,
+  ...GOVERNANCE_TOOLS,
+  ...ACCOUNT_TOOLS,
+  ...BRAND_RIGHTS_TOOLS,
+  ...PROTOCOL_TOOLS,
+  ...EVENT_TRACKING_TOOLS,
+]);
+
+/**
+ * Preferred probe target when the agent advertises no allowlisted read tool.
+ * `get_principal` is the auth-meaningful read — it answers "who is this
+ * credential" — and takes no arguments.
+ */
+const PREFERRED_PROBE_TARGET = 'get_principal';
+
+/** True when the SDK's generated request schema declares no required field. */
+function hasNoRequiredRequestFields(tool: string): boolean {
+  const schema = TOOL_REQUEST_SCHEMAS[tool as keyof typeof TOOL_REQUEST_SCHEMAS];
+  const shape = (schema as { shape?: Record<string, unknown> } | undefined)?.shape;
+  if (!shape) return false;
+  return !Object.values(shape).some(field => {
+    const candidate = field as { safeParse?: (value: unknown) => { success: boolean } };
+    if (typeof candidate?.safeParse !== 'function') return false;
+    return !candidate.safeParse(undefined).success;
+  });
+}
+
+/**
+ * Ordered protected-tool candidates for the MCP session probe.
+ *
+ * **Only canonical AdCP tasks are eligible.** An agent names its own tools, so
+ * accepting any advertised `get_*` / `list_*` lets it plant a decoy: advertise
+ * `get_probe_target`, enforce credentials on that one alone, leave the real
+ * AdCP surface open, and the probe certifies an agent that serves tenant data
+ * to anyone. Eligibility is therefore the intersection of what the agent
+ * advertises with the runner's own notion of a canonical task
+ * (`PROBE_TASK_ALLOWLIST` ∪ {@link CANONICAL_ADCP_TOOLS}), minus the public
+ * tier and minus every mutating task. `TOOL_REQUEST_SCHEMAS` is consulted only
+ * for arity — having a request schema is not, by itself, eligibility.
+ *
+ * Order is **runner-controlled**, never the agent's advertisement order, so a
+ * hostile or merely reshuffled tool list cannot steer the choice:
+ *
+ *   1. `PROBE_TASK_ALLOWLIST` entries, in allowlist order — the tools the
+ *      protocol already vouches for as auth-required, read-only and
+ *      empty-body-safe.
+ *   2. Remaining canonical read tasks whose generated request schema declares
+ *      no required field, sorted lexicographically for determinism. (The first
+ *      tool an agent happens to advertise may require an id, which would force
+ *      every probe inconclusive on a shape refusal.)
+ */
+function protectedToolCandidates(tools: readonly string[] | undefined): string[] {
+  if (!tools) return [];
+  const advertised = new Set(tools);
+  const eligible = (tool: string): boolean =>
+    advertised.has(tool) && !SESSION_PROBE_PUBLIC_TIER.has(tool) && !MUTATING_TASKS.has(tool);
+  const allowlisted = PROBE_TASK_ALLOWLIST.filter(eligible);
+  const canonicalReads = [...CANONICAL_ADCP_TOOLS]
+    .filter(tool => /^(list|get)_/.test(tool))
+    .filter(tool => !allowlisted.includes(tool))
+    .filter(eligible)
+    .filter(hasNoRequiredRequestFields)
+    .sort((a, b) => {
+      // `get_principal` first: it is the auth-meaningful read — "who am I" —
+      // takes no arguments, and returns nothing tenant-sensitive beyond the
+      // caller's own identity.
+      if (a === PREFERRED_PROBE_TARGET) return -1;
+      if (b === PREFERRED_PROBE_TARGET) return 1;
+      return a.localeCompare(b);
+    });
+  return [...allowlisted, ...canonicalReads];
+}
+
+/**
+ * Tools this run would have to sign (RFC 9421) to call faithfully.
+ *
+ * The session probe drives its own transport and mints no signatures. If the
+ * agent declares the probe's target under `request_signing.required_for` — or
+ * under `supported_for`, which the functional-dispatch contract also signs —
+ * an unsigned `tools/call` is refused for the *signature*, and reading that
+ * refusal as a credential verdict would certify auth the probe never tested.
+ *
+ * Fails closed: an advertisement the runner cannot parse yields the whole
+ * candidate set, which makes the step `session_probe_ungradable` rather than
+ * graded on a guess.
+ */
+function signatureBoundTools(options: StoryboardRunOptions): ReadonlySet<string> | 'unparseable' {
+  if (options.functional_request_signing === undefined) return new Set();
+  const raw = options._profile?.raw_capabilities;
+  if (raw === null || typeof raw !== 'object') return 'unparseable';
+  const advertised = (raw as { request_signing?: unknown }).request_signing;
+  if (advertised === undefined) return new Set(); // Verifier not advertised: nothing to sign.
+  if (advertised === null || typeof advertised !== 'object') return 'unparseable';
+  const buckets = advertised as { required_for?: unknown; supported_for?: unknown };
+  const bound = new Set<string>();
+  for (const bucket of [buckets.required_for, buckets.supported_for]) {
+    if (bucket === undefined) continue;
+    if (!Array.isArray(bucket) || bucket.some(entry => typeof entry !== 'string')) return 'unparseable';
+    for (const entry of bucket) bound.add(entry as string);
+  }
+  return bound;
+}
+
+/**
+ * Choose the protected operation the MCP session probe will call.
+ *
+ * Returns `undefined` when the agent advertises no canonical AdCP read task,
+ * which the caller turns into `session_probe_ungradable` rather than inventing
+ * or trusting a target.
+ */
+function selectProtectedToolTarget(tools: readonly string[] | undefined): string | undefined {
+  return protectedToolCandidates(tools)[0];
+}
+
+/** Mechanism a step's auth directive exercises. */
+function sessionControlMechanismFor(auth: StepAuthDirective): SessionControlMechanism {
+  if (auth === 'none') return 'any';
+  switch (auth.type) {
+    case 'oauth_bearer':
+      return 'oauth_bearer';
+    case 'basic':
+      return 'basic';
+    case 'api_key':
+      return 'api_key';
+  }
+}
+
+/**
+ * How to dispatch a step that resolved to the `mcp_session_probe` sentinel
+ * (adcp-client#2940).
+ *
+ * The sentinel drives a complete MCP session lifecycle and grades the
+ * protected `tools/call` (or the earlier rejection that prevented it), so it
+ * can grade any step whose assertions are about HTTP status and
+ * `WWW-Authenticate` — including `auth: none`, where leaving the required
+ * `unauth_rejection` phase vacuous would be the worse outcome. Because the
+ * probe walks past the handshake, an agent that authenticates per operation
+ * rather than per session is graded on its `tools/call` rejection, not
+ * mistakenly on an open handshake.
+ *
+ * The one shape it cannot grade is a step with **no** `auth` override: those
+ * are the positive static-credential probes (`probe_api_key`, `probe_basic`),
+ * whose authored validations assert an AdCP response body (`context`,
+ * `context.correlation_id`) that an arbitrary protected read tool is not
+ * required to produce. Grading them from a session-probe result would be
+ * fabricated evidence, so they keep today's `not_applicable` — which also
+ * keeps their `contributes_if: prior_step.<id>.passed` gate closed, so the
+ * static branches cannot contribute on session evidence alone.
+ */
+type McpSessionSentinelPlan =
+  | { kind: 'error'; error: string }
+  | { kind: 'skip'; reason: RunnerDetailedSkipReason; detail: string }
+  | { kind: 'probe'; headers: Record<string, string>; toolNames: string[]; control: McpSessionProbeControl };
+
+function planMcpSessionSentinel(
+  step: StoryboardStep,
+  options: StoryboardRunOptions,
+  client: unknown,
+  agentUrl: string | undefined
+): McpSessionSentinelPlan {
+  // `selectProbeTask` only *resolves* the sentinel on an explicit
+  // `protocol: 'mcp'`, but a storyboard can name it directly. Re-check here:
+  // without this gate a directly authored sentinel on a run that never
+  // declared a transport would still send MCP JSON-RPC at the agent.
+  if (options.protocol !== 'mcp') {
+    const declared = options.protocol === undefined ? 'no transport' : `"${options.protocol}"`;
+    return {
+      kind: 'error',
+      error:
+        `"${MCP_SESSION_PROBE_TASK}" is an MCP session probe and requires an explicit \`protocol: 'mcp'\` on ` +
+        `the run; this run declared ${declared}. A2A has no equivalent parameter-free protected operation, ` +
+        `so the runner refuses to substitute one.`,
+    };
+  }
+
+  if (step.auth === undefined) {
+    return {
+      kind: 'skip',
+      reason: 'session_probe_ungradable',
+      detail: redactOAuthUrlsInText(
+        `Agent advertises no auth-required, read-only AdCP tool that accepts an empty request body, so the runner ` +
+          `fell back to the MCP "${MCP_SESSION_PROBE_TASK}" session probe. That probe cannot grade a positive ` +
+          `static-credential step: its validations assert an AdCP task response body, which no MCP protocol ` +
+          `operation produces, so this mechanism's branch cannot contribute auth_mechanism_verified. Remedy: ` +
+          `advertise one allowlisted read tool (${PROBE_TASK_ALLOWLIST_SUMMARY}), or serve RFC 9728 metadata ` +
+          `and run with OAuth so the OAuth branch can be verified instead. ` +
+          `Advertised tools: [${summarizeAdvertisedTools(options.agentTools)}].`
+      ),
+    };
+  }
+
+  const signatureBound = signatureBoundTools(options);
+  const candidates = protectedToolCandidates(options.agentTools);
+  if (signatureBound === 'unparseable') {
+    return {
+      kind: 'skip',
+      reason: 'session_probe_ungradable',
+      detail:
+        `This run signs functional dispatch (RFC 9421), but the runner could not read which operations your ` +
+        `\`request_signing\` capability covers, so it cannot tell whether the session probe's unsigned call would ` +
+        `be refused for the signature rather than the credential. Refusing to grade instead of guessing. ` +
+        `Remedy: advertise \`request_signing.required_for\` / \`supported_for\` as string arrays, or advertise one ` +
+        `allowlisted read tool (${PROBE_TASK_ALLOWLIST_SUMMARY}) so the probe has a protocol-vouched target.`,
+    };
+  }
+  const toolNames = candidates.filter(tool => !signatureBound.has(tool));
+  if (toolNames.length === 0 && candidates.length > 0) {
+    return {
+      kind: 'skip',
+      reason: 'session_probe_ungradable',
+      detail: redactOAuthUrlsInText(
+        `Every protected read the probe could call (${candidates.join(', ')}) is covered by this agent's ` +
+          `\`request_signing\` advertisement, and the session probe mints no RFC 9421 signatures. An unsigned call ` +
+          `would be refused for the missing signature, which is not evidence about the credential, so the ` +
+          `runner refuses to grade it. Remedy: advertise one allowlisted read tool ` +
+          `(${PROBE_TASK_ALLOWLIST_SUMMARY}) outside \`request_signing.required_for\`/\`supported_for\`, or run ` +
+          `with OAuth against RFC 9728 metadata so the OAuth branch can be verified instead.`
+      ),
+    };
+  }
+  if (toolNames.length === 0) {
+    return {
+      kind: 'skip',
+      reason: 'session_probe_ungradable',
+      detail: redactOAuthUrlsInText(
+        `Agent advertises no auth-required, read-only AdCP tool the probe can call with an empty request ` +
+          `body, so there is no protected operation to grade. MCP discovery (\`tools/list\`) is not a ` +
+          `protected task and public-tier tools (${[...SESSION_PROBE_PUBLIC_TIER].join(', ')}) are served ` +
+          `unauthenticated by design. Remedy: advertise one allowlisted read tool ` +
+          `(${PROBE_TASK_ALLOWLIST_SUMMARY}). ` +
+          `Advertised tools: [${summarizeAdvertisedTools(options.agentTools)}].`
+      ),
+    };
+  }
+
+  const unroutable = unroutableProbeHeader(options);
+  if (unroutable !== undefined) {
+    // Ambiguity about the *operator's* header is not an agent defect. Failing
+    // the step would mark a conformant agent non-compliant for how the run was
+    // invoked, so this is reported as an ungradable coverage gap: the probe
+    // still refuses to forward or drop the header, it just says why instead of
+    // blaming the agent.
+    const name = escapeControlChars(unroutable.name.slice(0, 64));
+    const detail =
+      unroutable.reason === 'credential_collision'
+        ? `Routing header "${name}" has a value containing a credential this run holds. Nothing was graded: ` +
+          `forwarding it could authenticate the unauthenticated probe, and dropping it could change tenants. ` +
+          `Choose a routing value or suite credential that does not collide.`
+        : unroutable.reason === 'malformed'
+          ? `Routing header "${name}" contains invalid header characters. Nothing was graded because ` +
+            `dropping it could change tenants. Correct this run header before retrying the probe.`
+          : `The runner cannot classify run header "${name}", and both ` +
+            `answers are unsafe — forwarding it could make the unauthenticated probe authenticated, dropping it ` +
+            `could send the probe to a different tenant than the rest of this run. Nothing was graded, and this ` +
+            `is a property of the run, not of the agent. Three ways forward: rename it to a recognised routing ` +
+            `header (${[...SESSION_PROBE_ROUTING_HEADERS].join(', ')}); drop it from this run if the probe does ` +
+            `not need it; or, if it carries a credential, move that into \`options.auth\` / \`test_kit.auth\` ` +
+            `where the runner owns it.`;
+    return { kind: 'skip', reason: 'session_probe_ungradable', detail };
+  }
+
+  const routing = sessionProbeRoutingHeaders(options);
+  let headers: Record<string, string>;
+  try {
+    // Routing first so a step credential always wins on Authorization.
+    headers = { ...routing, ...withMcpBearerParity(authHeadersForStep(step.auth, options)) };
+  } catch (err) {
+    return {
+      kind: 'error',
+      error: `Step auth configuration error: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  const control = sessionControlCredentials(sessionControlMechanismFor(step.auth), options, client, agentUrl);
+  if ('unavailable' in control) {
+    // The probe still runs — its response is useful evidence — but grades
+    // inconclusive rather than certifying an auth mechanism.
+    return { kind: 'probe', headers, toolNames, control: { kind: 'unavailable', ...control.unavailable } };
+  }
+  // An identical control would re-send the credential under test and prove
+  // nothing; that shape is a positive probe, graded on its own acceptance.
+  if (headers.authorization !== undefined && control.headers.authorization === headers.authorization) {
+    return { kind: 'probe', headers, toolNames, control: { kind: 'probe_is_valid_credential' } };
+  }
+  return {
+    kind: 'probe',
+    headers,
+    toolNames,
+    control: { kind: 'credential', headers: { ...routing, ...withMcpBearerParity(control.headers) } },
+  };
+}
+
+/**
+ * Translate a `StepAuthDirective` into HTTP headers for the raw MCP probe.
+ * - `'none'` returns an empty object and the probe sends no `Authorization`.
+ * - `api_key` / `oauth_bearer` resolve the value from `value`, `from_test_kit`,
+ *   or `value_strategy` — in that order — and produce `Authorization: Bearer <value>`.
+ * - `basic` resolves explicit credentials, `from_test_kit`, or
+ *   `value_strategy: random_invalid` and produces `Authorization: Basic <base64>`.
+ */
+function authHeadersForStep(directive: StepAuthDirective, options: StoryboardRunOptions): Record<string, string> {
+  if (directive === 'none') return {};
+  if (directive.type === 'basic') return basicAuthHeadersForStep(directive, options);
+
+  let value: string | undefined;
+  if ('value' in directive && directive.value) {
+    value = directive.value;
+  } else if ('from_test_kit' in directive && directive.from_test_kit) {
+    // The storyboard schema documents a named-principal path form
+    // (`auth.principals.<name>.api_key`). The `basic` arm walks it via
+    // `resolveStepBasicFromTestKit`; this arm never did, and any truthy value
+    // — a path string included — resolved to the *primary* principal, which
+    // silently grades a multi-principal isolation step against the wrong
+    // identity. Refuse it until the path form is properly supported. The type
+    // declares `boolean`, but storyboards are YAML and are not type-checked at
+    // runtime, so the string case is reachable. The message echoes neither the
+    // path nor any credential.
+    if (typeof (directive.from_test_kit as string | boolean) === 'string') {
+      throw new Error(
+        'Named test-kit API-key paths are not supported; use from_test_kit: true only for the primary key.'
+      );
+    }
+    value = options.test_kit?.auth?.api_key;
+    if (!value) {
+      // adcp#6735 — hard-fail instead of silently degrading to an
+      // unauthenticated probe: a probe with no credential cannot test a
+      // credential-keyed contract, and the resulting 401 grades a
+      // conformant agent FAIL.
+      throw new Error(
+        'step declares auth.from_test_kit but no test kit with auth.api_key is configured — ' +
+          'declare prerequisites.test_kit and authorize its cache with options.complianceDir ' +
+          '(CLI: --compliance-dir), ' +
+          'or pass options.test_kit (CLI: --test-kit).'
+      );
+    }
+  } else if ('value_strategy' in directive && directive.value_strategy) {
+    if (directive.value_strategy === 'random_invalid') value = generateRandomInvalidApiKey();
+    else if (directive.value_strategy === 'random_invalid_jwt') value = generateRandomInvalidJwt();
+  }
+  if (!value) return {};
+  // Reject CR/LF/NUL and non-printable ASCII — a test-kit key with stray
+  // whitespace would otherwise crash undici's header validator and the raw
+  // exception (containing the secret) lands in the serialized compliance
+  // report. Fail loudly with a non-echoing error instead.
+  if (/[\r\n\x00]|[^\x20-\x7E]/.test(value)) {
+    throw new Error('test_kit.auth.api_key contains invalid characters (control chars or non-printable ASCII)');
+  }
+  return { authorization: `Bearer ${value}` };
+}
+
+/**
+ * Checks graded from the raw HTTP probe result rather than the task result.
+ *
+ * These must keep the step on the raw-probe path: the SDK dispatch leaves
+ * `ctx.httpResult` undefined and `requireHttpResult` then hard-fails the
+ * validation. A `check.startsWith('http_')` test is not equivalent — three of
+ * the five `requireHttpResult` callers in `validations.ts` carry no `http_`
+ * prefix. Keep in sync with that switch.
+ */
+const HTTP_PROBE_ONLY_CHECKS: ReadonlySet<string> = new Set([
+  'http_status',
+  'http_status_in',
+  'probe_passed',
+  'on_401_require_header',
+  'resource_equals_agent_url',
+]);
+
+const AUTH_OVERRIDE_HEADER_NAMES = new Set([
+  'authorization',
+  'proxy-authorization',
+  'cookie',
+  'x-adcp-auth',
+  'x-api-key',
+]);
+const AUTH_OVERRIDE_CREDENTIAL_HEADER_RE =
+  /(^|[-_])(auth(?:entication|orization)?|credentials?|secrets?|tokens?|keys?|api[-_]?keys?|access[-_]?keys?|private[-_]?keys?|password|passwd|signatures?|cert(?:ificate)?s?)([-_]|$)/i;
+
+/**
+ * Credential suffixes matched after separators are stripped.
+ *
+ * Every alternative in `AUTH_OVERRIDE_CREDENTIAL_HEADER_RE` is anchored to a
+ * `-`/`_` boundary, so it recognises `X-Api-Key` but not the separator-less
+ * spellings of the same thing — `XApiKey`, `X-AuthToken`, `X-AccessToken`,
+ * `X-SessionToken`, `XSecret`. Those are legal header names, and a credential
+ * parked under one used to ride along into an isolated step. Compacting the
+ * name first closes that class without needing to know the value.
+ *
+ * Match complete credential suffixes rather than arbitrary substrings:
+ * `x-author-id` and `x-monkey-route` are not authentication or key headers.
+ * Bare `key`, `session` and `id` are deliberately absent; recognized routing
+ * names are excluded before either name heuristic runs.
+ */
+const AUTH_OVERRIDE_COMPACT_CREDENTIAL_RE =
+  /(auth(?:entication|orization)?|credentials?|secrets?|tokens?|passwords?|passwd|signatures?|certificates?|bearer|(?:api|access|private|session|auth|secret|client|app|master|signing|shared|subscription)keys?|(?:client|tls|ssl)certs?)$/i;
+
+function isCredentialHeaderName(name: string): boolean {
+  const normalized = name.toLowerCase();
+  // A routing key must not teach runCredentialValues that its own routing
+  // value is a secret. Actual known-secret collisions are still checked by
+  // value in createAuthOverrideClient and fail closed.
+  if (SESSION_PROBE_ROUTING_HEADERS.has(normalized)) return false;
+  return (
+    AUTH_OVERRIDE_HEADER_NAMES.has(normalized) ||
+    AUTH_OVERRIDE_CREDENTIAL_HEADER_RE.test(normalized) ||
+    AUTH_OVERRIDE_COMPACT_CREDENTIAL_RE.test(normalized.replace(/[-_]/g, ''))
+  );
+}
+
+/**
+ * Create an isolated protocol client whose credential-bearing headers are exactly
+ * the step override. Removing `test_kit` is load-bearing: createTestClient
+ * otherwise promotes its API key back into `auth`, defeating `auth: none`.
+ * Credential-looking custom headers are removed as well, while non-auth
+ * routing headers remain intact. Functional request signing is deliberately
+ * disabled to avoid mixing the suite's signing identity with a different
+ * step principal or authenticating an unauthenticated probe. The configured transport (most importantly
+ * trustedFetchFn for private CAs / hosted egress) still flows through the
+ * protocol layer's guarded fetch boundary.
+ *
+ * Exclusion uses credential-shaped names and known credential values, so a
+ * known secret cannot ride along under an opaque name. A routing-value
+ * collision fails closed instead of silently rerouting the step. Unknown
+ * opaque credentials cannot be inferred from arbitrary routing headers.
+ * The step's own credential is re-added below after the exclusions.
+ */
+function createAuthOverrideClient(
+  agentUrl: string,
+  protocol: 'mcp' | 'a2a',
+  options: StoryboardRunOptions,
+  authHeaders: Record<string, string>
+): TestClient {
+  const runSecrets = runCredentialValues(options);
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(options.headers ?? {})) {
+    const isRouting = SESSION_PROBE_ROUTING_HEADERS.has(name.toLowerCase());
+    // Curated routing names are exempt from the *name* heuristics only.
+    // `x-routing-key`, `x-partition-key` and `x-idempotency-key` all trip the
+    // `key` alternative without being credentials, and dropping them reroutes
+    // the step to another tenant.
+    if (!isRouting && isCredentialHeaderName(name)) continue;
+    if (typeof value === 'string' && runSecrets.some(secret => value.includes(secret))) {
+      // The value test is never waived, or a secret parked in `x-tenant`
+      // would be forwarded under cover of the routing exemption.
+      if (isRouting) {
+        // Silently dropping would reroute the step; forwarding would leak the
+        // suite principal. Neither is a safe default, so refuse the run and
+        // let the operator rename the header or the credential. Name only —
+        // the message must not echo the value.
+        throw new Error(
+          `options.headers.${name} is a routing header but its value contains a credential this run holds; ` +
+            `an isolated step cannot both route correctly and withhold the suite principal. ` +
+            `Choose a routing value or suite credential that does not collide.`
+        );
+      }
+      continue;
+    }
+    headers[name] = value;
+  }
+  let auth: StoryboardRunOptions['auth'];
+  for (const [name, value] of Object.entries(authHeaders)) {
+    if (name.toLowerCase() === 'authorization' && value.startsWith('Bearer ')) {
+      // Route bearer overrides through the normal AgentConfig auth field so
+      // the official protocol path emits both Authorization and x-adcp-auth, just
+      // like an ordinary SDK dispatch. Basic auth remains a custom header.
+      auth = { type: 'bearer', token: value.slice('Bearer '.length) };
+    } else {
+      headers[name] = value;
+    }
+  }
+
+  return createTestClient(agentUrl, protocol, {
+    ...options,
+    protocol,
+    auth,
+    test_kit: undefined,
+    _client: undefined,
+    functional_request_signing: undefined,
+    headers: Object.keys(headers).length > 0 ? headers : undefined,
+  });
+}
+
+function basicAuthHeadersForStep(
+  directive: Extract<StepAuthDirective, { type: 'basic' }>,
+  options: StoryboardRunOptions
+): Record<string, string> {
+  if (directive.value_strategy) {
+    if (directive.value_strategy !== 'random_invalid') return {};
+    return {
+      authorization: encodeBasicAuthHeader(
+        {
+          username: generateRandomInvalidApiKey(),
+          password: generateRandomInvalidApiKey(),
+        },
+        'step.auth.basic'
+      ),
+    };
+  }
+
+  const usesTestKit =
+    directive.from_test_kit === true ||
+    (typeof directive.from_test_kit === 'string' && directive.from_test_kit.length > 0);
+  const source = usesTestKit
+    ? resolveStepBasicFromTestKit(directive.from_test_kit!, options)
+    : directive.basic !== undefined
+      ? directive.basic
+      : directive;
+  if (source === undefined) {
+    if (usesTestKit) {
+      // adcp#6735 — same hard-fail as the api_key arm: never send an
+      // unauthenticated probe in place of a declared kit credential.
+      throw new Error(
+        'step declares auth.from_test_kit (basic) but no test kit with matching credentials is configured — ' +
+          'declare prerequisites.test_kit and authorize its cache with options.complianceDir ' +
+          '(CLI: --compliance-dir), ' +
+          'or pass options.test_kit (CLI: --test-kit).'
+      );
+    }
+    return {};
+  }
+  return { authorization: encodeBasicAuthHeader(source, 'step.auth.basic') };
+}
+
+function resolveStepBasicFromTestKit(
+  fromTestKit: string | boolean,
+  options: StoryboardRunOptions
+): BasicCredentialInput | undefined {
+  const path = typeof fromTestKit === 'string' && fromTestKit.length > 0 ? fromTestKit : 'auth.basic';
+  const segments = path.split('.');
+  let value: unknown = options.test_kit;
+  for (const segment of segments) {
+    if (value == null || typeof value !== 'object') return undefined;
+    value = (value as Record<string, unknown>)[segment];
+  }
+  if (value === undefined || value === null) return undefined;
+  return value as BasicCredentialInput;
+}
+
+interface BasicCredentialInput {
+  username?: unknown;
+  password?: unknown;
+  credentials?: unknown;
+}
+
+function encodeBasicAuthHeader(input: BasicCredentialInput, fieldPrefix: string): string {
+  const userpass = normalizeBasicCredentials(input, fieldPrefix);
+  return `Basic ${Buffer.from(userpass).toString('base64')}`;
+}
+
+function normalizeBasicCredentials(input: BasicCredentialInput, fieldPrefix: string): string {
+  const hasCredentials = input.credentials !== undefined;
+  const hasUserPass = input.username !== undefined || input.password !== undefined;
+  if (hasCredentials && hasUserPass) {
+    throw new Error(`${fieldPrefix} must use either credentials or username/password, not both`);
+  }
+  if (hasCredentials) {
+    if (typeof input.credentials !== 'string' || input.credentials.length === 0) {
+      throw new Error(`${fieldPrefix}.credentials must be a non-empty string`);
+    }
+    assertSafeAuthHeaderPart(input.credentials, `${fieldPrefix}.credentials`);
+    const colonIndex = input.credentials.indexOf(':');
+    if (colonIndex <= 0) {
+      throw new Error(`${fieldPrefix}.credentials must be in unencoded username:password form`);
+    }
+    return input.credentials;
+  }
+  if (typeof input.username !== 'string' || input.username.length === 0) {
+    throw new Error(`${fieldPrefix}.username must be a non-empty string`);
+  }
+  if (typeof input.password !== 'string') {
+    throw new Error(`${fieldPrefix}.password must be a string`);
+  }
+  if (input.username.includes(':')) {
+    throw new Error(`${fieldPrefix}.username must not contain colon (RFC 7617)`);
+  }
+  assertSafeAuthHeaderPart(input.username, `${fieldPrefix}.username`);
+  assertSafeAuthHeaderPart(input.password, `${fieldPrefix}.password`);
+  return `${input.username}:${input.password}`;
+}
+
+// Reject control chars and non-printable ASCII. Without this, undici's header
+// validator throws a message that includes the offending value — landing
+// secrets in logs. Validate raw inputs before encoding so the field name in
+// the error identifies which input to fix without echoing the value.
+function assertSafeAuthHeaderPart(value: string, field: string): void {
+  if (/[\r\n\x00]|[^\x20-\x7E]/.test(value)) {
+    throw new Error(`${field} contains invalid characters (control chars or non-printable ASCII)`);
+  }
+}
+
+/**
+ * Evaluate a step's `contributes_if` expression. Grammar:
+ *   - `"prior_step.<step_id>.passed"` — prior step passed
+ * Unknown expressions → false (contribution does NOT fire).
+ */
+function evalContributesIf(expr: string | undefined, priorStepResults: Map<string, StoryboardStepResult>): boolean {
+  if (!expr) return true;
+  const match = /^prior_step\.([A-Za-z0-9_]+)\.passed$/.exec(expr.trim());
+  if (!match) return false;
+  const stepId = match[1]!;
+  const prior = priorStepResults.get(stepId);
+  return !!prior?.passed && !prior.skipped;
+}
+
+// ────────────────────────────────────────────────────────────
+// Brand/account invariant
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Force every outgoing request onto the storyboard's brand context.
+ *
+ * Sellers that scope session state by brand (spec-required for multi-tenant
+ * isolation) derive a session key from `brand.domain` — or, when brand is
+ * absent, from `account.brand.domain`. If any step in a run targets a
+ * different brand, it lands in a different session and can't see state
+ * created by earlier steps.
+ *
+ * This helper runs after builder / sample_request resolution and writes the
+ * run-scoped brand into the addressing forms the tool's schema allows:
+ *
+ *   - Top-level `brand` — only when the tool's request schema declares it
+ *     (e.g. `get_products`, `create_media_buy`, signal tools). Governance
+ *     tools like `sync_plans` do not declare `brand` at the request root
+ *     (brand belongs inside each `Plan` object) — injecting it would fail
+ *     the framework's strict AJV validation (#940).
+ *   - `account.brand` — merged into an existing `account` object only when
+ *     it uses the natural-key variant (`{brand, operator, sandbox?}`). The
+ *     `{account_id}` variant is closed (`additionalProperties: false`); merging
+ *     `brand` into it produces a payload that matches neither `oneOf` branch
+ *     and is rejected by AJV strict request validation. Detect the natural-key
+ *     variant by looking for an existing `brand` or `operator` key.
+ *   - Synthetic `account` — constructed only when the request has no
+ *     `account` AND the tool's schema declares `account` (e.g. `get_media_buys`,
+ *     `list_creatives`). Tools like `sync_plans` that declare neither
+ *     `brand` nor `account` at the root are left unchanged.
+ *
+ * When `taskName` is omitted or the schema is unavailable (not synced yet),
+ * the function fails open and injects as before. Schema checks use raw JSON
+ * reads, not AJV internals.
+ */
+export function applyBrandInvariant(
+  request: Record<string, unknown>,
+  options: StoryboardRunOptions,
+  taskName?: string,
+  stepFlags?: { omit_account?: boolean }
+): Record<string, unknown> {
+  // Only force the invariant when the caller has actually supplied a brand.
+  // Storyboards that don't exercise brand-scoped tools (e.g. security
+  // probes) legitimately run without one and should pass through unchanged.
+  if (!options.brand && !options.brand_manifest) return request;
+  const brand = resolveBrand(options);
+
+  // Gate brand/account injection on the tool's request schema. Tools that
+  // declare `additionalProperties: false` without listing the field will fail
+  // the framework's strict AJV validator if we inject it (#940). Fails open
+  // when taskName is absent or the schema isn't available.
+  const topBrandOk = !taskName || schemaAllowsTopLevelField(taskName, 'brand');
+  const topAccountOk = !taskName || schemaAllowsTopLevelField(taskName, 'account');
+
+  const result: Record<string, unknown> = { ...request };
+  if (topBrandOk) result.brand = brand;
+
+  // When a storyboard step sets `omit_account: true` it is deliberately
+  // testing the seller's missing-account rejection path. Skip all account
+  // synthesis — both the natural-key-merge branch (existing account on the
+  // request) and the synthetic-construction branch (no account on the
+  // request) — so the request reaches the wire exactly as authored.
+  if (stepFlags?.omit_account) return result;
+
+  if ('account' in request) {
+    // Caller sent an account — merge brand in only when it's a plain object
+    // using AccountReference's natural-key variant (`{brand, operator, sandbox?}`).
+    // The `{account_id}` variant is a closed object; merging `brand` would
+    // produce a payload that matches neither `oneOf` branch under strict AJV.
+    // Leave non-object values (null, array) and `{account_id}`-only payloads
+    // alone so intentionally narrow or malformed requests aren't silently
+    // "corrected."
+    const existingAccount = request.account;
+    if (existingAccount && typeof existingAccount === 'object' && !Array.isArray(existingAccount)) {
+      const acct = existingAccount as Record<string, unknown>;
+      const isNaturalKeyVariant = 'brand' in acct || 'operator' in acct;
+      if (isNaturalKeyVariant) {
+        // Wholesale discovery storyboards deliberately address a different
+        // natural-key account to prove public/account token isolation. Keep
+        // that explicitly authored account identity for product and signal
+        // feeds while still enforcing the run-scoped top-level brand. Other
+        // tools and discovery modes retain the cross-step invariant from #579.
+        const preserveWholesaleAccountBrand =
+          ((taskName === 'get_products' && request.buying_mode === 'wholesale') ||
+            (taskName === 'get_signals' && request.discovery_mode === 'wholesale')) &&
+          acct.brand !== undefined;
+        const merged: Record<string, unknown> = {
+          ...acct,
+          brand: preserveWholesaleAccountBrand ? acct.brand : brand,
+        };
+        // The natural-key arm of AccountReference requires `operator` (per
+        // schemas/cache/{version}/core/account-ref.json). A fixture or earlier
+        // context-extraction step that produced `{brand, sandbox}` without
+        // operator would otherwise be passed through and rejected by a
+        // strict-validating seller. Default operator to brand.domain — same
+        // convention `resolveAccount` uses for synthetic refs.
+        const accountBrand = merged.brand as { domain?: unknown } | undefined;
+        if (typeof merged.operator !== 'string' && typeof accountBrand?.domain === 'string') {
+          merged.operator = accountBrand.domain;
+        }
+        result.account = merged;
+      }
+    }
+  } else if (topAccountOk && taskName !== 'list_accounts' && !ACCOUNT_FREE_DISCOVERY_TASKS.has(taskName ?? '')) {
+    // No account on the request — construct one so tools whose schema
+    // declares `account` but not top-level `brand` (e.g. get_media_buys,
+    // list_creatives) still carry the run-scoped brand on the wire.
+    // list_accounts is deliberately exempt: without an authored account it
+    // enumerates the caller's visible accounts. Synthesizing the runner's
+    // default natural key would silently narrow pagination and discovery
+    // storyboards to one brand.
+    result.account = resolveAccount(options);
+  }
+  return result;
+}
+
+/**
+ * Inject `ext.adcp.disable_sandbox: true` into the outgoing request when the
+ * operator passed `--no-sandbox` (or `disable_sandbox: true` programmatically).
+ * Issue #841.
+ *
+ * `ext` is the spec-blessed channel for read-by-agent extensions and is
+ * accepted-without-error on every tool, so the schema check is conservative
+ * — only inject when the tool's request schema permits a top-level `ext`
+ * field. Tools with `additionalProperties: false` that don't list `ext`
+ * would fail strict AJV validation otherwise.
+ *
+ * Merging strategy: preserve any existing `ext.adcp` block the storyboard
+ * fixture or builder authored (e.g. vendor extensions a future scenario
+ * might exercise). The injected `disable_sandbox` flag rides alongside
+ * those rather than overwriting them.
+ */
+export function applyDisableSandboxHint(request: Record<string, unknown>, taskName?: string): Record<string, unknown> {
+  if (taskName && !schemaAllowsTopLevelField(taskName, 'ext')) return request;
+
+  const existingExt = request.ext;
+  const existingExtObj =
+    existingExt != null && typeof existingExt === 'object' && !Array.isArray(existingExt)
+      ? (existingExt as Record<string, unknown>)
+      : {};
+
+  const existingAdcpExt = existingExtObj.adcp;
+  const existingAdcpExtObj =
+    existingAdcpExt != null && typeof existingAdcpExt === 'object' && !Array.isArray(existingAdcpExt)
+      ? (existingAdcpExt as Record<string, unknown>)
+      : {};
+
+  return {
+    ...request,
+    ext: {
+      ...existingExtObj,
+      adcp: {
+        ...existingAdcpExtObj,
+        disable_sandbox: true,
+      },
+    },
+  };
+}
+
+/**
+ * Mint an `idempotency_key` for mutating storyboard requests when one wasn't
+ * supplied. Storyboard `sample_request` blocks generally omit it; the runner
+ * fills it in so the server's required-field check doesn't short-circuit the
+ * handler under test, including on `expect_error` steps that name specific
+ * failure modes (GOVERNANCE_DENIED, UNAUTHORIZED, brand_mismatch, etc.).
+ *
+ * Skipped when:
+ *   - `step.omit_idempotency_key === true` — the scenario is explicitly
+ *     exercising the server's missing-key rejection path.
+ *   - the concrete request is not state-changing per `requestUsesIdempotency`.
+ *   - the request already carries a key — typically a
+ *     `$generate:uuid_v4#alias` the context injector has resolved to a
+ *     concrete UUID for replay scenarios, or a BYOK key supplied inline.
+ */
+export function applyIdempotencyInvariant(
+  request: Record<string, unknown>,
+  taskName: string,
+  step: StoryboardStep
+): Record<string, unknown> {
+  if (step.omit_idempotency_key === true) return request;
+  if (!requestUsesIdempotency(taskName, request)) return request;
+  if (typeof request.idempotency_key === 'string' && request.idempotency_key.length > 0) return request;
+  return { ...request, idempotency_key: generateIdempotencyKey() };
+}
+
+// ────────────────────────────────────────────────────────────
+// Helpers
+// ────────────────────────────────────────────────────────────
+
+const MAX_ERROR_LENGTH = 2000;
+
+function truncateError(error: string | undefined): string | undefined {
+  if (!error) return undefined;
+  return error.length > MAX_ERROR_LENGTH ? error.slice(0, MAX_ERROR_LENGTH) + '...[truncated]' : error;
+}
+
+interface FlatStep {
+  step: StoryboardStep;
+  phaseId: string;
+  globalIndex: number;
+}
+
+/**
+ * Pre-fetch `query_upstream_traffic` responses for every unique
+ * `since_timestamp` window declared by `upstream_traffic` validations on
+ * THIS step. The dispatcher is synchronous; the controller call is async
+ * — running it once here keeps the validator simple and avoids redundant
+ * controller traffic when a step has multiple upstream_traffic checks
+ * sharing a window.
+ *
+ * Returns `undefined` when the step declares no upstream_traffic checks
+ * (no work to do), or a context with `advertised: false` when the
+ * controller does not advertise `query_upstream_traffic` (every check
+ * grades not_applicable per the spec's adopter-opt-in rule).
+ */
+async function prefetchUpstreamTraffic(
+  stepId: string,
+  resolvedValidations: StoryboardValidation[],
+  client: unknown,
+  options: StoryboardRunOptions,
+  runState: ExecutionState,
+  requestStartIso: string,
+  requestPayload: unknown,
+  sampleRequest: Record<string, unknown> | undefined
+): Promise<UpstreamTrafficValidationContext | undefined> {
+  const upstreamChecks = resolvedValidations.filter(v => v.check === 'upstream_traffic');
+  if (upstreamChecks.length === 0) return undefined;
+  if (upstreamChecks.some(check => (check.identifier_paths ?? []).some(path => validatePortableIdentifierPath(path)))) {
+    return undefined;
+  }
+
+  const advertised =
+    options._controllerCapabilities?.detected === true &&
+    options._controllerCapabilities.scenarios.includes('query_upstream_traffic');
+  if (!advertised) {
+    return {
+      advertised: false,
+      queries: new Map(),
+      thisStepSince: requestStartIso,
+    };
+  }
+
+  // Resolve `since: prior_step_id` references against runState's
+  // recorded request timestamps. Validations that name an unknown step
+  // fall back to this step's own start (matching default behavior).
+  const priorStepSinceMap = new Map<string, string>();
+  const unresolvedSinceRefs = new Set<string>();
+  const sinceTimestamps = new Set<string>([requestStartIso]);
+  for (const v of upstreamChecks) {
+    if (!v.since) continue;
+    const priorStart = runState.stepRequestStarts?.get(v.since);
+    if (priorStart) {
+      priorStepSinceMap.set(v.since, priorStart);
+      sinceTimestamps.add(priorStart);
+    } else {
+      // Spec PR adcp#3816: a `since: prior_step_id` that doesn't resolve
+      // is a storyboard authoring bug — silently masking it as "use this
+      // step's start" lets misspelled refs pass vacuously. Track and
+      // surface as a typed failure on the validation result.
+      priorStepSinceMap.set(v.since, requestStartIso);
+      unresolvedSinceRefs.add(v.since);
+    }
+  }
+
+  const queries = new Map<string, UpstreamTrafficQueryResult>();
+  const identifierDigestCollection = collectUpstreamIdentifierDigests(upstreamChecks, requestPayload, sampleRequest);
+  const identifierDigestByValue = identifierDigestCollection.digests;
+  const identifier_value_digests = [...identifierDigestByValue.values()];
+  const requiresRawAttestation = upstreamChecks.some(
+    check => check.attestation_mode_required === 'raw' || (check.payload_must_contain?.length ?? 0) > 0
+  );
+  const prefersRawAttestation = upstreamChecks.some(check => check.preferred_attestation_mode === 'raw');
+  const prefersDigestAttestation = upstreamChecks.some(check => check.preferred_attestation_mode === 'digest');
+  const requestedAttestationMode: 'raw' | 'digest' =
+    requiresRawAttestation || prefersRawAttestation
+      ? 'raw'
+      : prefersDigestAttestation || identifier_value_digests.length > 0
+        ? 'digest'
+        : 'raw';
+  for (const sinceTs of sinceTimestamps) {
+    // Per spec PR adcp#3816: runners SHOULD subtract a clock-skew tolerance
+    // (50ms minimum, 250ms recommended) before sending the bound to the
+    // controller, so a recorded call timestamped microseconds before the
+    // runner's clock measurement isn't silently excluded. We use 250ms (the
+    // spec's recommended value).
+    const adjustedSince = new Date(new Date(sinceTs).getTime() - 250).toISOString();
+    const params = {
+      since_timestamp: adjustedSince,
+      limit: 100,
+      attestation_mode: requestedAttestationMode,
+      ...(identifier_value_digests.length > 0 ? { identifier_value_digests } : {}),
+    };
+    const requestRecord: RunnerRequestRecord = {
+      transport: options.protocol === 'a2a' ? 'a2a' : 'mcp',
+      operation: 'comply_test_controller',
+      payload: redactSecrets({ scenario: 'query_upstream_traffic', params }),
+      ...(runState.agentUrl ? { url: redactOAuthUrlForOutput(runState.agentUrl) } : {}),
+    };
+    const startMs = Date.now();
+    let payload: UpstreamTrafficSuccess | { error: string; error_kind?: string };
+    try {
+      const result = await queryUpstreamTraffic(client as TestClient, params, options);
+      if ('success' in result && result.success === true) {
+        payload = result;
+      } else {
+        const errResult = result as { error?: string; error_detail?: string; context?: unknown; ext?: unknown };
+        const message = errResult.error_detail
+          ? `${errResult.error ?? 'controller_error'}: ${errResult.error_detail}`
+          : (errResult.error ?? 'controller returned a non-success response');
+        const errorKind = extractControllerErrorKind(errResult);
+        payload = { error: message, ...(errorKind ? { error_kind: errorKind } : {}) };
+      }
+    } catch (err) {
+      payload = { error: err instanceof Error ? err.message : String(err) };
+    }
+    const responseRecord: RunnerResponseRecord = {
+      transport: options.protocol === 'a2a' ? 'a2a' : 'mcp',
+      payload: redactSecrets(payload),
+      duration_ms: Date.now() - startMs,
+    };
+    queries.set(sinceTs, { request: requestRecord, response: responseRecord, payload });
+  }
+
+  return {
+    advertised: true,
+    queries,
+    thisStepSince: requestStartIso,
+    ...(identifierDigestByValue.size > 0 ? { identifierDigestByValue } : {}),
+    ...(identifierDigestCollection.clipped > 0
+      ? {
+          identifierDigestLimitExceeded: {
+            limit: identifierDigestCollection.limit,
+            clipped: identifierDigestCollection.clipped,
+          },
+        }
+      : {}),
+    ...(priorStepSinceMap.size > 0 ? { priorStepSinceMap } : {}),
+    ...(unresolvedSinceRefs.size > 0 ? { unresolvedSinceRefs } : {}),
+  };
+}
+
+function extractControllerErrorKind(result: { context?: unknown; ext?: unknown }): string | undefined {
+  return readErrorKind(result.context) ?? readErrorKind(result.ext);
+}
+
+function readErrorKind(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.error_kind === 'string' && record.error_kind.length > 0) return record.error_kind;
+  if (typeof record.kind === 'string' && record.kind.length > 0) return record.kind;
+  return undefined;
+}
+
+function collectUpstreamIdentifierDigests(
+  validations: StoryboardValidation[],
+  requestPayload: unknown,
+  sampleRequest: Record<string, unknown> | undefined
+): { digests: Map<string, string>; limit: number; clipped: number } {
+  const digests = new Map<string, string>();
+  let clipped = 0;
+  const sample =
+    requestPayload && typeof requestPayload === 'object' && !Array.isArray(requestPayload)
+      ? (requestPayload as Record<string, unknown>)
+      : sampleRequest;
+  if (!sample) return { digests, limit: IDENTIFIER_DIGEST_LIMIT, clipped };
+  const clippedVectors = new Set<string>();
+  for (const validation of validations) {
+    for (const path of validation.identifier_paths ?? []) {
+      const vectors = resolvePortableIdentifierPathAll(sample, path);
+      for (const vector of vectors) {
+        if (typeof vector !== 'string') continue;
+        if (digests.has(vector)) continue;
+        if (digests.size >= IDENTIFIER_DIGEST_LIMIT) {
+          if (!clippedVectors.has(vector)) {
+            clippedVectors.add(vector);
+            clipped++;
+          }
+          continue;
+        }
+        digests.set(vector, sha256Hex(vector));
+      }
+    }
+  }
+  return { digests, limit: IDENTIFIER_DIGEST_LIMIT, clipped };
+}
+
+function sha256Hex(value: string): string {
+  // Protocol-defined identifier proof: the receiver compares this exact
+  // SHA-256 value with `identifier_value_sha256`. It is not a credential or
+  // password verifier and cannot be replaced with a salted/KDF construction.
+  // codeql[js/insufficient-password-hash]
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+/**
+ * Find any "$context.xxx" strings that weren't resolved during injection.
+ * Returns one entry per occurrence with both the bare key (for legacy
+ * detail-string formatting) and the full token (for the
+ * `unresolved_substitution` validation result's `expected` field, per
+ * runner-output-contract.yaml v2.0.0).
+ *
+ * See `DOTTED_CONTEXT_TOKEN_RE` below for the second shape it detects.
+ */
+
+/**
+ * Dotted or indexed access into a captured object, e.g.
+ * `$context.__adcp_fixture_price.min_spend_per_package`.
+ *
+ * `$context.<key>` matches a WHOLE key only, so the substituter leaves these
+ * in place — and because the detector used the same anchored pattern, the
+ * literal placeholder string shipped on the wire in, say, a numeric budget
+ * field with nothing reported. The `snapshot:` capture form makes this shape
+ * the natural thing to reach for, so it is detected and named explicitly.
+ */
+const DOTTED_CONTEXT_TOKEN_RE = /^\$context\.(\w+)((?:\.\w+|\[\d+\])+)$/;
+
+/**
+ * The dotted capture path a `$context.<key><accessor>` token should have
+ * used, e.g. `$context.p.min_spend` → `min_spend`, `$context.p[0]` → `[0]`.
+ *
+ * `indexOf('.')` alone returned -1 for the indexed form, so the hint
+ * echoed the whole token back and read `path: $context.foo[0]`.
+ */
+function suggestedCapturePath(token: string): string {
+  const match = token.match(DOTTED_CONTEXT_TOKEN_RE);
+  const accessor = match?.[2] ?? '';
+  return accessor.startsWith('.') ? accessor.slice(1) : accessor;
+}
+
+function findUnresolvedContextVars(obj: unknown): Array<{ key: string; token: string }> {
+  const vars: Array<{ key: string; token: string }> = [];
+  const walk = (val: unknown) => {
+    if (typeof val === 'string') {
+      const match = val.match(/^\$context\.(\w+)$/);
+      if (match?.[1]) vars.push({ key: match[1], token: val });
+      else {
+        const dotted = val.match(DOTTED_CONTEXT_TOKEN_RE);
+        if (dotted?.[1]) vars.push({ key: dotted[1], token: val });
+      }
+    } else if (Array.isArray(val)) {
+      val.forEach(walk);
+    } else if (val !== null && typeof val === 'object') {
+      Object.values(val as Record<string, unknown>).forEach(walk);
+    }
+  };
+  walk(obj);
+  return vars;
+}
+
+const UNRESOLVED_RUNNER_TOKEN_RE =
+  /\{\{(?:runner\.(?:webhook_url:[A-Za-z0-9_]+|webhook_base)|prior_step\.[A-Za-z0-9_]+\.operation_id)\}\}/g;
+
+function findUnresolvedRunnerTokens(obj: unknown): string[] {
+  const vars: string[] = [];
+  const walk = (val: unknown) => {
+    if (typeof val === 'string') {
+      const matches = val.match(UNRESOLVED_RUNNER_TOKEN_RE);
+      if (matches) vars.push(...matches);
+    } else if (Array.isArray(val)) {
+      val.forEach(walk);
+    } else if (val !== null && typeof val === 'object') {
+      Object.values(val as Record<string, unknown>).forEach(walk);
+    }
+  };
+  walk(obj);
+  return [...new Set(vars)];
+}
+
+function hasUnresolvedPriorStepToken(tokens: string[]): boolean {
+  return tokens.some(token => token.startsWith('{{prior_step.'));
+}
+
+function flattenSteps(storyboard: Storyboard): FlatStep[] {
+  const result: FlatStep[] = [];
+  let index = 0;
+  for (const phase of storyboard.phases) {
+    for (const step of phase.steps) {
+      result.push({ step, phaseId: phase.id, globalIndex: index++ });
+    }
+  }
+  return result;
+}
+
+function getNextStepPreview(
+  currentStepId: string,
+  allSteps: FlatStep[],
+  context: StoryboardContext,
+  runnerVars?: RunnerVariables
+): StoryboardStepPreview | undefined {
+  const currentIdx = allSteps.findIndex(s => s.step.id === currentStepId);
+  if (currentIdx === -1 || currentIdx >= allSteps.length - 1) return undefined;
+
+  const nextFlat = allSteps[currentIdx + 1];
+  if (!nextFlat) return undefined;
+  const nextStep = nextFlat.step;
+
+  // Inject context into the next step's sample_request for preview
+  const previewRequest = nextStep.sample_request
+    ? injectContext({ ...nextStep.sample_request }, context, runnerVars)
+    : undefined;
+
+  return {
+    step_id: nextStep.id,
+    phase_id: nextFlat.phaseId,
+    title: nextStep.title,
+    task: nextStep.task,
+    narrative: nextStep.narrative,
+    expected: nextStep.expected,
+    sample_request: previewRequest,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// Multi-instance dispatch
+// ────────────────────────────────────────────────────────────
+
+interface StepAssignment {
+  client: TestClient;
+  agentUrl: string;
+  /**
+   * Exact key in `options.agents` that dispatch resolved for this step. Set
+   * only by the routing dispatcher; `undefined` for replica round-robin,
+   * which has keys of its own.
+   *
+   * The URL is NOT a route identity: two keys may legitimately share one URL
+   * with different `auth` — one tenant per bearer against a shared control
+   * plane. Anything keyed per route must key on this, or two tenants collapse
+   * into whichever key happens to appear first in the map
+   * (adcp-client#2945 review).
+   */
+  agentKey?: string;
+  /** 0-based index into the agent URL list */
+  instanceIndex: number;
+  /** Profile discovered for the agent selected to execute this step. */
+  profile?: AgentProfile;
+  /** Execution view bound to the routed agent, including its toolset and transport. */
+  options?: StoryboardRunOptions;
+}
+
+interface Dispatcher {
+  nextFor(step: StoryboardStep): StepAssignment;
+}
+
+/**
+ * Build a dispatcher that picks an (agent URL, client) pair per step.
+ *
+ * Single-URL runs always return the same assignment. Multi-URL runs use
+ * round-robin — step N hits `clients[(N + startOffset) % N_urls]`.
+ * Deterministic and reproducible for bug reports.
+ *
+ * `startOffset` lets the `multi-pass` strategy run the same storyboard with
+ * the dispatcher starting at a different replica each pass so write→read
+ * pairs separated by an even number of stateful steps get exercised
+ * cross-replica on at least one pass.
+ */
+function createDispatcher(
+  agentUrls: string[],
+  clients: TestClient[],
+  _strategy: 'round-robin',
+  startOffset = 0,
+  profile?: AgentProfile
+): Dispatcher {
+  let counter = startOffset;
+  return {
+    nextFor(_step: StoryboardStep): StepAssignment {
+      const idx = ((counter % agentUrls.length) + agentUrls.length) % agentUrls.length;
+      counter++;
+      return {
+        client: clients[idx]!,
+        agentUrl: agentUrls[idx]!,
+        instanceIndex: idx,
+        profile,
+      };
+    },
+  };
+}
+
+/**
+ * Per-specialism routing dispatcher (#1066). Picks the agent that claims
+ * each step's tool's protocol via the routing context. Throws
+ * `RoutingError` mid-step when no route can be determined; the runner's
+ * step loop catches and reports as a hard failure.
+ *
+ * `instanceIndex` reflects the agent key's insertion order in the map —
+ * deterministic and matches the index used for downstream `agent_urls`
+ * exposure on the storyboard result.
+ */
+function createRoutingDispatcher(
+  ctx: AgentRoutingContext,
+  options: StoryboardRunOptions,
+  agents: Record<string, AgentEntry>
+): Dispatcher {
+  const keyOrder = Object.keys(agents);
+  const keyToIndex = new Map(keyOrder.map((k, i) => [k, i]));
+  return {
+    nextFor(step: StoryboardStep): StepAssignment {
+      const task = resolveTaskName(step, { ...options, agentTools: undefined });
+      const key = resolveAgentForStep(task ? { ...step, task } : step, options, ctx);
+      const client = ctx.clients.get(key);
+      const profile = ctx.profiles.get(key);
+      const url = agents[key]?.url;
+      if (!client || !url) {
+        throw new RoutingError(
+          `Internal: resolved agent key "${key}" has no client/url. ` +
+            `This indicates a bug in routing-context construction.`,
+          step.task,
+          `key ${key} unbound`
+        );
+      }
+      if (!profile) {
+        const failure = ctx.discoveryFailures.find(failure => failure.agentKey === key);
+        throw new RoutingError(
+          `Agent "${key}" has no discovered profile; its task contract cannot be established.` +
+            (failure ? ` Discovery failed: ${failure.underlying}. Fix the agent or select a healthy route.` : ''),
+          step.task,
+          `agent "${key}" failed discovery`
+        );
+      }
+      return {
+        client,
+        agentUrl: url,
+        agentKey: key,
+        instanceIndex: keyToIndex.get(key) ?? 0,
+        profile,
+        options: routedAgentOptions(agents[key]!, options, profile),
+      };
+    },
+  };
+}
+
+const HORIZONTAL_SCALING_DOCS_URL =
+  'https://adcontextprotocol.org/docs/building/validate-your-agent#verifying-cross-instance-state';
+const NOT_FOUND_PATTERN = /not[_ ]found|not-found|\b404\b/i;
+
+// Agent-controlled text (error messages, response payloads) lands in terminal
+// output. Strip C0/C1 control chars so a hostile agent returning
+// `\x1b[2J\x1b[H` (clear screen) or `\r` (overwrite prior line) can't mangle
+// CI logs or forge terminal state. Tabs and newlines are preserved.
+// The cap bounds JSON-stringification cost if an agent returns an enormous
+// or deeply-nested response body.
+const MAX_ATTRIBUTION_SNIPPET = 512;
+function sanitizeAgentText(text: string): string {
+  return text.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '').slice(0, MAX_ATTRIBUTION_SNIPPET);
+}
+
+/**
+ * Detect the canonical horizontal-scaling failure signature on a step result.
+ *
+ * Reads structured fields the runner commonly populates (error string,
+ * nested response.error/code/message/status) rather than regex-matching the
+ * full stringified response — structured lookup is cheaper, resistant to an
+ * agent smuggling "NOT_FOUND" into an unrelated field to falsely trigger the
+ * canonical wording, and doesn't blow up on circular or oversized payloads.
+ */
+function isNotFoundSignature(result: StoryboardStepResult): boolean {
+  const candidates: Array<unknown> = [result.error];
+  const resp = result.response as Record<string, unknown> | null | undefined;
+  if (resp && typeof resp === 'object' && !Array.isArray(resp)) {
+    candidates.push(resp.error, resp.code, resp.message, resp.status, resp.status_code);
+  }
+  for (const c of candidates) {
+    if (typeof c === 'string' && NOT_FOUND_PATTERN.test(c)) return true;
+    if (typeof c === 'number' && c === 404) return true;
+  }
+  return false;
+}
+
+/**
+ * Mutate a failed step result to include cross-instance attribution.
+ *
+ * In multi-instance mode any step failure is worth attributing because the
+ * failure signature may not be NOT_FOUND — it can surface as 500, an empty
+ * array, PERMISSION_DENIED, or stale status. Attribution always emits:
+ *   - which replica served this step and the immediate prior stateful write
+ *   - a replica→step map for pattern-matching in CI logs
+ *   - a single-replica repro command
+ * When the signature matches the canonical horizontal-scaling case (prior
+ * write on A, read fails on B with NOT_FOUND), the wording mirrors the
+ * protocol docs verbatim so developers pattern-match the page they'll
+ * eventually click through to.
+ */
+function annotateMultiInstanceFailure(
+  result: StoryboardStepResult,
+  storyboard: Storyboard,
+  priorResults: StoryboardStepResult[]
+): void {
+  const currentInstance = result.agent_index;
+  const currentUrl = result.agent_url;
+  if (!currentInstance || !currentUrl) return;
+
+  // Lookup stateful flag on step defs — needed to identify "prior writes".
+  const stepDefs = new Map<string, StoryboardStep>();
+  for (const phase of storyboard.phases) {
+    for (const s of phase.steps) stepDefs.set(s.id, s);
+  }
+
+  const priorCrossInstanceWrite = [...priorResults].reverse().find(prior => {
+    if (!prior.passed || prior.skipped) return false;
+    if (!prior.agent_index || prior.agent_index === currentInstance) return false;
+    return stepDefs.get(prior.step_id)?.stateful === true;
+  });
+
+  const replicaMap = priorResults
+    .filter(r => !r.skipped && r.agent_index)
+    .map(r => `    [#${r.agent_index}] ${r.step_id} — ${r.passed ? 'ok' : 'FAIL'}`)
+    .join('\n');
+
+  const lines: string[] = [];
+
+  if (priorCrossInstanceWrite) {
+    const writerIdx = priorCrossInstanceWrite.agent_index;
+    const writerUrl = priorCrossInstanceWrite.agent_url;
+    // Wording deliberately mirrors the failure example in the protocol docs
+    // ("<write> on replica A returned …; <read> on replica B returned NOT_FOUND;
+    // → Brand-scoped state is not shared across replicas.") so CI readers
+    // pattern-match the page they'll click through to.
+    lines.push(`${priorCrossInstanceWrite.step_id} on replica [#${writerIdx}] (${writerUrl}) succeeded.`);
+    lines.push(
+      `${result.step_id} on replica [#${currentInstance}] (${currentUrl}) failed${
+        isNotFoundSignature(result) ? ' with NOT_FOUND' : ''
+      }.`
+    );
+    lines.push('→ Brand-scoped state is not shared across replicas.');
+    lines.push(`See: ${HORIZONTAL_SCALING_DOCS_URL}`);
+  } else {
+    lines.push(
+      `Multi-instance failure on replica [#${currentInstance}] (${currentUrl}). ` +
+        `No prior cross-replica stateful write found — the failure may be intrinsic to this replica.`
+    );
+  }
+
+  if (replicaMap) {
+    lines.push('Replica → step map:');
+    lines.push(replicaMap);
+  }
+  lines.push(`Reproduce single-replica: adcp storyboard run ${currentUrl} ${storyboard.id}`);
+
+  // Agent-controlled text goes in the base line; control chars are stripped
+  // so a hostile agent can't forge terminal escape sequences in CI output.
+  const base = sanitizeAgentText(result.error ?? 'Step failed');
+  result.error = `${base}\n\n${lines.join('\n')}`;
+}
+
+/**
+ * Get a preview of the first step in a storyboard (for showing what will happen).
+ *
+ * `{{runner.*}}` tokens are passed through unchanged since no receiver is
+ * bound at preview time. They'll resolve when the step actually runs.
+ */
+export function getFirstStepPreview(
+  storyboard: Storyboard,
+  context: StoryboardContext = {}
+): StoryboardStepPreview | undefined {
+  const firstPhase = storyboard.phases[0];
+  if (!firstPhase?.steps[0]) return undefined;
+
+  const step = firstPhase.steps[0];
+  const previewRequest = step.sample_request ? injectContext({ ...step.sample_request }, context) : undefined;
+
+  return {
+    step_id: step.id,
+    phase_id: firstPhase.id,
+    title: step.title,
+    task: step.task,
+    narrative: step.narrative,
+    expected: step.expected,
+    sample_request: previewRequest,
+  };
+}

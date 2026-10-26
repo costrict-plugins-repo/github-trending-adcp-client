@@ -1,0 +1,498 @@
+// Test helpers for AdCP client library
+// Provides pre-configured test agents for examples and quick testing
+
+export { assertPendingWebFlowStoreRoundTrip, type PendingWebFlowStoreRoundTripOptions } from './pending-web-flow-store';
+
+// A refused prepared-state lookup throws this instead of returning a
+// grading result, so a caller of `runStoryboard` / `runStoryboardStep`
+// needs it to tell a denial from an ordinary failure.
+export { PreparedFixturesDeniedError } from '../errors';
+
+export {
+  // Test agents (with auth)
+  testAgent,
+  testAgentA2A,
+  testAgentClient,
+  createTestAgent,
+  TEST_AGENT_TOKEN,
+  TEST_AGENT_MCP_CONFIG,
+  TEST_AGENT_A2A_CONFIG,
+  // Test agents (without auth - for demonstrating auth requirements)
+  testAgentNoAuth,
+  testAgentNoAuthA2A,
+  TEST_AGENT_NO_AUTH_MCP_CONFIG,
+  TEST_AGENT_NO_AUTH_A2A_CONFIG,
+  // Creative agents (MCP only - A2A not yet supported)
+  creativeAgent,
+} from './test-helpers';
+
+// E2E Agent Testing Framework
+export {
+  testAgent as runAgentTests,
+  formatTestResults,
+  formatTestResultsJSON,
+  formatTestResultsSummary,
+  setAgentTesterLogger,
+  getLogger,
+  createTestClient,
+  runStep,
+  // Individual scenarios
+  testHealthCheck,
+  testDiscovery,
+  testCreateMediaBuy,
+  testFullSalesFlow,
+  testReportingFlow,
+  testCreativeSync,
+  testCreativeInline,
+  testCreativeFlow,
+  testSignalsFlow,
+  testErrorHandling,
+  testValidation,
+  testPricingEdgeCases,
+  testTemporalValidation,
+  testBehaviorAnalysis,
+  testResponseConsistency,
+  // v3 scenarios
+  testGovernancePropertyLists,
+  testGovernanceContentStandards,
+  testPropertyListFilters,
+  testSISessionLifecycle,
+  testSIAvailability,
+  testSIHandoff,
+  testCapabilityDiscovery,
+  testSyncAudiences,
+  resolveAccountForMediaBuy,
+  resolveAccountForAudiences,
+  testSchemaCompliance,
+  // State machine compliance
+  testMediaBuyLifecycle,
+  testTerminalStateEnforcement,
+  testPackageLifecycle,
+  // Deterministic state machine testing
+  testCreativeStateMachine,
+  testMediaBuyStateMachine,
+  testAccountStateMachine,
+  testSessionStateMachine,
+  testDeliverySimulation,
+  testBudgetSimulation,
+  testControllerValidation,
+  // Brand rights
+  testBrandRightsFlow,
+  hasBrandRightsTools,
+  // v3 helpers
+  hasGovernanceTools,
+  hasSITools,
+  likelySupportsV3,
+  // Suite orchestrator
+  testAllScenarios,
+  getApplicableScenarios,
+  SCENARIO_REQUIREMENTS,
+  DEFAULT_SCENARIOS,
+  formatSuiteResults,
+  formatSuiteResultsJSON,
+  // Types
+  type TestScenario,
+  type TestOptions,
+  type OrchestratorOptions,
+  type TestResult,
+  type SuiteResult,
+  type TestStepResult,
+  type AgentProfile,
+  type TaskResult,
+  type TestClient,
+  type Logger,
+} from './agent-tester';
+
+// Compliance assessment
+export {
+  comply,
+  buildComplianceBundleResults,
+  formatComplianceResults,
+  formatComplianceResultsJSON,
+  buildComplianceSummary,
+  // Brief library
+  SAMPLE_BRIEFS,
+  getBriefById,
+  getBriefsByVertical,
+  // Types
+  type ComplyOptions,
+  type ComplianceBundleAssessmentOptions,
+  type ComplyRouteStoryboardContext,
+  type ComplyStoryboardRoute,
+  type ComplyStoryboardRouting,
+  type ComplyStoryboardSkip,
+  type ComplianceTrack,
+  type TrackResult,
+  type TestedTrackEntry,
+  type TrackStatus,
+  type ComplianceBundleResult,
+  type ComplianceBundleStatus,
+  type ComplianceResult,
+  type ComplianceSummary,
+  type ComplianceSummaryArtifact,
+  type BuildSummaryOptions,
+  type AdvisoryObservation,
+  type ObservationSource,
+  type SampleBrief,
+} from './compliance';
+
+// Test stubs for compliance testing
+export { GovernanceAgentStub } from './stubs';
+export type { StubCallRecord } from './stubs';
+
+// Controller response assertion helpers
+export { expectControllerError, expectControllerSuccess } from './controller-assertions';
+export type { ControllerErrorWithDetail } from './controller-assertions';
+
+// Seller-side comply_test_controller scaffold
+export { createComplyController } from './comply-controller';
+export type {
+  ComplyController,
+  ComplyControllerConfig,
+  ComplyControllerContext,
+  ComplyControllerToolDefinition,
+  DirectiveAdapter,
+  ForceAccountStatusParams,
+  ForceAdapter,
+  ForceAudienceStatusParams,
+  ForceCatalogItemStatusParams,
+  ForceCreateMediaBuyArmParams,
+  ForceGetProductsArmParams,
+  ForceGetSignalsArmParams,
+  ForceCreativeStatusParams,
+  ForceMediaBuyStatusParams,
+  ForceSessionStatusParams,
+  ForceTaskCompletionParams,
+  SeedAccountParams,
+  SeedAdapter,
+  SeedBuyerAgentParams,
+  SeedCreativeFormatParams,
+  SeedCreativeParams,
+  SeedMediaBuyParams,
+  SeedPlanParams,
+  SeedPricingOptionParams,
+  SeedProductParams,
+  SimulateAdapter,
+  SimulateBudgetSpendParams,
+  SimulateDeliveryParams,
+} from './comply-controller';
+// Re-export the full `comply_test_controller` integration surface so sellers
+// wiring their own `TestControllerStore` against typed domain state
+// (MediaBuyState, CreativeState, PlanState, …) can import everything they need
+// from a single path. See `examples/seller-test-controller.ts` for the
+// end-to-end pattern.
+export {
+  TestControllerError,
+  CONTROLLER_SCENARIOS,
+  DISCOVERY_ARM_SCENARIOS,
+  SEED_SCENARIOS,
+  SESSION_ENTRY_CAP,
+  createSeedFixtureCache,
+  enforceMapCap,
+  registerTestController,
+} from '../server/test-controller';
+export type {
+  ControllerScenario,
+  SeedFixtureCache,
+  SeedScenario,
+  TestControllerStore,
+  TestControllerStoreFactory,
+  TestControllerStoreOrFactory,
+} from '../server/test-controller';
+// Status enums every controller implementer mutates. Re-exported here so a
+// seller wiring `forceMediaBuyStatus` / `forceCreativeStatus` doesn't have to
+// reach into `@adcp/sdk` root just for the literal unions.
+export type { AccountStatus, CreativeStatus, MediaBuyStatus } from '../types/core.generated';
+
+// Seed fixture merge helpers (permissive defaults + storyboard overlay).
+export {
+  mergeSeed,
+  overlayById,
+  mergeSeedProduct,
+  mergeSeedProductLegacy,
+  mergeSeedPricingOption,
+  mergeSeedCreative,
+  mergeSeedPlan,
+  mergeSeedMediaBuy,
+} from './seed-merge';
+
+// Test-controller bridge: seeded augmentation of read-side responses on sandbox
+// requests. Per-tool callbacks (`getSeededProducts`, `getSeededCreatives`,
+// `getSeededMediaBuys`, `getSeededAccounts`, `getSeededAccountFinancials`,
+// `getSeededCreativeFormats`) opt in by presence — see TestControllerBridge.
+export {
+  isSandboxRequest,
+  mergeSeededProductsIntoResponse,
+  filterValidSeededProducts,
+  filterValidSeededCreatives,
+  filterValidSeededMediaBuys,
+  filterValidSeededAccounts,
+  filterValidSeededAccountFinancials,
+  filterValidSeededCreativeFormats,
+  mergeSeededCreativesIntoResponse,
+  mergeSeededMediaBuysIntoResponse,
+  mergeSeededAccountsIntoResponse,
+  mergeSeededCreativeFormatsIntoResponse,
+  pickSeededAccountFinancialsForRequest,
+  replaceAccountFinancialsIfSeeded,
+  bridgeFromTestControllerStore,
+  bridgeFromSessionStore,
+} from '../server/test-controller-bridge';
+export type {
+  TestControllerBridge,
+  TestControllerBridgeContext,
+  BridgeFromSessionStoreOptions,
+  SeededCreative,
+  SeededMediaBuy,
+  SeededAccountFinancials,
+} from '../server/test-controller-bridge';
+
+// One-call harness for server-side agents — composes serve() +
+// seedComplianceFixtures + createWebhookReceiver + runStoryboard.
+export { runAgainstLocalAgent } from './local-agent-runner';
+export type { LocalAgentRunResult, PerStoryboardOverride, RunAgainstLocalAgentOptions } from './local-agent-runner';
+
+// External schema bundles for hosted compliance/certification runs.
+export {
+  registerExternalSchemaRoot,
+  unregisterExternalSchemaRoot,
+  withExternalSchemaRoot,
+  withServedReleaseSchemaRoots,
+} from '../validation';
+
+// Storyboard-driven testing
+export {
+  // Runner
+  runStoryboard,
+  runStoryboardStep,
+  applyAdcpVersionRunOptions,
+  applyStoryboardVersionOptions,
+  getFirstStepPreview,
+  // Parser (single-file load for spec evolution)
+  parseStoryboard,
+  loadStoryboardFile,
+  normalizeValidationOnlyTasks,
+  VALIDATION_ONLY_TASK,
+  applyFixtureBindingsToRequest,
+  buildFixtureResolutionSpecs,
+  FixtureBindingRegistry,
+  matchesFixtureRequirements,
+  normalizeFixtureMatchExpression,
+  validateFixtureResolutionDeclarations,
+  // Compliance cache: capability-driven resolution
+  getComplianceCacheDir,
+  loadComplianceIndex,
+  listBundles,
+  loadBundleStoryboards,
+  listAllComplianceStoryboards,
+  getComplianceStoryboardById,
+  findBundleById,
+  resolveBundleOrStoryboard,
+  resolveStoryboardsForCapabilities,
+  isComplianceVersionSupported,
+  CapabilityResolutionError,
+  // Task mapping
+  TASK_TO_METHOD,
+  executeStoryboardTask,
+  // Storyboard-only creative asset directives
+  expandCreativeAssetDirectives,
+  findUnresolvedCreativeAssetDirectives,
+  // Context
+  extractContext,
+  injectContext,
+  // Validations
+  runValidations,
+  resolvePath,
+  // Rate-limit trip/replay observer
+  RateLimitTripObserver,
+  RATE_LIMIT_TRIP_CONTRACT,
+  RATE_LIMIT_TRIP_DEFAULT_REPLAY_MAX_WAIT_SECONDS,
+  RATE_LIMIT_TRIP_MAX_ATTEMPTS_MAX,
+  RATE_LIMIT_TRIP_MAX_ATTEMPTS_MIN,
+  validateRateLimitTripSpec,
+  // Sandbox entities
+  getSandboxEntities,
+  getSandboxBrands,
+  getSandboxBrand,
+  isSandboxDomain,
+  clearSandboxCache,
+  // Assertion registry (adcontextprotocol/adcp#2639) — authors of invariant
+  // modules import these from `@adcp/sdk/testing` to register cross-step
+  // checks the runner will resolve from `storyboard.invariants: [...]`.
+  registerAssertion,
+  getAssertion,
+  listAssertions,
+  listDefaultAssertions,
+  clearAssertionRegistry,
+  resolveAssertions,
+  type AssertionSpec,
+  type AssertionContext,
+  type AssertionResult,
+  type RegisterAssertionOptions,
+  // Types
+  type Storyboard,
+  type StoryboardFixtureResolution,
+  type FixtureResolutionStrategy,
+  type FixtureMatchOperator,
+  type FixtureMatchClause,
+  type FixtureResolutionDeclaration,
+  type ProductFixtureResolutionDeclaration,
+  type PricingOptionFixtureResolutionDeclaration,
+  type FixtureResolutionStatus,
+  type FixtureResolutionRecord,
+  type FixtureResolutionAttempt,
+  type FixtureResolutionEvidence,
+  type FixtureResolutionCoverageGap,
+  type StoryboardInvariants,
+  type StoryboardInvariantsObject,
+  type StepInvariantsObject,
+  type StoryboardPhase,
+  type StoryboardStep,
+  type RateLimitTripSpec,
+  type StoryboardValidation,
+  type RateLimitTripClient,
+  type RateLimitTripFailureCode,
+  type RateLimitTripObservation,
+  type RateLimitTripObserverOptions,
+  type RateLimitTripResponseSnapshot,
+  type RateLimitTripStructuredResult,
+  type RateLimitTripTaskOptions,
+  type StoryboardContext,
+  type StoryboardRunOptions,
+  type PrepareStoryboardFixturesOptions,
+  type TrustedMatchContextProviderEndpoint,
+  type TrustedMatchContextRegistrationContext,
+  type TrustedMatchContextRouterRunnerOptions,
+  type TrustedMatchPublisherAuthOperation,
+  type TrustedMatchPublisherCredentialState,
+  type TrustedMatchPublisherAuthTls,
+  type TrustedMatchPublisherAuthProbeConfiguration,
+  type TrustedMatchPublisherAuthRunner,
+  type ValidationResult,
+  type StoryboardStepPreview,
+  type StoryboardStepResult,
+  type StoryboardStepHint,
+  type StoryboardStepHintBase,
+  type ContextValueRejectedHint,
+  type ShapeDriftHint,
+  type MissingRequiredFieldHint,
+  type FormatMismatchHint,
+  type MonotonicViolationHint,
+  type ContextProvenanceEntry,
+  type StoryboardPhaseResult,
+  type StoryboardResult,
+  type RunnerNotice,
+  type NoticeCode,
+  type NoticeSeverity,
+  type AgentCapabilities,
+  type BundleKind,
+  type BundleRef,
+  type CapabilityResolutionCode,
+  type ComplianceIndex,
+  type ComplianceIndexProtocol,
+  type ComplianceIndexSpecialism,
+  type ResolveOptions,
+  type ResolvedBundle,
+  type ResolvedStoryboards,
+  type SandboxBrand,
+  type SandboxAgent,
+  type SandboxEntities,
+  type BrandJson,
+  type AdagentsJson,
+  gradeOAuthMetadataGraph,
+  gradeOAuthMetadataGraphVector,
+  loadOAuthMetadataGraphVectors,
+  normalizeOAuthResourceForComparison,
+  redactOAuthUrlForOutput,
+  type GradeOAuthMetadataGraphOptions,
+  type OAuthMetadataGraphErrorCode,
+  type OAuthMetadataGraphFinding,
+  type OAuthMetadataGraphGrade,
+  type OAuthMetadataGraphObservation,
+  type OAuthMetadataGraphVector,
+  type OAuthMetadataGraphVectorCorpus,
+  BrandJsonSchema,
+  AdagentsJsonSchema,
+  // Report consumers key on `StoryboardStepResult.task`; the MCP session auth
+  // probe is runner-native, so its task name ships as a constant rather than a
+  // magic string operators have to copy (adcp-client#2940).
+  MCP_SESSION_PROBE_TASK,
+} from './storyboard';
+
+// Collection fixture foundation.
+//
+// Deliberately narrow. The pair normalizer, the predicate evaluator and the
+// witness reader are exported because a downstream consumer validating its
+// own fixtures against the same definition of collection identity is the
+// whole point of having one normalizer.
+//
+// `diffCollectionPairSets` ships with its two renderers — `formatCollectionPair`
+// and `summarizeCollectionPairs`. The diff returns `CollectionPair[]`, so a
+// consumer without them reimplements the quoted `"domain":"id"` / `"domain":*`
+// form by hand and gets it subtly different, which is the drift one shared
+// normalizer exists to prevent. Half the pair on the public surface was the
+// worst of the three options.
+//
+// The genuinely internal helpers stay unexported entirely (there is no deep
+// subpath: `package.json#exports` has no wildcard reaching
+// `dist/lib/testing/storyboard/*`): `compareCollectionPairs`,
+// `normalizeCollectionSelectionSelector` and the witness-returning matcher
+// are runner internals, and a `minor` that promotes them to semver-stable
+// surface nobody asked for is a cost paid forever.
+export {
+  COLLECTION_DIAGNOSTIC_LIMIT,
+  COLLECTION_PAIR_LIMIT,
+  COLLECTION_TARGETING_MODES,
+  COLLECTION_WITNESS_KINDS,
+  diffCollectionPairSets,
+  evaluateCollectionSelection,
+  formatCollectionPair,
+  isProtectedContextKey,
+  isTrustedPreparedFixtures,
+  normalizeCollectionSelectors,
+  prepareStoryboardFixtures,
+  PREPARED_FIXTURES_CONTRACT_VERSION,
+  PreparedStoryboardFixtures,
+  productSatisfiesCollectionSelection,
+  PROTECTED_CONTEXT_PREFIX,
+  summarizeCollectionPairs,
+  ProtectedContextViolation,
+  readCollectionWitness,
+  withPreparedFixtures,
+} from './storyboard';
+export type {
+  CollectionNormalizationCode,
+  CollectionNormalizationFailure,
+  CollectionNormalizationResult,
+  CrossPublisherCollectionRelation,
+  CollectionPair,
+  CollectionSelectionEvaluation,
+  CollectionSelectionSelector,
+  CollectionSelectionWitness,
+  CollectionSelectorObject,
+  CollectionWitnessKind,
+  CollectionWitnessReadResult,
+  FixtureContextOutput,
+  NormalizedCollectionSelectors,
+  PreparedFixtureBinding,
+  PreparedFixtureSelection,
+  PreparedFixturesAuthorizer,
+  PreparedFixturesDecision,
+  PreparedFixturesDisposition,
+  PreparedFixturesLookup,
+  PreparedFixturesPreparationLookup,
+  PreparedFixturesPreparationAuthorizer,
+  PreparedFixturesRefusal,
+  PreparedFixturesRefusalCode,
+  PreparedFixturesReference,
+  PreparedSchemaArtifact,
+  ProtectedContextViolationCode,
+  ResolvedCollectionSelectionSelector,
+} from './storyboard';
+
+export { resolveCreativeBuildProbe, validateCreativeBuildProbeSpec } from './storyboard';
+export type {
+  CreativeBuildProbeSpec,
+  CreativeBuildProbeInputFixture,
+  CreativeBuildProbeResolution,
+} from './storyboard';

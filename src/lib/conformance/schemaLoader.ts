@@ -1,0 +1,182 @@
+import * as path from 'path';
+import type { ConformanceToolName } from './types';
+import { ADCP_VERSION } from '../version';
+import { resolveBundleKey } from '../validation/schema-loader';
+import { hasBundledSchemaStore, loadBundledSchemaFile } from '../validation/bundled-schema-store';
+
+type JsonSchema = Record<string, unknown>;
+
+export interface ConformanceSchemaOptions {
+  /** AdCP schema/cache version to load. Defaults to the SDK-pinned version. */
+  version?: string;
+  /** External schema-data root, e.g. `dist/schemas/latest` or `dist/lib/schemas-data/3.2.1`. */
+  schemaRoot?: string;
+}
+
+interface ToolSchemaLocation {
+  domain: string;
+  fileBase: string;
+}
+
+const TOOL_SCHEMA_LOCATIONS: Record<ConformanceToolName, ToolSchemaLocation> = {
+  // Tier 1
+  get_products: { domain: 'media-buy', fileBase: 'get-products' },
+  list_products: { domain: 'media-buy', fileBase: 'list-products' },
+  list_creative_formats: { domain: 'media-buy', fileBase: 'list-creative-formats' },
+  list_creatives: { domain: 'creative', fileBase: 'list-creatives' },
+  get_media_buys: { domain: 'media-buy', fileBase: 'get-media-buys' },
+  get_signals: { domain: 'signals', fileBase: 'get-signals' },
+  si_get_offering: { domain: 'sponsored-intelligence', fileBase: 'si-get-offering' },
+  get_adcp_capabilities: { domain: 'protocol', fileBase: 'get-adcp-capabilities' },
+  tasks_list: { domain: 'core', fileBase: 'tasks-list' },
+  list_property_lists: { domain: 'property', fileBase: 'list-property-lists' },
+  list_content_standards: { domain: 'content-standards', fileBase: 'list-content-standards' },
+  get_creative_features: { domain: 'creative', fileBase: 'get-creative-features' },
+  // Tier 2 (referential)
+  get_media_buy_delivery: { domain: 'media-buy', fileBase: 'get-media-buy-delivery' },
+  get_property_list: { domain: 'property', fileBase: 'get-property-list' },
+  get_content_standards: { domain: 'content-standards', fileBase: 'get-content-standards' },
+  get_creative_delivery: { domain: 'creative', fileBase: 'get-creative-delivery' },
+  tasks_get: { domain: 'core', fileBase: 'tasks-get' },
+  preview_creative: { domain: 'creative', fileBase: 'preview-creative' },
+  // Tier 3 (mutating updates)
+  update_media_buy: { domain: 'media-buy', fileBase: 'update-media-buy' },
+  update_property_list: { domain: 'property', fileBase: 'update-property-list' },
+  update_content_standards: { domain: 'content-standards', fileBase: 'update-content-standards' },
+  request_proposals: { domain: 'media-buy', fileBase: 'request-proposals' },
+  refine_proposals: { domain: 'media-buy', fileBase: 'refine-proposals' },
+  decline_proposals: { domain: 'media-buy', fileBase: 'decline-proposals' },
+  buy_products: { domain: 'media-buy', fileBase: 'buy-products' },
+  accept_proposal: { domain: 'media-buy', fileBase: 'accept-proposal' },
+  control_media_buy: { domain: 'media-buy', fileBase: 'control-media-buy' },
+};
+
+/**
+ * Resolve the bundled-schemas directory. Mirrors the validator's loader
+ * in `src/lib/validation/schema-loader.ts`: prefer the built tree where
+ * `scripts/copy-schemas-to-dist.ts` stages schemas at build time, and
+ * fall back to the source cache for local development.
+ *
+ * Path keys follow the same `resolveBundleKey` rule the validator uses
+ * (stable patches collapse to MAJOR.MINOR), so the conformance fuzzer's
+ * dist lookup matches what the build script writes.
+ *
+ * - Built:  <pkg>/dist/lib/schemas-data/<bundle-key>/bundled    (e.g. `3.0/bundled`)
+ * - Source: <pkg>/schemas/cache/<exact-version>/bundled          (e.g. `3.0.1/bundled`)
+ *
+ * The cache fallback uses the exact `ADCP_VERSION` string because cache
+ * directories preserve their spec-tag lineage (only the dist layout collapses).
+ */
+function findBundledDir(options: ConformanceSchemaOptions = {}): string {
+  if (options.schemaRoot) {
+    const bundled = path.join(options.schemaRoot, 'bundled');
+    if (hasBundledSchemaStore(bundled)) return bundled;
+    if (path.basename(options.schemaRoot) === 'bundled' && hasBundledSchemaStore(options.schemaRoot)) {
+      return options.schemaRoot;
+    }
+    throw new Error(`Conformance schema bundle not found at ${options.schemaRoot}. Expected a root with bundled/.`);
+  }
+
+  const version = options.version ?? ADCP_VERSION;
+  const bundleKey = resolveBundleKey(version);
+  const distCandidate = path.resolve(__dirname, '..', 'schemas-data', bundleKey, 'bundled');
+  if (hasBundledSchemaStore(distCandidate)) return distCandidate;
+
+  const srcCandidate = path.resolve(__dirname, '..', '..', '..', 'schemas', 'cache', version, 'bundled');
+  if (hasBundledSchemaStore(srcCandidate)) return srcCandidate;
+
+  throw new Error(
+    `Conformance schema bundle not found. Looked in ${distCandidate} and ${srcCandidate}. ` +
+      `Run \`npm run sync-schemas && npm run build:lib\`, or install the current package: \`npm i @adcp/sdk@latest\`.`
+  );
+}
+
+const schemaCache = new Map<string, JsonSchema>();
+
+function loadSchema(relativePath: string, options: ConformanceSchemaOptions = {}): JsonSchema {
+  const bundledDir = findBundledDir(options);
+  const cacheKey = `${bundledDir}\0${relativePath}`;
+  const cached = schemaCache.get(cacheKey);
+  if (cached) return cached;
+  const full = path.join(bundledDir, relativePath);
+  const parsed = loadBundledSchemaFile(full);
+  if (!parsed) throw new Error(`Conformance schema not found: ${full}`);
+  schemaCache.set(cacheKey, parsed);
+  return parsed;
+}
+
+export function loadRequestSchema(tool: ConformanceToolName, options: ConformanceSchemaOptions = {}): JsonSchema {
+  const loc = TOOL_SCHEMA_LOCATIONS[tool];
+  return loadSchema(`${loc.domain}/${loc.fileBase}-request.json`, options);
+}
+
+export function loadResponseSchema(tool: ConformanceToolName, options: ConformanceSchemaOptions = {}): JsonSchema {
+  const loc = TOOL_SCHEMA_LOCATIONS[tool];
+  const schema = loadSchema(`${loc.domain}/${loc.fileBase}-response.json`, options);
+  const bundledDir = findBundledDir(options);
+  // Packed bundles inline shared schemas into tools rather than shipping
+  // every core file. Discovery contains the same canonical envelope in allOf.
+  const findVersionEnvelope = (node: JsonSchema | undefined): JsonSchema | undefined => {
+    if (!node) return undefined;
+    if (typeof node.$id === 'string' && node.$id.endsWith('/core/version-envelope.json')) return node;
+    for (const keyword of ['allOf', 'anyOf', 'oneOf'] as const) {
+      const branches = node[keyword];
+      if (!Array.isArray(branches)) continue;
+      for (const branch of branches) {
+        if (!branch || typeof branch !== 'object' || Array.isArray(branch)) continue;
+        const found = findVersionEnvelope(branch);
+        if (found) return found;
+      }
+    }
+    return undefined;
+  };
+  const versionEnvelope =
+    loadBundledSchemaFile(path.join(bundledDir, 'core/version-envelope.json')) ??
+    findVersionEnvelope(loadBundledSchemaFile(path.join(bundledDir, 'protocol/get-adcp-capabilities-response.json')));
+  const properties = versionEnvelope?.properties;
+  if (!properties || typeof properties !== 'object' || Array.isArray(properties)) return schema;
+
+  // Version metadata belongs to every response envelope (SDK issue #3262).
+  // Some closed task schemas omit its declarations; add only the canonical version fields,
+  // retaining all other root restrictions and every nested-body constraint.
+  const admitVersionFields = (node: JsonSchema): JsonSchema => {
+    const copy = { ...node };
+    if (node.additionalProperties === false) {
+      copy.properties = { ...properties, ...(node.properties as JsonSchema | undefined) };
+    }
+    for (const keyword of ['allOf', 'anyOf', 'oneOf'] as const) {
+      const branches = node[keyword];
+      if (Array.isArray(branches)) {
+        copy[keyword] = branches.map(branch =>
+          branch && typeof branch === 'object' && !Array.isArray(branch) ? admitVersionFields(branch) : branch
+        );
+      }
+    }
+    return copy;
+  };
+  return admitVersionFields(schema);
+}
+
+export function hasSchemas(tool: ConformanceToolName, options: ConformanceSchemaOptions = {}): boolean {
+  try {
+    loadRequestSchema(tool, options);
+    loadResponseSchema(tool, options);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The AdCP schema version the fuzzer loaded. Surfaced on the report so
+ * a stored seed is replayable only against a matching snapshot.
+ */
+export function detectSchemaVersion(options: ConformanceSchemaOptions = {}): string {
+  if (options.version) return options.version;
+  if (options.schemaRoot) {
+    const root =
+      path.basename(options.schemaRoot) === 'bundled' ? path.dirname(options.schemaRoot) : options.schemaRoot;
+    return path.basename(root);
+  }
+  return ADCP_VERSION;
+}

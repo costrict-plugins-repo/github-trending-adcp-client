@@ -1,0 +1,459 @@
+// AdCP Core Types - Main exports for external consumers
+export * from './adcp';
+
+// Re-export key types for easier importing
+export type {
+  AgentConfig,
+  TestResult,
+  TestRequest,
+  ApiResponse,
+  LegacyCreativeFormatSummary,
+  LegacyAdvertisingProduct,
+  MediaBuy,
+  Targeting,
+  LegacyManagedCreativeAsset,
+  LegacyManageSyncCreativesRequest,
+  LegacyManageListCreativesRequest,
+  LegacyManageListCreativesResponse,
+  LegacyManagedCreativeFilters,
+  ManageCreativeAssetsRequest,
+  ManageCreativeAssetsResponse,
+  CreateMediaBuyAsyncResponseData,
+  UpdateMediaBuyAsyncResponseData,
+  GetProductsAsyncResponseData,
+  SyncCreativesAsyncResponseData,
+} from './adcp';
+
+// Re-export the structured format identifier from generated core types.
+// AdCP 3.0.1 renamed the schema title from "Format ID" to "Format Reference
+// (Structured Object)" — purely a doc change, the wire shape is identical.
+// We expose the new canonical name AND keep the historical `FormatID` alias
+// so SDK consumers don't break across the version bump.
+export type { FormatReferenceStructuredObject } from './core.generated';
+// Canonical-format declarations are part of the 3.2 authoring surface. Keep
+// these curated exports available from `@adcp/sdk/types` so adopters can type
+// check the shared array-valued `slots` contract without importing generated
+// implementation files.
+export type {
+  CanonicalFormatAgentPlacementAISurfaceSponsoredPlacement,
+  CanonicalFormatBase,
+  CanonicalFormatDAASTAudio,
+  CanonicalFormatDisplayTag,
+  CanonicalFormatHostedAudio,
+  CanonicalFormatHostedVideo,
+  CanonicalFormatHTML5Banner,
+  CanonicalFormatImageCarousel,
+  CanonicalFormatNativeInFeed,
+  CanonicalFormatResponsiveCreative,
+  CanonicalFormatSponsoredPlacementRetailMediaCatalogDriven,
+  CanonicalFormatVASTVideo,
+  CanonicalDeliveryForecast,
+  CanonicalForecastPoint,
+  ExtensionObject,
+  PlacementPresentationDocument,
+  PlacementPresentationReference,
+  WholesaleFeedEvent,
+  WholesaleFeedWebhook,
+} from './core.generated';
+// Supporting proposal-discovery criteria types are part of the public 3.2
+// negotiation surface and must not require deep generated-file imports.
+export type {
+  AcceptanceContext,
+  MediaBuyFrequencyCap,
+  OutcomeTarget,
+  ProductMediaBuySupportRequirements,
+  TargetingOverlay,
+  TargetingOverlayInput,
+} from './core.generated';
+import type {
+  FormatReferenceStructuredObject,
+  TargetingOverlayInput as GeneratedTargetingOverlayInput,
+} from './core.generated';
+
+/** Create-side `targeting_overlay`, including omission of the whole field. */
+export type CreateTargetingInput = GeneratedTargetingOverlayInput | undefined;
+/**
+ * Update-side `targeting_overlay`, including omission of the whole field.
+ *
+ * This is the overlay field only. Package update requests also expose
+ * incremental keyword/negative-keyword add/remove siblings.
+ */
+export type UpdateTargetingInput = GeneratedTargetingOverlayInput | undefined;
+export type { RequireCacheScopeWhenProducts, ServerPayload } from './server-payload';
+export * from './server-payload-aliases';
+/**
+ * @deprecated AdCP 3.0.1 renamed this type to `FormatReferenceStructuredObject`
+ * (the wire shape is identical — pure documentation rename per the spec). This
+ * alias is preserved for one minor cycle so existing imports keep compiling;
+ * editor tooling will surface the rename so downstream code can migrate at its
+ * own pace. Slated for removal in the next major.
+ */
+export type FormatID = FormatReferenceStructuredObject;
+
+// Re-export wire request/response types adopters need when building a
+// DecisioningPlatform or calling AdCP agents. Source of truth is
+// `tools.generated.ts`; this curated block is the public surface so
+// adopters never reach into generated files.
+//
+// Intentionally excluded — name conflicts with legacy adcp.ts shapes:
+//   LegacyManageSyncCreativesRequest, LegacyManageListCreativesRequest, LegacyManageListCreativesResponse,
+//   ManageCreativeAssetsRequest, ManageCreativeAssetsResponse (adcp.ts versions
+//   already public via `export * from './adcp'` above; use those).
+// Intentionally excluded — comply-runner internals, not specialism surface:
+//   ComplyTestControllerRequest/Response, SeedSuccess, SimulationSuccess,
+//   ControllerError, ForcedDirectiveSuccess, StateTransitionSuccess,
+//   ListScenariosSuccess.
+// Intentionally excluded — internal pagination/packaging sub-shapes, not
+// part of the top-level tool request/response surface:
+//   PaginationRequest, PaginationResponse, PackageRequest,
+//   TMPResponseType, WebhookResponseType.
+
+// Account model + account operations
+export type {
+  AccountReference,
+  AccountChange,
+  ListAccountChangesRequest,
+  ListAccountChangesResponse,
+  ListAccountsRequest,
+  ListAccountsResponse,
+  SyncAccountsRequest,
+  SyncAccountsResponse,
+  SyncAccountsSuccess,
+  SyncAccountsError,
+  GetAccountFinancialsRequest,
+  GetAccountFinancialsResponse,
+  GetAccountFinancialsSuccess,
+  GetAccountFinancialsError,
+} from './tools.generated';
+
+// Experimental managed-reporting ledger and receipt tools.
+export type {
+  GetReportingStatusRequest,
+  GetReportingStatusResponse,
+  SyncReportingStatusRequest,
+  SyncReportingStatusResponse,
+  SyncReportingReceiptsRequest,
+  SyncReportingReceiptsResponse,
+  ReportingCanonicalContentDigest,
+  ReportingAdjustment,
+  ReportingAdjustmentReceipt,
+  ReportingConsumerStatus,
+  ReportingControlTotal,
+  ReportingDeliveryCapabilities,
+  ReportingMaterialization,
+  ReportingResource,
+  ReportingObligation,
+  ReportingReceipt,
+  ReportingRevision,
+  ReportingVerification,
+  ReportingVerificationProfile,
+} from './tools.generated';
+
+// Capabilities
+export type { AdCPSpecialism, GetAdCPCapabilitiesRequest, GetAdCPCapabilitiesResponse } from './tools.generated';
+
+// Sales — media buy
+export type {
+  GetProductsRequest,
+  GetProductsResponse,
+  GetProductsAsyncSubmitted,
+  CreateMediaBuyRequest,
+  CreateMediaBuyResponse,
+  CreateMediaBuySuccess,
+  CreateMediaBuyError,
+  CreateMediaBuySubmitted,
+  CreateMediaBuyAsyncSubmitted,
+  UpdateMediaBuyRequest,
+  UpdateMediaBuyResponse,
+  UpdateMediaBuySuccess,
+  UpdateMediaBuyError,
+  UpdateMediaBuyAsyncSubmitted,
+  GetMediaBuysRequest,
+  GetMediaBuysResponse,
+  GetMediaBuyDeliveryRequest,
+  GetMediaBuyDeliveryResponse,
+  GetMediaBuyArtifactsRequest,
+  GetMediaBuyArtifactsResponse,
+  ProvidePerformanceFeedbackRequest,
+  ProvidePerformanceFeedbackResponse,
+  ProvidePerformanceFeedbackSuccess,
+  ProvidePerformanceFeedbackError,
+  SyncPlansRequest,
+  SyncPlansResponse,
+  ReportUsageRequest,
+  ReportUsageResponse,
+  ReportPlanOutcomeRequest,
+  ReportPlanOutcomeResponse,
+  GetPlanAuditLogsRequest,
+  GetPlanAuditLogsResponse,
+} from './tools.generated';
+
+// AdCP 3.2 compact media-buy lifecycle. RequestProposalsResponse is owned by
+// core.generated; the other tool types use their schema-faithful projections.
+export type {
+  ListProductsRequest,
+  ListProductsResponse,
+  ListCollectionsRequest,
+  ListCollectionsResponse,
+  ListProposalsRequest,
+  ListProposalsResponse,
+  RequestProposalsRequest,
+  RefineProposalsRequest,
+  RefineProposalsResponse,
+  DeclineProposalsRequest,
+  DeclineProposalsResponse,
+  BuyProductsRequest,
+  BuyProductsResponse,
+  AcceptProposalRequest,
+  AcceptProposalResponse,
+  ControlMediaBuyRequest,
+  ControlMediaBuyResponse,
+} from './tools.generated';
+export type { RequestProposalsResponse } from './core.generated';
+
+// Pricing models (discriminated union across pricing types)
+export type { PricingOption, CPMPricingOption, CPCPricingOption, CPVPricingOption } from './tools.generated';
+
+// Media-channel + status enums; publisher property + reporting shapes
+export type {
+  MediaChannel,
+  AudienceStatus,
+  MediaBuyStatus,
+  CreativeStatus,
+  Placement,
+  PublisherPropertySelector,
+  ReportingCapabilities,
+} from './tools.generated';
+
+// Audiences, catalogs, event sources, and events (audience-sync + retail media)
+export type {
+  SyncAudiencesRequest,
+  SyncAudiencesResponse,
+  SyncAudiencesSuccess,
+  SyncAudiencesError,
+  SyncCatalogsRequest,
+  SyncCatalogsResponse,
+  SyncCatalogsSuccess,
+  SyncCatalogsError,
+  SyncCatalogsAsyncSubmitted,
+  SyncEventSourcesRequest,
+  SyncEventSourcesResponse,
+  SyncEventSourcesSuccess,
+  SyncEventSourcesError,
+  LogEventRequest,
+  LogEventResponse,
+  LogEventSuccess,
+  LogEventError,
+} from './tools.generated';
+
+// Signals
+export type {
+  GetSignalsRequest,
+  GetSignalsResponse,
+  ActivateSignalRequest,
+  ActivateSignalResponse,
+  ActivateSignalSuccess,
+  ActivateSignalError,
+  SignalID,
+  SignalValueType,
+  SignalAvailabilityType,
+  SignalAvailabilityType as SignalCatalogType,
+  Destination,
+  Deployment,
+  ActivationKey,
+  VendorPricingOption,
+  SignalFilters, // embedded in GetSignalsRequest.filters
+  SignalTargeting, // embedded in ActivateSignalRequest.signal_targeting
+} from './tools.generated';
+
+// Creative
+export type {
+  BuildCreativeRequest,
+  BuildCreativeResponse,
+  BuildCreativeSuccess,
+  BuildCreativeError,
+  BuildCreativeMultiSuccess,
+  BuildCreativeVariantSuccess,
+  BuildCreativeAsyncSubmitted,
+  CreativeManifest,
+  PreviewCreativeRequest,
+  PreviewCreativeResponse,
+  PreviewCreativeSingleResponse,
+  PreviewCreativeVariantResponse,
+  PreviewCreativeBatchResponse,
+  PreviewBatchResultSuccess,
+  PreviewBatchResultError,
+  ListCreativeFormatsRequest,
+  ListCreativeFormatsResponse,
+  GetCreativeFeaturesRequest,
+  GetCreativeFeaturesResponse,
+  GetCreativeDeliveryRequest,
+  GetCreativeDeliveryResponse,
+  SyncCreativesRequest,
+  SyncCreativesResponse,
+  SyncCreativesSuccess,
+  SyncCreativesError,
+  SyncCreativesSubmitted,
+  SyncCreativesAsyncSubmitted,
+  ListCreativesRequest,
+  ListCreativesResponse,
+  CreativeFilters,
+  CreativeAsset,
+  CreativeQuality,
+  Format,
+  ProductFormatDeclaration,
+  FormatIDParameter,
+} from './tools.generated';
+
+// Governance — property lists
+export type {
+  PropertyList,
+  CreatePropertyListRequest,
+  CreatePropertyListResponse,
+  UpdatePropertyListRequest,
+  UpdatePropertyListResponse,
+  GetPropertyListRequest,
+  GetPropertyListResponse,
+  ListPropertyListsRequest,
+  ListPropertyListsResponse,
+  DeletePropertyListRequest,
+  DeletePropertyListResponse,
+} from './tools.generated';
+
+// Governance — collection lists
+export type {
+  CollectionList,
+  CreateCollectionListRequest,
+  CreateCollectionListResponse,
+  UpdateCollectionListRequest,
+  UpdateCollectionListResponse,
+  GetCollectionListRequest,
+  GetCollectionListResponse,
+  ListCollectionListsRequest,
+  ListCollectionListsResponse,
+  DeleteCollectionListRequest,
+  DeleteCollectionListResponse,
+} from './tools.generated';
+
+// Governance — content standards + delivery validation
+export type {
+  CheckGovernanceRequest,
+  CheckGovernanceResponse,
+  SyncGovernanceRequest,
+  SyncGovernanceResponse,
+  SyncGovernanceSuccess,
+  SyncGovernanceError,
+  CreateContentStandardsRequest,
+  CreateContentStandardsResponse,
+  UpdateContentStandardsRequest,
+  UpdateContentStandardsResponse,
+  UpdateContentStandardsSuccess,
+  UpdateContentStandardsError,
+  ListContentStandardsRequest,
+  ListContentStandardsResponse,
+  GetContentStandardsRequest,
+  GetContentStandardsResponse,
+  CalibrateContentRequest,
+  CalibrateContentResponse,
+  ValidateContentDeliveryRequest,
+  ValidateContentDeliveryResponse,
+} from './tools.generated';
+
+// Sponsored intelligence
+export type {
+  SIGetOfferingRequest,
+  SIGetOfferingResponse,
+  SIInitiateSessionRequest,
+  SIInitiateSessionResponse,
+  SISendMessageRequest,
+  SISendMessageResponse,
+  SITerminateSessionRequest,
+  SITerminateSessionResponse,
+  SICapabilities,
+  SIIdentity,
+  SISessionStatus,
+  SIUIElement,
+} from './tools.generated';
+
+// Brand rights — identity discovery + licensing for branded inventory.
+// `creative_approval` is webhook-only (not an MCP/A2A tool) — types
+// re-exported for adopters wiring their own HTTP receiver.
+export type {
+  GetBrandIdentityRequest,
+  GetBrandIdentityResponse,
+  GetBrandIdentitySuccess,
+  GetRightsRequest,
+  GetRightsResponse,
+  GetRightsSuccess,
+  AcquireRightsRequest,
+  AcquireRightsResponse,
+  AcquireRightsAcquired,
+  AcquireRightsPendingApproval,
+  AcquireRightsRejected,
+  AcquireRightsError,
+  UpdateRightsRequest,
+  UpdateRightsResponse,
+  UpdateRightsSuccess,
+  UpdateRightsError,
+  CreativeApprovalRequest,
+  CreativeApprovalResponse,
+  CreativeApproved,
+  CreativeRejected,
+  CreativePendingReview,
+  CreativeApprovalError,
+  RightsTerms,
+  RightsConstraint,
+  RightUse,
+  RightType,
+  GenerationCredential,
+} from './core.generated';
+
+// Strict format asset slot types (hand-authored — the codegen drops the
+// discriminated per-asset-type branches of Format.assets[]).
+export * from './format-asset-slots';
+
+// Discriminated union of creative asset INSTANCES (what a buyer delivers
+// inside `creative_manifest.assets`). Companion to format-asset-slots.ts
+// (which describes what a publisher SELLS in `Format.assets[]`). The
+// individual ImageAsset / VideoAsset / etc. interfaces and their canonical
+// `AssetVariant` union are generated. `AssetInstance` aliases that union so
+// every registry-backed asset branch remains available without curated drift.
+// `AssetVariant` itself is intentionally not re-exported.
+export * from './asset-instances';
+
+// Strict per-row types for sync_* response success arms. The codegen
+// leaves these row shapes inline; named types make the discriminators
+// (e.g., SyncAccountsResponseRow.action) reachable to handler authors.
+export * from './sync-rows';
+
+// Re-export const-array enum values (e.g., MediaChannelValues, PacingValues)
+// for consumers that need to enumerate or validate against the spec's
+// literal sets without re-deriving them from Zod schemas.
+export * from './enums.generated';
+
+// Re-export inline-union value arrays for anonymous string-literal unions
+// inside named schemas (e.g., ImageAssetRequirements_FormatsValues,
+// VideoAssetRequirements_ContainersValues). Companion to enums.generated;
+// see scripts/generate-inline-enum-arrays.ts.
+export * from './inline-enums.generated';
+
+// Back-compat aliases for inline-enum exports collapsed in AdCP 3.0.1
+// (adcp#3148 / #3174 hoisted byte-identical literal sets into shared
+// `enums/*.json` files). Each alias is `@deprecated` so editor tooling
+// surfaces the canonical replacement; slated for removal in the next major.
+export * from './inline-enums.aliases';
+export * from './enum-compat';
+
+// Back-compat aliases for the 6 error-details schemas renamed in AdCP 3.0.x
+// (adcp#3149 / adcp#3566 canonicalized SCREAMING_SNAKE titles into Title Case).
+// Each alias is `@deprecated`; slated for removal in the next major.
+export * from './error-details.aliases';
+
+// Well-known file shapes (brand.json, adagents.json) inferred from the
+// canonical Zod schemas. Re-exported so adopters can derive types like
+// `BrandDefinition` directly from the spec instead of hand-rolling
+// interfaces that drift across versions. Source of truth is the schema
+// cache (`schemas/cache/{version}/{brand,adagents}.json`) — regenerate
+// with `npm run generate-wellknown-schemas` when the spec bumps.
+export type { BrandJson, AdagentsJson } from './wellknown-schemas.generated';
+export { BrandJsonSchema, AdagentsJsonSchema } from './wellknown-schemas.generated';

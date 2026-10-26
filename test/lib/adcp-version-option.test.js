@@ -1,0 +1,252 @@
+// Stage 2 plumbing: `adcpVersion` constructor option on client + server
+// surfaces. Verifies the option is accepted, defaults to the SDK's pinned
+// ADCP_VERSION, and is reflected by `getAdcpVersion()`. Wire-shape effects
+// land in Stage 3 — these tests guard the surface contract.
+
+const { test, describe } = require('node:test');
+const assert = require('node:assert');
+
+const {
+  ADCP_VERSION,
+  ADCP_MAJOR_VERSION,
+  SingleAgentClient,
+  AgentClient,
+  ADCPMultiAgentClient,
+  parseAdcpMajorVersion,
+  resolveAdcpVersion,
+} = require('../../dist/lib/index.js');
+const { createAdcpServer } = require('../../dist/lib/server/legacy/v5/index.js');
+const ADCP_RELEASE_PRECISION = ADCP_VERSION.replace(
+  /^(\d+)\.(\d+)\.\d+(?:-(.+))?$/,
+  (_match, major, minor, prerelease) => `${major}.${minor}${prerelease ? `-${prerelease}` : ''}`
+);
+const ADCP_PRERELEASE_FAMILY = ADCP_RELEASE_PRECISION.includes('-')
+  ? ADCP_RELEASE_PRECISION.replace(/\.\d+$/, '')
+  : ADCP_RELEASE_PRECISION;
+
+const TEST_AGENT = {
+  id: 'test-agent',
+  name: 'Test Agent',
+  agent_uri: 'https://example.com',
+  protocol: 'mcp',
+};
+
+describe('adcpVersion constructor option', () => {
+  describe('SingleAgentClient', () => {
+    test('defaults to ADCP_VERSION when not provided', () => {
+      const client = new SingleAgentClient(TEST_AGENT);
+      assert.strictEqual(client.getAdcpVersion(), ADCP_VERSION);
+    });
+
+    test('returns the configured value when provided', () => {
+      const client = new SingleAgentClient(TEST_AGENT, { adcpVersion: ADCP_VERSION });
+      assert.strictEqual(client.getAdcpVersion(), ADCP_VERSION);
+    });
+  });
+
+  describe('AgentClient', () => {
+    test('defaults to ADCP_VERSION when not provided', () => {
+      const client = new AgentClient(TEST_AGENT);
+      assert.strictEqual(client.getAdcpVersion(), ADCP_VERSION);
+    });
+
+    test('returns the configured value when provided', () => {
+      const client = new AgentClient(TEST_AGENT, { adcpVersion: ADCP_VERSION });
+      assert.strictEqual(client.getAdcpVersion(), ADCP_VERSION);
+    });
+  });
+
+  describe('ADCPMultiAgentClient', () => {
+    test('defaults to ADCP_VERSION when not provided', () => {
+      const client = new ADCPMultiAgentClient([TEST_AGENT]);
+      assert.strictEqual(client.getAdcpVersion(), ADCP_VERSION);
+    });
+
+    test('returns the configured value when provided', () => {
+      const client = new ADCPMultiAgentClient([TEST_AGENT], { adcpVersion: ADCP_VERSION });
+      assert.strictEqual(client.getAdcpVersion(), ADCP_VERSION);
+    });
+  });
+
+  describe('createAdcpServer', () => {
+    test('defaults to ADCP_VERSION when not provided', () => {
+      const server = createAdcpServer({ name: 'test-server', version: '1.0.0' });
+      assert.strictEqual(server.getAdcpVersion(), ADCP_VERSION);
+    });
+
+    test('returns the configured value when provided', () => {
+      const server = createAdcpServer({
+        name: 'test-server',
+        version: '1.0.0',
+        adcpVersion: ADCP_VERSION,
+      });
+      assert.strictEqual(server.getAdcpVersion(), ADCP_VERSION);
+    });
+
+    test('config.version (app version) and adcpVersion are independent', () => {
+      const server = createAdcpServer({
+        name: 'test-server',
+        version: '7.4.2', // publisher app version
+        adcpVersion: ADCP_VERSION, // protocol version
+      });
+      assert.strictEqual(server.getAdcpVersion(), ADCP_VERSION);
+    });
+  });
+
+  describe('parseAdcpMajorVersion', () => {
+    test('extracts major from semver', () => {
+      assert.strictEqual(parseAdcpMajorVersion(ADCP_VERSION), 3);
+      assert.strictEqual(parseAdcpMajorVersion('3.0.0'), 3);
+      assert.strictEqual(parseAdcpMajorVersion('4.0.0'), 4);
+    });
+
+    test('handles legacy v-prefix aliases', () => {
+      assert.strictEqual(parseAdcpMajorVersion('v3'), 3);
+      assert.strictEqual(parseAdcpMajorVersion('v2.5'), 2);
+    });
+
+    test('returns NaN for unparseable input', () => {
+      assert.ok(Number.isNaN(parseAdcpMajorVersion('abc')));
+      assert.ok(Number.isNaN(parseAdcpMajorVersion('')));
+    });
+  });
+
+  describe('resolveAdcpVersion validation', () => {
+    test('returns the default when undefined', () => {
+      assert.strictEqual(resolveAdcpVersion(undefined), ADCP_VERSION);
+    });
+
+    test('accepts pins that resolve to a bundled version', () => {
+      // SDK bundles the current ADCP_VERSION. The full-semver pin,
+      // release-precision pin resolve to the same bundle. The 3.2 prerelease
+      // deliberately rejects its moving prerelease-family alias.
+      assert.strictEqual(resolveAdcpVersion(ADCP_VERSION), ADCP_VERSION);
+      assert.strictEqual(resolveAdcpVersion(ADCP_RELEASE_PRECISION), ADCP_RELEASE_PRECISION);
+      if (/^3\.(?:2|3)\.0-/.test(ADCP_VERSION)) {
+        assert.throws(() => resolveAdcpVersion(ADCP_PRERELEASE_FAMILY), /moving prerelease-family alias/);
+      } else {
+        assert.strictEqual(resolveAdcpVersion(ADCP_PRERELEASE_FAMILY), ADCP_PRERELEASE_FAMILY);
+      }
+    });
+
+    test('compatibility helpers include exact release-precision aliases without a moving preview family', () => {
+      const { getCompatibleVersions, isCompatibleWith } = require('../../dist/lib/index.js');
+      const { isAdcpVersionSupported } = require('../../dist/lib/utils/adcp-version-config.js');
+
+      assert.ok(getCompatibleVersions().includes(ADCP_RELEASE_PRECISION));
+      assert.strictEqual(isCompatibleWith(ADCP_RELEASE_PRECISION), true);
+      if (/^3\.(?:2|3)\.0-/.test(ADCP_VERSION)) {
+        assert.ok(!getCompatibleVersions().includes(ADCP_PRERELEASE_FAMILY));
+        assert.strictEqual(isCompatibleWith(ADCP_PRERELEASE_FAMILY), false);
+        assert.strictEqual(isAdcpVersionSupported(ADCP_VERSION, [ADCP_PRERELEASE_FAMILY]), false);
+      } else {
+        assert.ok(getCompatibleVersions().includes(ADCP_PRERELEASE_FAMILY));
+        assert.strictEqual(isCompatibleWith(ADCP_PRERELEASE_FAMILY), true);
+      }
+    });
+
+    test('server capabilities reject the moving prerelease-family alias', () => {
+      if (!/^3\.(?:2|3)\.0-/.test(ADCP_VERSION)) return;
+      assert.throws(
+        () =>
+          createAdcpServer({
+            name: 'moving-beta',
+            version: '1.0.0',
+            capabilities: { supported_versions: [ADCP_PRERELEASE_FAMILY] },
+          }),
+        /supported_versions contains moving prerelease-family alias/
+      );
+    });
+
+    test('rejects pins for which no schema bundle ships', () => {
+      // Stage 3 lifts the Stage 2 cross-major fence; the new gate is
+      // "schemas exist for this pin". '4.0.0' has no bundle in this build.
+      assert.throws(
+        () => resolveAdcpVersion('4.0.0'),
+        err =>
+          err.code === 'CONFIGURATION_ERROR' &&
+          /no schema bundle for that key ships/.test(err.message) &&
+          /sync-schemas/.test(err.message)
+      );
+    });
+
+    test('rejects unparseable strings with helpful message', () => {
+      assert.throws(
+        () => resolveAdcpVersion('not-a-version'),
+        err => err.code === 'CONFIGURATION_ERROR' && /not a valid AdCP version/.test(err.message)
+      );
+    });
+
+    test('SingleAgentClient surfaces validation error at construction', () => {
+      assert.throws(
+        () => new SingleAgentClient(TEST_AGENT, { adcpVersion: '4.0.0' }),
+        err => err.code === 'CONFIGURATION_ERROR'
+      );
+    });
+
+    test('createAdcpServer surfaces validation error at construction', () => {
+      assert.throws(
+        () => createAdcpServer({ name: 't', version: '1.0.0', adcpVersion: '4.0.0' }),
+        err => err.code === 'CONFIGURATION_ERROR'
+      );
+    });
+  });
+
+  describe('requireV3 ↔ requireSupportedMajor parity', () => {
+    test('SingleAgentClient.requireV3 delegates to requireSupportedMajor', async () => {
+      const client = new SingleAgentClient(TEST_AGENT);
+      let calledWith;
+      client.requireSupportedMajor = async function (taskType) {
+        calledWith = taskType;
+      };
+      await client.requireV3('create_media_buy');
+      assert.strictEqual(calledWith, 'create_media_buy');
+    });
+
+    test('SingleAgentClient.requireV3 forwards default taskType', async () => {
+      const client = new SingleAgentClient(TEST_AGENT);
+      let calledWith;
+      client.requireSupportedMajor = async function (taskType) {
+        calledWith = taskType;
+      };
+      await client.requireV3();
+      assert.strictEqual(calledWith, 'request');
+    });
+
+    test('AgentClient.requireV3 delegates to underlying client.requireSupportedMajor', async () => {
+      const wrapper = new AgentClient(TEST_AGENT);
+      let calledWith;
+      // AgentClient delegates to the inner SingleAgentClient via `this.client`.
+      wrapper.client.requireSupportedMajor = async function (taskType) {
+        calledWith = taskType;
+      };
+      await wrapper.requireV3('update_media_buy');
+      assert.strictEqual(calledWith, 'update_media_buy');
+    });
+
+    test('AgentClient.requireSupportedMajor and requireV3 reach the same underlying call', async () => {
+      const wrapper = new AgentClient(TEST_AGENT);
+      const seen = [];
+      wrapper.client.requireSupportedMajor = async function (taskType) {
+        seen.push(taskType);
+      };
+      await wrapper.requireSupportedMajor('a');
+      await wrapper.requireV3('b');
+      assert.deepStrictEqual(seen, ['a', 'b']);
+    });
+
+    test('SingleAgentClient.requireSupportedMajor accepts release-precision prerelease supported_versions', async () => {
+      const client = new SingleAgentClient(TEST_AGENT, { adcpVersion: ADCP_VERSION });
+      client.getCapabilities = async () => ({
+        version: 'v3',
+        majorVersions: [3],
+        supportedVersions: [ADCP_RELEASE_PRECISION],
+        protocols: [],
+        features: {},
+        idempotency: { replayTtlSeconds: 86400 },
+      });
+
+      await client.requireSupportedMajor('get_products');
+    });
+  });
+});

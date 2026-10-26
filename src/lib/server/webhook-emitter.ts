@@ -1,0 +1,1445 @@
+import { assertWebBotAuthSigningKey, signWebBotAuth, type WebBotSigningKey } from '../signing/web-bot-auth';
+/**
+ * Publisher-side webhook emitter — the symmetric counterpart to PR #629's
+ * receiver-side dedup. A seller / governance agent / rights agent building
+ * with `@adcp/sdk` gets a one-call API that handles:
+ *
+ *   - RFC 9421 webhook signing on every attempt (adcp#2423).
+ *   - A stable `idempotency_key` per logical event, reused across retries
+ *     (adcp#2417) — regenerating on retry is the #1 at-least-once-delivery
+ *     bug the runner-side conformance suite catches.
+ *   - Compact-separator JSON serialization once, signed once, posted once
+ *     (adcp#2478) — prevents the serialization-mismatch trap where a
+ *     signer's byte view differs from what the HTTP client writes.
+ *   - Retry/backoff on 5xx and 429. Terminal on 4xx and on 401 responses
+ *     carrying `WWW-Authenticate: Signature error="webhook_signature_*"`
+ *     (spec says retrying a signature failure just fails identically).
+ *   - HMAC-SHA256 fallback for legacy buyers that registered
+ *     `push_notification_config.authentication.credentials` — still pinned
+ *     to compact separators per adcp#2478.
+ *
+ * Handler authors using `createAdcpServer` call `ctx.emitWebhook(...)` with
+ * a `url`, complete payload, and SDK-local `delivery_id` — everything else
+ * is wired in. The payload's AdCP `operation_id` remains a separate task
+ * correlation identifier and MUST NOT be substituted for `delivery_id` when
+ * one operation can emit more than one status observation.
+ */
+
+import { signWebhook, type SignerKey } from '../signing/signer';
+import { signWebhookAsync } from '../signing/signer-async';
+import type { SigningProvider } from '../signing/provider';
+import type { RequestLike } from '../signing/canonicalize';
+import { canonicalJsonSha256 } from '../utils/jcs';
+import { createPinAndBindFetch } from './pin-and-bind-fetch';
+import { createHmac, randomUUID } from 'node:crypto';
+import {
+  assertDeliveryKey,
+  assertProposal,
+  assertRetentionMs,
+  isWebhookDeliveryTerminalError,
+  WebhookDeliveryTerminalError,
+} from './webhook-delivery/common';
+
+/**
+ * Minimum pattern per adcp#2417 / core/mcp-webhook-payload.json.
+ * Publisher-side check — catches `generateIdempotencyKey` overrides that
+ * produce keys too short for a conformant receiver to accept.
+ */
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_.:-]{16,255}$/;
+
+/** WWW-Authenticate header pattern signaling a signature-layer reject. */
+const TERMINAL_SIGNATURE_WWW_AUTH_RE = /Signature\s+error="webhook_signature_/i;
+
+/**
+ * Immutable binding for one webhook delivery. `delivery_id` is SDK-local;
+ * it is deliberately distinct from the AdCP `operation_id` correlation value
+ * carried inside task webhook payloads.
+ */
+export interface WebhookDeliveryBinding {
+  status: 'bound';
+  idempotencyKey: string;
+  /**
+   * Lowercase hex SHA-256 of RFC 8785 JCS({ ...payload, idempotency_key }).
+   * This is collision-resistant equality evidence, not a password hash or
+   * authenticity mechanism; RFC 9421 provides sender authentication.
+   */
+  payloadFingerprint: string;
+  /** Unix epoch milliseconds of the first delivery attempt. */
+  firstAttemptAtMs: number;
+  /**
+   * Store-authoritative physical retention boundary. The store MUST keep the
+   * full binding through this instant, then MAY replace it with a permanent
+   * retired tombstone. It MUST never make a claimed delivery ID look unused.
+   */
+  retainUntilMs: number;
+}
+
+/** Minimal permanent marker that prevents an expired delivery ID being rebound. */
+export interface WebhookDeliveryRetired {
+  status: 'retired';
+}
+
+export type WebhookDeliveryRecord = WebhookDeliveryBinding | WebhookDeliveryRetired;
+
+/** Store namespace. All members are trusted publisher-side values. */
+export interface WebhookDeliveryKey {
+  publisherScope: string;
+  tenantScope: string;
+  deliveryId: string;
+}
+
+export interface WebhookDeliveryProposal {
+  idempotencyKey: string;
+  payloadFingerprint: string;
+}
+
+/** Exact caller-owned state required to reconstruct a delivery after restart. */
+export interface WebhookDeliverySnapshot {
+  signingProfile?: 'adcp/webhook-signing/v1' | 'web-bot-auth';
+  url: string;
+  payload: Record<string, unknown>;
+  authentication: WebhookAuthentication;
+  retries: Required<WebhookRetryOptions>;
+  /**
+   * Non-secret application context used to re-authorize every external
+   * attempt, including attempts reconstructed from a durable outbox. This is
+   * stored with the recovery snapshot but is never included in the webhook
+   * body. Callers MUST NOT put credentials or bearer material here.
+   */
+  attemptAuthorizationContext?: Record<string, unknown>;
+}
+
+/**
+ * Durable outbox seam for process-crash recovery. `checkpoint` runs before
+ * the delivery binding is claimed or any POST occurs. It MUST atomically keep
+ * the first exact snapshot for `key`, reject a conflicting snapshot, encrypt
+ * authentication material at rest, and arrange replay of unsettled snapshots
+ * after restart. `settle` removes/terminalizes that snapshot only after a 2xx
+ * delivery or a non-retryable outcome. A retryable exhausted result remains
+ * pending for the outbox worker.
+ */
+export interface WebhookDeliveryRecovery {
+  readonly durability: 'durable';
+  checkpoint(
+    key: Readonly<WebhookDeliveryKey>,
+    snapshot: Readonly<WebhookDeliverySnapshot>
+  ): Promise<void | WebhookDeliveryRecoveryClaim> | void | WebhookDeliveryRecoveryClaim;
+  settle(key: Readonly<WebhookDeliveryKey>, disposition: 'delivered' | 'terminal'): Promise<void> | void;
+}
+
+/** Fenced ownership returned by SDK durable recovery implementations. */
+export interface WebhookDeliveryRecoveryClaim {
+  readonly leaseExpiresAtMs: number;
+  /** Monotone durable recovery-run ordinal when the backend exposes one. */
+  readonly attemptCount?: number;
+  /** Backend-independent renewal cadence. SDK claims set this from the configured lease duration. */
+  readonly heartbeatIntervalMs?: number;
+  renew(): Promise<boolean>;
+  release(retryAfterMs?: number): Promise<boolean>;
+  settle(disposition: 'delivered' | 'terminal'): Promise<boolean>;
+}
+
+/**
+ * Per-delivery immutable binding store. `claim` MUST be atomic and use the
+ * backend's authoritative clock when it creates `firstAttemptAtMs` and
+ * `retainUntilMs`. It returns the winning record whether this caller inserted
+ * `proposed`, another replica won, or the ID has been retired. The full
+ * binding MUST remain available through `retentionMs`. On the first claim
+ * after that boundary, the backend MUST atomically replace it with and return
+ * `{ status: 'retired' }`. A claimed key MUST never become absent/rebindable:
+ * retain the tombstone for the lifetime of the publisher/tenant delivery-ID
+ * namespace.
+ *
+ * Defaults to an in-memory Map in test/development only. Every production
+ * publisher MUST inject a durable backend (the same way
+ * `AsyncHandlerConfig.webhookDedup` accepts a pluggable store on the
+ * receiver side).
+ */
+export interface WebhookDeliveryStore {
+  readonly durability: 'process-local' | 'durable';
+  claim(
+    key: Readonly<WebhookDeliveryKey>,
+    proposed: Readonly<WebhookDeliveryProposal>,
+    retentionMs: number
+  ): Promise<WebhookDeliveryRecord> | WebhookDeliveryRecord;
+}
+
+/** @deprecated Use {@link WebhookDeliveryStore}. */
+export type WebhookIdempotencyKeyStore = WebhookDeliveryStore;
+
+export function memoryWebhookDeliveryStore(options: { now?: () => number } = {}): WebhookDeliveryStore {
+  const m = new Map<string, WebhookDeliveryRecord>();
+  const now = options.now ?? Date.now;
+  const storageKey = (key: Readonly<WebhookDeliveryKey>): string =>
+    JSON.stringify([key.publisherScope, key.tenantScope, key.deliveryId]);
+  return {
+    durability: 'process-local',
+    claim: (key, proposed, retentionMs) => {
+      assertDeliveryKey(key);
+      assertProposal(proposed);
+      assertRetentionMs(retentionMs);
+      const id = storageKey(key);
+      const existing = m.get(id);
+      if (existing?.status === 'bound' && now() > existing.retainUntilMs) {
+        const retired: WebhookDeliveryRetired = { status: 'retired' };
+        m.set(id, retired);
+        return retired;
+      }
+      if (existing !== undefined) return { ...existing };
+      const firstAttemptAtMs = now();
+      const stored: WebhookDeliveryBinding = {
+        status: 'bound',
+        ...proposed,
+        firstAttemptAtMs,
+        retainUntilMs: firstAttemptAtMs + retentionMs,
+      };
+      m.set(id, stored);
+      return { ...stored };
+    },
+  };
+}
+
+/** @deprecated Use {@link memoryWebhookDeliveryStore}. */
+export const memoryWebhookKeyStore = memoryWebhookDeliveryStore;
+
+/**
+ * Authentication mode for a single delivery. Omit / pass `null` to use the
+ * 9421 baseline. `bearer` / `hmac_sha256` drop back to legacy flows for
+ * buyers who populated `push_notification_config.authentication.credentials`.
+ *
+ * @deprecated The `hmac_sha256` variant is deprecated. HMAC remains in the
+ * AdCP spec as a legacy fallback for buyers that registered
+ * `push_notification_config.authentication.credentials`, so the SDK keeps
+ * supporting it — but the spec-current path is RFC 9421 webhook signatures.
+ * See docs/migration-4.x-to-5.x.md#webhook-hmac-legacy-deprecation.
+ */
+export type WebhookAuthentication = { type: 'bearer'; token: string } | { type: 'hmac_sha256'; secret: string } | null;
+
+let hmacWarningFired = false;
+
+function maybeWarnHmacDeprecation(suppressLegacyWarnings?: boolean): void {
+  if (hmacWarningFired) return;
+  if (suppressLegacyWarnings) return;
+  if (process.env.ADCP_SUPPRESS_HMAC_WARNING === '1') return;
+  hmacWarningFired = true;
+  console.warn(
+    '[adcp] Warning: webhook HMAC-SHA256 authentication is deprecated. ' +
+      'HMAC remains supported in the AdCP spec as a legacy fallback but RFC ' +
+      '9421 is the spec-current path; migrate when your counterparties are ' +
+      'ready. See docs/migration-4.x-to-5.x.md#webhook-hmac-legacy-deprecation. ' +
+      'Suppress with ADCP_SUPPRESS_HMAC_WARNING=1 (env) or ' +
+      'createWebhookEmitter({ suppressLegacyWarnings: true }) (programmatic).'
+  );
+}
+
+export interface WebhookRetryOptions {
+  /**
+   * Max delivery attempts (≥1). Default 5.
+   *
+   * A finite value floors to a whole attempt and clamps up to 1. A non-finite
+   * value falls back to the default, because an attempt bound has nothing to
+   * saturate to the way a delay does: `NaN` would make the delivery loop run
+   * zero attempts and re-queue itself forever without ever posting, and
+   * `Infinity` would leave it unbounded.
+   */
+  maxAttempts?: number;
+  /**
+   * Initial backoff in ms. Default 1000.
+   *
+   * Normalized to a whole millisecond from 0 through 604800000 (seven days),
+   * the range every durable recovery backend accepts for a retry-after. A
+   * fractional value floors, a value above the ceiling saturates to it, and
+   * `Infinity` saturates rather than collapsing to an immediate retry.
+   */
+  initialDelayMs?: number;
+  /** Cap per-attempt backoff. Default 60000. Normalized like `initialDelayMs`. */
+  maxDelayMs?: number;
+  /** Jitter factor ∈ [0,1]: 0 = none, 0.5 = ±50%. Default 0.25. */
+  jitter?: number;
+}
+
+export interface WebhookEmitterOptions {
+  /** Experimental profile must be selected by trusted subscription configuration. */
+  webBotAuth?: { origin: string; key: WebBotSigningKey };
+  signingProfile?: 'adcp/webhook-signing/v1' | 'web-bot-auth';
+  /**
+   * In-process JWK signing key. Its JWKS entry SHOULD carry
+   * `adcp_use: "request-signing"` — webhooks are signed with the agent's
+   * request-signing key (the deprecated `"webhook-signing"` value is still
+   * accepted by verifiers for backward compatibility). Mutually exclusive
+   * with `signerProvider` — exactly one must be provided.
+   */
+  signerKey?: SignerKey;
+  /**
+   * Async KMS-backed signing provider (GCP KMS, AWS KMS, Azure Key Vault, etc.).
+   * Routes webhook signing through `signWebhookAsync` so the private key never
+   * enters process memory. Mutually exclusive with `signerKey` — exactly one
+   * must be provided.
+   *
+   * **Key purpose.** Webhooks are signed with a `request-signing` key; domain
+   * separation between requests and webhooks is carried by the signature
+   * `tag`, not the `adcp_use` discriminator. The same `SigningProvider` used
+   * for `request_signing.provider` MAY be reused here. To isolate webhook key
+   * material (so a webhook-key compromise does not extend to request signing,
+   * or to rotate independently), wrap a second `request-signing`
+   * `cryptoKeyVersion` published under a distinct `kid` — isolation comes from
+   * the `kid`, not a distinct `adcp_use`. (The deprecated `"webhook-signing"`
+   * purpose is still accepted by verifiers for backward compatibility.)
+   */
+  signerProvider?: SigningProvider;
+  retries?: WebhookRetryOptions;
+  /**
+   * Durable immutable delivery-binding store. Multi-replica publishers MUST
+   * provide a shared implementation whose `claim` is atomic.
+   */
+  deliveryStore?: WebhookDeliveryStore;
+  /** @deprecated Use `deliveryStore`. */
+  idempotencyKeyStore?: WebhookDeliveryStore;
+  /**
+   * Maximum interval after the first attempt during which this emitter may
+   * retry a delivery. Defaults to the AdCP 3.2 minimum of 86400 seconds (24h).
+   * Must be an integer from 86400 through 604800 (7d).
+   */
+  deliveryRetryHorizonSeconds?: number;
+  /**
+   * Durable delivery snapshot/outbox. Required in production so the
+   * advertised retry horizon remains recoverable across process crashes.
+   */
+  deliveryRecovery?: WebhookDeliveryRecovery;
+  /**
+   * Stable publisher namespace for shared delivery stores. Production direct
+   * emitter callers MUST set this. `createAdcpServer` defaults it from the
+   * trusted server name.
+   */
+  publisherScope?: string;
+  /**
+   * Stable tenant namespace for direct emitter callers. A production emitter
+   * that omits it is intentionally unbound: direct `emit()` calls fail until
+   * `forTenantScope()` supplies trusted scope. `createAdcpServer` derives that
+   * scope from resolved request context and never from webhook payload fields.
+   */
+  tenantScope?: string;
+  /**
+   * Override the default idempotency-key generator. Must return a value
+   * matching `/^[A-Za-z0-9_.:-]{16,255}$/` — the emitter rejects anything
+   * else (a malformed key would fail the receiver's schema check, which
+   * would report as a conformance violation of the publisher).
+   */
+  generateIdempotencyKey?: () => string;
+  /**
+   * Override the HTTP client. Defaults to `createPinAndBindFetch()`, which
+   * defeats DNS-rebinding / SSRF attacks against the buyer-supplied
+   * `push_notification_config.url` (https-only; loopback, private, and cloud
+   * metadata ranges denied). See `docs/guides/SIGNING-GUIDE.md` § Webhook
+   * SSRF defense.
+   *
+   * In-process storyboard / test harnesses that deliver to a loopback
+   * `http://127.0.0.1:port` receiver must opt into the relaxed policy
+   * explicitly: `fetch: createPinAndBindFetch({ policy:
+   * LOOPBACK_OK_WEBHOOK_SSRF_POLICY })`. Passing `globalThis.fetch` here
+   * restores the unguarded pre-9.8 behavior — only do so behind your own
+   * URL validation.
+   */
+  fetch?: typeof fetch;
+  /** Default `User-Agent` header. */
+  userAgent?: string;
+  /** Signing tag override. Defaults to `adcp/webhook-signing/v1`. */
+  tag?: string;
+  /** Observability hook called BEFORE each attempt. */
+  onAttempt?: (info: WebhookEmitAttempt) => void | Promise<void>;
+  /** Observability hook called AFTER each attempt completes. */
+  onAttemptResult?: (info: WebhookEmitAttemptResult) => void | Promise<void>;
+  /** Observer failures are isolated from delivery and reported here. */
+  onAttemptObserverError?: (error: unknown, phase: 'attempt' | 'result') => void;
+  /** Maximum time allowed for each non-authoritative observability hook. Defaults to 5 seconds. */
+  attemptObserverTimeoutMs?: number;
+  /** Maximum time allowed for signing plus one external POST. Defaults to 30 seconds. */
+  deliveryTimeoutMs?: number;
+  /**
+   * Resolve a retry ordinal before authorization. A successful authorization
+   * may replace it with the ordinal returned by its final durable pre-POST
+   * checkpoint; reporting activity uses that later seam so suppressions do
+   * not consume transport attempts. Do not back both seams with the same
+   * counter: use this option for pre-authorization allocation or return an
+   * ordinal from the authorizer checkpoint, never both.
+   */
+  resolveAttemptOrdinal?: (candidate: Readonly<WebhookEmitAttempt>) => number | Promise<number>;
+  /**
+   * Fail-closed authorization hook invoked immediately before every external
+   * POST, including each in-process retry and every recovered attempt. A
+   * suppression is terminal for this delivery identity. Throwing is treated
+   * as `authorization_error` and never falls through to network delivery.
+   *
+   * The hook may resolve write-only authentication just in time. This lets a
+   * persistent subscription runtime keep only an opaque credential binding in
+   * its store and keep the clear credential out of recovery snapshots.
+   */
+  authorizeAttempt?: WebhookAttemptAuthorizer;
+  /**
+   * Sleeper override. Production uses `setTimeout`; tests inject a stub to
+   * skip real backoff. Takes (ms, abortSignal) and resolves when slept.
+   */
+  sleep?: (ms: number) => Promise<void>;
+  /**
+   * Suppress the one-time `console.warn` emitted on first HMAC-SHA256
+   * webhook delivery. Programmatic equivalent of
+   * `ADCP_SUPPRESS_HMAC_WARNING=1`, for libraries embedded in agents where
+   * setting an env var is awkward. Does not affect the `@deprecated` JSDoc
+   * flag on `WebhookAuthentication` — the type-level deprecation signal
+   * always shows up in IDEs.
+   */
+  suppressLegacyWarnings?: boolean;
+  /** Clock override for deterministic tests. */
+  now?: () => number;
+}
+
+export interface WebhookEmitParams {
+  /** Full destination URL. Typically from `push_notification_config.url`. */
+  url: string;
+  /** Object body. Serialized with compact separators (adcp#2478). */
+  payload: Record<string, unknown>;
+  /**
+   * SDK-local identity for this exact webhook delivery. Retries MUST reuse
+   * the same value; a changed payload or distinct lifecycle observation MUST
+   * use a fresh value. This is intentionally not the AdCP `operation_id`,
+   * which remains a stable task correlation value inside the payload.
+   */
+  delivery_id: string;
+  /**
+   * Per-emit override of the delivery's authentication mode. Omit for the
+   * 9421 default.
+   */
+  authentication?: WebhookAuthentication;
+  signingProfile?: 'adcp/webhook-signing/v1' | 'web-bot-auth';
+  /** Per-emit retries override. */
+  retries?: WebhookRetryOptions;
+  /**
+   * Non-secret context for `authorizeAttempt`. It is durably snapshotted so a
+   * restarted worker can re-check the exact subscription generation. It is
+   * never serialized into the webhook payload.
+   */
+  attemptAuthorizationContext?: Record<string, unknown>;
+}
+
+export interface WebhookEmitAttempt {
+  delivery_id: string;
+  idempotency_key: string;
+  attempt: number;
+  url: string;
+  /** Exact UTF-8 byte length of the serialized request body. */
+  payload_size_bytes: number;
+  /** Durable non-secret context supplied by the emission owner. */
+  attemptAuthorizationContext?: Record<string, unknown>;
+  /**
+   * True when this attempt replays a durable outbox snapshot rather than a live
+   * emission. A recovered attempt is pinned to the snapshot it was taken from,
+   * so authority that has since moved on can never become valid for it.
+   */
+  recovered?: boolean;
+}
+
+export type WebhookAttemptSuppressionReason =
+  /** A durable pre-POST attempt checkpoint could not be written. */
+  | 'attempt_checkpoint_unavailable'
+  | 'authorization_denied'
+  | 'authorization_error'
+  | 'subscription_missing'
+  | 'subscription_inactive'
+  | 'subscription_stale'
+  | 'event_not_allowed'
+  | 'credential_unavailable';
+
+export type WebhookAttemptAuthorizationDecision =
+  | {
+      decision: 'allow';
+      /** Optional just-in-time override; `null` explicitly selects RFC 9421. */
+      authentication?: WebhookAuthentication;
+      signingProfile?: 'adcp/webhook-signing/v1' | 'web-bot-auth';
+      /** Durable transport ordinal allocated by the pre-POST checkpoint. */
+      attemptOrdinal?: number;
+    }
+  | {
+      decision: 'suppress';
+      reason: WebhookAttemptSuppressionReason;
+      /**
+       * True when authority could not be established rather than deliberately
+       * withheld. The delivery stays pending for the outbox worker instead of
+       * being terminalized, so a transient store, authorization or credential
+       * failure does not destroy the only durable record of the send.
+       */
+      retryable?: boolean;
+    };
+
+export type WebhookAttemptAuthorizer = (
+  info: Readonly<WebhookEmitAttempt>
+) => Promise<WebhookAttemptAuthorizationDecision> | WebhookAttemptAuthorizationDecision;
+
+export interface WebhookEmitAttemptResult extends WebhookEmitAttempt {
+  status?: number;
+  durationMs: number;
+  error?: string;
+  willRetry: boolean;
+}
+
+export interface WebhookEmitResult {
+  delivery_id: string;
+  idempotency_key: string;
+  /** Number of external HTTP attempts; authorization suppression before network access reports zero. */
+  attempts: number;
+  delivered: boolean;
+  /** True only when the final outcome is known to be non-retryable. */
+  terminal?: boolean;
+  final_status?: number;
+  /** Sanitized per-attempt failure classifications; nested provider/backend messages are never copied here. */
+  errors: string[];
+  /**
+   * Present when live delivery authority failed closed before an external
+   * attempt. `retryable` marks authority that could not be established, which
+   * leaves the delivery pending for the outbox worker.
+   */
+  suppression?: { reason: WebhookAttemptSuppressionReason; retryable?: boolean };
+}
+
+export interface WebhookEmitter {
+  emit(params: WebhookEmitParams): Promise<WebhookEmitResult>;
+  /** Bind an emitter to a trusted tenant namespace without exposing scope in emit params. */
+  forTenantScope(tenantScope: string): WebhookEmitter;
+}
+
+/** SDK emitter with durable replay support. Kept separate so existing custom WebhookEmitter implementations remain valid. */
+export interface RecoverableWebhookEmitter extends WebhookEmitter {
+  /** Replay a fenced durable snapshot without creating a competing checkpoint. */
+  emitRecovered(delivery: WebhookRecoveredDelivery): Promise<WebhookEmitResult>;
+  forTenantScope(tenantScope: string): RecoverableWebhookEmitter;
+}
+
+export interface WebhookRecoveredDelivery extends WebhookDeliveryRecoveryClaim {
+  key: WebhookDeliveryKey;
+  snapshot: WebhookDeliverySnapshot;
+}
+
+// ────────────────────────────────────────────────────────────
+// Factory
+// ────────────────────────────────────────────────────────────
+
+export function createWebhookEmitter(options: WebhookEmitterOptions): RecoverableWebhookEmitter {
+  if (options.signerKey && options.signerProvider) {
+    throw new TypeError('createWebhookEmitter: provide exactly one of signerKey or signerProvider, not both');
+  }
+  if (!options.signerKey && !options.signerProvider) {
+    throw new TypeError('createWebhookEmitter: one of signerKey or signerProvider is required');
+  }
+  if (options.deliveryStore && options.idempotencyKeyStore) {
+    throw new TypeError('createWebhookEmitter: provide deliveryStore, not both deliveryStore and idempotencyKeyStore');
+  }
+  if (options.webBotAuth?.key) assertWebBotAuthSigningKey(options.webBotAuth.key);
+  const retryHorizonSeconds = resolveRetryHorizonSeconds(options.deliveryRetryHorizonSeconds);
+  const explicitStore = options.deliveryStore ?? options.idempotencyKeyStore;
+  const store = explicitStore ?? memoryWebhookDeliveryStore({ now: options.now });
+  const production = process.env.NODE_ENV !== 'test' && process.env.NODE_ENV !== 'development';
+  if (production && store.durability !== 'durable') {
+    throw new TypeError(
+      'createWebhookEmitter: production webhook emission requires a durable WebhookDeliveryStore; ' +
+        'memoryWebhookDeliveryStore() is for development and tests only'
+    );
+  }
+  if (production && options.deliveryRecovery?.durability !== 'durable') {
+    throw new TypeError(
+      'createWebhookEmitter: production webhook emission requires durable deliveryRecovery ' +
+        'to checkpoint exact retry state before the first attempt'
+    );
+  }
+  if (production && !options.publisherScope) {
+    throw new TypeError('createWebhookEmitter: production webhook emitters require a non-empty publisherScope');
+  }
+  const publisherScope = requireScope(options.publisherScope ?? 'development-publisher', 'publisherScope');
+  const tenantScope =
+    options.tenantScope === undefined && production
+      ? undefined
+      : requireScope(options.tenantScope ?? 'development-tenant', 'tenantScope');
+  const generateKey = options.generateIdempotencyKey ?? defaultGenerateIdempotencyKey;
+  const fetchImpl = options.fetch ?? createPinAndBindFetch();
+  const sleep = options.sleep ?? defaultSleep;
+  const now = options.now ?? Date.now;
+  const observerTimeoutMs = options.attemptObserverTimeoutMs ?? 5_000;
+  const deliveryTimeoutMs = options.deliveryTimeoutMs ?? 30_000;
+  assertPositiveInteger(observerTimeoutMs, 'attemptObserverTimeoutMs', 300_000);
+  assertPositiveInteger(deliveryTimeoutMs, 'deliveryTimeoutMs', 300_000);
+
+  const makeEmitter = (boundTenantScope: string | undefined): RecoverableWebhookEmitter => ({
+    forTenantScope(nextTenantScope: string): RecoverableWebhookEmitter {
+      return makeEmitter(requireScope(nextTenantScope, 'tenantScope'));
+    },
+    emitRecovered(delivery): Promise<WebhookEmitResult> {
+      if (delivery.key.publisherScope !== publisherScope || delivery.key.tenantScope !== boundTenantScope) {
+        throw new Error('Recovered webhook delivery does not belong to this publisher/tenant emitter scope.');
+      }
+      return this.emit({
+        url: delivery.snapshot.url,
+        payload: delivery.snapshot.payload,
+        authentication: delivery.snapshot.authentication,
+        retries: delivery.snapshot.retries,
+        signingProfile: delivery.snapshot.signingProfile ?? 'adcp/webhook-signing/v1',
+        ...(delivery.snapshot.attemptAuthorizationContext === undefined
+          ? {}
+          : { attemptAuthorizationContext: delivery.snapshot.attemptAuthorizationContext }),
+        delivery_id: delivery.key.deliveryId,
+        __recoveryClaim: delivery,
+      } as WebhookEmitParams & { __recoveryClaim: WebhookDeliveryRecoveryClaim });
+    },
+    async emit(params: WebhookEmitParams): Promise<WebhookEmitResult> {
+      if (boundTenantScope === undefined) {
+        throw new TypeError(
+          'WebhookEmitter.emit: production emitter is not tenant-bound; call forTenantScope(trustedTenant) before emit()'
+        );
+      }
+      // Snapshot every caller-owned value before the first await. A slow
+      // durable claim must not let post-invocation mutation change identity,
+      // destination, authentication, or retry policy.
+      const deliveryId = params.delivery_id;
+      if (typeof deliveryId !== 'string' || deliveryId.length === 0) {
+        throw new TypeError('delivery_id must be a non-empty string');
+      }
+      const url = params.url;
+      const signingProfile = params.signingProfile ?? options.signingProfile ?? 'adcp/webhook-signing/v1';
+      if (
+        !['adcp/webhook-signing/v1', 'web-bot-auth'].includes(signingProfile) ||
+        (signingProfile === 'web-bot-auth' && !options.webBotAuth)
+      )
+        throw new TypeError('Unsupported or unconfigured webhook signing profile');
+      const payloadSnapshot = structuredClone(params.payload);
+      if (signingProfile === 'web-bot-auth' && params.authentication != null)
+        throw new TypeError('Web Bot Auth cannot be combined with legacy webhook authentication');
+      const authentication = params.authentication == null ? null : structuredClone(params.authentication);
+      const attemptAuthorizationContext =
+        params.attemptAuthorizationContext === undefined
+          ? undefined
+          : structuredClone(params.attemptAuthorizationContext);
+      const retries = resolveRetries(params.retries === undefined ? options.retries : structuredClone(params.retries));
+      assertIJson(payloadSnapshot);
+      if (attemptAuthorizationContext !== undefined) assertIJson(attemptAuthorizationContext);
+      const deliveryKey = { publisherScope, tenantScope: boundTenantScope, deliveryId };
+      const recoveredClaim = (params as WebhookEmitParams & { __recoveryClaim?: WebhookDeliveryRecoveryClaim })
+        .__recoveryClaim;
+      const recoveryClaim =
+        recoveredClaim ??
+        (await options.deliveryRecovery?.checkpoint(deliveryKey, {
+          url,
+          payload: structuredClone(payloadSnapshot),
+          authentication: authentication === null ? null : structuredClone(authentication),
+          retries: { ...retries },
+          ...((signingProfile === 'web-bot-auth' || options.signingProfile === 'web-bot-auth') && { signingProfile }),
+          ...(attemptAuthorizationContext === undefined
+            ? {}
+            : { attemptAuthorizationContext: structuredClone(attemptAuthorizationContext) }),
+        }));
+      const recoveryHeartbeat = recoveryClaim ? startRecoveryClaimHeartbeat(recoveryClaim) : undefined;
+      try {
+        let binding;
+        try {
+          binding = await resolveDeliveryBinding({
+            store,
+            key: deliveryKey,
+            payload: payloadSnapshot,
+            generateKey,
+            nowMs: now(),
+            retryHorizonSeconds,
+          });
+        } catch (error) {
+          if (isWebhookDeliveryTerminalError(error) && recoveryClaim && !recoveredClaim) {
+            await recoveryHeartbeat?.stop();
+            if (!recoveryHeartbeat?.lossMessage() && !(await recoveryClaim.settle('terminal'))) {
+              throw new Error('Terminal delivery binding failure could not settle its recovery lease', {
+                cause: error,
+              });
+            }
+          }
+          throw error;
+        }
+        const idempotency_key = binding.idempotencyKey;
+
+        // Serialize ONCE with compact separators — the same bytes feed both
+        // the content-digest input and the HTTP body on every attempt. This
+        // is the load-bearing rule from adcp#2478.
+        const bodyPayload = { ...payloadSnapshot, idempotency_key };
+        const bodyBytes = JSON.stringify(bodyPayload);
+
+        const errors: string[] = [];
+        let lastStatus: number | undefined;
+        let finalTerminal = false;
+        let attempts = 0;
+
+        for (let attempt = 1; attempt <= retries.maxAttempts; attempt++) {
+          await recoveryHeartbeat?.renewNow();
+          if (attempt > 1) {
+            binding = await refreshDeliveryBinding(store, deliveryKey, binding, retryHorizonSeconds);
+          }
+          assertWithinRetryHorizon(binding, deliveryId, now(), retryHorizonSeconds);
+          const candidate: WebhookEmitAttempt = {
+            delivery_id: deliveryId,
+            idempotency_key,
+            attempt,
+            url,
+            payload_size_bytes: Buffer.byteLength(bodyBytes, 'utf8'),
+            ...(attemptAuthorizationContext === undefined
+              ? {}
+              : { attemptAuthorizationContext: structuredClone(attemptAuthorizationContext) }),
+            ...(recoveredClaim ? { recovered: true } : {}),
+          };
+          const resolvedAttempt = options.resolveAttemptOrdinal
+            ? await promiseBeforeDeadline(
+                Promise.resolve(options.resolveAttemptOrdinal(candidate)),
+                deliveryTimeoutMs,
+                'webhook attempt ordinal resolution timed out'
+              )
+            : attempt;
+          assertPositiveInteger(resolvedAttempt, 'resolved webhook attempt ordinal', 1_000_000);
+          let attemptInfo: WebhookEmitAttempt = { ...candidate, attempt: resolvedAttempt };
+
+          let attemptAuthentication = authentication;
+          let attemptSigningProfile = signingProfile;
+          if (options.authorizeAttempt) {
+            let authorization: WebhookAttemptAuthorizationDecision;
+            try {
+              authorization = await options.authorizeAttempt(attemptInfo);
+              assertAttemptAuthorizationDecision(authorization);
+            } catch {
+              authorization = { decision: 'suppress', reason: 'authorization_error' };
+            }
+            if (authorization.decision === 'suppress') {
+              const retryableSuppression = authorization.retryable === true;
+              await recoveryHeartbeat?.stop();
+              const heartbeatError = recoveryHeartbeat?.lossMessage();
+              if (heartbeatError) errors.push(heartbeatError);
+              if (!recoveredClaim) {
+                if (recoveryClaim) {
+                  const settled = retryableSuppression
+                    ? await recoveryClaim.release(backoffDelay(attempt, retries))
+                    : await recoveryClaim.settle('terminal');
+                  if (!heartbeatError && !settled) {
+                    errors.push('suppressed delivery could not settle its recovery lease');
+                  }
+                } else if (!retryableSuppression) {
+                  await options.deliveryRecovery?.settle(deliveryKey, 'terminal');
+                }
+              }
+              return {
+                delivery_id: deliveryId,
+                idempotency_key,
+                attempts,
+                delivered: false,
+                terminal: !retryableSuppression,
+                errors,
+                suppression: { reason: authorization.reason, ...(retryableSuppression ? { retryable: true } : {}) },
+              };
+            }
+            if (authorization.attemptOrdinal !== undefined) {
+              assertPositiveInteger(authorization.attemptOrdinal, 'authorized webhook attempt ordinal', 1_000_000);
+              attemptInfo = { ...attemptInfo, attempt: authorization.attemptOrdinal };
+            }
+            if (authorization.signingProfile !== undefined) {
+              if (
+                !['adcp/webhook-signing/v1', 'web-bot-auth'].includes(authorization.signingProfile) ||
+                (authorization.signingProfile === 'web-bot-auth' && !options.webBotAuth)
+              )
+                throw new TypeError('Attempt selected an unsupported webhook signing profile');
+              attemptSigningProfile = authorization.signingProfile;
+            }
+            if ('authentication' in authorization) {
+              attemptAuthentication =
+                authorization.authentication == null ? null : structuredClone(authorization.authentication);
+            }
+          }
+          if (attemptSigningProfile === 'web-bot-auth' && attemptAuthentication !== null)
+            throw new TypeError('Web Bot Auth cannot be combined with legacy webhook authentication');
+          attempts = attempt;
+          await observeAttempt(options, 'attempt', attemptInfo);
+          // Observers are awaited and may outlive a recovery lease. Fence the
+          // final transport boundary after they finish, before any POST.
+          await recoveryHeartbeat?.renewNow();
+
+          const started = Date.now();
+          let status: number | undefined;
+          let error: string | undefined;
+          let terminal = false;
+
+          try {
+            const controller = new AbortController();
+            const response = await promiseBeforeDeadline(
+              deliverOnce({
+                url,
+                bodyBytes,
+                signerKey: options.signerKey,
+                signerProvider: options.signerProvider,
+                webBotAuth: options.webBotAuth,
+                signingProfile: attemptSigningProfile,
+                authentication: attemptAuthentication,
+                tag: options.tag,
+                userAgent: options.userAgent,
+                fetch: fetchImpl,
+                signal: controller.signal,
+                suppressLegacyWarnings: options.suppressLegacyWarnings,
+              }),
+              deliveryTimeoutMs,
+              'webhook delivery timed out',
+              () => controller.abort()
+            );
+            status = response.status;
+            lastStatus = status;
+
+            if (status >= 200 && status < 300) {
+              const durationMs = Date.now() - started;
+              await observeAttempt(options, 'result', { ...attemptInfo, status, durationMs, willRetry: false });
+              await recoveryHeartbeat?.stop();
+              const heartbeatError = recoveryHeartbeat?.lossMessage();
+              if (heartbeatError) errors.push(heartbeatError);
+              if (recoveredClaim) {
+                // The polling worker owns fenced settlement after classifying
+                // this recovered attempt.
+              } else if (recoveryClaim) {
+                if (!heartbeatError && !(await recoveryClaim.settle('delivered'))) {
+                  errors.push('delivery succeeded but its recovery lease could not be settled');
+                }
+              } else {
+                await options.deliveryRecovery?.settle(deliveryKey, 'delivered');
+              }
+              return {
+                delivery_id: deliveryId,
+                idempotency_key,
+                attempts: attempt,
+                delivered: true,
+                terminal: false,
+                final_status: status,
+                errors,
+              };
+            }
+
+            terminal = isTerminalStatus(status, response.wwwAuthenticate);
+            error =
+              status >= 300 && status < 400
+                ? `HTTP ${status} redirect — redirects are ` +
+                  `never followed for signed webhook delivery, because the signature covers @target-uri and ` +
+                  `would not verify at the redirect target. Re-register the webhook with the final URL.`
+                : `HTTP ${status}`;
+          } catch (err) {
+            error = formatTransportError(err);
+            // Network / transport errors are retryable — the delivery didn't
+            // reach the receiver, so no risk of double-processing.
+            // Pin-and-bind SSRF blocks are themselves terminal: the URL
+            // (or its DNS resolution) violates policy and won't change on retry.
+            if (errorContainsCode(err, 'EADCP_SSRF_BLOCKED')) {
+              terminal = true;
+            }
+          }
+
+          if (error) errors.push(`attempt ${attempt}: ${error}`);
+
+          const willRetry = !terminal && attempt < retries.maxAttempts;
+          finalTerminal = terminal;
+          await observeAttempt(options, 'result', {
+            ...attemptInfo,
+            ...(status !== undefined && { status }),
+            durationMs: Date.now() - started,
+            error,
+            willRetry,
+          });
+
+          if (!willRetry) break;
+
+          await sleep(backoffDelay(attempt, retries));
+        }
+
+        await recoveryHeartbeat?.stop();
+        const heartbeatError = recoveryHeartbeat?.lossMessage();
+        if (heartbeatError) errors.push(heartbeatError);
+        if (finalTerminal && !recoveredClaim) {
+          if (recoveryClaim && !heartbeatError && !(await recoveryClaim.settle('terminal'))) {
+            errors.push('terminal delivery outcome could not settle its recovery lease');
+          } else if (!recoveryClaim) await options.deliveryRecovery?.settle(deliveryKey, 'terminal');
+        } else if (recoveryClaim && !recoveredClaim && !heartbeatError) {
+          if (!(await recoveryClaim.release(0))) {
+            errors.push('retryable delivery outcome could not release its recovery lease');
+          }
+        }
+
+        return {
+          delivery_id: deliveryId,
+          idempotency_key,
+          attempts,
+          delivered: false,
+          terminal: finalTerminal,
+          ...(lastStatus !== undefined && { final_status: lastStatus }),
+          errors,
+        };
+      } finally {
+        await recoveryHeartbeat?.stop();
+      }
+    },
+  });
+  return makeEmitter(tenantScope);
+}
+
+async function observeAttempt(
+  options: WebhookEmitterOptions,
+  phase: 'attempt' | 'result',
+  value: WebhookEmitAttempt | WebhookEmitAttemptResult
+): Promise<void> {
+  try {
+    const observer =
+      phase === 'attempt'
+        ? options.onAttempt?.(value as WebhookEmitAttempt)
+        : options.onAttemptResult?.(value as WebhookEmitAttemptResult);
+    if (observer !== undefined) {
+      await promiseBeforeDeadline(
+        Promise.resolve(observer),
+        options.attemptObserverTimeoutMs ?? 5_000,
+        `webhook ${phase} observer timed out`
+      );
+    }
+  } catch (error) {
+    try {
+      if (options.onAttemptObserverError) options.onAttemptObserverError(error, phase);
+      else console.warn(`[adcp/webhook] ${phase} observer failed`);
+    } catch {
+      // Delivery observability is deliberately isolated from transport.
+      try {
+        console.warn(`[adcp/webhook] ${phase} observer-error hook failed`);
+      } catch {
+        // A broken logger must not prevent delivery.
+      }
+    }
+  }
+}
+
+function assertAttemptAuthorizationDecision(value: unknown): asserts value is WebhookAttemptAuthorizationDecision {
+  if (value == null || typeof value !== 'object') {
+    throw new TypeError('authorizeAttempt must return an authorization decision');
+  }
+  const decision = value as { decision?: unknown; reason?: unknown; authentication?: unknown };
+  if (decision.decision === 'allow') {
+    if ('authentication' in decision) assertWebhookAuthentication(decision.authentication);
+    return;
+  }
+  if (
+    decision.decision !== 'suppress' ||
+    ![
+      'attempt_checkpoint_unavailable',
+      'authorization_denied',
+      'authorization_error',
+      'subscription_missing',
+      'subscription_inactive',
+      'subscription_stale',
+      'event_not_allowed',
+      'credential_unavailable',
+    ].includes(String(decision.reason))
+  ) {
+    throw new TypeError('authorizeAttempt returned an invalid authorization decision');
+  }
+}
+
+function assertWebhookAuthentication(value: unknown): asserts value is WebhookAuthentication {
+  if (value === null) return;
+  if (value == null || typeof value !== 'object') {
+    throw new TypeError('authorizeAttempt authentication must be null, bearer, or hmac_sha256');
+  }
+  const auth = value as { type?: unknown; token?: unknown; secret?: unknown };
+  if (auth.type === 'bearer' && typeof auth.token === 'string' && auth.token.length > 0) return;
+  if (auth.type === 'hmac_sha256' && typeof auth.secret === 'string' && auth.secret.length > 0) return;
+  throw new TypeError('authorizeAttempt authentication must be null, bearer, or hmac_sha256');
+}
+
+interface RecoveryClaimHeartbeat {
+  renewNow(): Promise<void>;
+  stop(): Promise<void>;
+  lossMessage(): string | undefined;
+}
+
+/** Keep the initial live-owner fence valid across KMS, POST, and retry sleeps. */
+function startRecoveryClaimHeartbeat(claim: WebhookDeliveryRecoveryClaim): RecoveryClaimHeartbeat {
+  let stopped = false;
+  let lost: Error | undefined;
+  let inFlight: Promise<void> | undefined;
+  // Never subtract the backend-authoritative expiry from the replica's wall
+  // clock. Clock skew could otherwise postpone the first renewal until after
+  // takeover. Third-party legacy claims fall back to the safe 1s-lease cadence.
+  const intervalMs = claim.heartbeatIntervalMs ?? 250;
+
+  const markLost = (cause?: unknown) => {
+    lost = new Error('Webhook delivery recovery lease was lost during backend renewal', {
+      ...(cause !== undefined && { cause }),
+    });
+  };
+  const renew = async () => {
+    if (stopped || lost) return;
+    try {
+      if (!(await claim.renew())) markLost();
+    } catch (error) {
+      markLost(error);
+    }
+  };
+  const scheduleRenewal = () => {
+    if (stopped || lost || inFlight) return;
+    inFlight = renew().finally(() => {
+      inFlight = undefined;
+    });
+  };
+  const timer = setInterval(scheduleRenewal, intervalMs);
+  timer.unref?.();
+
+  return {
+    async renewNow() {
+      if (inFlight) await inFlight;
+      if (!stopped && !lost) await renew();
+      if (lost) throw lost;
+    },
+    async stop() {
+      if (!stopped) {
+        stopped = true;
+        clearInterval(timer);
+      }
+      if (inFlight) await inFlight;
+    },
+    lossMessage: () => lost?.message,
+  };
+}
+
+async function refreshDeliveryBinding(
+  store: WebhookDeliveryStore,
+  key: WebhookDeliveryKey,
+  expected: WebhookDeliveryBinding,
+  retryHorizonSeconds: number
+): Promise<WebhookDeliveryBinding> {
+  const record = await store.claim(
+    key,
+    { idempotencyKey: expected.idempotencyKey, payloadFingerprint: expected.payloadFingerprint },
+    retryHorizonSeconds * 1000
+  );
+  if (record?.status === 'retired') throw retiredDeliveryError(key.deliveryId);
+  const binding = record as WebhookDeliveryBinding;
+  assertValidDeliveryBinding(binding, key.deliveryId, retryHorizonSeconds);
+  if (
+    binding.idempotencyKey !== expected.idempotencyKey ||
+    binding.payloadFingerprint !== expected.payloadFingerprint ||
+    binding.firstAttemptAtMs !== expected.firstAttemptAtMs ||
+    binding.retainUntilMs !== expected.retainUntilMs
+  ) {
+    throw new Error(`Webhook delivery store changed the immutable binding for delivery_id "${key.deliveryId}".`);
+  }
+  return binding;
+}
+
+// ────────────────────────────────────────────────────────────
+// Delivery primitives
+// ────────────────────────────────────────────────────────────
+
+interface DeliveryResponse {
+  status: number;
+  wwwAuthenticate?: string;
+  /** `Location` on a 3xx, so the diagnostic can name the redirect target. */
+  location?: string;
+}
+
+function assertPositiveInteger(value: number, name: string, maximum: number): void {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new TypeError(`${name} must be an integer from 1 through ${maximum}`);
+  }
+}
+
+async function promiseBeforeDeadline<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  message: string,
+  onTimeout?: () => void
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      onTimeout?.();
+      const error = new Error(message);
+      Object.assign(error, { code: 'ETIMEDOUT' });
+      reject(error);
+    }, timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function deliverOnce(args: {
+  url: string;
+  bodyBytes: string;
+  signerKey?: SignerKey;
+  signerProvider?: SigningProvider;
+  authentication: WebhookAuthentication;
+  webBotAuth?: { origin: string; key: WebBotSigningKey };
+  signingProfile?: 'adcp/webhook-signing/v1' | 'web-bot-auth';
+  tag?: string;
+  userAgent?: string;
+  fetch: typeof fetch;
+  signal: AbortSignal;
+  suppressLegacyWarnings?: boolean;
+}): Promise<DeliveryResponse> {
+  const headers = await buildHeaders(args);
+  const response = await args.fetch(args.url, {
+    method: 'POST',
+    headers,
+    body: args.bodyBytes,
+    signal: args.signal,
+  });
+  return {
+    status: response.status,
+    ...(response.headers.get('www-authenticate') && { wwwAuthenticate: response.headers.get('www-authenticate')! }),
+    ...(response.headers.get('location') && { location: response.headers.get('location')! }),
+  };
+}
+
+async function buildHeaders(args: {
+  url: string;
+  bodyBytes: string;
+  signerKey?: SignerKey;
+  signerProvider?: SigningProvider;
+  authentication: WebhookAuthentication;
+  webBotAuth?: { origin: string; key: WebBotSigningKey };
+  signingProfile?: 'adcp/webhook-signing/v1' | 'web-bot-auth';
+  tag?: string;
+  userAgent?: string;
+  suppressLegacyWarnings?: boolean;
+}): Promise<Record<string, string>> {
+  const baseHeaders: Record<string, string> = {
+    'content-type': 'application/json',
+  };
+  if (args.userAgent) baseHeaders['user-agent'] = args.userAgent;
+
+  // Legacy HMAC-SHA256 path. Matches docs/building/implementation/webhooks.mdx
+  // §3.0 legacy section: X-ADCP-Signature + X-ADCP-Timestamp over
+  // `${ts}.${raw_body_bytes}`.
+  if (args.authentication?.type === 'hmac_sha256') {
+    maybeWarnHmacDeprecation(args.suppressLegacyWarnings);
+    const ts = Math.floor(Date.now() / 1000).toString();
+    const hmac = createHmac('sha256', args.authentication.secret);
+    hmac.update(`${ts}.${args.bodyBytes}`, 'utf8');
+    return {
+      ...baseHeaders,
+      'x-adcp-timestamp': ts,
+      'x-adcp-signature': `sha256=${hmac.digest('hex')}`,
+    };
+  }
+
+  // Bearer fallback — the legacy path for buyers that registered an API
+  // key in push_notification_config.authentication. No body signing —
+  // just a header. Not recommended; strictly for interop with 2.x buyers.
+  if (args.authentication?.type === 'bearer') {
+    return { ...baseHeaders, authorization: `Bearer ${args.authentication.token}` };
+  }
+
+  // Default: 9421 webhook signing. Fresh nonce + fresh created/expires per
+  // attempt, but the `idempotency_key` inside the body stays stable — the
+  // signature covers the body bytes, which include the key; multiple
+  // retries of the same logical event produce different signatures over
+  // the same body, which is exactly what the receiver expects.
+  const request: RequestLike = {
+    method: 'POST',
+    url: args.url,
+    headers: baseHeaders,
+    body: args.bodyBytes,
+  };
+  if (args.signingProfile === 'web-bot-auth') {
+    if (!args.webBotAuth) throw new TypeError('Selected Web Bot Auth profile has no configured signing identity');
+    return signWebBotAuth(request, args.webBotAuth.key, { origin: args.webBotAuth.origin });
+  }
+  const signOpts = args.tag !== undefined ? { tag: args.tag } : {};
+  const signed = args.signerProvider
+    ? await signWebhookAsync(request, args.signerProvider, signOpts)
+    : signWebhook(request, args.signerKey!, signOpts);
+  return { ...baseHeaders, ...signed.headers };
+}
+
+// ────────────────────────────────────────────────────────────
+// Helpers
+// ────────────────────────────────────────────────────────────
+
+async function resolveDeliveryBinding(args: {
+  store: WebhookDeliveryStore;
+  key: WebhookDeliveryKey;
+  payload: Record<string, unknown>;
+  generateKey: () => string;
+  nowMs: number;
+  retryHorizonSeconds: number;
+}): Promise<WebhookDeliveryBinding> {
+  const deliveryId = args.key.deliveryId;
+  if (typeof deliveryId !== 'string' || !deliveryId) throw new TypeError('delivery_id must be a non-empty string');
+
+  const candidateKey = args.generateKey();
+  assertValidIdempotencyKey(candidateKey, 'generateIdempotencyKey', deliveryId);
+
+  const proposed: WebhookDeliveryProposal = {
+    idempotencyKey: candidateKey,
+    payloadFingerprint: canonicalJsonSha256({ ...args.payload, idempotency_key: candidateKey }),
+  };
+  const record = await args.store.claim(args.key, proposed, args.retryHorizonSeconds * 1000);
+  if (record?.status === 'retired') {
+    throw retiredDeliveryError(deliveryId);
+  }
+  const binding = record as WebhookDeliveryBinding;
+  assertValidDeliveryBinding(binding, deliveryId, args.retryHorizonSeconds);
+
+  const suppliedFingerprint = canonicalJsonSha256({
+    ...args.payload,
+    idempotency_key: binding.idempotencyKey,
+  });
+  if (binding.payloadFingerprint !== suppliedFingerprint) {
+    throw new WebhookDeliveryTerminalError(
+      `Webhook delivery_id "${deliveryId}" is already bound to a different canonical payload. ` +
+        'Use a fresh delivery_id for each changed payload or lifecycle observation.'
+    );
+  }
+
+  assertWithinRetryHorizon(binding, deliveryId, args.nowMs, args.retryHorizonSeconds);
+  return binding;
+}
+
+function retiredDeliveryError(deliveryId: string): Error {
+  return new WebhookDeliveryTerminalError(
+    `Webhook delivery_id "${deliveryId}" is retired after its retry horizon and MUST NOT be rebound. ` +
+      'Create a new logical notification and delivery_id only when protocol re-emission is allowed.'
+  );
+}
+
+function assertWithinRetryHorizon(
+  binding: WebhookDeliveryBinding,
+  deliveryId: string,
+  nowMs: number,
+  retryHorizonSeconds: number
+): void {
+  // Clamp ordinary replica clock skew. The store's authoritative
+  // retainUntilMs remains the actual hard boundary.
+  const effectiveNowMs = Math.max(binding.firstAttemptAtMs, nowMs);
+  if (effectiveNowMs > binding.firstAttemptAtMs + retryHorizonSeconds * 1000) {
+    throw new WebhookDeliveryTerminalError(
+      `Webhook delivery_id "${deliveryId}" is outside its ${retryHorizonSeconds}-second retry horizon. ` +
+        'Do not retry the retained idempotency key; create a new logical notification and delivery_id if re-emission is allowed.'
+    );
+  }
+}
+
+function assertValidDeliveryBinding(
+  binding: WebhookDeliveryBinding,
+  deliveryId: string,
+  retryHorizonSeconds: number
+): void {
+  if (binding === null || typeof binding !== 'object' || binding.status !== 'bound') {
+    throw new Error(`Webhook delivery store returned an invalid binding for delivery_id "${deliveryId}".`);
+  }
+  assertValidIdempotencyKey(binding.idempotencyKey, 'delivery store', deliveryId);
+  if (!/^[a-f0-9]{64}$/.test(binding.payloadFingerprint)) {
+    throw new Error(`Webhook delivery store returned an invalid payload fingerprint for delivery_id "${deliveryId}".`);
+  }
+  if (!Number.isSafeInteger(binding.firstAttemptAtMs) || binding.firstAttemptAtMs < 0) {
+    throw new Error(`Webhook delivery store returned an invalid firstAttemptAtMs for delivery_id "${deliveryId}".`);
+  }
+  const requiredRetainUntilMs = binding.firstAttemptAtMs + retryHorizonSeconds * 1000;
+  if (!Number.isSafeInteger(binding.retainUntilMs) || binding.retainUntilMs < requiredRetainUntilMs) {
+    throw new Error(
+      `Webhook delivery store returned a retainUntilMs shorter than the advertised retry horizon for delivery_id "${deliveryId}".`
+    );
+  }
+}
+
+function requireScope(value: string, name: 'publisherScope' | 'tenantScope'): string {
+  if (typeof value !== 'string' || value.length === 0 || value.includes('\0')) {
+    throw new TypeError(`${name} must be a non-empty string without NUL characters`);
+  }
+  return value;
+}
+
+function assertIJson(value: unknown): void {
+  const ancestors = new WeakSet<object>();
+  const stack: Array<{ value: unknown; exit?: boolean }> = [{ value }];
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    const current = frame.value;
+    if (frame.exit) {
+      ancestors.delete(current as object);
+      continue;
+    }
+    if (typeof current === 'string') {
+      assertIJsonString(current);
+      continue;
+    }
+    if (current !== null && typeof current === 'object') {
+      if (ancestors.has(current)) {
+        throw new TypeError('Webhook payload contains a circular reference and is not valid JSON');
+      }
+      ancestors.add(current);
+      stack.push({ value: current, exit: true });
+      const entries = Array.isArray(current)
+        ? current.map((member, index) => [String(index), member] as const)
+        : Object.entries(current as Record<string, unknown>);
+      for (let index = entries.length - 1; index >= 0; index--) {
+        const [key, member] = entries[index]!;
+        assertIJsonString(key);
+        stack.push({ value: member });
+      }
+    }
+  }
+}
+
+function assertIJsonString(value: string): void {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        index++;
+        continue;
+      }
+      throw new TypeError('Webhook payload contains a lone Unicode surrogate, which is not valid I-JSON');
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) {
+      throw new TypeError('Webhook payload contains a lone Unicode surrogate, which is not valid I-JSON');
+    }
+  }
+}
+
+function assertValidIdempotencyKey(key: string, source: string, deliveryId: string): void {
+  if (!IDEMPOTENCY_KEY_PATTERN.test(key)) {
+    throw new Error(
+      `${source} returned "${key}" for delivery_id "${deliveryId}"; ` +
+        `does not match required pattern ${IDEMPOTENCY_KEY_PATTERN.source}`
+    );
+  }
+}
+
+/**
+ * Default key generator — `evt_` prefix + a base64url 18-byte random.
+ * Length 27 (comfortably within 16–255), only base64url-safe characters,
+ * obviously-webhook-scoped prefix for log grepping.
+ */
+function defaultGenerateIdempotencyKey(): string {
+  const uuid = randomUUID().replace(/-/g, '');
+  return `evt_${uuid.slice(0, 24)}`;
+}
+
+function isTerminalStatus(status: number, wwwAuthenticate?: string): boolean {
+  if (status === 429) return false;
+  if (status >= 500) return false;
+  // A redirect is a configuration error, not a transient one — retrying it
+  // produces the same redirect. `createPinAndBindFetch` deliberately does not
+  // follow redirects (the signature covers `@target-uri`, so a replayed hop
+  // would not verify at the target anyway), so a 3xx means the registered URL
+  // is not the final one.
+  if (status >= 300 && status < 400) return true;
+  // 401 with a signature-layer reject is terminal per adcp#2423 —
+  // retrying a signature failure produces identical bytes and identical
+  // rejection. Non-signature 401s (opaque auth failures) are also
+  // terminal; there's nothing the publisher can do by retrying.
+  if (status === 401 && wwwAuthenticate && TERMINAL_SIGNATURE_WWW_AUTH_RE.test(wwwAuthenticate)) return true;
+  if (status >= 400 && status < 500) return true;
+  return false;
+}
+
+/**
+ * Backoff in whole milliseconds, inside the retry-after range every durable
+ * recovery backend accepts.
+ *
+ * Normalized here rather than at the call sites because this value is both slept
+ * on and handed to `WebhookDeliveryRecoveryClaim.release`, which asserts a safe
+ * integer from 0 through 604800000. A fractional configured delay used to reach
+ * that assertion unchanged: releasing a retryable suppression threw instead of
+ * releasing, and the delivery stayed leased until its lease expired.
+ */
+function backoffDelay(attempt: number, retries: Required<WebhookRetryOptions>): number {
+  const base = Math.min(retries.initialDelayMs * Math.pow(2, attempt - 1), retries.maxDelayMs);
+  const jittered =
+    retries.jitter <= 0 ? base : base + (Math.random() * base * retries.jitter * 2 - base * retries.jitter);
+  return clampRetryAfterMs(jittered);
+}
+
+/**
+ * Whole milliseconds within the recovery contract's accepted range.
+ *
+ * Non-finite input is deliberately split rather than collapsed. `Infinity`
+ * means "wait as long as possible", so it saturates to the ceiling; mapping it
+ * to 0 would turn a request for the longest possible backoff into an immediate
+ * retry burst. `NaN` and `-Infinity` carry no such intent and floor to 0, which
+ * is the same value an explicit negative delay already produced.
+ */
+function clampRetryAfterMs(value: number): number {
+  if (Number.isNaN(value)) return 0;
+  if (value === Number.POSITIVE_INFINITY) return MAX_RETRY_AFTER_MS;
+  if (value === Number.NEGATIVE_INFINITY) return 0;
+  return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, Math.floor(value)));
+}
+
+const MAX_RETRY_AFTER_MS = 604_800_000;
+const DEFAULT_MAX_ATTEMPTS = 5;
+
+function resolveRetries(opts?: WebhookRetryOptions): Required<WebhookRetryOptions> {
+  // Delays are normalized to whole milliseconds on the way in as well, so the
+  // durable snapshot a recovered attempt replays carries the same integers this
+  // process used rather than whatever was configured. An infinite delay
+  // saturates to the ceiling here, so it cannot become a zero-delay burst.
+  //
+  // An attempt bound cannot saturate the same way, so a non-finite one falls
+  // back to the default instead. `NaN` is the dangerous case: `attempt <= NaN`
+  // is false on the first comparison, so the delivery loop runs zero attempts,
+  // reports no terminal outcome, and releases its recovery lease with a zero
+  // backoff — an immediately re-eligible entry that never posts anything.
+  const configuredMaxAttempts = opts?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+  return {
+    maxAttempts: Number.isFinite(configuredMaxAttempts)
+      ? Math.max(1, Math.floor(configuredMaxAttempts))
+      : DEFAULT_MAX_ATTEMPTS,
+    initialDelayMs: clampRetryAfterMs(opts?.initialDelayMs ?? 1000),
+    maxDelayMs: clampRetryAfterMs(opts?.maxDelayMs ?? 60_000),
+    jitter: Math.max(0, Math.min(1, opts?.jitter ?? 0.25)),
+  };
+}
+
+function resolveRetryHorizonSeconds(value?: number): number {
+  const resolved = value ?? 86_400;
+  if (!Number.isInteger(resolved) || resolved < 86_400 || resolved > 604_800) {
+    throw new TypeError('deliveryRetryHorizonSeconds must be an integer from 86400 through 604800');
+  }
+  return resolved;
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise(r => {
+    const t = setTimeout(r, ms);
+    t.unref?.();
+  });
+}
+
+/**
+ * Format a transport-layer error for caller-visible `result.errors[]` without
+ * copying provider, database, hostname, IAM, or secret-manager detail.
+ */
+function formatTransportError(err: unknown): string {
+  let cur: unknown = err;
+  let depth = 0;
+  while (cur instanceof Error && depth < 5) {
+    const code = (cur as NodeJS.ErrnoException).code;
+    if (code === 'EADCP_SSRF_BLOCKED') return 'EADCP_SSRF_BLOCKED: webhook destination rejected by policy';
+    if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{1,63}$/.test(code)) {
+      return `${code}: webhook delivery failed`;
+    }
+    cur = cur.cause;
+    depth++;
+  }
+  return 'Webhook delivery failed';
+}
+
+function errorContainsCode(err: unknown, code: string): boolean {
+  let cur: unknown = err;
+  let depth = 0;
+  while (cur instanceof Error && depth < 5) {
+    if ((cur as NodeJS.ErrnoException).code === code) return true;
+    cur = (cur as { cause?: unknown }).cause;
+    depth++;
+  }
+  return false;
+}

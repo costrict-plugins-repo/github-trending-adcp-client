@@ -1,0 +1,385 @@
+// Preview utilities for rendering product/format cards with creative agent
+
+import type { SingleAgentClient } from '../core/SingleAgentClient';
+import type { Format, Product, FormatReferenceStructuredObject as FormatID } from '../types/tools.generated';
+import type { PreviewCreativeRequest, PreviewCreativeResponse } from '../types/tools.generated';
+import type { CanonicalProduct } from '../v2/projection/creative-delivery';
+
+/**
+ * Preview result for a single canonical item.
+ */
+export interface PreviewResult<TItem = CanonicalProduct> {
+  /** The item being previewed. */
+  item: TItem;
+  /** Preview URL for the rendered card */
+  previewUrl?: string;
+  /** Preview ID from the creative agent */
+  previewId?: string;
+  /** Error message if preview failed */
+  error?: string;
+}
+
+/** Raw named-format preview result for explicit migration tooling. */
+export type LegacyPreviewResult = PreviewResult<Product | Format>;
+
+/**
+ * Options for batch preview generation
+ */
+export interface BatchPreviewOptions {
+  /** Cache TTL in milliseconds (defaults to 1 hour) */
+  cacheTtl?: number;
+  /** Whether to skip cache and force fresh previews (defaults to false) */
+  skipCache?: boolean;
+  /**
+   * Cache backend for preview results.
+   *
+   * The default backend is process-local memory. It is safe for tests,
+   * local development, and single-process CLIs, but it is not shared
+   * across pods and does not survive restarts. Production services that
+   * cache preview URLs should provide a shared backend such as Redis or
+   * Postgres, and the cached URL itself must still resolve to durable
+   * storage rather than process-local assets.
+   */
+  cacheBackend?: PreviewCacheBackend;
+}
+
+/**
+ * Cache entry for preview results
+ */
+export interface PreviewCacheEntry {
+  previewUrl: string;
+  previewId: string;
+  timestamp: number;
+  /** ISO 8601 timestamp from `preview_creative.expires_at`, when provided. */
+  expiresAt?: string;
+}
+
+/**
+ * Pluggable cache backend for preview results.
+ *
+ * This cache stores references returned by `preview_creative`; it is not
+ * an asset store. Preview URLs placed in any cache must already be
+ * durable across load-balancer hops, pod restarts, and later refinement
+ * calls.
+ */
+export interface PreviewCacheBackend {
+  get(cacheKey: string): PreviewCacheEntry | null | undefined | Promise<PreviewCacheEntry | null | undefined>;
+  set(cacheKey: string, entry: PreviewCacheEntry): void | Promise<void>;
+  delete?(cacheKey: string): void | Promise<void>;
+  clear?(): void | Promise<void>;
+}
+
+/**
+ * Process-local in-memory cache for preview results.
+ *
+ * Development-only default: this map is not multi-pod-safe and does not
+ * survive process restarts. It must not be used as the backing store for
+ * MCPUI preview assets in production.
+ *
+ * Key format: `${formatId.agent_url}:${formatId.id}:${manifestHash}`
+ */
+const previewCache = new Map<string, PreviewCacheEntry>();
+
+const defaultPreviewCacheBackend: PreviewCacheBackend = {
+  get(cacheKey) {
+    return previewCache.get(cacheKey);
+  },
+  set(cacheKey, entry) {
+    previewCache.set(cacheKey, entry);
+  },
+  delete(cacheKey) {
+    previewCache.delete(cacheKey);
+  },
+  clear() {
+    previewCache.clear();
+  },
+};
+
+/**
+ * Generate a cache key for a preview request
+ */
+function getCacheKey(formatId: FormatID, manifest: any): string {
+  // Simple hash of manifest for cache key
+  const manifestStr = JSON.stringify(manifest);
+  const manifestHash = Array.from(manifestStr)
+    .reduce((hash, char) => (hash << 5) - hash + char.charCodeAt(0), 0)
+    .toString(36);
+
+  return `${formatId.agent_url}:${formatId.id}:${manifestHash}`;
+}
+
+function hasExpiredAt(expiresAt: string | undefined, now: number): boolean {
+  if (!expiresAt) return false;
+  const expiresAtMs = Date.parse(expiresAt);
+  return Number.isNaN(expiresAtMs) ? false : expiresAtMs <= now;
+}
+
+/**
+ * Get cached preview if available and not expired
+ */
+async function getCachedPreview(
+  cacheBackend: PreviewCacheBackend,
+  cacheKey: string,
+  ttl: number
+): Promise<PreviewCacheEntry | null> {
+  const entry = await cacheBackend.get(cacheKey);
+  if (!entry) return null;
+
+  const now = Date.now();
+  if (now - entry.timestamp > ttl || hasExpiredAt(entry.expiresAt, now)) {
+    await cacheBackend.delete?.(cacheKey);
+    return null;
+  }
+
+  return entry;
+}
+
+/**
+ * Set cached preview
+ */
+async function setCachedPreview(
+  cacheBackend: PreviewCacheBackend,
+  cacheKey: string,
+  previewUrl: string,
+  previewId: string,
+  expiresAt?: string
+): Promise<void> {
+  await cacheBackend.set(cacheKey, {
+    previewUrl,
+    previewId,
+    expiresAt,
+    timestamp: Date.now(),
+  });
+}
+
+/**
+ * Clear all previews from the default process-local cache.
+ */
+export function clearPreviewCache(): void {
+  defaultPreviewCacheBackend.clear?.();
+}
+
+/**
+ * Extract preview URLs from products' `product_card` fields.
+ *
+ * AdCP 3.1.0-beta.2 changed `product_card` from a creative-agent-rendered
+ * shape (`{ format_id, manifest }`) to a self-contained visual card
+ * (`{ image, title, description, price_label, cta_label }`). The card IS
+ * the preview — no creative-agent round-trip required. This function now
+ * extracts the image URL directly from the inline card.
+ *
+ * Products with no `product_card`, or with a card that lacks an `image.url`,
+ * return a result with no `previewUrl`. The function preserves its
+ * `Promise<PreviewResult[]>` return shape so existing adopters' code paths
+ * keep compiling and behaving correctly.
+ *
+ * @param products - Array of products to extract previews from
+ * @param creativeAgentClient - Retained for signature compatibility; unused
+ *   under 3.1.0-beta.2's self-rendering card model. Will be removed in
+ *   8.0 final (or 9.0 at the latest) — pass any value through during the
+ *   beta cycle.
+ * @param options - Retained for signature compatibility. Cache fields
+ *   (`cacheTtl`, `skipCache`) are unused — there's no expensive call to
+ *   cache. Will be removed alongside `creativeAgentClient`.
+ * @returns Array of preview results matching input products by index.
+ *
+ * @example
+ * ```typescript
+ * const previews = await batchPreviewProducts(products, creativeAgent);
+ * previews.forEach(p => {
+ *   if (p.previewUrl) {
+ *     console.log(`${p.item.name}: ${p.previewUrl}`);
+ *   }
+ * });
+ * ```
+ *
+ * @deprecated Use `product.product_card?.image?.url` directly. This wrapper
+ *   only exists for 8.0-beta migration ergonomics and will be removed.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export async function batchPreviewProducts(
+  products: CanonicalProduct[],
+  _creativeAgentClient: SingleAgentClient,
+  _options: BatchPreviewOptions = {}
+): Promise<PreviewResult[]> {
+  return products.map(product => {
+    const imageUrl = (product.product_card as { image?: { url?: string } } | undefined)?.image?.url;
+    if (imageUrl) {
+      return { item: product, previewUrl: imageUrl };
+    }
+    return { item: product };
+  });
+}
+
+/**
+ * Generate batch previews for legacy named formats with format_card manifests.
+ *
+ * Formats with format_card fields will have their cards rendered via the creative agent.
+ * Formats without format_card will be returned with no preview.
+ *
+ * @param formats - Array of formats to preview
+ * @param creativeAgentClient - ADCP client configured for creative agent
+ * @param options - Preview generation options
+ * @returns Array of preview results matching input formats
+ *
+ * @example
+ * ```typescript
+ * const creativeAgent = new SingleAgentClient({
+ *   id: 'creative',
+ *   name: 'Creative Agent',
+ *   agent_uri: 'https://creative.adcontextprotocol.org/mcp',
+ *   protocol: 'mcp'
+ * });
+ *
+ * const previews = await batchPreviewFormatsLegacy(formats, creativeAgent);
+ * previews.forEach(p => {
+ *   if (p.previewUrl) {
+ *     console.log(`${(p.item as Format).name}: ${p.previewUrl}`);
+ *   }
+ * });
+ * ```
+ */
+export async function batchPreviewFormatsLegacy(
+  formats: Format[],
+  creativeAgentClient: SingleAgentClient,
+  options: BatchPreviewOptions = {}
+): Promise<LegacyPreviewResult[]> {
+  const cacheTtl = options.cacheTtl ?? 3600000; // 1 hour default
+  const skipCache = options.skipCache ?? false;
+  const cacheBackend = options.cacheBackend ?? defaultPreviewCacheBackend;
+
+  // Collect all formats that have format_card manifests
+  const previewRequests: {
+    format: Format;
+    formatId: FormatID;
+    manifest: any;
+    cacheKey: string;
+    inputName: string;
+  }[] = [];
+
+  const results: LegacyPreviewResult[] = [];
+
+  for (const format of formats) {
+    if (format.format_card) {
+      const cacheKey = getCacheKey(format.format_card.format_id, format.format_card.manifest);
+
+      // Check cache first
+      if (!skipCache) {
+        let cached: PreviewCacheEntry | null = null;
+        try {
+          cached = await getCachedPreview(cacheBackend, cacheKey, cacheTtl);
+        } catch {
+          cached = null;
+        }
+        if (cached) {
+          results.push({
+            item: format,
+            previewUrl: cached.previewUrl,
+            previewId: cached.previewId,
+          });
+          continue;
+        }
+      }
+
+      previewRequests.push({
+        format,
+        formatId: format.format_card.format_id,
+        manifest: format.format_card.manifest,
+        cacheKey,
+        inputName: format.name || 'Format Card',
+      });
+    } else {
+      // No format_card, return format with no preview
+      results.push({
+        item: format,
+      });
+    }
+  }
+
+  // If all were cached or none have format_card, return early
+  if (previewRequests.length === 0) {
+    return results;
+  }
+
+  // Batch preview using preview_creative with inputs array
+  // Group by format_id since preview_creative takes one format_id
+  const groupedByFormat = new Map<string, typeof previewRequests>();
+
+  previewRequests.forEach(req => {
+    const formatKey = `${req.formatId.agent_url}:${req.formatId.id}`;
+    if (!groupedByFormat.has(formatKey)) {
+      groupedByFormat.set(formatKey, []);
+    }
+    groupedByFormat.get(formatKey)!.push(req);
+  });
+
+  // Process each format individually
+  // Note: Each format has different manifest data, so we can't truly batch them
+  // We process them sequentially but could parallelize in the future
+  for (const req of previewRequests) {
+    try {
+      // Build preview_creative request for this format
+      // For format cards, the manifest typically contains the format object as JSON
+      const previewRequest: PreviewCreativeRequest = {
+        request_type: 'single',
+        format_id: req.formatId,
+        creative_manifest: {
+          format_id: req.formatId,
+          assets: req.manifest, // manifest contains the asset map (format, etc)
+        },
+      };
+
+      // Call preview_creative
+      const response = await creativeAgentClient.previewCreativeLegacy(previewRequest);
+
+      // Check for data even if validation failed (response.success may be false due to schema warnings)
+      // Handle both single request (previews) and batch request (results) response formats
+      const responseData = response.data;
+      if (responseData && 'previews' in responseData && responseData.previews && responseData.previews.length > 0) {
+        const preview = responseData.previews[0]!;
+        if (preview.renders && preview.renders.length > 0) {
+          const render = preview.renders[0]!;
+          const previewUrl =
+            render.output_format === 'url' || render.output_format === 'both' ? render.preview_url : undefined;
+          const previewId = preview.preview_id;
+
+          if (previewUrl) {
+            results.push({
+              item: req.format,
+              previewUrl,
+              previewId,
+            });
+            try {
+              await setCachedPreview(cacheBackend, req.cacheKey, previewUrl, previewId, responseData.expires_at);
+            } catch {
+              // Preview cache is an accelerator; successful previews should still return on cache write failures.
+            }
+          } else {
+            results.push({
+              item: req.format,
+              error: 'Preview render has no URL',
+            });
+          }
+        } else {
+          results.push({
+            item: req.format,
+            error: 'No renders in preview response',
+          });
+        }
+      } else {
+        // Only treat as error if we have no data at all
+        results.push({
+          item: req.format,
+          error: response.error || 'Preview generation failed',
+        });
+      }
+    } catch (error) {
+      results.push({
+        item: req.format,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  return results;
+}

@@ -1,0 +1,313 @@
+/**
+ * Bridges storyboard execution to the comply() track system.
+ *
+ * Maps StoryboardResult objects to TrackResult objects so that
+ * comply() can use storyboards as its testing engine while
+ * maintaining the existing ComplianceResult interface.
+ */
+
+import type { TestResult, TestStepResult, AgentProfile } from '../types';
+import type { ComplianceTrack, TrackResult, TrackStatus, AdvisoryObservation } from './types';
+import type { AssertionResult, StoryboardResult, StoryboardStepResult } from '../storyboard/types';
+import { signingCoverageUnverified } from '../storyboard/runner';
+
+export interface DetachedAssertionFailure {
+  assertion: AssertionResult;
+  owningStep?: StoryboardStepResult;
+}
+
+/** Assertion failures that are not represented by a counted failed step. */
+export function collectDetachedAssertionFailures(result: StoryboardResult): DetachedAssertionFailure[] {
+  const failures: DetachedAssertionFailure[] = [];
+  for (const assertion of result.assertions ?? []) {
+    if (assertion.passed) continue;
+    if (assertion.scope === 'storyboard') {
+      failures.push({ assertion });
+      continue;
+    }
+    const assertionPhases =
+      assertion.pass_index === undefined
+        ? result.phases
+        : (result.passes?.find(pass => pass.pass_index === assertion.pass_index)?.phases ?? []);
+    const owningStep = assertionPhases.flatMap(phase => phase.steps).find(step => step.step_id === assertion.step_id);
+    if (owningStep?.skipped === true) {
+      failures.push({ assertion, owningStep });
+    }
+  }
+  return failures;
+}
+
+/** Labels for each compliance track. */
+export const TRACK_LABELS: Record<ComplianceTrack, string> = {
+  core: 'Core Protocol',
+  products: 'Product Discovery',
+  media_buy: 'Media Buy Lifecycle',
+  creative: 'Creative Management',
+  reporting: 'Reporting & Delivery',
+  governance: 'Governance',
+  campaign_governance: 'Campaign Governance',
+  signals: 'Signals',
+  si: 'Sponsored Intelligence',
+  audiences: 'Audience Management',
+  error_handling: 'Error Handling',
+  brand: 'Brand Rights',
+  security_transport: 'Transport Security',
+};
+
+/**
+ * Convert storyboard results to a TrackResult for backwards-compatible ComplianceResult.
+ */
+export function mapStoryboardResultsToTrackResult(
+  track: ComplianceTrack,
+  storyboardResults: StoryboardResult[],
+  _profile: AgentProfile
+): TrackResult {
+  const label = TRACK_LABELS[track] || track;
+
+  // No storyboards ran for this track
+  if (storyboardResults.length === 0) {
+    return {
+      track,
+      status: 'skip',
+      label,
+      scenarios: [],
+      skipped_scenarios: [],
+      observations: [],
+      duration_ms: 0,
+    };
+  }
+
+  // Convert each storyboard result into pseudo-TestResults (one per phase)
+  const scenarios: TestResult[] = [];
+  const observations: AdvisoryObservation[] = [];
+  let totalDuration = 0;
+
+  for (const sbResult of storyboardResults) {
+    totalDuration += sbResult.total_duration_ms;
+    const assertionFailures = collectDetachedAssertionFailures(sbResult);
+
+    for (const { assertion, owningStep } of assertionFailures) {
+      observations.push({
+        category: 'error_compliance',
+        severity: 'error',
+        track,
+        message: `A ${assertion.scope}-scoped compliance assertion failed.`,
+        evidence: {
+          assertion_id: assertion.assertion_id,
+          description: assertion.description,
+          scope: assertion.scope,
+          ...(assertion.error !== undefined && { error: assertion.error }),
+          ...(assertion.hint !== undefined && { hint: assertion.hint }),
+          ...(assertion.observation_count !== undefined && { observation_count: assertion.observation_count }),
+          ...(assertion.status !== undefined && { status: assertion.status }),
+          ...(assertion.pass_index !== undefined && { pass_index: assertion.pass_index }),
+        },
+        source: owningStep
+          ? {
+              kind: 'storyboard_step',
+              code: 'storyboard-assertion-failed',
+              storyboard_id: sbResult.storyboard_id,
+              step_id: owningStep.step_id,
+            }
+          : {
+              kind: 'storyboard',
+              code: 'storyboard-assertion-failed',
+              storyboard_id: sbResult.storyboard_id,
+            },
+      });
+    }
+
+    for (const phase of sbResult.phases) {
+      const steps: TestStepResult[] = phase.steps.map(stepResult => mapStepToTestStep(stepResult));
+
+      const testResult: TestResult = {
+        agent_url: sbResult.agent_url,
+        scenario: `${sbResult.storyboard_id}/${phase.phase_id}` as any,
+        overall_passed: phase.passed,
+        steps,
+        summary: phase.passed
+          ? `${phase.phase_title}: all steps passed`
+          : `${phase.phase_title}: ${steps.filter(s => !s.passed).length} step(s) failed`,
+        total_duration_ms: phase.duration_ms,
+        tested_at: sbResult.tested_at,
+      };
+
+      scenarios.push(testResult);
+    }
+
+    // Phase scenarios retain their own verdicts. When the authoritative
+    // storyboard verdict fails without a counted failed step (including an
+    // all-skipped run), retain one storyboard-level scenario for diagnostics.
+    // It does not change the authoritative track grade or seller failure count.
+    if (
+      !sbResult.overall_passed &&
+      (sbResult.failed_count === 0 ||
+        ((sbResult.passed_count > 0 || assertionFailures.length > 0) && sbResult.phases.every(phase => phase.passed)))
+    ) {
+      scenarios.push({
+        agent_url: sbResult.agent_url,
+        scenario: `${sbResult.storyboard_id}/storyboard` as any,
+        overall_passed: false,
+        steps: [],
+        summary:
+          assertionFailures.length > 0
+            ? `${sbResult.storyboard_title}: ${assertionFailures.length} assertion(s) failed`
+            : `${sbResult.storyboard_title}: storyboard-level verdict failed`,
+        total_duration_ms: 0,
+        tested_at: sbResult.tested_at,
+      });
+    }
+  }
+
+  // Determine track status
+  const status = computeTrackStatus(storyboardResults);
+
+  // Detect deterministic mode
+  const hasDeterministic = storyboardResults.some(r =>
+    r.phases.some(p => p.steps.some(s => s.task === 'comply_test_controller'))
+  );
+
+  return {
+    track,
+    status,
+    label,
+    scenarios,
+    skipped_scenarios: [],
+    observations,
+    duration_ms: totalDuration,
+    mode: hasDeterministic ? 'deterministic' : 'observational',
+  };
+}
+
+/**
+ * Map a StoryboardStepResult to a TestStepResult.
+ */
+function mapStepToTestStep(stepResult: StoryboardStepResult): TestStepResult {
+  // v.warning carries actionable hints (shape-drift recipes, strict deltas,
+  // variant-fallback notices). Append alongside v.error so JSON consumers —
+  // CI dashboards, LLM self-correction loops, JUnit formatters — see the
+  // recipe without having to know to read the full ValidationResult shape.
+  const validationDetails = stepResult.validations
+    .map(v => {
+      const status = v.passed ? '✓' : '✗';
+      const error = v.error ? `: ${v.error}` : '';
+      const warning = v.warning ? ` [⚠ ${v.warning}]` : '';
+      return `${status} ${v.description}${error}${warning}`;
+    })
+    .join('; ');
+
+  return {
+    step: stepResult.title,
+    step_id: stepResult.step_id,
+    task: stepResult.task,
+    passed: stepResult.passed,
+    duration_ms: stepResult.duration_ms,
+    error: stepResult.error,
+    details: validationDetails || undefined,
+    validations: stepResult.validations.map(v => ({
+      ...(v.id !== undefined && { id: v.id }),
+      check: v.check,
+      passed: v.passed,
+      ...(v.severity !== undefined && { severity: v.severity }),
+      ...(v.not_applicable !== undefined && { not_applicable: v.not_applicable }),
+      ...(v.severity_promoted_from_advisory !== undefined && {
+        severity_promoted_from_advisory: v.severity_promoted_from_advisory,
+      }),
+    })),
+    observation_data: stepResult.response as Record<string, unknown> | undefined,
+    warnings: stepResult.skipped
+      ? [stepResult.skip?.detail ?? skipReasonLabel(stepResult.skip_reason) ?? 'Step skipped']
+      : undefined,
+    ...(stepResult.skipped && { skipped: true as const }),
+    ...(stepResult.skip_reason && { skip_reason: stepResult.skip_reason }),
+    ...(stepResult.selection_result?.reason && { selection_reason: stepResult.selection_result.reason }),
+    ...(stepResult.skip?.requirement && { requirement: stepResult.skip.requirement }),
+  };
+}
+
+function skipReasonLabel(reason: string | undefined): string | undefined {
+  if (!reason) return undefined;
+  const labels: Record<string, string> = {
+    // `not_applicable` is the spec reason for both
+    // "agent did not declare this protocol/specialism" AND
+    // "storyboard was introduced in a later AdCP version".
+    not_applicable:
+      'Not applicable: agent did not declare this protocol/specialism, or storyboard was introduced in a later AdCP version',
+    no_phases: 'Skipped: storyboard has no executable phases',
+    prerequisite_failed: 'Skipped: a prerequisite did not pass',
+    missing_tool: 'Skipped: agent did not advertise the required tool',
+    missing_test_controller: 'Not testable: requires comply_test_controller',
+    fixture_unavailable: 'Not testable: the runner fixture cannot satisfy the seller-declared contract',
+    unsatisfied_contract: 'Skipped: test-kit contract is out of scope',
+    peer_branch_taken: 'Skipped: a peer branch in the same any_of branch set already contributed the aggregation flag',
+  };
+  return labels[reason];
+}
+
+/**
+ * Compute the track status from storyboard results.
+ *
+ * `silent` lands when every observation-based invariant on the track
+ * ran with zero observations *and* nothing failed — the agent is wired
+ * but its lifecycle protections were not exercised this run, so the
+ * track has nothing to attest. See `TrackStatus` doc and
+ * adcontextprotocol/adcp#2834.
+ */
+function computeTrackStatus(results: StoryboardResult[]): TrackStatus {
+  const totalPassed = results.reduce((sum, r) => sum + r.passed_count, 0);
+  const totalFailed = results.reduce((sum, r) => sum + r.failed_count, 0);
+  const totalSkipped = results.reduce((sum, r) => sum + r.skipped_count, 0);
+  const totalSteps = totalPassed + totalFailed + totalSkipped;
+  const hasAssertionFailure = results.some(result => collectDetachedAssertionFailures(result).length > 0);
+
+  const stepsOf = (result: StoryboardResult): StoryboardStepResult[] =>
+    (result.passes?.flatMap(pass => pass.phases) ?? result.phases).flatMap(phase => phase.steps);
+  const hasFixtureUnavailable = results.some(result =>
+    stepsOf(result).some(step => step.skip?.reason === 'fixture_unavailable')
+  );
+  // Scoped to request-signing probe steps, and decided by the runner's own
+  // rule so the track and the storyboard verdict can't disagree. Narrower
+  // than `hasFixtureUnavailable` in what it looks at: the legacy producers of
+  // that canonical reason (seeding unsupported, fixture ladder exhausted,
+  // creative-asset gap) keep their long-standing position below the
+  // all-skipped check, because an all-skipped track of that kind has always
+  // graded `skip` and reclassifying it here would move verdicts for tracks
+  // that have nothing to do with signing.
+  const hasUnverifiedSigningCoverage = results.some(result => signingCoverageUnverified(stepsOf(result)));
+
+  if (totalSteps === 0) return 'skip';
+  if (totalFailed > 0) return totalPassed === 0 ? 'fail' : 'partial';
+  if (hasAssertionFailure) return totalPassed === 0 ? 'fail' : 'partial';
+  // Ordered ahead of the all-skipped check (adcp-client#2954): a track whose
+  // signing vectors never reached the agent — no framing for this protocol,
+  // or every vector excluded by the operator — is not an inapplicable track,
+  // it is an unverified one. Letting it grade `skip` erases it from
+  // `computeOverallStatus`'s `attempted` count, so sibling tracks alone could
+  // carry the run to `passing` while this track verified nothing.
+  if (hasUnverifiedSigningCoverage) return 'partial';
+  if (totalSteps === totalSkipped) return 'skip';
+  // Storyboard-scoped assertions are not steps, so their failures correctly
+  // leave failed_count at zero. The runner's overall verdict is authoritative:
+  // some steps passed, but the cross-step invariant did not.
+  if (results.some(result => !result.overall_passed)) return 'partial';
+  // Legacy canonical gaps keep their long-standing position and meaning: a
+  // mixed track carrying one is coverage-incomplete (`partial`), an
+  // all-skipped one already returned `skip` above. Only the signing reason
+  // is promoted ahead of that all-skipped check.
+  if (hasFixtureUnavailable) return 'partial';
+
+  // No failures. Demote to `silent` when every observation-bearing
+  // invariant record reports zero observations. Step-level passes alone
+  // (response_schema, field_present, …) are not enough to lift a track
+  // out of silent — only an invariant that actually observed a
+  // lifecycle resource counts as real protection. Tracks whose
+  // invariants don't carry `observation_count` (no observation-based
+  // assertion ran) stay `pass` as before.
+  const observationRecords = results
+    .flatMap(r => r.assertions ?? [])
+    .filter(a => typeof a.observation_count === 'number');
+  if (observationRecords.length > 0 && observationRecords.every(a => a.observation_count === 0)) {
+    return 'silent';
+  }
+  return 'pass';
+}

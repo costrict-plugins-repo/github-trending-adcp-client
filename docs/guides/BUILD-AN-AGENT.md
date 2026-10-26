@@ -1,0 +1,1111 @@
+# Build an AdCP Agent
+
+## Overview
+
+This guide walks through building an AdCP agent (server) using `@adcp/sdk`. While most documentation covers the client side — calling existing agents — this guide covers the server side: implementing an agent that other clients can discover and call.
+
+We'll build a **signals agent** that serves audience segments via the `get_signals` tool. The same patterns apply to any AdCP tool (`get_products`, `create_media_buy`, etc.) — for mutating tools, see the `create_media_buy` example in the Calling Tools section below.
+
+## Prerequisites
+
+- Node.js 20+
+- `@adcp/sdk` installed from the AdCP 3.1 line while validating AdCP 3.1 (`npm install @adcp/sdk@adcp-3.1`)
+- `@modelcontextprotocol/sdk` (installed as a dependency of `@adcp/sdk`)
+
+## The server entry point
+
+`@adcp/sdk` exposes `createAdcpServerFromPlatform` as the server entry
+point. You declare a typed `DecisioningPlatform` (per-specialism
+interfaces: `SalesCorePlatform` + `SalesIngestionPlatform`,
+`CreativeBuilderPlatform`, `AudiencePlatform`, `SignalsPlatform`,
+`CampaignGovernancePlatform`, `BrandRightsPlatform`, etc.) and the
+framework wires capability projection, idempotency, RFC 9421 signing,
+async tasks, status normalization, lifecycle state, multi-tenant
+routing, and async task completion webhooks. Under AdCP 3.2 synchronous
+terminal responses remain silent on the task-webhook channel; the deprecated
+`autoEmitCompletionWebhooks` option is ignored. Compile-time
+enforcement via `RequiredPlatformsFor<S>` catches missing methods
+before runtime. The `definePlatform` / `defineSalesCorePlatform` /
+sibling helpers let you write inline platform literals without
+`req: unknown` casts.
+
+Standing caller- and account-level notification subscribers need durable
+control-plane state in addition to the webhook delivery outbox. Use
+`createPostgresPersistentNotificationRuntime()`; it owns declarative
+replacement, proof generations, and per-attempt authorization while composing
+with the existing delivery kernel. See
+[Persistent notification subscriptions](./PERSISTENT-NOTIFICATION-RUNTIME.md).
+
+For multi-specialism production agents (sales + creative + governance +
+brand-rights), the `examples/hello_*` family is the copy-paste
+starting point for each specialism.
+
+## Quick Start
+
+A minimal signals agent using `createAdcpServerFromPlatform` + the
+`definePlatform` / `defineSignalsPlatform` identity helpers:
+
+```typescript
+import { serve } from '@adcp/sdk';
+import {
+  createAdcpServerFromPlatform,
+  createIdempotencyStore,
+  definePlatform,
+  defineSignalsPlatform,
+  memoryBackend,
+} from '@adcp/sdk/server';
+
+// Single-process example. Use pgBackend(pool) or redisBackend(client) in production.
+const idempotency = createIdempotencyStore({ backend: memoryBackend(), ttlSeconds: 86400 });
+
+const platform = definePlatform({
+  capabilities: {
+    specialisms: ['signal-marketplace'] as const,
+    pricingModels: ['cpm'] as const,
+  },
+  accounts: {
+    resolve: async () => ({ id: 'acc_1', ctx_metadata: {} }),
+  },
+  signals: defineSignalsPlatform({
+    getSignals: async (req, ctx) => ({
+      signals: [
+        {
+          signal_agent_segment_id: 'demo_segment',
+          signal_id: { source: 'catalog', data_provider_domain: 'example.com', id: 'demo_segment' },
+          name: 'Demo Segment',
+          description: 'A demo audience segment.',
+          value_type: 'binary',
+          signal_type: 'owned',
+          data_provider: 'My Agent',
+          coverage_percentage: 10,
+          deployments: [],
+          pricing_options: [
+            { pricing_option_id: 'po_demo', model: 'cpm', currency: 'USD', cpm: 5 },
+          ],
+        },
+      ],
+      sandbox: true,
+    }),
+    activateSignal: async (req, ctx) => ({
+      /* ... */
+    }),
+  }),
+});
+
+serve(() => createAdcpServerFromPlatform(platform, { name: 'My Signals Agent', version: '1.0.0', idempotency }));
+// listening on http://localhost:3001/mcp
+```
+
+Start it and test immediately:
+
+```bash
+npx tsx agent.ts
+npx @adcp/sdk@adcp-3.1 http://localhost:3001/mcp                    # discover tools
+npx @adcp/sdk@adcp-3.1 http://localhost:3001/mcp get_signals '{}'   # call get_signals
+```
+
+`definePlatform` / `defineSignalsPlatform` (and the sibling
+`defineSalesCorePlatform` / `defineSalesIngestionPlatform` / etc.) are
+pure identity helpers from `@adcp/sdk/server`. They force a concrete
+platform interface as the parameter type so TypeScript flows
+`req` / `ctx` typing into nested handler bodies — adopters who skipped
+them on inline platforms historically saw `req: unknown` and had to
+cast in every handler. Class-pattern adopters with explicit property
+annotations don't need them.
+
+## Key Concepts
+
+### `createAdcpServerFromPlatform` (recommended)
+
+The declarative path. You declare a typed `DecisioningPlatform` per specialism and the framework handles schema validation, response formatting, account resolution, capabilities generation, idempotency, signing, async tasks, lifecycle state, and error catching.
+
+```typescript
+import { serve } from '@adcp/sdk';
+import {
+  createAdcpServerFromPlatform,
+  createIdempotencyStore,
+  definePlatform,
+  defineSalesCorePlatform,
+  memoryBackend,
+  refAccountId,
+  AccountNotFoundError,
+} from '@adcp/sdk/server';
+
+// Single-process example. Use pgBackend(pool) or redisBackend(client) in production.
+const idempotency = createIdempotencyStore({ backend: memoryBackend(), ttlSeconds: 86400 });
+
+const platform = definePlatform({
+  capabilities: {
+    specialisms: ['sales-non-guaranteed'] as const,
+    channels: ['display'] as const,
+    pricingModels: ['cpm'] as const,
+  },
+  accounts: {
+    resolve: async (ref, ctx) => {
+      const id = refAccountId(ref);
+      if (!id) return null; // → ACCOUNT_NOT_FOUND
+      const acct = await db.findAccount(id);
+      if (!acct) throw new AccountNotFoundError({ message: `account ${id} not found` });
+      return acct;
+    },
+    upsert: async (refs, ctx) => refs.map(r => upsertOne(r, ctx)),
+    list: async (filter, ctx) => db.listAccounts(filter, { agentUrl: ctx?.agent?.agent_url }),
+  },
+  sales: defineSalesCorePlatform({
+    getProducts: async (req, ctx) => {
+      const result = catalog.search(req);
+      return {
+        products: result.products,
+        cache_scope: result.usesAccountSpecificPricing ? 'account' : 'public',
+      };
+    }, // req typed ✓
+    createMediaBuy: async (req, ctx) => ({
+      media_buy_id: `mb_${Date.now()}`,
+      media_buy_status: 'pending_creatives',
+      confirmed_at: new Date().toISOString(),
+      packages: [],
+    }),
+    updateMediaBuy: async (id, patch, ctx) => ({ media_buy_id: id, media_buy_status: 'active' }),
+    getMediaBuyDelivery: async (req, ctx) => ({ media_buys: [] }),
+    getMediaBuys: async (req, ctx) => ({ media_buys: [] }),
+  }),
+});
+
+serve(() => createAdcpServerFromPlatform(platform, { name: 'My Publisher', version: '1.0.0', idempotency }));
+```
+
+**What the framework does for you:**
+
+- **Compile-time specialism enforcement** via `RequiredPlatformsFor<S>` — claim `'sales-non-guaranteed'` and the typechecker requires `SalesCorePlatform & SalesIngestionPlatform` on `sales` (`SalesPlatform` was split in 6.7 with all methods individually optional; per-specialism enforcement moves up to the type-level).
+- **Auto-generates `get_adcp_capabilities`** from registered platform methods — no manual capability declaration.
+- **Auto-applies response builders** — return raw data, the framework wraps them in MCP `CallToolResult` with `structuredContent`.
+- **Resolves accounts** — `accounts.resolve(ref, ctx)` runs before your platform method, and the resolved account lands at `ctx.account`. A buyer-supplied unknown, unauthorized, or mismatched ref returns terminal `ACCOUNT_NOT_FOUND`; an account-required operation with no supplied or auth-derived selection returns correctable `ACCOUNT_REQUIRED`. `accounts.resolution: 'implicit'` enforces inline-`{account_id}` refusal at the framework boundary (post-6.7 — pre-6.7 the docstring was aspirational).
+- **Idempotency, signing, async tasks, status normalization, lifecycle state** are framework-owned. Synchronous terminal responses do not emit completion webhooks by default; the inline result is authoritative. Adopters write the business decisions.
+- **Catches handler errors** — unhandled exceptions return `SERVICE_UNAVAILABLE` instead of crashing. Throw a typed error class (see § "Returning errors from handlers") to surface a structured envelope.
+
+When one tool cannot truthfully project across the server's entire release
+window, narrow that tool with `toolVersions`. The framework applies the same
+inclusive range to MCP discovery (legacy and modern), A2A skills, direct
+dispatch, validation/projection, and capability discovery:
+
+```typescript
+const platform = definePlatform({
+  capabilities: {
+    specialisms: ['sales-non-guaranteed', 'signal-marketplace'] as const,
+    supported_versions: ['3.0.25', '3.1.18'],
+    // ...
+  },
+  // ...
+});
+
+createAdcpServerFromPlatform(platform, {
+  name: 'My Publisher',
+  version: '1.0.0',
+  toolVersions: {
+    get_signals: { min: '3.1' },
+  },
+});
+```
+
+This keeps compatible media-buy tools available to 3.0 buyers while hiding
+and rejecting only `get_signals` at 3.0. Unknown tool names, invalid releases,
+empty ranges, and `min > max` fail during server construction.
+
+### Customizing human-readable MCP response text
+
+Native platform handlers normally return only structured domain payloads, and
+the framework writes a default MCP `content[].text` summary. When a disclosure
+or other adopter-authored explanation must remain visible in text-first MCP
+clients, wrap a synchronous `getProducts` result with
+`withResponseSummary(payload, text)`:
+
+```typescript
+import { withResponseSummary } from '@adcp/sdk/server';
+
+getProducts: async (req, ctx) =>
+  withResponseSummary(
+    {
+      products: await catalog.search(req),
+      cache_scope: 'public',
+      ext: { example_vendor: { demo: true } },
+    },
+    'Synthetic sample data for demonstration only.'
+  ),
+```
+
+The wrapper is not a protocol envelope. The SDK still projects and validates
+the payload, writes only the supplied text to MCP `content[]`, and never copies
+the summary into `structuredContent`. Use it only for synchronous
+`getProducts` payloads and trusted, static disclosures. Summary text is capped
+at 4096 UTF-8 bytes and may be cached; never include credentials, buyer input,
+upstream/LLM output, or other secrets.
+
+### Identity, multi-tenant, and lifecycle helpers (6.7)
+
+Six helper families adopters reach for. Pick what your agent shape needs:
+
+| Helper                                                                 | Use when                                                                                                                   |
+|------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------|
+| `definePlatform` / `defineSalesCorePlatform` / sibling `define<X>Platform` | Inline platform literal — drops `req: unknown` casts on handler bodies. Class-pattern adopters with explicit property annotations don't need them. |
+| `composeMethod(inner, { before, after })`                              | Wrap any platform method with typed before/after hooks (caching, enrichment under `ext.*`, typed-error guards).            |
+| `requireAccountMatch` / `requireAdvertiserMatch` / `requireOrgScope`   | Pre-built `accounts.resolve` post-resolve guards. Default deny is `null` (avoids principal enumeration); `onDeny: 'throw'` for `PermissionDeniedError`. |
+| `InMemoryImplicitAccountStore` (Shape A) / `createOAuthPassthroughResolver` (Shape B) / `createRosterAccountStore` (Shape C) | Reference `AccountStore` shapes. Shape A: `'implicit'` buyer-driven onboarding. Shape B: vendor OAuth + `/me/adaccounts`. Shape C: publisher-curated roster. |
+| `createTenantRegistry` (host-routed) / `createTenantStore` (account-routed) | Multi-tenant. Host-routed = one server per tenant + tenant-id keyed lookup. Account-routed = one server with built-in fail-closed tenant-isolation gate on `upsert` / `syncGovernance`. |
+| `BuyerAgentRegistry.signingOnly` / `bearerOnly` / `mixed` (+ `cached`) | Durable buyer-agent identity. Resolved `BuyerAgent` flows through `ctx.agent` to every `AccountStore` method and `tasks_get` polling. `BuyerAgent.status === 'suspended' \| 'blocked'` triggers `AGENT_SUSPENDED` / `AGENT_BLOCKED`; `sync_accounts.billing` is enforced against `BuyerAgent.billing_capabilities`. See [`docs/migration-buyer-agent-registry.md`](../migration-buyer-agent-registry.md). |
+| `MEDIA_BUY_TRANSITIONS` / `getMediaBuyTransitions` / `assertMediaBuyTransition` (+ creative pair) | Canonical lifecycle graphs shared with the storyboard runner. `getMediaBuyTransitions(adcpVersion)` selects the served release; `MEDIA_BUY_TRANSITIONS` uses the SDK default. `assertMediaBuyTransition(from, to, adcpVersion?)` throws `AdcpError` with the spec-correct code (`NOT_CANCELLABLE` / `INVALID_STATE`). Replaces local copies of the status graph. |
+| `createMediaBuyStore({ store })`                                       | Opt-in `targeting_overlay` echo on `get_media_buys`. Sellers claiming `property-lists` / `collection-lists` MUST echo the persisted list reference. |
+
+The full migration recipe walking adopters through each is at [`docs/migration-6.6-to-6.7.md`](../migration-6.6-to-6.7.md). The `examples/hello_*` family demonstrates each helper in a runnable adapter.
+
+When serving AdCP 3.3 or its beta/RC candidates, pass the negotiated release to
+`isLegalMediaBuyTransition` or `assertMediaBuyTransition` as the optional third
+argument. A blocking creative review rejection can move a not-yet-active buy
+from `pending_start` to `pending_creatives`; active and paused buys still cannot
+rewind to a pending state. Omitting the version keeps the SDK default release's
+contract. The storyboard runner selects the graph from the seller's response
+version, falling back to the run's `adcpVersion` and then the SDK default.
+
+### Exposing your agent over A2A (preview)
+
+MCP is the default transport. To additionally expose the same `AdcpServer` over A2A JSON-RPC — so A2A-native buyers can discover and call your agent — mount `createA2AAdapter`:
+
+```typescript
+import express from 'express';
+import { serve } from '@adcp/sdk';
+import { createAdcpServerFromPlatform, createA2AAdapter } from '@adcp/sdk/server';
+
+const adcp = createAdcpServerFromPlatform(platform, { name: 'My SSP', version: '1.0.0' });
+
+// MCP (as today)
+serve(() => adcp);
+
+// A2A (new, preview)
+const a2a = createA2AAdapter({
+  server: adcp,
+  agentCard: {
+    name: 'My SSP',
+    description: 'Guaranteed + non-guaranteed display inventory',
+    url: 'https://ssp.example.com/a2a',
+    version: '1.0.0',
+    provider: { organization: 'My Org', url: 'https://my-org.example' },
+    securitySchemes: { bearer: { type: 'http', scheme: 'bearer' } },
+  },
+  async authenticate(req) {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/, '');
+    if (!token) return null;
+    const principal = await tokenStore.lookup(token);
+    return principal ? { token, clientId: principal.id, scopes: principal.scopes } : null;
+  },
+});
+
+const app = express();
+// With `signedRequests` configured, record the exact request bytes so the
+// signature gate can verify them: pass `verify: a2a.rawBodyVerify`, or mount the
+// adapter before any body parser (it buffers the body itself).
+app.use(express.json({ verify: a2a.rawBodyVerify }));
+// mount() wires: JSON-RPC at the `agentCard.url` pathname (`/a2a` here),
+// the agent card at both `{basePath}/.well-known/agent-card.json` (A2A
+// SDK discovery derives this) AND `/.well-known/agent-card.json` (origin-
+// root probes). The `jsonRpcHandler` and `agentCardHandler` properties
+// stay exposed for deployments that need custom mounting.
+a2a.mount(app);
+app.listen(3000);
+```
+
+**Request signing over A2A.** If the server you pass to `createA2AAdapter` was built with `createAdcpServer({ signedRequests })`, the adapter runs the same RFC 9421 verifier on the JSON-RPC endpoint that `serve()` runs on MCP, so `request_signing.required_for` and `protocol_methods_required_for` hold on both transports. The adapter resolves the AdCP operation from the Message's sole DataPart `skill`, rejects a body that does not resolve to exactly one operation (`request_body_malformed`: zero or several DataParts, a FilePart, a duplicate or case-variant `skill` key, a non-string `skill`, a batch, a non-JSON body) before any handler runs, and dispatches only that operation. Rejections are HTTP 401 with `WWW-Authenticate: Signature error="<code>"`, issued before `authenticate` runs; a verified signature reaches handlers as `ctx.authInfo` with `clientId: signing:<keyid>`. Because the gate needs the exact signed bytes, do not mount a body parser ahead of the adapter unless it records them (`express.json({ verify: a2a.rawBodyVerify })`); a request whose raw body is unavailable gets a 500 and is never dispatched. If you wired the verifier by hand (`serve({ preTransport })`), pass it as `createA2AAdapter({ preTransport })`: the adapter refuses to construct when the server advertises request signing but nothing verifies signatures on A2A, unless you set `allowUnenforcedSignedRequests: true` because a gateway enforces it. `protocol_methods_required_for` matches the JSON-RPC `method` by exact name, and the A2A SDK serves its task methods under both the 1.0 and 0.3 names while `legacyCompat` is on, so list both (`CancelTask` and `tasks/cancel`). Resolve operations yourself with `adcpOperationResolver` (MCP `tools/call` and A2A message methods); `mcpToolNameResolver` is MCP-only and leaves `required_for` unenforced over A2A.
+
+The adapter enables the official A2A SDK's v0.3 compatibility layer by
+default, preserving existing sellers and buyers. For a native A2A 1.0-only
+server, pass `legacyCompat: { enabled: false }` to `createA2AAdapter`. This
+removes the v0.3 interface from the agent card and disables the SDK's legacy
+JSON-RPC and card handlers; it does not introduce a separate protocol
+implementation.
+
+Compliance storyboards are stricter than ordinary adopter calls: A2A runs use
+native 1.0 mode unconditionally, including per-agent routes in a multi-agent
+run. An agent that publishes only the v0.3 compatibility interface can remain
+reachable by normal SDK clients but will fail A2A compliance grading until it
+publishes its native 1.0 card and JSON-RPC interface.
+
+`tokenStore.lookup` represents your real credential verifier or identity provider. Returning a fixed principal for any
+non-empty bearer is an authentication bypass, not a safe example simplification.
+
+Both transports share the same `AdcpServer` — handlers, idempotency store, state store, and `resolveAccount` all run the same pipeline regardless of which transport received the request. Changes to handlers are picked up by both at once.
+
+**Skill addressing.** AdCP 3.2 uses A2A 1.0 and requires clients to activate `https://adcontextprotocol.org/extensions/adcp/v3`. Clients send a `Message` with one structured DataPart whose value is `{ skill: 'get_products', input: { brief: '...' } }`. `skill` matches an AdCP tool name; `input` is the tool arguments. The server's A2A 0.3 compatibility path accepts the older `parameters` alias, but 1.0 clients must use `input`.
+
+**Two lifecycles, one response.** A2A's `Task.state` tracks the *transport call* (did the request complete?). AdCP's `status` inside the artifact tracks the *work* (submitted / completed / failed). Don't conflate them — a completed A2A task can carry a `submitted`, `input-required`, or `auth-required` AdCP response. The adapter has no durable, principal-bound continuation dispatcher, so handler-produced pause arms are completed, nonresumable artifact results. Leaving the A2A task live would let continuation-only input re-enter the ordinary mutation pipeline as a fresh request.
+
+**Handler return → A2A `Task.state` + artifact:**
+
+| Handler returned… | A2A `Task.state` | Artifact payload |
+|---|---|---|
+| Success arm | `completed` | DataPart with the typed AdCP response |
+| Submitted arm (`status:'submitted'`) | `completed` | DataPart with the typed AdCP response, including its `task_id` |
+| Pause arm (`status:'input-required'` / `'auth-required'`) | `completed` | DataPart with the nonresumable AdCP pause response |
+| Error arm (`errors: [...]`) | `completed` | DataPart with the Error arm payload |
+| `adcpError('CODE', ...)` | `failed` | DataPart with `adcp_error` |
+
+**A2A `Task.id` vs AdCP `task_id`.** A2A owns its transport `Task.id`. The AdCP-level `task_id` is part of the typed Submitted response and identifies the asynchronous ad-tech work. Use A2A `GetTask` only for the A2A transport task; query AdCP work by sending the profile's `get_task_status` invocation with the AdCP `task_id`.
+
+**A2A scope.** The adapter exposes A2A 1.0 `SendMessage`, `GetTask`, `CancelTask`, and `GET /.well-known/agent-card.json`. Streaming, push notifications, and resumable mid-flight `input-required` interrupts are not yet implemented by this adapter.
+
+**Production task storage.** Pass `taskStore` when creating the A2A adapter in
+production. The SDK's in-memory A2A store is intentionally limited to
+`NODE_ENV=test` or `NODE_ENV=development`; it is not bounded or durable. The
+adapter redacts secret-shaped fields before every task-store write, including
+credentials carried in request history, but the application-owned store must
+still provide capacity limits, retention, and tenant/owner isolation.
+
+### Reading tool results (client side)
+
+The framework emits responses with typed data in `structuredContent` (MCP L3) and a human-readable summary in `content[0].text` (L2). When calling an AdCP agent from client code, prefer `structuredContent`; only fall back to parsing the text block for pre-`structuredContent` servers. The SDK ships two helpers with different failure modes:
+
+```typescript
+import { extractResult, unwrapProtocolResponse } from '@adcp/sdk';
+
+const res = await mcpClient.callTool({ name: 'get_products', arguments: { brief: '...' } });
+
+// Happy-path: returns structuredContent (or JSON-parsed text); undefined if neither yields data.
+const payload = extractResult<GetProductsResponse>(res);
+
+// Validated read: narrows against the tool schema, throws on missing / drifted payloads.
+const validated = unwrapProtocolResponse(res, 'get_products', 'mcp');
+```
+
+Pick based on the caller: `extractResult` when you just want the payload and can handle `undefined`; `unwrapProtocolResponse` when you want a schema-narrowed AdCP response or an explicit throw.
+
+### Returning errors from handlers
+
+Three shapes round-trip as errors:
+
+- **Typed error class — preferred for v6.** `throw new AuthMissingError()`, `throw new AuthInvalidError()`, `throw new PermissionDeniedError('action')`, `throw new RateLimitedError(retryAfterSeconds)`, `throw new ServiceUnavailableError()`, `throw new IdempotencyConflictError()`, `throw new BudgetTooLowError()`, plus the not-found family (`AccountNotFoundError`, `MediaBuyNotFoundError`, `PackageNotFoundError`, `ProductNotFoundError`, `CreativeNotFoundError`) and the governance family (`GovernanceDeniedError`, `PolicyViolationError`, `ComplianceUnsatisfiedError`). `AuthRequiredError` remains as a deprecated `AUTH_REQUIRED` compatibility wrapper for older sellers; new seller code should use the split auth classes. Each maps to its wire error code with `recovery` baked in. Throw from any platform method or `accounts.resolve`. Imports come from `@adcp/sdk/server`.
+- **Spec-defined tool failure** — return the tool's `*Error` arm directly: `return { errors: [{ code: 'PRODUCT_NOT_FOUND', message: 'no such product' }] }`. The dispatcher detects the Error arm by shape, sets `isError: true`, and preserves the `errors[]` / `context` / `ext` fields on `structuredContent`. Use this when the AdCP spec defines a per-tool error variant for the condition you're surfacing.
+- **`AdcpError(code, opts)` raw escape hatch** — for codes without a typed wrapper, or for codes you want to inject custom `details` into. The typed classes are sugar over this.
+
+```typescript
+// Typed (preferred)
+import { AuthMissingError, PermissionDeniedError, RateLimitedError } from '@adcp/sdk/server';
+
+createMediaBuy: async (req, ctx) => {
+  if (!ctx.authInfo?.credential && !ctx.account.authInfo) throw new AuthMissingError();
+  if (!agentCanCreate(ctx.agent, ctx.account.id)) throw new PermissionDeniedError('create_media_buy');
+  if (rateLimitHit(ctx.account.id)) throw new RateLimitedError(60);
+  /* ... */
+}
+
+// Raw escape hatch
+import { AdcpError } from '@adcp/sdk/server';
+throw new AdcpError('CUSTOM_CODE', { recovery: 'terminal', message: '...', details: { foo: 'bar' } });
+```
+
+All surface as `isError: true` on the wire and skip response-schema validation. Prefer throwing the typed class.
+
+**7 domain groups:**
+
+| Group | Handler keys |
+|-------|-------------|
+| `mediaBuy` | `getProducts`, `createMediaBuy`, `updateMediaBuy`, `getMediaBuys`, `getMediaBuyDelivery`, `providePerformanceFeedback`, `listCreativeFormats`, `syncCreatives`, `listCreatives` |
+| `signals` | `getSignals`, `activateSignal` |
+| `creative` | `listCreativeFormats`, `buildCreative`, `listCreatives`, `syncCreatives`, `getCreativeDelivery` |
+| `governance` | `createPropertyList`, `updatePropertyList`, `getPropertyList`, `listPropertyLists`, `deletePropertyList`, `listContentStandards`, `getContentStandards`, `createContentStandards`, `updateContentStandards`, `calibrateContent`, `validateContentDelivery`, `getMediaBuyArtifacts`, `getCreativeFeatures`, `syncPlans`, `checkGovernance`, `reportPlanOutcome`, `getPlanAuditLogs` |
+| `accounts` | `listAccounts`, `syncAccounts`, `syncGovernance`, `getAccountFinancials`, `reportUsage` |
+| `eventTracking` | `syncEventSources`, `logEvent`, `syncAudiences`, `syncCatalogs` |
+| `sponsoredIntelligence` | `getOffering`, `initiateSession`, `sendMessage`, `terminateSession` |
+
+### State Persistence (ctx.store)
+
+Every handler receives `ctx.store` — a key-value store for persisting domain objects across requests. Operations: `get`, `put`, `patch`, `delete`, `list`, each scoped by collection and ID.
+
+```typescript
+mediaBuy: {
+  createMediaBuy: async (params, ctx) => {
+    const mediaBuy = { media_buy_id: `mb_${Date.now()}`, status: 'pending_creatives', packages: [] };
+    await ctx.store.put('media_buys', mediaBuy.media_buy_id, mediaBuy);
+    return {
+      media_buy_id: mediaBuy.media_buy_id,
+      media_buy_status: mediaBuy.status,
+      packages: mediaBuy.packages,
+    };
+  },
+  getMediaBuys: async (params, ctx) => {
+    if (params.media_buy_ids?.length) {
+      const buys = await Promise.all(
+        params.media_buy_ids.map(id => ctx.store.get('media_buys', id))
+      );
+      return { media_buys: buys.filter(Boolean) };
+    }
+    const all = await ctx.store.list('media_buys');
+    return { media_buys: all };
+  },
+},
+```
+
+`InMemoryStateStore` is the default (good for development and testing). Use `PostgresStateStore` for production deployments where state must survive restarts.
+
+### Account Resolution
+
+`AccountStore.resolve(ref, ctx)` runs before every platform method. The resolved account lands at `ctx.account`. If a supplied ref resolves to `null`, the framework responds with terminal `ACCOUNT_NOT_FOUND`. If no ref was supplied and auth-derived resolution cannot select an account, account-required operations respond with correctable `ACCOUNT_REQUIRED`; account-optional operations may still run without `ctx.account`.
+
+```typescript
+import { definePlatform, refAccountId, AccountNotFoundError } from '@adcp/sdk/server';
+
+const platform = definePlatform({
+  capabilities: { specialisms: ['sales-non-guaranteed'] as const, /* ... */ },
+  accounts: {
+    // 'explicit' (default), 'implicit' (sync_accounts-first), or 'derived'
+    // (upstream-managed account-id namespace, discovered via list_accounts).
+    // The framework enforces each mode's durable reference shape *before*
+    // reaching your resolver: 'implicit' refuses inline {account_id};
+    // 'derived' refuses the {brand, operator} natural key.
+    resolution: 'explicit',
+    resolve: async (ref, ctx) => {
+      const id = refAccountId(ref);
+      if (id) return db.findAccount(id);
+      // ref undefined: tool without `account` field on wire — auth-derived path
+      if (ctx?.authInfo?.credential?.client_id) {
+        return db.findByClient(ctx.authInfo.credential.client_id);
+      }
+      return null; // account-required operation → ACCOUNT_REQUIRED
+    },
+  },
+  sales: defineSalesCorePlatform({
+    getProducts: async (req, ctx) => {
+      // ctx.account is the resolved account
+      const products = await catalog.search(req, ctx.account.id);
+      return { products, cache_scope: 'account' };
+    },
+    /* ... */
+  }),
+});
+```
+
+Three resolution modes:
+
+- **`'explicit'`** (default) — buyer passes `{account_id}` inline on every request. Snap, Meta, GAM-style sellers. The framework calls `resolve(ref, ctx)` with the inline ref.
+- **`'implicit'`** — buyer must call `sync_accounts` first; subsequent requests resolve from the auth-principal linkage your `upsert` populated. LinkedIn-shaped sellers. The framework refuses inline `{account_id}` references with `INVALID_REQUEST` (post-6.7 — pre-6.7 the docstring claimed this but nothing checked it). Use [`InMemoryImplicitAccountStore`](https://github.com/adcontextprotocol/adcp-client/blob/main/src/lib/adapters/implicit-account-store.ts) for the reference shape.
+- **`'derived'`** — an upstream-managed account-id namespace: you front a platform that owns the roster (Meta / Snap ad accounts, AudioStack workspaces, a retail-media proxy), or the credential is bound to a single account. Buyers discover ids via `list_accounts` and pass `{account_id}`; the framework refuses the `{brand, operator}` arm, `accounts.list` is required, and `resolve` must verify the buyer-supplied id against what the caller's credential can reach. Use [`createDerivedAccountStore`](https://github.com/adcontextprotocol/adcp-client/blob/main/src/lib/adapters/derived-account-store.ts), which does both. `resolve(undefined, ctx)` auto-selects when exactly one account is reachable. **Changed in SDK 14** — see the [migration guide](../migration-13-to-14.md#derived-account-resolution-is-now-an-upstream-managed-account-id-namespace).
+
+**Stateless BYOK provider adapters.** For single-account API-key or
+bearer-token BYOK, the provider credential can be the AdCP request credential
+for that endpoint: `Authorization: Bearer <provider_api_key_or_access_token>`.
+This keeps the baseline seller-agent wrapper pattern single-plane: the seller
+agent authenticates the request with the caller-presented provider credential,
+derives the account from request auth, and uses the same request-local token
+for upstream provider calls. No SDK-managed OAuth flow, refresh-token store,
+provider-token store, or callback route is required when the caller owns the
+provider credential lifecycle. If the provider credential can see multiple
+upstream accounts, stay in `'derived'` and supply `listAccounts` so buyers
+can discover and name one, or use `createOAuthPassthroughResolver` under
+`'explicit'` when you own the id namespace. Handlers with a
+resolved account should read the active token from
+`ctx.account.authInfo?.token`; refresh hooks update `account.authInfo`.
+Handlers without a resolved account can read the request token from
+`ctx.authInfo.token`. Use a stable non-secret identity such as
+`ctx.authInfo.credential.key_id`, `ctx.authInfo.credential.client_id`, or
+an adopter-supplied `principal` string for cache/idempotency scoping. Treat
+both token paths as request-local: do not copy provider tokens into persisted
+Account rows, `ctx_metadata`, `ctx.authInfo.extra`, request `ext` / body
+fields, or log lines. Add a separate provider-auth channel only for dual-auth
+proxy deployments where one request carries both caller-to-agent auth and a
+distinct upstream-provider credential.
+
+**Three reference shapes** for adopters who don't want to write the resolver from scratch:
+
+- `InMemoryImplicitAccountStore` — Shape A, buyer-driven `sync_accounts` populates the auth-principal → accounts map.
+- `createOAuthPassthroughResolver` — Shape B, returns just the `resolve` function for adapters fronting an upstream OAuth listing endpoint (Snap, Meta, TikTok, LinkedIn — `extract bearer → GET /me/adaccounts → match by id`).
+- `createRosterAccountStore` — Shape C, returns a complete `AccountStore` for adopters who own the roster (storefront table, admin-UI-managed JSON).
+
+For multi-tenant adapters, use `createTenantStore({...})` (account-routed) or `createTenantRegistry({...})` (host-routed). `createTenantStore` ships with a built-in fail-closed tenant-isolation gate on `upsert` / `syncGovernance` — cross-tenant entries are rejected with `PERMISSION_DENIED` *before* your callbacks run. See `examples/hello_seller_adapter_multi_tenant.ts`.
+
+Composable post-resolve guards: `requireAccountMatch(predicate)`, `requireAdvertiserMatch(getRoster)`, `requireOrgScope(getAccountOrg, getCtxOrg)`. Wrap with `composeMethod`:
+
+```typescript
+import { composeMethod, requireAdvertiserMatch } from '@adcp/sdk/server';
+
+accounts: {
+  resolve: composeMethod(
+    innerResolve,
+    requireAdvertiserMatch(async (ctx) => tenantRoster.for(ctx?.agent))
+  ),
+}
+```
+
+**Don't put credentials in `ctx_metadata`.** The wire-strip protects buyer responses but not server-side log lines, error envelopes, heap dumps, or adopter-generated strings. Re-derive bearers per request from `ctx.authInfo` + your token cache; embed only non-secret upstream IDs. See [`CTX-METADATA-SAFETY.md`](./CTX-METADATA-SAFETY.md).
+
+### Idempotency (mutating tools)
+
+AdCP v3 requires `idempotency_key` on every mutating request and requires sellers to declare a replay window. `@adcp/sdk/server` ships `createIdempotencyStore` which handles validation, JCS canonicalization, replay, and capability declaration:
+
+```typescript
+import { serve } from '@adcp/sdk';
+import {
+  createAdcpServerFromPlatform,
+  createIdempotencyStore,
+  memoryBackend,
+  pgBackend,
+} from '@adcp/sdk/server';
+
+// Development — in-process store, resets on restart:
+const idempotency = createIdempotencyStore({
+  backend: memoryBackend(),
+  ttlSeconds: 86400, // 1h–7d; values outside the spec bounds are rejected
+});
+
+serve(() =>
+  createAdcpServerFromPlatform(platform, {
+    name: 'My Publisher',
+    version: '1.0.0',
+    idempotency,
+    resolveSessionKey: ctx => ctx.account?.id, // doubles as idempotency principal
+  })
+);
+```
+
+**Production (pgBackend).** `pg.Pool` is lazy — a bad `DATABASE_URL` lets the server boot, advertise `IdempotencySupported`, then silently fail every mutating call. Wire `readinessCheck` so the server never accepts traffic with a broken pool:
+
+```typescript
+import { serve } from '@adcp/sdk';
+import { createAdcpServerFromPlatform, createIdempotencyStore, pgBackend, getIdempotencyMigration } from '@adcp/sdk/server';
+import { Pool } from 'pg';
+
+// Run getIdempotencyMigration() once before first boot to create the table —
+// readinessCheck below queries it to catch missing migrations, not just connectivity.
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+pool.on('error', err => console.error('pg pool error', err)); // prevent crash on idle-client errors
+const idempotency = createIdempotencyStore({ backend: pgBackend(pool), ttlSeconds: 86400 });
+
+serve(() => createAdcpServerFromPlatform(platform, { name: 'My Publisher', version: '1.0.0', idempotency }), {
+  readinessCheck: () => idempotency.probe(), // throws with a descriptive error if pool/table is broken
+});
+```
+
+The framework auto-handles:
+- `INVALID_REQUEST` when the key is missing on mutating tools
+- `IDEMPOTENCY_CONFLICT` on same-key-different-payload (no payload leak in the error body)
+- `IDEMPOTENCY_EXPIRED` past the TTL, with ±60s clock-skew tolerance
+- `replayed: true` injection on the envelope when replaying a cached response
+- `adcp.idempotency.replay_ttl_seconds` declared on `get_adcp_capabilities`
+
+Scoping is per-principal — `resolveSessionKey` doubles as the idempotency principal, so two buyers with different session keys won't share cache entries. Override with `resolveIdempotencyPrincipal` if you need a different scope (e.g., `operator_id`).
+
+**Successful responses are cached.** Request-validation failures happen before
+the handler and may be retried after correction. Once a mutating handler is
+invoked, however, a thrown exception cannot prove that no upstream side effect
+committed. The framework therefore caches non-transient typed rejections thrown
+directly by the handler as the durable outcome. Transient typed exceptions,
+unknown exceptions, and post-handler response failures become a full-window
+ambiguity fence rather than a misleading retryable response. Exact retries
+never re-enter that handler; reconcile an ambiguous operation by its natural
+key before issuing a new intent. Optional idempotency on non-mutating handlers
+may still release its claim after a thrown error because no mutation was
+admitted.
+
+### Durable proposal lifecycle state
+
+Production sellers using the proposal manager should keep proposal recipes
+and consumption fences in PostgreSQL alongside the durable task registry and
+task-settlement coordinator:
+
+```ts
+import {
+  createPostgresProposalStore,
+  getProposalStoreMigration,
+  serve,
+} from '@adcp/sdk/server';
+
+// Run this migration once from deployment tooling, not in every server replica.
+await pool.query(getProposalStoreMigration({ tableName: 'seller_adcp_proposals' }));
+pool.on('error', err => logger.error({ err }, 'PostgreSQL pool error'));
+const proposalStore = createPostgresProposalStore({
+  db: pool,
+  namespace: 'seller-prod',
+  tableName: 'seller_adcp_proposals',
+});
+serve(() => createAdcpServerFromPlatform(platform, {
+  name: 'Seller', version: '1.0.0', proposalStore,
+}), {
+  readinessCheck: () => proposalStore.probe(),
+});
+```
+
+The store scopes every read and CAS transition by deployment namespace and
+account, persists exact JSON-safe proposal/recipe documents, and atomically
+enforces `draft → committed → consuming → consumed`. Run bounded
+`proposalStore.cleanupExpired()` from an operations worker; expiry uses the
+database clock. Never place credentials in proposal recipes or payloads—the
+store rejects credential-shaped fields and oversized documents.
+`expectedAccountId` is required by durable store mutations; the framework
+supplies it automatically. The process-local store retains unscoped
+`commit`/`discard` only as a deprecated source-compatibility path for preview
+adopters, and refuses ambiguous duplicate IDs across accounts.
+
+### Schema-Driven Validation (opt-in)
+
+`createAdcpServerFromPlatform` can validate every inbound request and handler response against the bundled AdCP JSON schemas for the SDK's declared version. Catches field-name drift (e.g. a handler emits `targeting_overlay` where the spec expects `targeting`) before the response leaves your agent.
+
+```typescript
+createAdcpServerFromPlatform(platform, {
+  name: 'my-seller',
+  version: '1.0.0',
+  validation: {
+    requests: 'strict', // reject malformed requests with VALIDATION_ERROR
+    responses: 'warn', // log handler drift, return response unchanged
+  },
+});
+```
+
+Modes per side: `'strict' | 'warn' | 'off'`. Default is `'off'` — enable explicitly. `VALIDATION_ERROR` envelopes carry the full issue list (pointer, message, keyword, schema path) at the top level `adcp_error.issues` (and mirrored at `details.issues` for spec-convention compatibility) so buyers can surface each offending field without drilling into nested metadata.
+
+**Note on MCP `tools/list` introspection**: `@adcp/sdk` agents register framework tools with a passthrough input schema by default so the framework AJV validator is authoritative on both MCP and A2A (see [#909](https://github.com/adcontextprotocol/adcp-client/issues/909)). Outside the active AdCP 3.2 media-buy profile, MCP `tools/list` therefore publishes `{ type: 'object', properties: {}, additionalProperties: {} }` rather than the per-tool parameter schema. Generic MCP discovery clients can opt in with `exposeToolSchemas: true`; known AdCP tools then publish shallow top-level key hints while unknown surfaces fall back to passthrough. Active 3.2 profile discovery is the exception: it projects the exact self-contained draft-2020-12 request schema into `tools/list` without changing the passthrough registration or framework validation path. Output schemas remain framework-validated because current MCP clients also apply a declared success schema to structured error results. AdCP-native discovery via `get_adcp_capabilities` is unaffected; upstream [adcp#3057](https://github.com/adcontextprotocol/adcp/issues/3057) proposes a `get_schema` capability tool for per-tool shape discovery across transports.
+
+For AdCP 3.2 media-buy sellers, `mcpToolProfile: 'auto'` also filters
+discovery to the spec's active role profile as soon as a compact lifecycle
+handler is registered. Deprecated legacy handlers remain callable but are not
+listed. The list response exposes `_meta.adcp_version` and
+`_meta.adcp_profile`; each framework tool exposes `_meta.adcp_version`. Use
+`mcpToolProfile: 'all'` only when you intentionally need to inspect the entire
+registered compatibility surface. See [AdCP 3.2 media-buy lifecycle
+compatibility](MEDIA-BUY-3.2-COMPATIBILITY.md).
+
+The same validator runs on the `AdcpClient` side — storyboards and third-party clients configure it via `validation: { requests, responses }` on the client config. Request default is `warn` (so existing callers that send partial payloads still work); response default is `strict` in dev/test, `warn` in production. Set either side to `'off'` for zero overhead. Protocol feature preflights are separate from schema validation; the client may still reject request controls that are known to be incompatible with the configured AdCP version before dispatch.
+
+### Request Signing
+
+If your agent receives signed requests from buyers, verify them using `requireAuthenticatedOrSigned()` — one call that bundles signature verification with credential fallback and `requiredFor` enforcement:
+
+```typescript
+import { serve } from '@adcp/sdk';
+import {
+  createAdcpServerFromPlatform,
+  verifySignatureAsAuthenticator,
+  verifyApiKey,
+  requireAuthenticatedOrSigned,
+  adcpOperationResolver,
+} from '@adcp/sdk/server';
+import { ResolvedAgentJwksResolver } from '@adcp/sdk/signing/server';
+
+serve(
+  () =>
+    createAdcpServerFromPlatform(platform, {
+      name: 'My Seller',
+      version: '1.0.0',
+      capabilities: {
+        overrides: {
+          request_signing: {
+            supported: true,
+            required_for: ['create_media_buy', 'update_media_buy'],
+            covers_content_digest: 'either',
+          },
+        },
+      },
+    }),
+  {
+    authenticate: requireAuthenticatedOrSigned({
+      signature: verifySignatureAsAuthenticator({
+        capability: { supported: true, required_for: ['create_media_buy', 'update_media_buy'], covers_content_digest: 'either' },
+        jwks: new ResolvedAgentJwksResolver('https://buyer.example/mcp', 'mcp'),
+        resolveOperation: adcpOperationResolver,
+      }),
+      fallback: verifyApiKey({ keys: { sk_live_abc: { principal: 'acct_42' } } }),
+      requiredFor: ['create_media_buy', 'update_media_buy'],
+      resolveOperation: adcpOperationResolver,
+    }),
+  }
+);
+```
+
+When signature headers are present, only signature auth runs (no fallback to bearer — that prevents bypass attacks). When absent, the credential authenticator runs as normal. `requiredFor` enforces the spec's `request_signature_required` 401 on operations that arrive unsigned without other credentials — start narrow and widen as your counterparties roll out signing. `replayStore` and `revocationStore` default to in-memory implementations — pass shared (e.g. Redis-backed) stores for horizontally scaled fleets. The capability key is `request_signing`; `signed_requests` is silently dropped (the `AdcpCapabilitiesOverrides` shape is what `get_adcp_capabilities` advertises).
+
+For outbound webhook signing, pass a signing provider and durable delivery
+store on the server options:
+
+```typescript
+createAdcpServerFromPlatform(platform, {
+  name: 'My Seller',
+  version: '1.0.0',
+  webhooks: {
+    signerProvider: kmsSigningProvider,
+    deliveryStore: durableWebhookDeliveryStore,
+    deliveryRecovery: durableWebhookOutbox,
+    publisherScope: 'my-seller',
+  },
+});
+```
+
+**Push-enabled HITL task handoffs fail closed.** When a handler returns
+`ctx.handoffToTask(...)` for a request with a validated
+`push_notification_config.url`, the server must have a terminal task-webhook
+delivery owner. Configure `webhooks` for framework delivery, or omit
+`push_notification_config` and let the buyer poll. A server without either
+returns structured `UNSUPPORTED_FEATURE` before creating a task or starting the
+handoff callback. The platform handler has already run to return its marker, so
+keep irreversible effects in the handoff callback; framework-managed proposal
+reservations are unwound. Buyers changing the request must use a new
+`idempotency_key`. Synchronous responses are unaffected.
+
+This applies to `handoffToTask(..., { settlement: 'external' })` too: external
+producers have no SDK terminal-delivery path, so they must omit
+`push_notification_config` and use polling. A framework emitter does not make
+an externally settled task deliverable.
+
+**Production key storage.** For outbound request or webhook signing, prefer a KMS-backed `SigningProvider` over in-process JWKs. See [SIGNING-GUIDE.md § Production Key Storage](./SIGNING-GUIDE.md#step-35-production-key-storage--kms--hsm--vault) for the full walkthrough including a reference GCP KMS adapter. Production webhook servers must provide a shared durable `deliveryStore` plus `deliveryRecovery`, a durable outbox that checkpoints the exact destination, payload/timestamp, authentication reference, and retry policy before delivery and recovers unsettled snapshots after restart. The SDK supplies PostgreSQL and Redis delivery stores, recovery backends, migrations, and a bounded recovery polling API; applications supply the KMS/secret adapter and operational scheduler. Tenant namespaces are derived from trusted resolved request context.
+
+See [SIGNING-GUIDE.md](./SIGNING-GUIDE.md) for the full walkthrough: key generation, JWKS publication, brand.json, conformance testing, and KMS-backed production deployment.
+
+When a human approval or provider callback commits before the application can
+settle its SDK task, use the PostgreSQL settlement-intent queue to close that
+earlier crash window. See [Durable task settlement](./DURABLE-TASK-SETTLEMENT.md)
+for the domain transaction → task/webhook transaction → webhook recovery
+sequence, copyable polling and push settlement handlers, and scoped dead-letter
+operations.
+
+### Portable MCP Apps for custom tools
+
+Use `resources` with custom-tool `_meta.ui` to attach one host-neutral MCP
+App to a tool. The framework registers the `ui://` resource on both legacy
+MCP connections and every modern per-request server reconstruction; the same
+configuration therefore works in compliant Claude, ChatGPT, and future hosts.
+
+```typescript
+import { createAdcpServerFromPlatform } from '@adcp/sdk/server';
+
+const server = createAdcpServerFromPlatform(platform, {
+  name: 'My Publisher',
+  version: '1.0.0',
+  resources: [
+    {
+      name: 'creative_upload',
+      uri: 'ui://creative/upload',
+      _meta: {
+        ui: {
+          csp: {
+            connectDomains: ['https://uploads.example.com'],
+            resourceDomains: ['https://assets.example.com'],
+          },
+          prefersBorder: true,
+        },
+      },
+      handler: async () => renderUploadApp(),
+    },
+  ],
+  customTools: {
+    upload_creative_asset: {
+      description: 'Open the creative upload flow.',
+      _meta: { ui: { resourceUri: 'ui://creative/upload' } },
+      handler: async () => ({
+        // Required text-only fallback for hosts without MCP Apps support.
+        content: [{ type: 'text', text: 'Upload a creative asset.' }],
+      }),
+    },
+    prepare_creative_upload: {
+      _meta: { ui: { visibility: ['app'] } },
+      handler: prepareCreativeUpload,
+    },
+    finalize_creative_upload: {
+      _meta: { ui: { visibility: ['app'] } },
+      handler: finalizeCreativeUpload,
+    },
+  },
+});
+```
+
+MCP App resources always use a `ui://` URI and
+`text/html;profile=mcp-app`; the public types and construction-time checks
+reject other shapes. The resource `_meta.ui` object carries CSP domains,
+permissions, a dedicated host domain, and border preference, and is emitted
+consistently by both `resources/list` and `resources/read`.
+
+Registration delegates to the official MCP Apps v2 server helpers. New code
+should use `_meta.ui.resourceUri`; the helpers also mirror the deprecated
+`_meta['ui/resourceUri']` key for older hosts and accept that key from legacy
+configurations during migration. The resource MIME type defaults to the MCP
+Apps value, so it normally does not need to be specified.
+
+`ui.visibility` is host routing metadata, not an authorization boundary.
+App-only handlers must still authenticate and authorize every request, and
+tools should always return meaningful text content so clients that do not
+negotiate `io.modelcontextprotocol/ui` degrade gracefully. A startup warning
+identifies any tool `resourceUri` that does not match a configured resource.
+Resource handlers intentionally receive no authentication material: the HTML
+bundle must be principal-independent and cache-safe. Fetch tenant data or mint
+short-lived upload URLs through authenticated app-only tools after the app has
+loaded.
+
+### createTaskCapableServer (Low-Level)
+
+For advanced cases where you need direct control over MCP tool registration, schema wiring, and response formatting. `createAdcpServerFromPlatform` calls into this internally.
+
+```typescript
+import { createTaskCapableServer, taskToolResponse } from '@adcp/sdk';
+import { GetSignalsRequestSchema } from '@adcp/sdk/schemas';
+
+function createAgent({ taskStore }) {
+  const server = createTaskCapableServer('Agent Name', '1.0.0', { taskStore });
+
+  server.tool('get_signals', 'Discover segments.', GetSignalsRequestSchema.shape, async (args) => {
+    return taskToolResponse({ signals: [...], sandbox: true }, 'Found segments');
+  });
+
+  return server;
+}
+```
+
+When using `createTaskCapableServer` directly, you are responsible for:
+- Wiring Zod schemas via `.shape`
+- Wrapping responses with `taskToolResponse()` or domain-specific builders
+- Implementing `get_adcp_capabilities` manually
+- Error handling in each tool handler
+
+#### Envelope fields — `wrapEnvelope`
+
+Attach `replayed`, `context`, and `operation_id` onto your inner response without reimplementing the per-error-code allowlist (IDEMPOTENCY_CONFLICT drops `replayed`, keeps `context`):
+
+```typescript
+import { wrapEnvelope } from '@adcp/sdk/server';
+
+const inner = await createMediaBuy(request.params);
+return wrapEnvelope(inner, { replayed: false, context: request.context });
+```
+
+On error, pass the AdCP error envelope as `inner` — the helper reads `adcp_error.code` and applies the allowlist:
+
+```typescript
+return wrapEnvelope(
+  { adcp_error: { code: 'IDEMPOTENCY_CONFLICT', message, recovery: 'terminal' } },
+  { context: request.context }
+);
+```
+
+### Response Builders
+
+With `createAdcpServerFromPlatform`, return handler payloads, not full wire envelopes. The framework owns protocol fields such as task `status`, `task_id`, `adcp_version`, context echoing, and response validation. Domain lifecycle fields remain part of your payload: for media buys use `media_buy_status`, while nested resources such as accounts, creatives, audiences, and `media_buys[]` keep their resource `status` fields.
+
+For `getProducts`, any response that includes `products` or `unchanged: true` must also include `cache_scope`. Use `public` for a universal rate card and `account` when the response includes account-specific rate cards or pricing overlays. The framework can safely infer `public` only when there is no inline account and no auth-derived/resolved account; account-scoped product responses should set the field explicitly.
+
+If you need manual control (e.g., with `createTaskCapableServer`), builders are available:
+
+```typescript
+import {
+  legacyProductsResponse,
+  legacyMediaBuyResponse,
+  legacyDeliveryResponse,
+  taskToolResponse,
+} from '@adcp/sdk';
+// For error envelopes, throw a typed error class — `AuthMissingError`,
+// `PermissionDeniedError`, `RateLimitedError`, etc. — from `@adcp/sdk/server`.
+
+const response = legacyProductsResponse({ products, cache_scope: 'public' });
+```
+
+### Task Statuses (Server-Side Contract)
+
+When your agent receives a tool call, it returns one of these statuses. The buyer client handles each differently:
+
+| Status | When to use | What the buyer client does |
+|--------|------------|---------------------------|
+| `completed` | Request fulfilled synchronously | Reads `result.data` and proceeds |
+| `working` | Processing started, not done yet | Polls `tasks/get` until status changes |
+| `submitted` | Will notify via webhook when done | Waits for webhook delivery at `push_notification_config.url` |
+| `input_required` | Need clarification from buyer | Fires buyer's `InputHandler` callback with the question |
+| `deferred` | Requires human decision | Returns a token; human resumes later via `result.deferred.resume()` |
+
+With `createAdcpServerFromPlatform`, synchronous handlers return raw data and the framework sets `completed` automatically. With `createTaskCapableServer`, use `taskToolResponse()` explicitly.
+
+For async tools that need background processing, use `registerAdcpTaskTool()`:
+
+```typescript
+import { registerAdcpTaskTool, InMemoryTaskStore } from '@adcp/sdk';
+import { CreateMediaBuyRequestSchema } from '@adcp/sdk/schemas';
+
+const taskStore = new InMemoryTaskStore();
+
+registerAdcpTaskTool(server, taskStore, {
+  name: 'create_media_buy',
+  description: 'Create a media buy.',
+  schema: CreateMediaBuyRequestSchema.shape,
+  createTask: async (args) => {
+    // Start processing, return a task ID
+    const taskId = crypto.randomUUID();
+    processInBackground(taskId, args); // your async logic
+    return { taskId, status: 'submitted' };
+  },
+  getTask: async (taskId) => taskStore.get(taskId),
+  getTaskResult: async (taskId) => taskStore.getResult(taskId),
+});
+```
+
+**Error responses**: throw the typed error class for the spec code. The buyer agent uses the `recovery` classification baked into the class to decide retry behavior:
+
+```typescript
+import {
+  BudgetTooLowError,
+  ServiceUnavailableError,
+  PermissionDeniedError,
+} from '@adcp/sdk/server';
+
+// correctable — buyer should fix params and retry
+throw new BudgetTooLowError({ message: 'Minimum budget is $1,000' });
+
+// transient — buyer should retry after delay
+throw new ServiceUnavailableError({ retryAfterSeconds: 30 });
+
+// terminal — buyer should stop
+throw new PermissionDeniedError('account_access', { message: 'Contact support' });
+```
+
+For codes without a typed wrapper, `throw new AdcpError('CUSTOM_CODE', { recovery, message })` is the raw escape hatch.
+
+> **Heads-up for buyer-agent authors**: five codes are spec-`correctable` but operator-semantically human-escalate — don't auto-mutate-and-retry on `POLICY_VIOLATION`, `COMPLIANCE_UNSATISFIED`, `GOVERNANCE_DENIED`, `AUTH_REQUIRED`, or `AUTH_MISSING`. Surface to the user unless your agent owns a credential-refresh path. `AUTH_INVALID` is terminal by default because retrying revoked credentials creates an SSO retry storm.
+
+See `docs/llms.txt` for the full error code table with recovery classifications.
+
+### Storyboards
+
+The `storyboards/` directory contains YAML files that define exactly what tool call sequences a buyer agent will make against your server. Each storyboard includes phases, steps, sample requests/responses, and validation rules.
+
+Key storyboards for server-side builders:
+- `media_buy_non_guaranteed.yaml` — auction-based buying flow
+- `media_buy_guaranteed_approval.yaml` — guaranteed buying with IO approval
+- `media_buy_proposal_mode.yaml` — proposal-based buying
+- `creative_sales_agent.yaml` — push creative assets to your platform
+- `signal_marketplace.yaml` / `signal_owned.yaml` — signals agent flows
+- `si_session.yaml` — sponsored intelligence sessions
+- `media_buy_governance_escalation.yaml` — governance with human escalation
+
+### HTTP Transport
+
+The `serve()` helper handles HTTP transport setup. Pass it a factory function that returns a configured `AdcpServer`:
+
+```typescript
+import { serve } from '@adcp/sdk';
+import { createAdcpServerFromPlatform } from '@adcp/sdk/server';
+
+serve(() => createAdcpServerFromPlatform(platform, { name: 'My Agent', version: '1.0.0' }));
+serve(() => createAdcpServerFromPlatform(platform, { /* ... */ }), { port: 8080 }); // custom port
+serve(() => createAdcpServerFromPlatform(platform, { /* ... */ }), { path: '/v1/mcp' }); // custom path
+```
+
+`serve()` returns the underlying `http.Server` for lifecycle control (e.g., graceful shutdown).
+
+**Breaking transport requirement:** Host/Origin validation runs before MCP era
+classification, so it applies to both legacy and MCP 2026-07-28 requests served
+by an `AdcpServer`. Public deployments that previously omitted these settings
+must set `publicUrl` so `serve()` derives the public hostname, or pass explicit
+`allowedHosts` and `allowedOrigins` lists. Without either, requests are
+localhost-only to prevent DNS rebinding. If a reverse proxy rewrites `Host`,
+include both the public hostname and the upstream hostname in `allowedHosts`;
+keep browser-facing origins in `allowedOrigins`. Entries are hostnames without
+ports. Era classification buffers JSON bodies up to 2 MiB by default; use
+`maxRequestBytes` when a documented extension needs a larger payload.
+
+When using the v1 `createTaskCapableServer` directly, `serve()` passes a
+`{ taskStore }` to your factory so legacy MCP Tasks work correctly across
+stateless HTTP requests. Raw v1 `McpServer` instances remain legacy-only;
+return an `AdcpServer` from `createAdcpServerFromPlatform` for MCP 2026-07-28.
+
+For custom routing or middleware, you can wire the transport manually:
+
+```typescript
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { createServer } from 'http';
+
+const httpServer = createServer(async (req, res) => {
+  if (req.url === '/mcp' || req.url === '/mcp/') {
+    const agentServer = createMyAgent();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    try {
+      await agentServer.connect(transport);
+      await transport.handleRequest(req, res);
+    } catch (err) {
+      console.error('Server error:', err);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Internal server error' }));
+      }
+    } finally {
+      await agentServer.close();
+    }
+  } else {
+    res.writeHead(404);
+    res.end('Not found');
+  }
+});
+```
+
+For existing Express apps that must preserve path-routed public URLs such as `/storefront/:platformId/mcp`, see `examples/decisioning-platform-path-routed.ts`. It shows a `TenantRegistry` mounted behind an Express route, per-request `StreamableHTTPServerTransport`, MCP `req.auth` stamped from existing auth middleware, and `accounts.resolve(ref, ctx)` reading buyer identity from `ctx.authInfo` instead of closing over Express request state.
+
+## Testing Your Agent
+
+### Tool Discovery
+
+```bash
+npx @adcp/sdk@adcp-3.1 http://localhost:3001/mcp
+```
+
+This lists all tools your agent exposes, their descriptions, and parameters. If `get_signals` appears with the correct schema, your agent is wired up correctly.
+
+### Calling Tools
+
+```bash
+# All segments
+npx @adcp/sdk@adcp-3.1 http://localhost:3001/mcp get_signals '{"signal_spec":"audience segments"}'
+
+# Filtered by text
+npx @adcp/sdk@adcp-3.1 http://localhost:3001/mcp get_signals '{"signal_spec":"shoppers"}'
+
+# Filtered by catalog type
+npx @adcp/sdk@adcp-3.1 http://localhost:3001/mcp get_signals '{"filters":{"catalog_types":["marketplace"]}}'
+
+# JSON output for scripting
+npx @adcp/sdk@adcp-3.1 http://localhost:3001/mcp get_signals '{}' --json
+```
+
+```bash
+# Create a media buy (mutating tool — requires idempotency_key)
+# Schema traps: idempotency_key must be 16-255 chars (UUID v4 recommended);
+# package-level budget is a plain number (not {amount,currency}); brand uses {domain} (not {brand_id});
+# packages require product_id, budget, and pricing_option_id
+npx @adcp/sdk@adcp-3.1 http://localhost:3001/mcp create_media_buy '{
+  "idempotency_key": "550e8400-e29b-41d4-a716-446655440000",
+  "account": { "account_id": "acct_123" },
+  "brand": { "domain": "acme.example" },
+  "start_time": "2026-05-01T00:00:00Z",
+  "end_time": "2026-05-31T23:59:59Z",
+  "packages": [
+    { "product_id": "p_sports_ctv", "budget": 10000, "pricing_option_id": "po_cpm_35" }
+  ]
+}'
+```
+
+### Compliance Check
+
+```bash
+npx @adcp/sdk@adcp-3.1 storyboard run http://localhost:3001/mcp
+```
+
+This runs a standard validation suite against your agent to check AdCP compliance. For the full validation picture — storyboard runner, property-based fuzzing (`adcp fuzz`), multi-instance testing, webhook conformance, request-signing, schema-driven validation, and the skill→agent→grader dogfood harness — see [**VALIDATE-YOUR-AGENT.md**](./VALIDATE-YOUR-AGENT.md).
+
+## Complete Example
+
+See [`examples/signals-agent.ts`](../../examples/signals-agent.ts) for a complete, runnable signals agent with:
+
+- Three audience segments (owned, custom, marketplace)
+- Text search via `signal_spec`
+- Filtering by `signal_ids` and `catalog_types`
+- Result limiting via `max_results`
+- Proper HTTP transport setup
+
+See [`examples/error-compliant-server.ts`](../../examples/error-compliant-server.ts) for a media buy agent demonstrating:
+
+- Multiple tools (`get_products`, `create_media_buy`, `get_media_buy_delivery`)
+- Structured error handling (throw the typed error classes from `@adcp/sdk/server` — `AuthMissingError`, `AuthInvalidError`, `RateLimitedError`, etc. — see § "Returning errors from handlers")
+- Rate limiting
+- Business logic validation
+
+## Related
+
+- [`registerAdcpTaskTool()`](https://github.com/adcontextprotocol/adcp-client/blob/main/src/lib/server/tasks.ts) — for async tools that need background processing
+- [`examples/error-compliant-server.ts`](../../examples/error-compliant-server.ts) — media buy agent with multiple tools and error handling
+- [AdCP specification](https://adcontextprotocol.org) — full protocol reference

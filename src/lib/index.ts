@@ -1,0 +1,2437 @@
+// AdCP Client Library - Main Exports
+export * from './identifiers';
+export type { ResolveIdentifiersAllOptions, ResolveIdentifierOutcome } from './registry';
+// A comprehensive type-safe client library for the AdContext Protocol
+
+// ====== REGISTRY LOOKUPS ======
+export {
+  RegistryClient,
+  RegistryRequestError,
+  isRegistryRequestError,
+  RegistrySync,
+  PropertyRegistry,
+  InMemoryCursorStore,
+  FileCursorStore,
+  buildCommunityMirrorAdagents,
+} from './registry';
+export type {
+  RegistrySyncConfig,
+  RegistrySyncState,
+  RegistrySyncTransport,
+  RegistrySyncEvents,
+  AgentFilter,
+  RegistrySyncProperty,
+  CursorStore,
+  PropertyRegistryConfig,
+  FeedStreamQuery,
+  FeedStreamMessage,
+  FeedHeartbeat,
+  FeedStreamErrorData,
+  OpenFeedStreamOptions,
+  FeedFreshness,
+} from './registry';
+export {
+  openFeedStream,
+  parseSseStream,
+  sanitizeStreamText,
+  DEFAULT_MAX_SSE_FRAME_BYTES,
+  FeedStreamError,
+  FeedStreamUnsupportedError,
+  FeedStreamCursorExpiredError,
+  FeedStreamHttpError,
+  FeedStreamParseError,
+} from './registry';
+export type {
+  ResolvedBrand,
+  LookupBrandOptions,
+  ResolvedProperty as ResolvedRegistryProperty,
+  PropertyInfo,
+  RegistryClientConfig,
+  SaveBrandRequest,
+  SaveBrandResponse,
+  BrandLogoReviewStatus,
+  ApprovedBrandLogoAsset,
+  PendingBrandLogoAsset,
+  ReviewedBrandLogoAsset,
+  BrandLogoAsset,
+  ListBrandLogosOptions,
+  ListBrandLogosResponse,
+  SaveBrandLogoInput,
+  SaveBrandLogoResponse,
+  UploadBrandLogoInput,
+  UploadBrandLogoResponse,
+  SavePropertyIdentity,
+  RegistryPropertyIdentity,
+  SavePropertyRequest,
+  SavePropertyResponse,
+  ResolveIdentifiersRequest,
+  ResolveIdentifiersResponse,
+  FileCatalogDisputeRequest,
+  FileCatalogDisputeResponse,
+  GetCatalogDisputeResponse,
+  BrandRegistryItem,
+  PropertyRegistryItem,
+  ValidationResult as RegistryValidationResult,
+  FederatedAgentWithDetails,
+  FederatedPublisher,
+  DomainLookupResult,
+  ListBrandsOptions,
+  ListBrandsResponse,
+  GetBrandJsonResponse,
+  ListOptions,
+  ListAgentsOptions,
+  ListAgentsResponse,
+  ListPublishersResponse,
+  ValidateAdagentsRequest,
+  ValidateAdagentsResponse,
+  CreateAdagentsRequest,
+  CreateAdagentsResponse,
+  AdagentsAuthorizedAgent,
+  AdagentsCatalogFormat,
+  AdagentsPlacementDefinition,
+  AdagentsPlacementFormatReference,
+  AdagentsPlacementFormatOption,
+  AdagentsPlacementTag,
+  CreatedAdagentsJson,
+  CommunityMirrorAdagentsConfig,
+  CreateCommunityMirrorAdagentsConfig,
+  CommunityMirrorAdagentsCatalog,
+  PublishCommunityMirrorAdagentsResponse,
+  CommunityMirrorAdagentsSummary,
+  ListCommunityMirrorAdagentsResponse,
+  GetCommunityMirrorAdagentsResponse,
+  PublishCommunityMirrorAdagentsRequest,
+  PublishCommunityMirrorAdagentsError,
+  DeleteCommunityMirrorAdagentsResponse,
+  PublisherPropertySelector,
+  CompanySearchResult,
+  FindCompanyResult,
+  ManagerRevalidationRequest,
+  ManagerRevalidationResponse,
+  ListPoliciesQuery,
+  ListPoliciesResponse,
+  ResolvePolicyQuery,
+  ResolvePolicyResponse,
+  ResolvePoliciesBulkRequest,
+  ResolvePoliciesBulkResponse,
+  GetPolicyHistoryQuery,
+  GetPolicyHistoryResponse,
+  SavePolicyRequest,
+  SavePolicyResponse,
+  GetBrandHistoryQuery,
+  GetBrandHistoryResponse,
+  GetPropertyHistoryQuery,
+  GetPropertyHistoryResponse,
+  RegistryFeedEvent,
+  AgentEventPayload,
+  PropertyEventPayload,
+  CollectionEventPayload,
+  AuthorizationEventPayload,
+  PublisherEventPayload,
+  BrandEventPayload,
+  CatalogBrowseResponse,
+  CatalogBrowseEntry,
+  CatalogSyncResponse,
+  CatalogSyncEntry,
+  AgentCompliance,
+  AgentComplianceDetail,
+  StoryboardStatus,
+  OperatorLookupResult,
+  PublisherLookupResult,
+  ComplianceChangedPayload,
+  GetAgentStoryboardStatusResponse,
+  GetAgentStoryboardStatusBulkResponse,
+} from './registry';
+
+// ====== BRAND JSON HELPERS ======
+export {
+  COMMON_LOGO_SLOTS,
+  BrandDomainValidationError,
+  applyBrandAssetMappings,
+  checkLogoSlotCoverage,
+  extractBrandWebsiteAliasDomains,
+  extractBrandWebsiteAliases,
+  isDevelopmentBrandDomain,
+  selectLogoForSlot,
+  updateBrandJsonFromMappings,
+  validateBrandAssetMappings,
+  validateBrandDomain,
+} from './brand';
+export type {
+  AppliedBrandAssetMapping,
+  ApplyBrandAssetMappingsOptions,
+  ApplyBrandAssetMappingsResult,
+  BrandAssetCandidate,
+  BrandAssetCropBox,
+  BrandAssetExtractionMethod,
+  BrandAssetMapping,
+  BrandAssetMappingIssue,
+  BrandAssetMappingTarget,
+  BrandAssetMappingValidationResult,
+  BrandAssetReviewStatus,
+  BrandWebsiteAlias,
+  BrandWebsiteAliasRelationship,
+  BrandWebsiteAliasSource,
+  BrandJsonRecord,
+  BrandDomainValidationCode,
+  BrandLogoBackground,
+  BrandLogoOrientation,
+  BrandLogoProposal,
+  BrandLogoVariant,
+  ExtractBrandWebsiteAliasesOptions,
+  LogoSelectionOptions,
+  LogoSlotCoverage,
+  LogoSlotCoverageOptions,
+  ResolveBrandAssetUrl,
+  SkippedBrandAssetMapping,
+  UpdateBrandJsonFromMappingsOptions,
+  UpdateBrandJsonFromMappingsResult,
+  ValidateBrandDomainOptions,
+} from './brand';
+
+// ====== PROPERTY DISCOVERY (AdCP v2.2.0) ======
+export {
+  PropertyIndex,
+  getPropertyIndex,
+  resetPropertyIndex,
+  type PropertyMatch,
+  type AgentAuthorization,
+} from './discovery/property-index';
+export {
+  PropertyCrawler,
+  type AgentInfo,
+  type CrawlResult,
+  type PropertyCrawlerConfig,
+} from './discovery/property-crawler';
+export {
+  NetworkConsistencyChecker,
+  type NetworkConsistencyCheckerConfig,
+  type NetworkCheckReport,
+  type CheckSummary,
+  type CheckProgress,
+  type OrphanedPointer,
+  type StalePointer,
+  type MissingPointer,
+  type SchemaError,
+  type AgentHealthResult,
+  type DomainDetail,
+  type DomainStatus,
+} from './discovery/network-consistency-checker';
+export type {
+  Property,
+  PropertyIdentifier,
+  PropertyIdentifierType,
+  PropertyType,
+  AdAgentsJson,
+  AuthorizedAgent,
+  AuthorizationType,
+  // Aliased: the registry types also export a `PublisherPropertySelector`
+  // (registry-flat shape with no `selection_type` discriminator). The
+  // adagents.json schema's variant is a discriminated union, so we
+  // expose it under a distinct name to avoid clobbering the registry
+  // type that's been part of the public API longer.
+  PublisherPropertySelector as AdAgentsPublisherPropertySelector,
+  SinglePublisherPropertySelector,
+  CompactPublisherPropertySelector,
+} from './discovery/types';
+export {
+  parsePublisherPropertySelector,
+  expandPublisherPropertySelector,
+  expandPublisherPropertySelectors,
+  isCompactPublisherPropertySelector,
+  publisherDomainsCoveredBySelectors,
+  PublisherPropertySelectorParseError,
+  type PublisherPropertySelectorError,
+} from './discovery/publisher-property-selector';
+export {
+  resolveAgentProperties,
+  listAgentPropertyMap,
+  getAllProperties,
+  canonicalizeAgentUrl,
+  type ResolvedAgentScope,
+  type ResolveUnresolvableReason,
+} from './discovery/resolve-agent-properties';
+export {
+  resolveInlinePublisherProperties,
+  resolveSingularInline,
+  detectInlineFederatedDivergence,
+  type InlineResolutionResult,
+  type InlineFederatedDivergence,
+} from './discovery/inline-publisher-properties';
+export {
+  fetchAgentAuthorizationsFromDirectory,
+  type AgentAuthorizationsIterator,
+  type FetchAgentAuthorizationsOptions,
+  type DirectoryLookupPage,
+  type DirectoryPublisherEntry,
+  type DirectoryDiscoveryMethod,
+  type DirectoryPublisherStatus,
+} from './discovery/agent-directory';
+export {
+  validateAdAgents,
+  parseManagerDomain,
+  type DiscoveryMethod,
+  type AdAgentsValidationResult,
+  type ValidateAdAgentsOptions,
+} from './discovery/validate-adagents';
+
+// ====== CORE CONVERSATION-AWARE CLIENTS ======
+// New conversation-aware clients with input handler pattern
+export {
+  SingleAgentClient,
+  WebhookDispatchError,
+  createSingleAgentClient,
+  UnsupportedFeatureError,
+} from './core/SingleAgentClient';
+export { createInMemoryAgentDiscoveryCache } from './core/agent-discovery-cache';
+export type {
+  AgentDiscoveryCache,
+  AgentDiscoveryCacheConfig,
+  AgentDiscoveryEntry,
+  InMemoryAgentDiscoveryCache,
+  InMemoryAgentDiscoveryCacheOptions,
+} from './core/agent-discovery-cache';
+export type {
+  AgentDiscoverySeed,
+  CapabilityEvidenceScope,
+  CapabilityEvidenceSnapshot,
+  ClientProductPropertyPolicy,
+  CreativeDeliveryTaskOptions,
+  SingleAgentClientConfig,
+  StatusHandlerErrorContext,
+  SyncCreativesTaskOptions,
+  VerifyAndParseWebhookOptions,
+  WebhookHandlerAdapter,
+  WebhookHandlerRequest,
+  WebhookRequestContext,
+  WebhookParseErrorCode,
+  WebhookParseFailure,
+  WebhookParseResult,
+  WebhookParseSuccess,
+  WebhookVerificationConfig,
+} from './core/SingleAgentClient';
+export {
+  InMemoryWebhookRegistrationStore,
+  type InMemoryWebhookRegistrationStoreOptions,
+  type WebhookAuthenticationMode,
+  type WebhookRegistration,
+  type WebhookRegistrationStore,
+} from './core/webhook-registration';
+export {
+  pgWebhookRegistrationStore,
+  getWebhookRegistrationMigration,
+  WEBHOOK_REGISTRATION_MIGRATION,
+  cleanupExpiredWebhookRegistrations,
+  type PgWebhookRegistrationStoreOptions,
+  type CleanupExpiredWebhookRegistrationsOptions,
+} from './core/postgres-webhook-registration-store';
+export {
+  redisWebhookRegistrationStore,
+  type RedisWebhookRegistrationStoreOptions,
+} from './core/redis-webhook-registration-store';
+export type { DelegatedOperatorAuthorizationContext } from './signing/agent-resolver';
+export {
+  AgentClient,
+  CapabilityPreflightError,
+  type CanonicalGetProductsResponse,
+  type CanonicalProjectionTaskOptions,
+  type ProposalRefinementTaskOptions,
+  type TaskResponseTypeMap,
+  type TaskRequestTypeMap,
+  type TaskRequestFor,
+  type AdcpTaskName,
+  type CapabilityPreflightContext,
+  type CapabilityPreflightErrorCode,
+  type CapabilityPreflightLoader,
+  type InProcessAgentClientConfig,
+} from './core/AgentClient';
+export * from './principal';
+export {
+  MediaBuyLifecycleCoordinator,
+  MediaBuyLifecycleCompatibilityError,
+  LegacyPurchaseContinuationError,
+  negotiateMediaBuyLifecycle,
+  type CompatibleDeclineProposalsResponse,
+  type CompatibleDeclineProposalsWireResponse,
+  type CompatibleDeclineResult,
+  type CompatibleProductsResponse,
+  type CompatibleProductsWireResponse,
+  type CompatibleProduct,
+  type CompatibleProposal,
+  type CompatibleProposalResponse,
+  type CompatibleProjectedDeclineResult,
+  type CompatibleRefinementResult,
+  type CompatibleRefineProposalsResponse,
+  type CompatibleRefineProposalsWireResponse,
+  type CompatibleRequestProposalsResponse,
+  type CompatibleRequestProposalsWireResponse,
+  type CompatibleAcceptProposalRequest,
+  type CompatibilityDeferredContinuation,
+  type CompatibilitySubmittedContinuation,
+  type CompatibilityTaskResult,
+  type EstablishedProductsWireResponse,
+  type EstablishedProposalAcceptanceFallback,
+  type EstablishedProposalTaskReconciliationInput,
+  type MediaBuyCompatibility,
+  type MediaBuyCompatibilityLoss,
+  type MediaBuyCompatibilityReport,
+  type MediaBuyLifecycle,
+  type MediaBuyLifecycleCoordinatorOptions,
+  type LegacyPurchaseContinuationErrorCode,
+} from './media-buy/compatibility';
+export {
+  InMemoryLegacyPurchaseContinuationStore,
+  createInMemoryLegacyPurchaseContinuationStore,
+  LEGACY_PURCHASE_PUBLICATION_PROOF_RETENTION_MS,
+  legacyPurchaseSettlementFingerprint,
+  type InMemoryLegacyPurchaseContinuationStoreOptions,
+  type LegacyPurchaseBinding,
+  type LegacyPurchaseClaim,
+  type LegacyPurchaseClaimRequest,
+  type LegacyPurchaseClaimResult,
+  type LegacyPurchaseCompleteResult,
+  type LegacyPurchaseContinuationRecord,
+  type LegacyPurchaseContinuationStore,
+  type LegacyPurchaseCreateResult,
+  type LegacyPurchaseLoss,
+  type LegacyPurchaseOperation,
+  type LegacyPurchasePendingSettlement,
+  type LegacyPurchasePendingSettlementResult,
+  type LegacyPurchasePublicationLease,
+  type LegacyPurchaseReconciliationResult,
+  type LegacyPurchaseSourceVersion,
+  type LegacyPurchaseTerminalResult,
+  type ReconcileLegacyPurchase,
+} from './media-buy/legacy-purchase-continuation';
+export {
+  InMemoryEstablishedProposalStore,
+  createInMemoryEstablishedProposalStore,
+  ESTABLISHED_PROPOSAL_COMPLETION_TOMBSTONE_RETENTION_MS,
+  type EstablishedProposalBinding,
+  type EstablishedProposalCompletionWindow,
+  type EstablishedProposalMutationClaim,
+  type EstablishedProposalMutationBinding,
+  type EstablishedProposalMutationIntent,
+  type EstablishedProposalMutationDisposition,
+  type EstablishedProposalMutationKind,
+  type EstablishedProposalOperation,
+  type EstablishedProposalPutResult,
+  type EstablishedProposalRecord,
+  type EstablishedProposalReserveRequest,
+  type EstablishedProposalReserveResult,
+  type EstablishedProposalScope,
+  type EstablishedProposalSourceVersion,
+  type EstablishedProposalStore,
+  type EstablishedProposalSubmittedOperation,
+  type EstablishedProposalTaskScope,
+  type EstablishedProposalTransitionResult,
+  type InMemoryEstablishedProposalStoreOptions,
+  type ProposalSnapshotEntry,
+} from './media-buy/established-proposal-store';
+export {
+  ADCPMultiAgentClient,
+  createADCPMultiAgentClient,
+  type MultiAgentWebhookHandlerAdapter,
+} from './core/ADCPMultiAgentClient';
+export { ConfigurationManager } from './core/ConfigurationManager';
+export {
+  CreativeAgentClient,
+  createCreativeAgentClient,
+  STANDARD_CREATIVE_AGENTS,
+  type CreativeAgentListTaskOptions,
+  type CreativeAgentClientConfig,
+  type LegacyCreativeFormat,
+} from './core/CreativeAgentClient';
+export {
+  TaskExecutor,
+  DeferredSettlementOwnershipError,
+  DirectContinuationRecoveryError,
+  type DirectContinuationRecoveryFailure,
+} from './core/TaskExecutor';
+export { match, attachMatch } from './core/match';
+export type { MatchHandlers, PartialMatchHandlers } from './core/match';
+export { ProtocolResponseParser, responseParser, ADCP_STATUS, type ADCPStatus } from './core/ProtocolResponseParser';
+export {
+  ResponseValidator,
+  responseValidator,
+  type ValidationResult,
+  type ValidationOptions,
+} from './core/ResponseValidator';
+// ====== CONVERSATION TYPES ======
+export type {
+  Message,
+  InputRequest,
+  InputHandler,
+  InputHandlerResponse,
+  ConversationContext,
+  TaskOptions,
+  TrackTaskRequest,
+  TrackedTask,
+  SubmittedContinuation,
+  TaskInfo,
+  WebhookToolPredicate,
+  WebhookUrlTemplate,
+  TaskResult,
+  TaskResultCompleted,
+  TaskResultIntermediate,
+  TaskResultFailure,
+  TaskResultMetadata,
+  DeferredContinuation,
+  DirectPauseRecoveryRequest,
+  TaskState,
+  TaskStatus,
+  ConversationConfig,
+  AdcpErrorInfo,
+  AdcpValidationIssue,
+} from './core/ConversationTypes';
+
+// ====== GOVERNANCE ======
+// Buyer-side: GovernanceConfig + GovernanceMiddleware handle check → execute → report automatically.
+// Seller-side: GovernanceAdapter runs committed checks before executing media buys.
+// Types: GovernanceCheckResult, GovernanceOutcome are attached to TaskResult when governance is active.
+
+// Buyer-side middleware types
+export type {
+  GovernanceConfig,
+  CampaignGovernanceConfig,
+  GovernanceCheckResult,
+  GovernanceOutcome,
+  GovernanceFinding,
+  GovernanceIntentDetails,
+  GovernanceCondition,
+  GovernanceEscalation,
+  NormalizedGovernanceApproved,
+  NormalizedGovernanceConditions,
+  NormalizedGovernanceDenied,
+  NormalizedGovernanceVerdict,
+} from './core/GovernanceTypes';
+export { GovernanceMiddleware } from './core/GovernanceMiddleware';
+export {
+  isGovernanceApproved,
+  isGovernanceConditions,
+  isGovernanceDenied,
+  normalizeGovernanceVerdict,
+} from './core/GovernanceTypes';
+export type { GovernanceDebugEntry } from './core/GovernanceMiddleware';
+
+// ====== GOVERNANCE PLAN HELPERS ======
+// Invariants the schema encodes via if/then / oneOf that generated types
+// typically drop: budget reallocation autonomy and regulated-vertical
+// human review under GDPR Art 22 / EU AI Act Annex III.
+export {
+  GOVERNANCE_AUTHORIZATION_CRITICAL_CLAIMS,
+  GovernanceAuthorizationError,
+  GovernanceReplayStoreAdapter,
+  InMemoryGovernanceReplayStore,
+  buildGovernanceCommitment,
+  buildGovernanceExecutionCommitment,
+  buildGovernanceExecutionRequest,
+  buildGovernanceIntentRequest,
+  buildGovernanceProposedCommitment,
+  buildHumanReviewPlan,
+  buildHumanOverride,
+  computeGovernedPayloadHash,
+  createGovernanceEnforcementMiddleware,
+  getGovernanceEnforcementTasks,
+  governancePurchaseTypeForTask,
+  governanceTaskRequiresProposedCommitment,
+  targetDeclaresGovernanceEnforcement,
+  targetDeclaresLegacyGovernanceAwareness,
+  validateGovernancePlan,
+  verifyGovernanceAuthorization,
+  verifyHistoricalGovernanceContext,
+  createGovernanceAgentJwksResolver,
+  REGULATED_HUMAN_REVIEW_CATEGORIES,
+  ANNEX_III_POLICY_IDS,
+} from './governance';
+
+// ====== NETWORKING / SSRF GUARDS ======
+// Public so adopters can converge on the SDK's DNS-pinning and address
+// classification behavior instead of copying partial guards. Use
+// `ssrfSafeFetch` as the security boundary; address classifiers are advisory
+// helpers and do not protect raw fetches from DNS rebinding.
+export {
+  ssrfSafeFetch,
+  decodeBodyAsJsonOrText,
+  SSRF_TRANSIENT_CODES,
+  SsrfRefusedError,
+  isPrivateIp,
+  isAlwaysBlocked,
+  isLikelyPrivateUrl,
+  type SsrfRefusedCode,
+  type SsrfDnsLookup,
+  type SsrfFetchOptions,
+  type SsrfFetchResult,
+} from './net';
+
+// ====== CANONICAL REFERENCE RESOLUTION ======
+// Safe, structured resolver for AdCP 3.1 `format_schema` and
+// `platform_extensions` URI+SHA-256 references.
+export {
+  createCanonicalReferenceCache,
+  createCanonicalReferenceResolver,
+  canonicalReferenceCacheKey,
+  resolveCanonicalReference,
+  resolveFormatSchemaReference,
+  resolvePlatformExtensionsReference,
+  type CanonicalReference,
+  type CanonicalReferenceCache,
+  type CanonicalReferenceCacheOptions,
+  type CanonicalReferenceError,
+  type CanonicalReferenceErrorCode,
+  type CanonicalReferenceFailureResult,
+  type CanonicalReferenceKind,
+  type CanonicalReferenceResolveOptions,
+  type CanonicalReferenceResolvedResult,
+  type CanonicalReferenceResolver,
+  type CanonicalReferenceResolverOptions,
+  type CanonicalReferenceResult,
+  type CanonicalReferenceStatus,
+  type ExternalRefDigestMap,
+  type FormatSchemaReferenceResolvedResult,
+  type FormatSchemaReferenceResult,
+  type PlatformExtensionsReferenceResult,
+} from './canonical-references';
+
+// ====== ACCEPTANCE-POLICY DISCOVERY ======
+// Advisory buyer guidance from a seller's digest-pinned policy catalog.
+export {
+  assessAcceptancePolicy,
+  createAcceptancePolicyCatalogResolver,
+  resolveAcceptancePolicyCatalog,
+  resolveAcceptancePolicyProfiles,
+  resolveVerifiedAcceptancePolicyProfiles,
+  type AcceptancePolicyCatalog,
+  type AcceptancePolicyCatalogErrorCode,
+  type AcceptancePolicyCatalogFailure,
+  type AcceptancePolicyCatalogIssue,
+  type AcceptancePolicyCatalogResolver,
+  type AcceptancePolicyCatalogResult,
+  type AcceptancePolicyCatalogSuccess,
+  type AcceptancePolicyDiscoveryCapability,
+  type AcceptancePolicyProfile,
+  type AcceptancePolicyProfileResolution,
+  type AcceptancePolicyRegistryPolicy,
+  type AcceptancePolicyRegistryResolver,
+  type AcceptancePolicyReference,
+  type AcceptancePolicyRequirement,
+  type AcceptancePolicyRule,
+  type AcceptancePolicySurface,
+  type RegistryAcceptancePolicyProfileReference,
+  type ResolveAcceptancePolicyCatalogOptions,
+  type ResolveVerifiedAcceptancePolicyProfilesOptions,
+  type ResolvedAcceptancePolicyDefault,
+  type VerifiedAcceptancePolicyProfilesResult,
+  type VerifiedAcceptancePolicyProfilesSuccess,
+} from './acceptance-policy';
+export {
+  type AcceptancePolicyAssessment,
+  type AcceptancePolicyAssessmentDiagnostic,
+  type AcceptancePolicyAssessmentDiagnosticCode,
+  type AcceptancePolicyMatchedRule,
+  type AcceptancePolicyOutcome,
+  type AssessAcceptancePolicyInput,
+} from './acceptance-policy/evaluator';
+export type {
+  BuildGovernanceExecutionRequestInput,
+  BuildGovernanceIntentRequestInput,
+  BuildHumanReviewPlanInput,
+  BuildHumanOverrideInput,
+  DataSubjectContestation,
+  GovernanceAuthorizationClaims,
+  GovernanceAuthorizationCriticalClaim,
+  GovernanceAuthorizationErrorCode,
+  GovernanceAuthorizationFailure,
+  GovernanceAuthorizationResult,
+  GovernanceAuthorizationSuccess,
+  GovernanceCommitment,
+  GovernanceEnforcementMiddleware,
+  GovernanceEnforcementMiddlewareConfig,
+  GovernanceEnforcementMiddlewareInput,
+  GovernanceEnforcementMode,
+  GovernanceEnforcementTask,
+  GovernancePlan,
+  GovernanceReplayStore,
+  GovernanceReplayBinding,
+  GovernanceRevocationResolver,
+  GovernanceRevocationStatus,
+  GovernanceValidationIssue,
+  HumanOverride,
+  InMemoryGovernanceReplayStoreOptions,
+  PlanBudget,
+  ReallocationAutonomy,
+  VerifyGovernanceAuthorizationOptions,
+  VerifyHistoricalGovernanceContextOptions,
+  HistoricalGovernanceContextResult,
+  GovernanceBuyerIdentity,
+} from './governance';
+
+// ====== TASK EVENT TYPES ======
+export type {
+  BaseTaskEvent,
+  ProtocolRequestEvent,
+  ProtocolResponseEvent,
+  TaskStatusEvent,
+  ObjectEvent,
+  TaskEvent,
+  TaskEventCallbacks,
+} from './core/TaskEventTypes';
+export { createOperationId } from './core/TaskEventTypes';
+
+// ====== ASYNC HANDLER ======
+export type {
+  AsyncHandlerConfig,
+  WebhookMetadata,
+  Activity,
+  NotificationMetadata,
+  MediaBuyDeliveryNotification,
+  CreateMediaBuyStatusChangeHandler,
+  UpdateMediaBuyStatusChangeHandler,
+  SyncCreativesStatusChangeHandler,
+  GetProductsStatusChangeHandler,
+  ListProductsStatusChangeHandler,
+} from './core/AsyncHandler';
+export {
+  AsyncHandler,
+  WebhookDedupConflictError,
+  WebhookDedupInputError,
+  createAsyncHandler,
+} from './core/AsyncHandler';
+
+// ====== WHOLESALE FEED WEBHOOKS ======
+export {
+  normalizeWholesaleFeedWebhookNotification,
+  parseWholesaleFeedWebhookNotification,
+  WholesaleFeedWebhookNotificationError,
+} from './wholesale-feed-sync/webhook-notification';
+export type {
+  NormalizedWholesaleFeedWebhookNotification,
+  WholesaleFeedWebhookAffectedEntityType,
+  WholesaleFeedWebhookCacheScope,
+  WholesaleFeedWebhookNotificationErrorCode,
+  WholesaleFeedWebhookNotificationErrorDetails,
+  WholesaleFeedWebhookNotificationType,
+} from './wholesale-feed-sync/webhook-notification';
+
+// ====== INPUT HANDLERS ======
+export * from './handlers/types';
+
+// ====== STORAGE INTERFACES ======
+export type {
+  Storage,
+  AtomicTakeStorage,
+  DeferredTaskStorage,
+  BatchStorage,
+  PatternStorage,
+  AgentCapabilities,
+  ConversationState,
+  DeferredTaskState,
+  StorageConfig,
+  StorageFactory,
+  StorageMiddleware,
+} from './storage/interfaces';
+export { MemoryStorage, createMemoryStorage, createMemoryStorageConfig } from './storage/MemoryStorage';
+
+// ====== ERROR CLASSES ======
+export {
+  ADCPError,
+  TaskTimeoutError,
+  MaxClarificationError,
+  DeferredTaskError,
+  TaskAbortedError,
+  AgentNotFoundError,
+  UnsupportedTaskError,
+  ProtocolError,
+  ValidationError as ADCPValidationError, // Rename to avoid conflict
+  MissingInputHandlerError,
+  InvalidContextError,
+  ConfigurationError,
+  AuthenticationCredentialsRejectedError,
+  AuthenticationRequiredError,
+  FeatureUnsupportedError,
+  ProtocolFeatureUnsupportedError,
+  UnsupportedBuyingModeError,
+  AccountRequiredError,
+  AccountPendingApprovalError,
+  AccountAmbiguousError,
+  BuyerSetupError,
+  AccountNotFoundError,
+  AccountSetupRequiredError,
+  AccountPaymentRequiredError,
+  AccountNotProvisionedError,
+  SDK_ERROR_TO_PROTOCOL_ERROR_CODE,
+  VersionUnsupportedError,
+  IdempotencyConflictError,
+  IdempotencyExpiredError,
+  ResponseTooLargeError,
+  AgentRateLimitedError,
+  ActionNotAllowedError,
+  PreparedFixturesDeniedError,
+  adcpErrorToTypedError,
+  getClientPreflightAdcpError,
+  isADCPError,
+  isErrorOfType,
+  extractErrorInfo,
+  is401Error,
+  mapSdkErrorCodeToProtocolErrorCode,
+} from './errors';
+export type {
+  OAuthMetadataInfo,
+  ClientPreflightAdcpErrorInfo,
+  ClientPreflightAdcpErrorRecovery,
+  FeatureUnsupportedErrorOptions,
+  ProtocolFeatureUnsupportedErrorOptions,
+  ActionNotAllowedErrorDetails,
+  ActionNotAllowedReasonValue,
+  ActionNotAllowedAttemptedAction,
+  ActionNotAllowedAvailableAction,
+  ActionNotAllowedRecovery,
+} from './errors';
+
+// ====== MEDIA BUY ACTIONS (AdCP 3.1 / RFC #4480) ======
+// Wire-shape action types are generated; helper result/context types live in
+// the media-buy helper module.
+export type {
+  ActionNotAllowedDetails,
+  ActionNotAllowedReason,
+  AvailableActionsResult,
+  AvailableActionsSource,
+  DecomposedUpdateMediaBuy,
+  DecomposedUpdateMediaBuyMutation,
+  LegacyCoarseAction,
+  MediaBuyActionContext,
+  MediaBuyActionId,
+  MediaBuyActionMode,
+  MediaBuyAvailableAction,
+  MediaBuyMutationDirection,
+  MediaBuyMutationScope,
+  MediaBuyUpdateFieldAction,
+  MediaBuyValidAction,
+  ModeMismatchRecovery,
+  PreflightAllowed,
+  PreflightDenial,
+  PreflightDenied,
+  BuyerPropertyPolicy,
+  NormalizedPolicyDomain,
+  ProductPolicyProductLike,
+  ProductPolicyResolvedProperty,
+  ProductPropertyPolicyIdentifier,
+  ProductPropertyPolicyDiagnostic,
+  ProductPropertyPolicyDiagnosticCode,
+  ProductPropertyPolicyDiagnosticSeverity,
+  ProductPropertyPolicyMode,
+  ProductPropertyPolicySelectorBehavior,
+  ProductPropertyPolicyValidationResult,
+  PreflightResult,
+  ResolvedAction,
+  SLAWindow,
+  SlaWindow,
+  StructuredOnlyMediaBuyAction,
+  ResolvedTargetingInput,
+  TargetingInputFor,
+  ValidateProductsAgainstPropertyPolicyOptions,
+  UpdateFieldEntry,
+  UpdateMediaBuyRequestLike,
+} from './media-buy';
+export {
+  ACTIONS_BY_FIELD,
+  LEGACY_COARSE_ACTIONS,
+  STRUCTURED_ONLY_MEDIA_BUY_ACTIONS,
+  UPDATE_FIELDS_BY_ACTION,
+  applyTargetingInput,
+  hasTargetingClears,
+  resolveTargetingInput,
+  canAddPackages,
+  canCancel,
+  canDecreaseBudget,
+  canExtendFlight,
+  canIncreaseBudget,
+  canPause,
+  canReallocateBudget,
+  canRemoveCreative,
+  canRemovePackages,
+  canReplaceCreative,
+  canResume,
+  canShortenFlight,
+  canUpdateCreativeAssignments,
+  canUpdateFlightDates,
+  canUpdateFrequencyCaps,
+  canUpdatePacing,
+  canUpdateTargeting,
+  decomposeUpdateMediaBuy,
+  findAvailableAction,
+  getActionForMutation,
+  getAvailableActions,
+  getRollupParent,
+  ProductPropertyPolicyError,
+  normalizeDomainForPropertyPolicy,
+  preflightUpdateMediaBuy,
+  recoveryForModeMismatch,
+  validateProductsAgainstPropertyPolicy,
+} from './media-buy';
+export { InputRequiredError } from './core/TaskExecutor';
+
+// ====== IDEMPOTENCY ======
+export {
+  generateIdempotencyKey,
+  isMutatingTask,
+  requestUsesIdempotency,
+  isValidIdempotencyKey,
+  useIdempotencyKey,
+  redactIdempotencyKey,
+  IDEMPOTENCY_KEY_PATTERN,
+  MUTATING_TASKS,
+} from './utils/idempotency';
+export type { IdempotencyCapabilities } from './utils/capabilities';
+export type { MutatingRequestInput } from './utils/idempotency';
+export { canonicalize, canonicalJsonSha256 } from './utils/jcs';
+export { rollupOptimizationMetricsFromProducts } from './utils/capability-rollups';
+
+// ====== PROPOSAL NEGOTIATION (AdCP 3.2) ======
+export * from './negotiation';
+// Resolve the intentional name overlap with the wire-level response exported
+// from `@adcp/sdk/types`; the root keeps its richer negotiation helper types.
+export type { RefineProposalsRequest, RefineProposalsResponse } from './negotiation';
+
+// ====== RELIABLE REPORTING RECONCILIATION (AdCP 3.2 experimental) ======
+export * from './reporting';
+
+// ====== CORE TYPES ======
+export * from './types';
+
+// ====== TOOL TYPES ======
+// Request and response types for each AdCP tool.
+//
+// Naming convention:
+//   {ToolName}Request  -- parameters for a tool call (e.g., CreateMediaBuyRequest)
+//   {ToolName}Response -- return value; often a union of {ToolName}Success | {ToolName}Error
+//
+// Nested domain types within requests use a Request suffix when the shape
+// differs from the response version:
+//   PackageRequest  -- creation-shaped (required: buyer_ref, product_id, budget, pricing_option_id)
+//   Package         -- response-shaped from core.generated (has package_id, most fields optional)
+//
+// Platform implementors: use Request types to type incoming tool calls,
+// Response types to shape your return values.
+// Runtime Zod schemas live at `@adcp/sdk/schemas` to keep ordinary root
+// imports from loading the generated schema declaration bundle.
+export type {
+  // Media Buy Domain
+  GetProductsRequest as LegacyGetProductsRequest,
+  GetProductsResponse as LegacyGetProductsResponse,
+  ListCreativeFormatsRequest as LegacyListCreativeFormatsRequest,
+  ListCreativeFormatsResponse as LegacyListCreativeFormatsResponse,
+  CreateMediaBuyRequest as LegacyCreateMediaBuyRequest,
+  CreateMediaBuyResponse as LegacyCreateMediaBuyResponse,
+  CreateMediaBuySuccess as LegacyCreateMediaBuySuccess,
+  CreateMediaBuyError as LegacyCreateMediaBuyError,
+  CreateMediaBuySubmitted as LegacyCreateMediaBuySubmitted,
+  UpdateMediaBuyRequest as LegacyUpdateMediaBuyRequest,
+  UpdateMediaBuyResponse as LegacyUpdateMediaBuyResponse,
+  UpdateMediaBuySuccess as LegacyUpdateMediaBuySuccess,
+  UpdateMediaBuyError as LegacyUpdateMediaBuyError,
+  SyncCreativesRequest as LegacySyncCreativesRequest,
+  SyncCreativesResponse as LegacySyncCreativesResponse,
+  SyncCreativesSuccess as LegacySyncCreativesSuccess,
+  SyncCreativesError as LegacySyncCreativesError,
+  SyncCreativesSubmitted as LegacySyncCreativesSubmitted,
+  SyncAudiencesRequest,
+  SyncAudiencesResponse,
+  SyncAudiencesSuccess,
+  SyncAudiencesError,
+  ListCreativesRequest as LegacyListCreativesRequest,
+  ListCreativesResponse as LegacyListCreativesResponse,
+  CreativeFilters as LegacyCreativeFilters,
+  GetMediaBuyDeliveryRequest,
+  GetMediaBuyDeliveryResponse as LegacyGetMediaBuyDeliveryResponse,
+  ProvidePerformanceFeedbackRequest,
+  ProvidePerformanceFeedbackResponse,
+  ProvidePerformanceFeedbackSuccess,
+  ProvidePerformanceFeedbackError,
+  // Signals Domain
+  GetSignalsRequest,
+  GetSignalsResponse,
+  ActivateSignalRequest,
+  ActivateSignalResponse,
+  ActivateSignalSuccess,
+  ActivateSignalError,
+  CpmPricing,
+  PercentOfMediaPricing,
+  FlatFeePricing,
+  PerUnitPricing,
+  CustomPricing,
+  VendorPricing,
+  VendorPricingOption,
+  // Pricing variants for products (publisher rate cards in get_products etc.)
+  // PricingOption + CPAPricingOption are exported below near the other tool types.
+  CPMPricingOption,
+  VCPMPricingOption,
+  CPCPricingOption,
+  CPCVPricingOption,
+  CPVPricingOption,
+  CPPPricingOption,
+  FlatRatePricingOption,
+  TimeBasedPricingOption,
+  // Governance Domain - Property Lists
+  CreatePropertyListRequest,
+  CreatePropertyListResponse,
+  UpdatePropertyListRequest,
+  UpdatePropertyListResponse,
+  GetPropertyListRequest,
+  GetPropertyListResponse,
+  ListPropertyListsRequest,
+  ListPropertyListsResponse,
+  DeletePropertyListRequest,
+  DeletePropertyListResponse,
+  PropertyList,
+  PropertyListFilters,
+  // Governance Domain - Content Standards
+  ListContentStandardsRequest as LegacyListContentStandardsRequest,
+  ListContentStandardsResponse as LegacyListContentStandardsResponse,
+  GetContentStandardsRequest as LegacyGetContentStandardsRequest,
+  GetContentStandardsResponse as LegacyGetContentStandardsResponse,
+  CreateContentStandardsRequest as LegacyCreateContentStandardsRequest,
+  CreateContentStandardsResponse as LegacyCreateContentStandardsResponse,
+  UpdateContentStandardsRequest as LegacyUpdateContentStandardsRequest,
+  UpdateContentStandardsResponse as LegacyUpdateContentStandardsResponse,
+  UpdateContentStandardsSuccess as LegacyUpdateContentStandardsSuccess,
+  UpdateContentStandardsError as LegacyUpdateContentStandardsError,
+  CalibrateContentRequest as LegacyCalibrateContentRequest,
+  CalibrateContentResponse as LegacyCalibrateContentResponse,
+  ValidateContentDeliveryRequest as LegacyValidateContentDeliveryRequest,
+  ValidateContentDeliveryResponse as LegacyValidateContentDeliveryResponse,
+  ContentStandards as LegacyContentStandards,
+  Artifact as LegacyArtifact,
+  // Governance Domain - Campaign Governance
+  SyncPlansRequest,
+  SyncPlansResponse,
+  SyncGovernanceRequest,
+  SyncGovernanceResponse,
+  SyncGovernanceSuccess,
+  SyncGovernanceError,
+  CheckGovernanceRequest,
+  CheckGovernanceResponse,
+  ReportPlanOutcomeRequest,
+  ReportPlanOutcomeResponse,
+  GetPlanAuditLogsRequest,
+  GetPlanAuditLogsResponse,
+  // Governance Domain - Types & Enums
+  PlannedDelivery,
+  GovernancePhase,
+  EscalationSeverity,
+  PolicyEnforcementLevel,
+  OutcomeType,
+  // Governance Domain - Creative Features
+  GetCreativeFeaturesRequest as LegacyGetCreativeFeaturesRequest,
+  GetCreativeFeaturesResponse as LegacyGetCreativeFeaturesResponse,
+  // Sponsored Intelligence Domain
+  SIGetOfferingRequest,
+  SIGetOfferingResponse,
+  SIInitiateSessionRequest,
+  SIInitiateSessionResponse,
+  SISendMessageRequest,
+  SISendMessageResponse,
+  SITerminateSessionRequest,
+  SITerminateSessionResponse,
+  SICapabilities,
+  SIIdentity,
+  // Protocol Domain
+  GetAdCPCapabilitiesRequest,
+  GetAdCPCapabilitiesResponse,
+  // Event Tracking Domain
+  SyncEventSourcesRequest,
+  SyncEventSourcesResponse,
+  SyncEventSourcesSuccess,
+  SyncEventSourcesError,
+  LogEventRequest,
+  LogEventResponse,
+  LogEventSuccess,
+  LogEventError,
+  // Enums
+  CanceledBy,
+  // Core data structures used within requests and responses
+  Format as LegacyFormat,
+  Product as LegacyProduct,
+  Proposal,
+  ProductAllocation,
+  PackageRequest as LegacyPackageRequest, // Raw wire shape for migration/server tooling
+  CreativeAsset as LegacyCompatibleCreativeAsset,
+  CreativePolicy,
+  BrandReference,
+  BrandID,
+  AccountReference,
+  CPAPricingOption,
+  EventType,
+  ActionSource,
+  OptimizationGoal,
+  ReachUnit,
+  TargetingOverlay,
+  // 3.1.0-beta.2 renamed `OutcomeMeasurement` → `OutcomeMeasurementDeprecated`
+  // to signal the surface is on the 4.0 removal track. Re-export under both
+  // names so adopters' existing `import { OutcomeMeasurement }` keeps working.
+  OutcomeMeasurementDeprecated,
+  OutcomeMeasurementDeprecated as OutcomeMeasurement,
+  Duration,
+  DeviceType,
+  DigitalSourceType,
+  FrequencyCap,
+  GeographicBreakdownSupport,
+  // Catalog Domain
+  Catalog,
+  CatalogType,
+  FeedFormat,
+  UpdateFrequency,
+  ContentIDType,
+  CatalogFieldMapping,
+  SyncCatalogsRequest,
+  SyncCatalogsResponse,
+  SyncCatalogsSuccess,
+  SyncCatalogsError,
+  // Format Assets
+  Overlay,
+  Placement as LegacyPlacement,
+  // Creative Agent Domain
+  CreativeManifest as LegacyCreativeManifest,
+  CreativeVariable,
+  BuildCreativeRequest as LegacyBuildCreativeRequest,
+  BuildCreativeResponse as LegacyBuildCreativeResponse,
+  BuildCreativeSuccess as LegacyBuildCreativeSuccess,
+  BuildCreativeMultiSuccess as LegacyBuildCreativeMultiSuccess,
+  BuildCreativeVariantSuccess as LegacyBuildCreativeVariantSuccess,
+  BuildCreativeError as LegacyBuildCreativeError,
+  PreviewCreativeRequest as LegacyPreviewCreativeRequest,
+  PreviewCreativeResponse as LegacyPreviewCreativeResponse,
+  GetMediaBuysRequest,
+  GetMediaBuysResponse as LegacyGetMediaBuysResponse,
+  ImageAsset,
+  VideoAsset,
+  AudioAsset,
+  TextAsset,
+  URLAsset,
+  HTMLAsset,
+  VASTAsset,
+  DAASTAsset,
+  JavaScriptAsset,
+  WebhookAsset,
+  CSSAsset,
+  MarkdownAsset,
+  CatalogAsset,
+  BriefAsset,
+  ReferenceAsset,
+  Provenance,
+  PreviewOutputFormat,
+  DisclosurePosition,
+  // Event Tracking
+  EventCustomData,
+  // Creative Delivery Domain
+  GetCreativeDeliveryRequest,
+  GetCreativeDeliveryResponse as LegacyGetCreativeDeliveryResponse,
+  // Account Domain
+  Account,
+  AccountChange,
+  ListAccountChangesRequest,
+  ListAccountChangesResponse,
+  ListAccountsRequest,
+  ListAccountsResponse,
+  SyncAccountsRequest,
+  SyncAccountsResponse,
+  SyncAccountsSuccess,
+  SyncAccountsError,
+  GetAccountFinancialsRequest,
+  GetAccountFinancialsResponse,
+  GetAccountFinancialsSuccess,
+  GetAccountFinancialsError,
+  // Pagination
+  PaginationRequest,
+  PaginationResponse,
+  // Nested domain types used as fields within request/response objects
+  PackageUpdate as LegacyPackageUpdate,
+  Package as LegacyPackage,
+  Destination,
+  SignalFilters,
+  PricingOption,
+  PriceGuidance,
+} from './types/tools.generated';
+
+// Legacy creative identity also appears indirectly in content-standard
+// artifacts, creative-feature manifests, media-buy artifacts, and rights
+// constraints. Keep those raw protocol shapes behind explicit migration
+// names; the primary clients intentionally do not expose these tasks until a
+// lossless canonical projection is defined.
+export type {
+  GetMediaBuyArtifactsRequest as LegacyGetMediaBuyArtifactsRequest,
+  GetMediaBuyArtifactsResponse as LegacyGetMediaBuyArtifactsResponse,
+} from './types/tools.generated';
+export type {
+  GetRightsRequest as LegacyGetRightsRequest,
+  GetRightsResponse as LegacyGetRightsResponse,
+  AcquireRightsRequest as LegacyAcquireRightsRequest,
+  AcquireRightsResponse as LegacyAcquireRightsResponse,
+  UpdateRightsRequest as LegacyUpdateRightsRequest,
+  UpdateRightsResponse as LegacyUpdateRightsResponse,
+} from './types/core.generated';
+
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type GetMediaBuyArtifactsRequest = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type GetMediaBuyArtifactsResponse = never;
+export type {
+  FormatReferenceStructuredObject as LegacyFormatReferenceStructuredObject,
+  FormatReferenceStructuredObject as LegacyFormatID,
+} from './types/core.generated';
+/** @deprecated Legacy creative routing identity is available as `LegacyFormatReferenceStructuredObject`. */
+export type FormatReferenceStructuredObject = never;
+/** @deprecated Legacy creative routing identity is available as `LegacyFormatID`. */
+export type FormatID = never;
+/** @deprecated Use `LegacyBuildCreativeRequest`; canonical build support awaits a canonical protocol request. */
+export type BuildCreativeRequest = never;
+/** @deprecated Use `LegacyBuildCreativeResponse`. */
+export type BuildCreativeResponse = never;
+/** @deprecated Use `LegacyBuildCreativePayload`. */
+export type BuildCreativePayload = never;
+/** @deprecated Use `LegacyBuildCreativeMultiPayload`. */
+export type BuildCreativeMultiPayload = never;
+/** @deprecated Use `LegacyListCreativeFormatsRequest`. */
+export type ListCreativeFormatsRequest = never;
+/** @deprecated Use `LegacyListCreativeFormatsResponse`. */
+export type ListCreativeFormatsResponse = never;
+/** @deprecated Use `LegacyListCreativeFormatsPayload`. */
+export type ListCreativeFormatsPayload = never;
+/** @deprecated Use `LegacyListCreativeFormatsResponsePayload`. */
+export type ListCreativeFormatsResponsePayload = never;
+/** @deprecated Use `LegacyListCreativeFormatsServerPayload`. */
+export type ListCreativeFormatsServerPayload = never;
+/** @deprecated Use the explicit legacy creative-agent migration types. */
+export type CreativeManifest = never;
+export type {
+  ManageCreativeAssetsRequest as LegacyManageCreativeAssetsRequest,
+  ManageCreativeAssetsResponse as LegacyManageCreativeAssetsResponse,
+  CreateMediaBuyAsyncResponseData as LegacyCreateMediaBuyAsyncResponseData,
+  GetProductsAsyncResponseData as LegacyGetProductsAsyncResponseData,
+  UpdateMediaBuyAsyncResponseData as LegacyUpdateMediaBuyAsyncResponseData,
+  SyncCreativesAsyncResponseData as LegacySyncCreativesAsyncResponseData,
+} from './types/adcp';
+/** @deprecated Use `LegacyManageCreativeAssetsRequest`. */
+export type ManageCreativeAssetsRequest = never;
+/** @deprecated Use `LegacyManageCreativeAssetsResponse`. */
+export type ManageCreativeAssetsResponse = never;
+/** @deprecated Use `LegacyCreateMediaBuyAsyncResponseData`. */
+export type CreateMediaBuyAsyncResponseData = never;
+/** @deprecated Use `LegacyGetProductsAsyncResponseData`. */
+export type GetProductsAsyncResponseData = never;
+/** @deprecated Use `LegacyUpdateMediaBuyAsyncResponseData`. */
+export type UpdateMediaBuyAsyncResponseData = never;
+/** @deprecated Use `LegacySyncCreativesAsyncResponseData`. */
+export type SyncCreativesAsyncResponseData = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type ListContentStandardsRequest = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type ListContentStandardsResponse = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type GetContentStandardsRequest = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type GetContentStandardsResponse = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type CreateContentStandardsRequest = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type CreateContentStandardsResponse = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type UpdateContentStandardsRequest = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type UpdateContentStandardsResponse = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type CalibrateContentRequest = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type CalibrateContentResponse = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type ValidateContentDeliveryRequest = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type ValidateContentDeliveryResponse = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type GetCreativeFeaturesRequest = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type GetCreativeFeaturesResponse = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type ContentStandards = never;
+/** @deprecated Use `LegacyArtifact` from the migration surface. */
+export type Artifact = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type GetRightsRequest = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type GetRightsResponse = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type AcquireRightsRequest = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type AcquireRightsResponse = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type UpdateRightsRequest = never;
+/** @deprecated Use the corresponding explicit `Legacy*` migration type. */
+export type UpdateRightsResponse = never;
+export type {
+  AccountStatus,
+  CreativeStatus,
+  DelegationAuthority,
+  CatalogAction,
+  CatalogItemStatus,
+  MediaBuyStatus,
+  // CreativeBrief is its own top-level schema (creative-brief.json) — emitted
+  // in core.generated, no longer transitively pulled into tools.generated now
+  // that BriefAsset merges its allOf[$ref] base inline.
+  CreativeBrief,
+  CompatibilityPurchaseCoordinatorInput,
+} from './types/core.generated';
+
+// ====== WELL-KNOWN FILE TYPES ======
+// brand.json / adagents.json shapes inferred from the canonical Zod schemas.
+// Re-exported explicitly here (in addition to the transitive `export * from
+// './types'` above) so the top-level public API contract is visible at the
+// main barrel and not dependent on the sub-barrel's wildcard re-export.
+// Source of truth: schemas/cache/{version}/{brand,adagents}.json — regenerate
+// with `npm run generate-wellknown-schemas` when the spec bumps.
+export type { BrandJson, AdagentsJson } from './types/wellknown-schemas.generated';
+export { BrandJsonSchema, AdagentsJsonSchema } from './types/wellknown-schemas.generated';
+
+// ====== PLACEMENT PRESENTATION ======
+// These boundary validators are explicit root-level exceptions to the general
+// @adcp/sdk/schemas-only policy below. Consumers fetch presentation_ref from a
+// publisher-controlled URL, so keeping the canonical validation path visible
+// alongside ssrfSafeFetch and resolvePreviewAuthority avoids unsupported deep
+// imports or locally copied schemas.
+export type { PlacementPresentationDocument, PlacementPresentationReference } from './types/core.generated';
+export { PlacementPresentationDocumentSchema, PlacementPresentationReferenceSchema } from './types/schemas.generated';
+
+// ====== ERROR CODES ======
+// Standard error code vocabulary for programmatic error handling
+export type { Error as TaskErrorDetail } from './types/core.generated';
+export {
+  STANDARD_ERROR_CODES,
+  isStandardErrorCode,
+  getErrorRecovery,
+  DEFAULT_UNKNOWN_ERROR_RECOVERY,
+} from './types/error-codes';
+export type { StandardErrorCode, ErrorRecovery } from './types/error-codes';
+
+// ====== SERVER-SIDE HELPERS ======
+// Low-level raw response builders are explicit `legacy*` migration APIs.
+// Modern DecisioningPlatform handlers return canonical payloads directly.
+export {
+  adcpError,
+  legacyCapabilitiesResponse,
+  legacyProductsResponse,
+  legacyMediaBuyResponse,
+  legacyDeliveryResponse,
+  legacyListAccountsResponse,
+  legacyListCreativeFormatsResponse,
+  legacyUpdateMediaBuyResponse,
+  legacyGetMediaBuysResponse,
+  legacyPerformanceFeedbackResponse,
+  legacyBuildCreativeResponse,
+  legacyBuildCreativeMultiResponse,
+  legacyPreviewCreativeResponse,
+  legacyCreativeDeliveryResponse,
+  legacyListCreativesResponse,
+  legacyListPropertyListsResponse,
+  legacyListCollectionListsResponse,
+  legacyListContentStandardsResponse,
+  legacyGetPlanAuditLogsResponse,
+  legacySyncCreativesResponse,
+  legacyGetSignalsResponse,
+  legacyActivateSignalResponse,
+  legacyCancelMediaBuyResponse,
+  legacyAcquireRightsResponse,
+  legacyAcquireRightsAcquired,
+  legacyAcquireRightsPendingApproval,
+  legacyAcquireRightsRejected,
+  legacySyncAccountsResponse,
+  legacySyncGovernanceResponse,
+  legacyReportUsageResponse,
+  validActionsForStatus,
+  MEDIA_BUY_TRANSITIONS,
+  getMediaBuyTransitions,
+  CREATIVE_ASSET_TRANSITIONS,
+  isLegalMediaBuyTransition,
+  isLegalCreativeTransition,
+  assertMediaBuyTransition,
+  assertCreativeTransition,
+  getAccountMode,
+  isSandboxOrMockAccount,
+  assertSandboxAccount,
+  taskToolResponse,
+  registerAdcpTaskTool,
+  createTaskCapableServer,
+  InMemoryTaskStore,
+  isTerminal,
+  serve,
+  taskScopeFromPrincipal,
+  UnknownHostError,
+  hostname,
+  resolveHost,
+  verifyIntrospection,
+  registerTestController,
+  handleTestControllerRequest,
+  TestControllerError,
+  toMcpResponse,
+  TOOL_INPUT_SHAPE,
+  CONTROLLER_SCENARIOS,
+  DISCOVERY_ARM_SCENARIOS,
+  SEED_SCENARIOS,
+  SESSION_ENTRY_CAP,
+  enforceMapCap,
+  createSeedFixtureCache,
+  PostgresTaskStore,
+  cleanupExpiredTasks,
+  getMcpTasksMigration,
+  MCP_TASKS_MIGRATION,
+  ADCP_PRE_TRANSPORT,
+  checkGovernance,
+  governanceDeniedError,
+  DEFAULT_REPORTING_CAPABILITIES,
+  InMemoryStateStore,
+  PostgresStateStore,
+  getAdcpStateMigration,
+  ADCP_STATE_MIGRATION,
+  StateError,
+  PatchConflictError,
+  SESSION_KEY_FIELD,
+  createSessionedStore,
+  scopedStore,
+  patchWithRetry,
+  isPutIfMatchConflict,
+  requireSessionKey,
+  structuredSerialize,
+  structuredDeserialize,
+  createIdempotencyStore,
+  memoryBackend,
+  pgBackend,
+  getIdempotencyMigration,
+  IDEMPOTENCY_MIGRATION,
+  cleanupExpiredIdempotency,
+  redisBackend,
+  createLazyBackend,
+  hashPayload,
+  IdempotencyClaimOwnershipError,
+  getServeRequestContext,
+  ADCP_SERVE_REQUEST_CONTEXT,
+  createA2AAdapter,
+  A2AInvocationError,
+  MCP_APP_RESOURCE_MIME_TYPE,
+  ADCP_MIRRORED_STRUCTURED_CONTENT_META_KEY,
+} from './server';
+export type {
+  AdcpErrorOptions,
+  AdcpErrorResponse,
+  McpToolResponse,
+  ValidAction,
+  CancelMediaBuyInput,
+  AdcpTaskToolConfig,
+  TaskStore,
+  TaskMessageQueue,
+  CreateTaskOptions,
+  ToolTaskHandler,
+  CreateTaskRequestHandlerExtra,
+  TaskRequestHandlerExtra,
+  CreateTaskResult,
+  GetTaskResult,
+  Task,
+  ServeContext,
+  ServeOptions,
+  PgQueryable,
+  PostgresTaskStoreOptions,
+  TestControllerStore,
+  TestControllerStoreFactory,
+  TestControllerStoreOrFactory,
+  ControllerScenario,
+  SeedScenario,
+  SeedFixtureCache,
+  SessionContext,
+  OnInstructionsError,
+  MaybePromise,
+  LegacyAdcpServerConfig,
+  LegacyAdcpToolMap,
+  AdcpServerToolName,
+  AdcpCapabilitiesConfig,
+  LegacyAdcpCustomToolConfig,
+  LegacyAdcpCustomToolHandler,
+  LegacyAdcpCustomToolHandlerExtra,
+  McpAppUiMeta,
+  McpAppMeta,
+  AdcpMcpResourceDefinition,
+  McpAppResourceCsp,
+  McpAppResourcePermissions,
+  McpAppResourceUiMeta,
+  McpAppResourceMeta,
+  McpAppResourceReadContext,
+  AdcpLogger,
+  LegacyHandlerContext,
+  LegacyMediaBuyHandlers,
+  LegacySignalsHandlers,
+  LegacyCreativeHandlers,
+  LegacyGovernanceHandlers,
+  LegacyAccountHandlers,
+  LegacyEventTrackingHandlers,
+  LegacySponsoredIntelligenceHandlers,
+  SignedRequestsConfig,
+  AdcpPreTransport,
+  AdcpServer,
+  AdcpServerTransport,
+  AdcpTestRequest,
+  AdcpTestToolsCallRequest,
+  AdcpTestResponse,
+  AdcpInvokeOptions,
+  StructuredContentFallbackTransport,
+  StructuredContentTextFallback,
+  StructuredContentTextFallbackContext,
+  CheckGovernanceOptions,
+  GovernanceCallResult,
+  GovernanceApproved,
+  GovernanceDenied,
+  GovernanceConditions,
+  AdcpStateStore,
+  ListOptions as StateListOptions,
+  ListResult as StateListResult,
+  PostgresStateStoreOptions,
+  InMemoryStateStoreOptions,
+  VersionedDocument,
+  PutIfMatchResult,
+  PatchWithRetryOptions,
+  StateErrorCode,
+  SessionKeyContext,
+  IdempotencyStore,
+  IdempotencyStoreConfig,
+  IdempotencyBackend,
+  IdempotencyCacheEntry,
+  IdempotencyCheckResult,
+  MemoryBackendOptions,
+  PgBackendOptions,
+  RedisBackendOptions,
+  RedisBackendClient,
+  RedisLikeClient,
+  LazyBackendFactory,
+  LazyBackendOptions,
+  A2AAdapter,
+  A2AAdapterOptions,
+  A2AAgentCardOverrides,
+  A2AAgentCapabilitiesOverride,
+  A2AAgentSkillOverride,
+  A2AMountOptions,
+  ExpressAppLike,
+  LegacyHttpSecurityScheme,
+  LegacySecurityScheme,
+  AccountMode,
+  RequireCacheScopeWhenProducts,
+  ServerPayload,
+  GetProductsPayload,
+  CreateMediaBuyPayload,
+  UpdateMediaBuyPayload,
+  GetMediaBuysPayload,
+  GetMediaBuyDeliveryPayload,
+  ListCreativesPayload,
+  GetCreativeDeliveryPayload,
+  CanonicalPreviewCreativePayload,
+  PreviewCreativePayload,
+  LegacyGetProductsPayload,
+  LegacyCreateMediaBuyPayload,
+  LegacyUpdateMediaBuyPayload,
+  LegacyGetMediaBuysPayload,
+  LegacyGetMediaBuyDeliveryPayload,
+  LegacyListCreativesPayload,
+  LegacyGetCreativeDeliveryPayload,
+  LegacyListCreativeFormatsPayload,
+  LegacyListCreativeFormatsResponsePayload,
+  LegacyListCreativeFormatsServerPayload,
+  LegacyBuildCreativePayload,
+  LegacyBuildCreativeMultiPayload,
+  LegacyBuildCreativeVariantPayload,
+  LegacyPreviewCreativePayload,
+  SyncCreativesPayload,
+  SyncCreativesSuccessPayload,
+  SyncCreativesErrorPayload,
+} from './server';
+
+// ====== ERROR HANDLING & RETRY ======
+export { isRetryable, getRetryDelay } from './utils/retry';
+export { decideRetry, BuyerRetryPolicy } from './utils/buyer-retry-policy';
+export type { RetryDecision, RetryContext, RetryDecisionOverride } from './utils/buyer-retry-policy';
+
+// Public API: use these for programmatic error handling
+export {
+  extractAdcpErrorInfo,
+  extractCorrelationId,
+  resolveRecovery,
+  getExpectedAction,
+} from './utils/error-extraction';
+
+// Internal: transport-level extraction (used by SDK internals; prefer result.adcpError instead)
+export { extractAdcpErrorFromMcp, extractAdcpErrorFromTransport } from './utils/error-extraction';
+export type { ExtractedAdcpError } from './utils/error-extraction';
+export { extractVersionUnsupportedDetails } from './utils/error-extraction';
+export type { VersionUnsupportedDetails } from './utils/error-extraction';
+
+// ====== BACKWARDS COMPATIBILITY ======
+// Deprecated types from past protocol migrations
+export type {
+  BrandManifest,
+  BrandManifestReference,
+  AssetContentType,
+  PromotedProducts,
+  PromotedOfferings,
+  Measurement,
+} from './types/compat';
+export { brandManifestToBrandReference, promotedProductsToCatalog, promotedOfferingsToCatalog } from './types/compat';
+
+// Request parameter normalization (deprecated field auto-conversion)
+export { normalizeRequestParams, normalizePackageParams } from './utils/request-normalizer';
+
+// get_products response cache-scope helpers
+export {
+  ensureGetProductsCacheScope,
+  validateGetProductsCacheScope,
+  type EnsureGetProductsCacheScopeOptions,
+  type GetProductsCacheScope,
+  type GetProductsResponseWithCacheScope,
+  type GetProductsCacheScopeValidation,
+} from './utils/get-products-cache-scope';
+
+// ====== ENUM VALUE ARRAYS ======
+// `${TypeName}Values` const arrays for every named string-literal union in
+// the spec. Consumers can enumerate or validate against these without
+// duplicating literal lists from the Zod unions.
+export * from './types/enums.generated';
+
+// `${ParentSchema}_${PropertyName}Values` const arrays for inline
+// anonymous unions inside named schemas — e.g.
+// `ImageAssetRequirements_FormatsValues`,
+// `VideoAssetRequirements_ContainersValues`. Companion to enums.generated;
+// see scripts/generate-inline-enum-arrays.ts for naming + scoping rules.
+export * from './types/inline-enums.generated';
+export * from './types/enum-compat';
+
+// PreviewCreativeRequestSchema is now a flat z.object() with request_type discriminant.
+// The old variant exports (PreviewCreativeSingleRequestSchema, etc.) are no longer needed —
+// use PreviewCreativeRequestSchema.shape directly with server.registerTool().
+
+// ====== AUTHENTICATION ======
+// Auth utilities for custom integrations
+export { getAuthToken, createAdCPHeaders, createMCPAuthHeaders, createAuthenticatedFetch } from './auth';
+
+// OAuth diagnostics utilities (see src/lib/auth/oauth/diagnostics.ts)
+export {
+  parseWWWAuthenticate,
+  decodeAccessTokenClaims,
+  validateTokenAudience,
+  type WWWAuthenticateChallenge,
+  type DecodedJWTHeader,
+  type DecodedJWTClaims,
+  type DecodedAccessToken,
+  type TokenAudienceResult,
+  InvalidTokenError,
+  InsufficientScopeError,
+} from './auth/oauth';
+
+// End-to-end OAuth handshake diagnosis — powers `adcp diagnose-auth`
+export {
+  runAuthDiagnosis,
+  AUTH_DIAGNOSIS_SCHEMA_VERSION,
+  type DiagnoseOptions,
+  type HttpCapture as DiagnosisHttpCapture,
+  type DiagnosisStep,
+  type Hypothesis as DiagnosisHypothesis,
+  type HypothesisVerdict as DiagnosisHypothesisVerdict,
+  type AuthDiagnosisReport,
+} from './auth/oauth';
+
+// Zero-config OAuth: actionable error + discovery + file storage + per-agent binding
+export {
+  NeedsAuthorizationError,
+  discoverAuthorizationRequirements,
+  hasValidatedMcpAuthorizationRequirements,
+  createFileOAuthStorage,
+  bindAgentStorage,
+  getAgentStorage,
+  unbindAgentStorage,
+  type AuthorizationRequirements,
+  type DiscoverAuthorizationOptions,
+  type FileOAuthStorageOptions,
+} from './auth/oauth';
+
+// OAuth 2.0 client credentials (RFC 6749 §4.4) — machine-to-machine token
+// exchange used by programmatic CC consumers and by the CLI's `--save-auth
+// --oauth-token-url ...` flow. The library call path pre-refreshes before
+// every request automatically when `AgentConfig.oauth_client_credentials`
+// is set; these symbols are exposed for consumers that need explicit
+// control (building custom AgentConfigs, testing, or implementing
+// server-side `save_agent` endpoints like Addie's).
+export {
+  exchangeClientCredentials,
+  ensureClientCredentialsTokens,
+  ClientCredentialsExchangeError,
+  MissingEnvSecretError,
+  resolveSecret,
+  isEnvSecretReference,
+  toEnvSecretReference,
+  extractEnvSecretName,
+  type ExchangeClientCredentialsOptions,
+  type EnsureClientCredentialsOptions,
+  type AgentOAuthClientCredentials,
+  AgentOAuthClientCredentialsSchema,
+} from './auth/oauth';
+
+// ====== VALIDATION ======
+// Schema validation for requests/responses
+export { validateAgentUrl, validateAdCPResponse, getExpectedSchema, handleAdCPResponse } from './validation';
+
+// ====== PROTOCOL CLIENTS ======
+// Low-level protocol clients for MCP and A2A (primarily for testing)
+export {
+  ProtocolClient,
+  callMCPTool,
+  callA2ATool,
+  createA2AClientFromCardUrl,
+  createMCPClient,
+  createA2AClient,
+  closeMCPConnections,
+  closeOAuthConnections,
+  closeScopedConnections,
+  withMCPConnectionScope,
+  bundleSupportsAdcpVersionField,
+  BODY_SNIPPET_TIMEOUT_MS,
+  OBSERVER_FLUSH_TIMEOUT_MS,
+  sanitizeTransportHeaders,
+  sanitizeTransportUrl,
+  DEFAULT_MAX_RESPONSE_BYTES,
+  SSE_CUMULATIVE_BUDGET_MULTIPLIER,
+} from './protocols';
+export { toReleasePrecisionWire, validateAdcpVersionWire } from './validation/schema-loader';
+export type {
+  CallToolOptions,
+  TransportActivity,
+  TransportActivityContext,
+  TransportActivityHandler,
+  TransportActivityType,
+  TransportResponseOutcome,
+  TransportOptions,
+  A2ALegacyCompatOptions,
+} from './protocols';
+
+// ====== WIRE VERSION HELPERS (NAMESPACE) ======
+// Grouped re-exports of the three AdCP `adcp_version` envelope helpers
+// (spec PR adcontextprotocol/adcp#3493). Prefer this surface over the
+// individual top-level exports — the namespace stays stable as helpers
+// are added (a fourth helper drops in here without churning the barrel).
+// The top-level exports are kept for back-compat and aren't deprecated.
+import { bundleSupportsAdcpVersionField as _isSupported } from './protocols';
+import { toReleasePrecisionWire as _normalize, validateAdcpVersionWire as _validate } from './validation/schema-loader';
+export const wireVersion = {
+  isSupported: _isSupported,
+  normalize: _normalize,
+  validate: _validate,
+} as const;
+
+// ====== RESPONSE UTILITIES ======
+// Public utilities for working with AdCP responses
+export {
+  getStandardFormatsLegacy,
+  unwrapProtocolResponse,
+  isAdcpError,
+  isAdcpSuccess,
+  isTerminalAdcpError,
+  hasAdvisorySuccessPayload,
+  getAuthoritativeMediaBuyStatus,
+  isMediaBuyStatus,
+  resolveTaskState,
+} from './utils';
+export type { EffectiveTaskState, ResolvedTaskState, ResolveTaskStateOptions } from './utils';
+export { injectLegacyEnvelopeStatus } from './utils/envelope-status-compat';
+export { extractResult, type ToolCallResultLike } from './utils';
+export { REQUEST_TIMEOUT, MAX_CONCURRENT, LEGACY_STANDARD_FORMATS } from './utils';
+export {
+  batchPreviewProducts,
+  batchPreviewFormatsLegacy,
+  clearPreviewCache,
+  type PreviewResult,
+  type LegacyPreviewResult,
+  type BatchPreviewOptions,
+  type PreviewCacheBackend,
+  type PreviewCacheEntry,
+} from './utils';
+export { detectProtocol, detectProtocolWithTimeout } from './utils';
+export { A2A_CARD_PATHS, isAgentCardPath, isWellKnownAgentCardUrl, buildCardUrls, stripAgentCardPath } from './utils';
+
+// ====== PRICING UTILITIES ======
+// Pricing adapter for v2/v3 compatibility and CPA detection
+export { isCPAPricing } from './utils';
+
+// ====== PAGINATION UTILITIES ======
+// Auto-pagination helpers for cursor-based AdCP endpoints
+export { paginate, paginatePages, type PaginateOptions } from './utils';
+
+// ====== FORMAT ASSET UTILITIES ======
+// Structural access to canonical asset-slot arrays. These helpers deliberately
+// do not require or expose a legacy named-format `Format` / `format_id`.
+export {
+  getFormatAssets,
+  getRequiredAssets,
+  getOptionalAssets,
+  getIndividualAssets,
+  getRepeatableGroups,
+  usesDeprecatedAssetsField,
+  getAssetCount,
+  hasAssets,
+  type CanonicalFormatAssetSlot,
+  type FormatAssetsInput,
+  type IndividualFormatAssetSlot,
+  type RepeatableFormatAssetGroup,
+} from './utils/format-assets';
+
+// ====== CREATIVE ASSET BUILDERS ======
+// Typed factories that inject the `asset_type` discriminator.
+// `imageAsset({ url, width, height })` returns a valid `ImageAsset`
+// without repeating `asset_type: 'image'` at every call site.
+// Prefer the named exports; use `Asset.image({...})` when constructing
+// several asset types together (assets-by-role manifests).
+export {
+  Asset,
+  imageAsset,
+  videoAsset,
+  audioAsset,
+  textAsset,
+  urlAsset,
+  htmlAsset,
+  javascriptAsset,
+  cssAsset,
+  markdownAsset,
+  webhookAsset,
+} from './utils/asset-builders';
+
+// ====== FORMAT ASSET SLOT BUILDERS ======
+// Typed factories for the slot definitions inside `Format.assets[]` — what a
+// seller/publisher declares it accepts. Each builder injects the `item_type`
+// and `asset_type` discriminators, and the `requirements` object is strictly
+// typed per asset_type: misnamed fields (`file_types` vs `formats`) and wrong
+// units (`min_duration_seconds` vs `min_duration_ms`) fail type-check.
+// Use `repeatableGroup({...})` (or `FormatAsset.group(...)`) to wrap assets
+// that repeat — that's the correct home for `min_count` / `max_count`.
+export {
+  FormatAsset,
+  imageAssetSlot,
+  videoAssetSlot,
+  audioAssetSlot,
+  textAssetSlot,
+  markdownAssetSlot,
+  htmlAssetSlot,
+  cssAssetSlot,
+  javascriptAssetSlot,
+  vastAssetSlot,
+  daastAssetSlot,
+  urlAssetSlot,
+  webhookAssetSlot,
+  briefAssetSlot,
+  catalogAssetSlot,
+  repeatableGroup,
+  imageGroupAsset,
+  videoGroupAsset,
+  audioGroupAsset,
+  textGroupAsset,
+  markdownGroupAsset,
+  htmlGroupAsset,
+  cssGroupAsset,
+  javascriptGroupAsset,
+  vastGroupAsset,
+  daastGroupAsset,
+  urlGroupAsset,
+  webhookGroupAsset,
+} from './utils/format-asset-slot-builders';
+
+// ====== PREVIEW RENDER BUILDERS ======
+// Typed factories that inject the `output_format` discriminator on
+// `PreviewRender` objects. `urlRender({ render_id, preview_url, role })`
+// returns a valid url-variant render without repeating
+// `output_format: 'url'` at every call site. Matrix runs consistently
+// saw this drift: Claude emitted renders that omitted the discriminator
+// or its required sibling field.
+export { Render, urlRender, htmlRender, bothRender } from './utils/render-builders';
+
+// ====== FORMAT RENDER BUILDERS ======
+// Typed factories for `Format.renders[]` entries on format declarations.
+// The item schema's `oneOf` forces a render to satisfy exactly one branch —
+// either `dimensions` (display/video) OR `parameters_from_format_id: true`
+// (audio, template formats). A render with only `{ role }` fails validation.
+// Audio specifically cannot use `{ role, duration_seconds }` — duration is
+// not a recognized `renders[]` field and wouldn't satisfy the oneOf anyway.
+// Use `parameterizedRender({ role })` (or the alias `templateRender`) so
+// format_id parameters carry duration.
+//
+// `FormatRender` below is the factory namespace. The structural interface
+// is exported separately as `FormatRenderEntry` further down.
+export {
+  FormatRender,
+  displayRender,
+  parameterizedRender,
+  templateRender,
+  type DimensionsRender,
+  type ParameterizedRender,
+  type RenderItem,
+} from './utils/format-render-builders';
+
+// ====== CANONICAL CREATIVE FORMAT HELPERS ======
+// Primary application surfaces author canonical `Product.format_options[]`,
+// `format_option_refs[]`, and creative `format_kind`. Raw projection helpers
+// live only under the explicit `@adcp/sdk/v2/projection` migration subpath.
+export {
+  CanonicalFormat,
+  canonicalFormatDeclaration,
+  type CanonicalFormatDeclaration,
+  type CanonicalFormatDeclaration as Format,
+  type CanonicalFormatDeclarationFields,
+  type CanonicalFormatKind,
+  type CanonicalFormatParams,
+  type ProductCardDetailedFields,
+  type ProductCardFields,
+} from './v2/projection';
+
+export {
+  toCanonicalFormatOptionsWithRoutes,
+  toAdditiveCanonicalProduct,
+  withAdditiveCanonicalFormatOptions,
+  toCanonicalOnlyProduct,
+  toCanonicalOnlyResponse,
+  packageRefsForFormatOptions,
+  FormatOptionRefsLookupError,
+  CreativeFormatCapabilityError,
+  CreativeFormatProjectionError,
+  type CreativeFormatWireMode,
+  type LegacyFormatConversionContext,
+  type LegacyFormatConverter,
+  type LegacyFormatResolutionContext,
+  type LegacyFormatResolver,
+  legacyFormatConverterFromCatalogSnapshots,
+  canonicalFormatLegacyResolverFromCatalogSnapshots,
+  canonicalFormatLegacyResolverFromRoutes,
+  carryFormatOptionOrigins,
+  legacyRoutesForProduct,
+  projectionAdaptersFromCatalogSnapshots,
+  type ProjectionCatalogAdapters,
+  type ProjectionCatalogSnapshot,
+  type ProjectionCatalogSource,
+  type CanonicalFormatLegacyResolver,
+  type CanonicalFormatLegacyResolutionContext,
+  type CanonicalFormatLegacyRoute,
+  type LegacyRoutesForProductOptions,
+  type AdditiveCanonicalProduct,
+  type CanonicalOnlyProduct,
+  type CanonicalCreativeAsset,
+  type CanonicalCreativeAsset as CreativeAsset,
+  type CanonicalSyncCreativeAsset,
+  type CanonicalCreateMediaBuyInput,
+  type CanonicalCreateMediaBuyRequest,
+  type CanonicalCreateMediaBuyRequest as CreateMediaBuyRequest,
+  type CanonicalCreateMediaBuyResponse,
+  type CanonicalCreateMediaBuyResponse as CreateMediaBuyResponse,
+  type CanonicalCreativeResponse,
+  type CanonicalCreativeFilters,
+  type CanonicalCreativeFilters as CreativeFilters,
+  type CanonicalGetCreativeDeliveryResponse,
+  type CanonicalGetCreativeDeliveryResponse as GetCreativeDeliveryResponse,
+  type CanonicalGetMediaBuyDeliveryResponse,
+  type CanonicalGetMediaBuyDeliveryResponse as GetMediaBuyDeliveryResponse,
+  type CanonicalGetMediaBuysResponse,
+  type CanonicalGetMediaBuysResponse as GetMediaBuysResponse,
+  type CanonicalGetProductsResponse as GetProductsResponse,
+  type CanonicalGetProductsRequest,
+  type CanonicalGetProductsRequest as GetProductsRequest,
+  type CanonicalListCreativesRequest,
+  type CanonicalListCreativesRequest as ListCreativesRequest,
+  type CanonicalListCreativesResponse,
+  type CanonicalListCreativesResponse as ListCreativesResponse,
+  type CanonicalListedCreative,
+  type CanonicalPackageRequest,
+  type CanonicalPackageRequest as PackageRequest,
+  type CanonicalPackageUpdate,
+  type CanonicalPackageUpdate as PackageUpdate,
+  type CanonicalPackage,
+  type CanonicalPackage as Package,
+  type CanonicalPlacement,
+  type CanonicalPlacement as Placement,
+  type CanonicalPreviewCreativeRequest,
+  type CanonicalPreviewCreativeRequest as PreviewCreativeRequest,
+  type CanonicalPreviewCreativeResponse,
+  type CanonicalPreviewCreativeResponse as PreviewCreativeResponse,
+  type CanonicalProduct,
+  type CanonicalProduct as Product,
+  type CanonicalProjectedCreative,
+  type CanonicalSyncCreativesRequest,
+  type CanonicalSyncCreativesRequest as SyncCreativesRequest,
+  type CanonicalSyncCreativesResponse,
+  type CanonicalSyncCreativesResponse as SyncCreativesResponse,
+  type CanonicalUpdateMediaBuyRequest,
+  type CanonicalUpdateMediaBuyRequest as UpdateMediaBuyRequest,
+  type CanonicalUpdateMediaBuyResponse,
+  type CanonicalUpdateMediaBuyResponse as UpdateMediaBuyResponse,
+  type LegacyCreativeAsset,
+  type CanonicalCreativeFormatSelectorContainer,
+  type PackageFormatRefs,
+  type ProjectionDiagnostic,
+  type SyncCreativeFormatProjection,
+} from './v2/projection';
+
+// ====== ACTIVATION KEY BUILDERS ======
+// Typed factories that inject the `type` discriminator on `ActivationKey`.
+// SHAPE-GOTCHAS §1 — `key`/`value` flatten on the activation key itself.
+export { activationKey, segmentIdActivationKey, keyValueActivationKey } from './utils/activation-key-builders';
+
+// ====== SIGNAL ID BUILDERS AND ACCESSORS ======
+// Typed factories that inject the `source` discriminator on `SignalID`.
+// Used in `signal_ids` filter arrays and as the `signal_id` provenance
+// field on every `Signal` returned by `get_signals`. SHAPE-GOTCHAS §2.
+// To read fields from a received `SignalID`, use `getSignalId` (segment id)
+// and `getSignalIssuer` (data_provider_domain or agent_url).
+export { signalId, catalogSignalId, agentSignalId, getSignalId, getSignalIssuer } from './utils/signal-id-builders';
+export {
+  buildActivateSignalRequest,
+  getSignalActivationId,
+  getSignalPricingOptionIds,
+  normalizeDiscoveredSignal,
+} from './utils/signal-discovery-helpers';
+export type {
+  BuildActivateSignalRequestOptions,
+  DiscoveredSignal,
+  NormalizedDiscoveredSignal,
+} from './utils/signal-discovery-helpers';
+
+// ====== BUILD CREATIVE RETURN BUILDERS ======
+// Typed factories for the five return shapes accepted by the framework
+// from `build_creative` handlers. `.single` / `.multi` emit bare manifests
+// the framework auto-wraps; `.singleEnveloped` / `.multiEnveloped` emit
+// the shaped envelope when the handler needs to attach `sandbox` /
+// `expires_at` / `preview`; `.variantEnveloped` preserves multiplicity.
+// SHAPE-GOTCHAS §5.
+export {
+  buildCreativeReturn,
+  singleBuildCreativeReturn,
+  multiBuildCreativeReturn,
+  singleEnvelopedBuildCreativeReturn,
+  multiEnvelopedBuildCreativeReturn,
+  variantEnvelopedBuildCreativeReturn,
+} from './utils/build-creative-return-builders';
+
+// ====== PREVIEW CREATIVE BUILDERS ======
+// Typed factories that inject the `response_type` discriminator on
+// `PreviewCreativeResponse`. Three-way oneOf — `single | batch | variant`.
+// Pair with `urlRender` / `htmlRender` / `bothRender` for the per-render
+// `output_format`. SHAPE-GOTCHAS §4.
+export {
+  previewCreative,
+  singlePreviewCreativeResponse,
+  batchPreviewCreativeResponse,
+  variantPreviewCreativeResponse,
+} from './utils/preview-creative-builders';
+
+// ====== MEDIA BUY DELIVERY NOTIFICATION BUILDERS ======
+// Typed factories that inject the `notification_type` discriminator on
+// `GetMediaBuyDeliveryResponse` for webhook deliveries. Five variants:
+// `scheduled` / `final` / `delayed` / `adjusted` / `window_update`.
+export {
+  mediaBuyDeliveryNotification,
+  scheduledMediaBuyDeliveryNotification,
+  finalMediaBuyDeliveryNotification,
+  delayedMediaBuyDeliveryNotification,
+  adjustedMediaBuyDeliveryNotification,
+  windowUpdateMediaBuyDeliveryNotification,
+} from './utils/media-buy-delivery-notification-builders';
+
+// ====== V3.0 COMPATIBILITY UTILITIES ======
+// Capabilities detection, version negotiation, and v3 enforcement.
+// See also:
+//   - `VersionUnsupportedError` in errors — thrown by requireV3()/requireV3ForMutations
+//   - `SyncCreativesItemSchema` in validation — per-item sync_creatives validator
+//   - `ADCP_MAJOR_VERSION` / `COMPATIBLE_ADCP_VERSIONS` in version information
+//   - `SingleAgentClient#requireV3()` / `AgentClient#requireV3()` — runtime gate
+export {
+  buildSyntheticV3Capabilities,
+  parseCapabilitiesResponse,
+  supportsV3,
+  supportsProtocol,
+  supportsPropertyListFiltering,
+  supportsContentStandards,
+  supportsSyncCreatives,
+  supportsBuyingMode,
+  requiresOperatorAuth,
+  requiresAccountForProducts,
+  supportsSandbox,
+  supportsExperimentalFeature,
+  resolveFeature,
+  listDeclaredFeatures,
+  MEDIA_BUY_TOOLS,
+  SIGNALS_TOOLS,
+  GOVERNANCE_TOOLS,
+  CREATIVE_TOOLS,
+  EVENT_TRACKING_TOOLS,
+  ACCOUNT_TOOLS,
+  PROTOCOL_TOOLS,
+  BRAND_RIGHTS_TOOLS,
+  TASK_FEATURE_MAP,
+} from './utils/capabilities';
+export type {
+  AdcpCapabilities,
+  AdcpMajorVersion,
+  AdcpProtocol,
+  AccountCapabilities,
+  BuyingMode,
+  MediaBuyFeatures,
+  ToolInfo,
+  FeatureName,
+} from './utils/capabilities';
+export type { ResolveAccountOptions, ResolveAccountResult, ListedAccount } from './core/account-resolution';
+
+// Buyer-side creative delivery helpers
+export { inlineCreativesForPackages, inlineCreativesForPackagesLegacy } from './utils/creative-delivery';
+export type {
+  InlineCreativeAssignment,
+  InlineCreativePackage,
+  InlineCreativePackagePatch,
+  InlineCreativesForPackagesOptions,
+  InlineCreativesForPackagesLegacyOptions,
+  LegacyInlineCreativePackage,
+} from './utils/creative-delivery';
+
+// AdCP 3 creative assignment helpers
+export {
+  normalizePackageResponse,
+  normalizeMediaBuyResponse,
+  usesV3CreativeAssignments,
+  getCreativeIds,
+  getCreativeAssignments,
+} from './utils/creative-adapter';
+export type { CreativeAssignment } from './utils/creative-adapter';
+
+// AdCP 3 format render helpers
+export {
+  normalizeFormatRenders,
+  normalizeFormatsResponse,
+  getFormatRenders,
+  getPrimaryRender,
+  getCompanionRenders,
+  isMultiRenderFormat,
+  usesV3Renders,
+  getFormatDimensions,
+} from './utils/format-renders';
+export type { FormatRenderEntry, RenderDimensions } from './utils/format-renders';
+
+// AdCP 3 preview render helpers
+export {
+  normalizePreviewRender,
+  normalizePreview,
+  normalizePreviewCreativeResponse,
+  usesV3RenderFields,
+  getRenderId,
+  getRenderRole,
+  getPrimaryPreviewRender,
+  getPreviewUrl,
+  getPreviewHtml,
+} from './utils/preview-normalizer';
+export type { PreviewRendererMetadata, PreviewRenderV3 } from './utils/preview-normalizer';
+
+export {
+  resolvePreviewAuthority,
+  type PlacementPreviewCandidate,
+  type PreviewAuthorityInput,
+  type PreviewAuthorityResolution,
+  type PreviewFidelity,
+  type SelectedPreviewAuthority,
+  type SellerPreviewCandidate,
+} from './utils/preview-authority';
+
+// ====== TYPE GUARD UTILITIES ======
+// Type guards for automatic TypeScript type narrowing in webhook handlers
+export {
+  // Generic status checks
+  isStatusCompleted,
+  isStatusWorking,
+  isStatusInputRequired,
+  isStatusSubmitted,
+  isStatusFailed,
+  isStatusRejected,
+  // GetProducts type guards
+  isGetProductsCompleted,
+  isGetProductsWorking,
+  isGetProductsInputRequired,
+  isGetProductsSubmitted,
+  isGetProductsFailed,
+  // CreateMediaBuy type guards
+  isCreateMediaBuyCompleted,
+  isCreateMediaBuyWorking,
+  isCreateMediaBuyInputRequired,
+  isCreateMediaBuySubmitted,
+  isCreateMediaBuyFailed,
+  // UpdateMediaBuy type guards
+  isUpdateMediaBuyCompleted,
+  isUpdateMediaBuyWorking,
+  isUpdateMediaBuyInputRequired,
+  isUpdateMediaBuySubmitted,
+  isUpdateMediaBuyFailed,
+  // SyncCreatives type guards
+  isSyncCreativesCompleted,
+  isSyncCreativesWorking,
+  isSyncCreativesInputRequired,
+  isSyncCreativesSubmitted,
+  isSyncCreativesFailed,
+} from './utils/typeGuards';
+
+// ====== VERSION INFORMATION ======
+export {
+  getAdcpVersion,
+  getLibraryVersion,
+  isCompatibleWith,
+  getCompatibleVersions,
+  parseAdcpMajorVersion,
+  ADCP_VERSION,
+  ADCP_MAJOR_VERSION,
+  LIBRARY_VERSION,
+  COMPATIBLE_ADCP_VERSIONS,
+  VERSION_INFO,
+} from './version';
+export type { AdcpVersion } from './version';
+export {
+  listBundledAdcpVersions,
+  resolveAdcpVersion,
+  isAdcpVersionAtLeast,
+  sellerAdvertises31,
+  shouldOmit31Fields,
+} from './utils/adcp-version-config';
+export { redactSecrets } from './utils/redact-secrets';
+
+// ====== OBSERVABILITY ======
+// OpenTelemetry tracing utilities (no-op if @opentelemetry/api not installed)
+export {
+  getTracer,
+  isTracingEnabled,
+  injectTraceHeaders,
+  withSpan,
+  addSpanAttributes,
+  recordSpanException,
+} from './observability';
+
+// ====== AGENT CLASSES ======
+// Primary agent interface - returns raw AdCP responses
+// Generated all-tool facades mirror raw protocol schemas, including legacy
+// format_id-bearing tools. Keep them explicit so the primary root surface
+// cannot bypass AgentClient's canonical boundary.
+export { Agent as LegacyAgent, AgentCollection as LegacyAgentCollection } from './agents/index.generated';
+
+// ====== SERVER-SIDE ADAPTERS ======
+// Adapters for building AdCP servers with customizable business logic
+export {
+  // Content Standards
+  LegacyContentStandardsAdapter,
+  type LegacyIContentStandardsAdapter,
+  type LegacyContentEvaluationResult,
+  LegacyContentStandardsErrorCodes,
+  isLegacyContentStandardsError,
+  legacyDefaultContentStandardsAdapter,
+  // Property Lists
+  PropertyListAdapter,
+  type IPropertyListAdapter,
+  type ResolvedProperty,
+  PropertyListErrorCodes,
+  isPropertyListError,
+  defaultPropertyListAdapter,
+  // Sponsored Intelligence Sessions
+  SISessionManager,
+  AISISessionManager,
+  type ISISessionManager,
+  type SISession,
+  SIErrorCodes,
+  defaultSISessionManager,
+  // Governance (seller-side committed checks)
+  GovernanceAdapter,
+  defaultGovernanceAdapter,
+  type IGovernanceAdapter,
+  type GovernanceAdapterConfig,
+  type GovernanceAdapterErrorCode,
+  type CommittedCheckRequest,
+  type LegacyCommittedCheckRequest,
+  type ModernCommittedCheckRequest,
+  GovernanceAdapterError,
+  GovernanceAdapterErrorCodes,
+  isGovernanceAdapterError,
+  // Implicit Account Store (resolution: 'implicit') — Shape A reference adapter
+  InMemoryImplicitAccountStore,
+  defaultImplicitKeyFn,
+  type ImplicitAccountStoreOptions,
+  // OAuth pass-through resolver — Shape B accounts.resolve factory
+  createOAuthPassthroughResolver,
+  type OAuthPassthroughResolverOptions,
+  // Roster-backed AccountStore — Shape C factory for publisher-curated explicit platforms
+  createRosterAccountStore,
+  type RosterAccountStoreOptions,
+  // Derived AccountStore — Shape D factory for `resolution: 'derived'` agents
+  // fronting an upstream-managed account namespace
+  createDerivedAccountStore,
+  type DerivedAccountStoreOptions,
+  type DerivedAccountStoreBaseOptions,
+  type DerivedSingletonAccountStoreOptions,
+  type DerivedRosterAccountStoreOptions,
+} from './adapters';
+
+// ====== BACKWARD COMPATIBILITY & ENVIRONMENT LOADING ======
+
+import type { AgentConfig } from './types';
+import { ADCPMultiAgentClient } from './core/ADCPMultiAgentClient';
+
+/**
+ * Legacy AdCPClient alias for backward compatibility
+ * @deprecated Use ADCPMultiAgentClient instead for new code
+ */
+export const AdCPClient = ADCPMultiAgentClient;
+
+// Legacy configuration manager maintained for backward compatibility
+// The enhanced ConfigurationManager is exported above
+
+/**
+ * Legacy createAdCPClient function for backward compatibility
+ * @deprecated Use new ADCPMultiAgentClient constructor instead
+ */
+export function createAdCPClient(agents?: AgentConfig[]): ADCPMultiAgentClient {
+  return new AdCPClient(agents);
+}
+
+/**
+ * Load agents from environment and create multi-agent client
+ * @deprecated Use ADCPMultiAgentClient.fromEnv() instead
+ */
+export function createAdCPClientFromEnv(): ADCPMultiAgentClient {
+  return ADCPMultiAgentClient.fromEnv();
+}
+
+// ====== SUBSTITUTION OBSERVER / ENCODER ======
+// Primitives backing the `substitution-observer-runner` test-kit contract.
+// Runners (conformance graders) import the observer side; sales/retail-
+// media agents implementing the #2620 catalog-item macro encoding rule
+// import `SubstitutionEncoder`. Re-exported here for discoverability;
+// the full surface is also available via `@adcp/sdk/substitution`.
+export {
+  SubstitutionObserver,
+  SubstitutionEncoder,
+  PreviewFetchError,
+  MacroInRawValueError,
+  CATALOG_MACRO_VECTORS,
+  getCatalogMacroVector,
+  extractTrackerUrls,
+  matchBindings,
+  assertRfc3986Safe,
+  assertUnreservedOnly,
+  assertNoNestedExpansion,
+  assertSchemePreserved,
+  DEFAULT_MACRO_PROHIBITED_PATTERN,
+  enforceSsrfPolicy,
+  enforceSsrfPolicyResolved,
+  DEFAULT_SSRF_POLICY,
+  encodeUnreserved,
+  equalUnderHexCasePolicy,
+  isUnreservedOnly,
+  divergenceOffset,
+  translateUniversalMacros,
+  UnsafeNativeMappingError,
+  MultipleVendorConsentMacrosError,
+  compileUniversalMacroTemplate,
+} from './substitution';
+export type {
+  ObserverFetchOptions,
+  ObserverDispatcher,
+  CatalogMacroVectorName,
+  AssertionOptions as SubstitutionAssertionOptions,
+  AssertionResult as SubstitutionAssertionResult,
+  BindingMatch,
+  CatalogBinding,
+  CatalogMacroVector,
+  PolicyResult as SubstitutionPolicyResult,
+  SsrfPolicy,
+  TrackerUrlRecord,
+  MacroMapping,
+  TranslateResult,
+  BuiltInSourceMacroSyntax,
+  CompileUniversalMacroTemplateInput,
+  CompileUniversalMacroTemplateResult,
+  CustomSourceMacroSyntax,
+  MacroDocumentationReference,
+  SourceMacroMapping,
+  SourceMacroRequirement,
+  SourceMacroRequirementSatisfaction,
+  SourceMacroSyntax,
+  SourceMacroSyntaxDeclaration,
+  UniversalMacroCompileDiagnostic,
+  UniversalMacroOccurrence,
+} from './substitution';
+
+// ====== TEST HELPERS ======
+// Re-export test helpers for convenience (also available via @adcp/sdk/testing)
+export {
+  testAgent,
+  testAgentA2A,
+  testAgentClient,
+  createTestAgent,
+  TEST_AGENT_TOKEN,
+  TEST_AGENT_MCP_CONFIG,
+  TEST_AGENT_A2A_CONFIG,
+  testAgentNoAuth,
+  testAgentNoAuthA2A,
+  TEST_AGENT_NO_AUTH_MCP_CONFIG,
+  TEST_AGENT_NO_AUTH_A2A_CONFIG,
+  creativeAgent,
+  testBrandRightsFlow,
+  hasBrandRightsTools,
+  expectControllerError,
+  expectControllerSuccess,
+  RateLimitTripObserver,
+  RATE_LIMIT_TRIP_CONTRACT,
+  RATE_LIMIT_TRIP_DEFAULT_REPLAY_MAX_WAIT_SECONDS,
+  RATE_LIMIT_TRIP_MAX_ATTEMPTS_MAX,
+  RATE_LIMIT_TRIP_MAX_ATTEMPTS_MIN,
+  validateRateLimitTripSpec,
+} from './testing/index';
+export type {
+  ControllerErrorWithDetail,
+  TestClient,
+  RateLimitTripSpec,
+  RateLimitTripClient,
+  RateLimitTripFailureCode,
+  RateLimitTripObservation,
+  RateLimitTripObserverOptions,
+  RateLimitTripResponseSnapshot,
+  RateLimitTripStructuredResult,
+  RateLimitTripTaskOptions,
+} from './testing/index';
+export * from './client/account-change-cursor';
+export * from './client/account-changes';
+export * from './client/account-change-subscription';
+export * from './notifications/account-change-recorded';
+export type { AccountChangeFeedCapabilities } from './utils/capabilities';
+
+export * from './media-buy/actions';
+export { mediaBuyActionResolver } from './server/media-buy-action-resolver';
+export type {
+  SellerActionDecision,
+  SellerActionResolutionOptions,
+  SellerActionResolution,
+} from './server/media-buy-action-resolver';
+
+// Authoritative supply-path evidence and the canonical registry wrapper.
+export * from './supply-path';
+export type {
+  AuthorizationCollectionSelector,
+  ProductCollectionSelector,
+  CollectionDistribution,
+  DiscoveryCollection,
+} from './discovery/types';
+
+export {
+  BuyerAccountRegistry,
+  type AccountPolicy,
+  type BuyerAccountStorage,
+  type BuyerAccountRegistryOptions,
+  type BuyerAccountDispatch,
+  type BuyerAccountProvisioningDispatch,
+  type EnsureAccountOptions,
+  type ProvisionedAccount,
+} from './core/buyer-account-registry';
+export { createProductCache, ProductCache, type ProductCacheOptions } from './core/product-cache';

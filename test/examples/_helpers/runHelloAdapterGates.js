@@ -1,0 +1,362 @@
+/**
+ * Shared three-gate CI test runner for `examples/hello_*_adapter_*.ts`
+ * reference adapters. Each adapter test file passes its config and the
+ * helper registers the three gates (strict tsc / storyboard / façade).
+ *
+ * **Contract**: `docs/guides/EXAMPLE-TEST-CONTRACT.md` documents what each
+ * gate catches, the adversarial-sabotage validation pattern (when to add
+ * a fourth gate, how to confirm gate independence), and the acceptance
+ * criteria new adapters must meet. Read it before adding a new adapter
+ * test or modifying this helper.
+ *
+ * Adversarial-sabotage validated: each gate fires for a distinct
+ * regression class. See PR #1274 for the original rationale.
+ */
+
+const { describe, it, before, after } = require('node:test');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const { spawn, spawnSync } = require('node:child_process');
+const { bootMockServer } = require('@adcp/sdk/mock-server');
+const { createMCPClient } = require('../../../dist/lib/protocols');
+
+const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
+const CLI = path.join(REPO_ROOT, 'bin', 'adcp.js');
+
+/**
+ * @typedef {Object} HelloGatesConfig
+ * @property {string} suiteName               — `describe()` label, typically `examples/<file>`
+ * @property {string} exampleFile             — absolute path to the adapter `.ts` file under test
+ * @property {Parameters<typeof bootMockServer>[0]['specialism']} specialism
+ * @property {string} storyboardId            — storyboard id passed to `adcp storyboard run`
+ * @property {string} adcpAuthToken           — bearer the agent verifies + the grader sends
+ * @property {string[]} expectedRoutes        — façade gate: routes that must show ≥1 hit
+ * @property {Record<string, string|undefined>} [extraEnv]  — extra env vars for the agent child
+ * @property {Parameters<typeof bootMockServer>[0]} [mockOptions] — extra mock-server boot opts
+ * @property {(grader: any) => any[]} [filterFailures] — narrow the failures list (default: all)
+ * @property {string} [storyboardSummary]     — optional storyboard description for the test name
+ * @property {Array<{id: string, label?: string, auth?: string, testKitPath?: string, assertResult?: (grader: any) => void}>} [extraStoryboards]
+ *           — additional storyboards run against the same agent process after the
+ *             primary storyboard. Each entry runs as its own `it()` gate with
+ *             default-strict failure assertion. `auth` overrides the bearer
+ *             passed to the grader; `testKitPath` is forwarded to the grader as
+ *             `--test-kit PATH` so storyboard steps with `auth.from_test_kit: true`
+ *             or `$test_kit.<path>` references resolve. `assertResult` runs after
+ *             the zero-failure check for adapter-specific observations.
+ * @property {Array<{label: string, run: (ctx: {agentUrl: string, mockUrl: string, authToken: string, callTool: (toolName: string, args: Record<string, unknown>, auth?: string) => Promise<any>}) => Promise<void>}>} [extraMcpAssertions]
+ *           — direct MCP assertions that run against the already-booted
+ *             example and mock server. Use for adapter-specific invariants
+ *             that the current storyboard skips.
+ *
+ * Ports are picked dynamically per test run (kernel-assigned via `pickFreePort()`)
+ * so concurrent test-file workers never race on the same hardcoded number. See
+ * adcontextprotocol/adcp-client#1361 CI runs 25266540111 / 25266762789 / 25266848405
+ * for the original EADDRINUSE-on-41504 + agent-port-timeout-on-35004 flakes.
+ */
+
+/**
+ * Register the three CI gates for a hello-adapter example.
+ * @param {HelloGatesConfig} config
+ */
+function runHelloAdapterGates(config) {
+  const {
+    suiteName,
+    exampleFile,
+    specialism,
+    storyboardId,
+    adcpAuthToken,
+    expectedRoutes,
+    extraEnv = {},
+    mockOptions = {},
+    filterFailures,
+    storyboardSummary,
+    extraStoryboards = [],
+    extraMcpAssertions = [],
+  } = config;
+
+  describe(suiteName, () => {
+    // ── Gate 1 — strictest realistic typecheck ──
+    it('passes tsc with --strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes + noPropertyAccessFromIndexSignature', () => {
+      const res = spawnSync(
+        'npx',
+        [
+          'tsc',
+          '--noEmit',
+          exampleFile,
+          '--target',
+          'ES2022',
+          '--module',
+          'commonjs',
+          '--moduleResolution',
+          'node',
+          '--esModuleInterop',
+          '--skipLibCheck',
+          '--strict',
+          '--noUncheckedIndexedAccess',
+          '--exactOptionalPropertyTypes',
+          '--noImplicitOverride',
+          '--noFallthroughCasesInSwitch',
+          '--noPropertyAccessFromIndexSignature',
+        ],
+        { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000 }
+      );
+      assert.equal(res.status, 0, `tsc reported errors:\n${(res.stdout || '') + (res.stderr || '')}`);
+    });
+
+    // ── Gates 2 + 3 — runtime: storyboard + traffic ──
+    let mockHandle;
+    let agent;
+    let agentPort;
+
+    before(async () => {
+      // Pick free ports per-run so concurrent test-file workers never race
+      // on a hardcoded number. The mock server gets `port: 0` directly (its
+      // boot helper reads `server.address()` and surfaces the bound port via
+      // `mockHandle.url`); the spawned agent is a child process that reads
+      // `PORT` from env, so we must hand it a concrete number — `pickFreePort`
+      // asks the kernel for one and closes immediately, leaving a small
+      // race window between close and the agent's `listen()`. Acceptable for
+      // tests; the rare collision falls back into `waitForPort`'s timeout
+      // and reports cleanly.
+      agentPort = await pickFreePort();
+      mockHandle = await bootMockServer({ specialism, port: 0, ...mockOptions });
+      agent = spawnAgent(exampleFile, {
+        PORT: String(agentPort),
+        UPSTREAM_URL: mockHandle.url,
+        ADCP_AUTH_TOKEN: adcpAuthToken,
+        NODE_ENV: 'development',
+        ...extraEnv,
+      });
+      await waitForPort('127.0.0.1', agentPort, 30_000);
+    });
+
+    after(async () => {
+      await stopAgent(agent);
+      if (mockHandle) await mockHandle.close();
+    });
+
+    const passLabel = storyboardSummary
+      ? `passes the ${storyboardId} storyboard with zero failed steps (${storyboardSummary})`
+      : `passes the ${storyboardId} storyboard with zero failed steps`;
+
+    it(passLabel, async () => {
+      const grader = await runGrader(`http://127.0.0.1:${agentPort}/mcp`, storyboardId, adcpAuthToken);
+      // A storyboard that skips every step reports zero failures and would
+      // pass the assertion below without exercising the adapter at all. That
+      // is what grading the wrong process looks like (e.g. a stale agent from
+      // another suite answering on this port), so treat it as a failure.
+      assert.ok(
+        (grader.summary?.steps_passed ?? 0) > 0,
+        `storyboard ${storyboardId} ran zero passing steps (${grader.summary?.steps_skipped ?? '?'} skipped) — ` +
+          `is the agent on port ${agentPort} the one under test?\n${JSON.stringify(grader.summary, null, 2)}`
+      );
+      const failures = filterFailures ? filterFailures(grader) : (grader.failures || []).filter(f => !f.skipped);
+      assert.equal(
+        failures.length,
+        0,
+        `storyboard reported ${failures.length} failed step(s):\n` + formatFailures(failures)
+      );
+      assert.notEqual(grader.overall_status, 'failing');
+    });
+
+    for (const extra of extraStoryboards) {
+      const label = extra.label
+        ? `${extra.label} (${extra.id})`
+        : `additional storyboard ${extra.id} passes with zero failed steps`;
+      it(label, async () => {
+        // Each entry is an independent compliance run. Clear renders,
+        // idempotency records, scripted responses, and traffic from the
+        // primary run so repeated storyboard ids cannot inherit mock state.
+        await mockHandle.scenario.reset();
+        const grader = await runGrader(
+          `http://127.0.0.1:${agentPort}/mcp`,
+          extra.id,
+          extra.auth ?? adcpAuthToken,
+          extra.testKitPath ? { testKitPath: extra.testKitPath } : {}
+        );
+        const failures = (grader.failures || []).filter(f => !f.skipped);
+        assert.equal(
+          failures.length,
+          0,
+          `storyboard ${extra.id} reported ${failures.length} failed step(s):\n` + formatFailures(failures)
+        );
+        assert.notEqual(grader.overall_status, 'failing');
+        if (extra.assertResult) extra.assertResult(grader);
+      });
+    }
+
+    for (const extra of extraMcpAssertions) {
+      it(extra.label, async () => {
+        const agentUrl = `http://127.0.0.1:${agentPort}/mcp`;
+        await extra.run({
+          agentUrl,
+          mockUrl: mockHandle.url,
+          authToken: adcpAuthToken,
+          callTool: (toolName, args, auth = adcpAuthToken) => createMCPClient(agentUrl, auth).callTool(toolName, args),
+        });
+      });
+    }
+
+    it('hits every expected upstream route at least once (façade gate)', async () => {
+      const res = await fetch(`${mockHandle.url}/_debug/traffic`);
+      const body = await res.json();
+      const traffic = body.traffic || {};
+      const missing = expectedRoutes.filter(r => (traffic[r] || 0) < 1);
+      assert.deepEqual(
+        missing,
+        [],
+        `These upstream routes had zero hits — the adapter is a façade for them:\n  ${missing.join('\n  ')}\n\nFull traffic:\n${JSON.stringify(traffic, null, 2)}`
+      );
+    });
+  });
+}
+
+/**
+ * Boot an example adapter as a child process. `npx tsx <file>` is a three-deep
+ * process tree (npx → tsx → node); `detached: true` puts the whole tree in its
+ * own process group so `stopAgent` can signal the group rather than only the
+ * npx parent. Killing npx alone can orphan the node grandchild, which keeps
+ * listening on the agent port after the suite's `after` hook returns — the
+ * next suite's `waitForPort` then connects to the stale agent and grades the
+ * wrong process (storyboard passes with every step skipped, façade gate sees
+ * zero upstream hits, controller tool is missing).
+ */
+function spawnAgent(exampleFile, env) {
+  const agent = spawn('npx', ['tsx', exampleFile], {
+    cwd: REPO_ROOT,
+    env: { ...process.env, ...env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true,
+  });
+  // Drain stdio so the kernel pipe buffers don't fill and block the child.
+  agent.stdout.on('data', () => {});
+  agent.stderr.on('data', () => {});
+  return agent;
+}
+
+function signalAgentTree(agent, signal) {
+  if (!agent || agent.pid == null) return;
+  try {
+    // Negative pid targets the process group created by `detached: true`.
+    process.kill(-agent.pid, signal);
+  } catch {
+    try {
+      agent.kill(signal);
+    } catch {
+      // already gone
+    }
+  }
+}
+
+/**
+ * Terminate the agent's whole process tree and wait for the parent to exit.
+ * SIGTERM first so `serve()` can shut down cleanly; SIGKILL the group if the
+ * parent is still alive after a grace period.
+ */
+async function stopAgent(agent, { graceMs = 1_000 } = {}) {
+  if (!agent || agent.exitCode !== null || agent.signalCode !== null) return;
+  const exited = new Promise(resolve => agent.once('exit', resolve));
+  signalAgentTree(agent, 'SIGTERM');
+  const graceful = await Promise.race([exited.then(() => true), new Promise(r => setTimeout(() => r(false), graceMs))]);
+  if (!graceful) {
+    signalAgentTree(agent, 'SIGKILL');
+    await Promise.race([exited, new Promise(r => setTimeout(r, graceMs))]);
+  }
+}
+
+function waitForPort(host, port, timeoutMs) {
+  const { connect } = require('node:net');
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      const s = connect(port, host, () => {
+        s.end();
+        resolve();
+      });
+      s.on('error', () => {
+        if (Date.now() >= deadline) reject(new Error(`timed out waiting for ${host}:${port}`));
+        else setTimeout(tick, 100);
+      });
+    };
+    tick();
+  });
+}
+
+/**
+ * Ask the kernel for a free TCP port on 127.0.0.1: open a server on port 0,
+ * read what was assigned, close it, and hand the number back. There's a small
+ * race window between close and whoever uses the port next — acceptable for
+ * test fixtures, much better than fighting hardcoded numbers across
+ * concurrent test-file workers.
+ */
+function pickFreePort() {
+  const { createServer } = require('node:net');
+  return new Promise((resolve, reject) => {
+    const s = createServer();
+    s.unref();
+    s.once('error', reject);
+    s.listen(0, '127.0.0.1', () => {
+      const addr = s.address();
+      const port = typeof addr === 'object' && addr ? addr.port : 0;
+      s.close(err => (err ? reject(err) : resolve(port)));
+    });
+  });
+}
+
+function runGrader(agentUrl, storyboardId, adcpAuthToken, { testKitPath } = {}) {
+  return new Promise((resolveFn, reject) => {
+    const child = spawn(
+      'node',
+      [
+        CLI,
+        'storyboard',
+        'run',
+        agentUrl,
+        storyboardId,
+        '--json',
+        '--allow-http',
+        '--auth',
+        adcpAuthToken,
+        '--webhook-receiver',
+        ...(testKitPath ? ['--test-kit', testKitPath] : []),
+      ],
+      { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+    const out = [];
+    const err = [];
+    child.stdout.on('data', c => out.push(c));
+    child.stderr.on('data', c => err.push(c));
+    const timer = setTimeout(() => child.kill('SIGTERM'), 120_000);
+    child.on('close', () => {
+      clearTimeout(timer);
+      const stdout = Buffer.concat(out).toString('utf8');
+      try {
+        resolveFn(JSON.parse(stdout));
+      } catch (e) {
+        reject(
+          new Error(
+            `grader stdout was not parseable JSON (storyboard=${storyboardId}):\n${stdout.slice(0, 500)}\n\nstderr: ${Buffer.concat(err).toString('utf8').slice(0, 500)}`
+          )
+        );
+      }
+    });
+    child.on('error', reject);
+  });
+}
+
+function formatFailures(failures) {
+  return (
+    failures
+      .map(f => {
+        const detail =
+          f.error || f.validation?.error || f.validation?.message || f.validation?.description || f.expected || '';
+        return (
+          `  ✗ ${f.task || '?'} — ${f.step_title || f.step_id || '?'}\n      ${String(detail).slice(0, 500)}` +
+          `\n      evidence: ${JSON.stringify(f).slice(0, 1500)}`
+        );
+      })
+      .join('\n') || '(no per-step detail captured)'
+  );
+}
+
+module.exports = { runHelloAdapterGates, spawnAgent, stopAgent, waitForPort, pickFreePort };

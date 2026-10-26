@@ -1,0 +1,346 @@
+---
+name: build-generative-seller-agent
+description: Use when building an AdCP generative seller — an AI ad network, generative DSP, or platform that sells inventory AND generates creatives from briefs.
+---
+
+# Build a Generative Seller Agent
+
+## Overview
+
+A generative seller does everything a standard seller does (products, media buys, delivery) plus generates creatives from briefs. The buyer sends a creative brief instead of uploading pre-built assets. Your platform resolves the brand identity, generates the creative, and serves it.
+
+A generative seller that sells programmatic inventory MUST also accept standard IAB formats (display images, VAST tags, HTML banners). The generative capability is additive — buyers who already have creatives need to upload them directly.
+
+## When to Use
+
+- User wants to build a generative DSP or AI ad network
+- User's platform both sells inventory and creates/generates creatives
+- User mentions "creative from brief", "AI-generated ads", or "generative"
+
+**Not this skill:**
+
+- Standard seller (no creative generation) → `skills/build-seller-agent/`
+- Standalone creative agent (renders but doesn't sell) → creative agent
+- Signals/audience data → `skills/build-signals-agent/`
+
+## Before Writing Code
+
+Determine these things. Ask the user — don't guess.
+
+### 1. What kind of platform?
+
+- **AI ad network** — sells inventory across publishers, generates creatives from briefs
+- **Generative DSP** — programmatic buying + AI creative generation
+- **Retail media with creative** — retail inventory + dynamic ad generation from catalogs
+
+### 2. Products and pricing
+
+Same as standard seller. Each product needs: `product_id`, `name`, `description`, `publisher_properties`, `format_ids`, `delivery_type`, `pricing_options`. See [`docs/TYPE-SUMMARY.md`](../../docs/TYPE-SUMMARY.md) for full field details and `PricingOption` variants.
+
+### 3. Generative formats
+
+What creative formats does your platform generate?
+
+- **Display** — generated static images (300x250, 728x90, etc.)
+- **Video** — generated video ads (15s, 30s pre-roll)
+- **HTML** — generated interactive/rich media
+
+Each generative format needs a brief asset slot. Standard formats need traditional asset slots (image, video, VAST).
+
+### 4. What inputs does the brief accept?
+
+At minimum: `name`, `objective`, `tone`, `messaging` (headline, cta, key_messages).
+Optional: `audience`, `territory`, `compliance` (required_disclosures, prohibited_claims).
+
+### 5. Brand resolution
+
+The buyer's brand domain should be resolvable. If the brand domain is invalid, reject the creative — don't generate with unknown brand identity.
+
+Brands should be registered dynamically through `sync_accounts` — when a buyer syncs an account with a `brand.domain`, treat that domain as resolvable. Do not hardcode a brand allowlist. Storyboards use fictional brand domains with the `.example` TLD (e.g., `acmeoutdoor.example`) from `storyboards/fictional-entities.yaml`, so a hardcoded list will fail validation.
+
+## Tools and Required Response Shapes
+
+Everything from the standard seller skill applies. The delta is in `list_creative_formats` and `sync_creatives`.
+
+**`get_adcp_capabilities`** — register first, empty `{}` schema
+
+```
+capabilitiesResponse({
+  adcp: { major_versions: [3] },
+  supported_protocols: ['media_buy'],
+})
+```
+
+**`sync_accounts`** — `SyncAccountsRequestSchema.shape`
+
+```
+taskToolResponse({
+  accounts: [{
+    account_id: string,
+    brand: { domain: string },
+    operator: string,
+    action: 'created' | 'updated',
+    status: 'active' | 'pending_approval',
+  }]
+})
+```
+
+**`get_products`** — `GetProductsRequestSchema.shape`
+
+```
+productsResponse({
+  products: [{
+    product_id: 'prod-1',
+    name: 'AI Display Network',
+    description: 'AI-generated display ads across premium publishers',
+    publisher_properties: [{ publisher_domain: 'example.com', selection_type: 'all' }],
+    format_ids: [{ agent_url: 'https://your-agent.example/mcp', id: 'display_300x250_generative' }],
+    delivery_type: 'non_guaranteed',
+    pricing_options: [{
+      pricing_option_id: 'cpm-standard',
+      pricing_model: 'cpm',
+      fixed_price: 15.00,
+      currency: 'USD',
+    }],
+  }],
+  sandbox: true,
+})
+```
+
+**`create_media_buy`** — `CreateMediaBuyRequestSchema.shape`
+
+```
+mediaBuyResponse({
+  media_buy_id: string,
+  packages: [{ package_id, product_id, pricing_option_id, budget }],
+})
+```
+
+**`list_creative_formats`** — `ListCreativeFormatsRequestSchema.shape`
+
+Return BOTH generative and standard formats:
+
+```
+listCreativeFormatsResponse({
+  formats: [
+    // Generative format — accepts brief input
+    {
+      format_id: { agent_url: string, id: 'display_300x250_generative' },
+      name: 'Generated Display 300x250',
+      description: 'AI-generated display ad from creative brief',
+      renders: [{ width: 300, height: 250 }],
+      assets: [{
+        item_type: 'individual',
+        asset_id: 'brief',
+        asset_type: 'brief',
+        required: true,
+        description: 'Creative brief with messaging and brand guidelines',
+      }],
+    },
+    // Standard format — accepts pre-built assets
+    {
+      format_id: { agent_url: string, id: 'display_300x250' },
+      name: 'Display 300x250',
+      description: 'Standard IAB display banner',
+      renders: [{ width: 300, height: 250 }],
+      assets: [{
+        item_type: 'individual',
+        asset_id: 'image',
+        asset_type: 'image',
+        required: true,
+        accepted_media_types: ['image/jpeg', 'image/png'],
+      }],
+    },
+  ],
+})
+```
+
+**`sync_creatives`** — `SyncCreativesRequestSchema.shape`
+
+Handle both brief-based and standard creatives:
+
+```
+syncCreativesResponse({
+  creatives: [{
+    creative_id: string,              // echo from request
+    action: 'created' | 'updated',    // required
+    preview_url: string,              // optional — URL to preview generative creative
+  }],
+})
+```
+
+For invalid brand domains, return failure:
+
+```
+syncCreativesResponse({
+  creatives: [{
+    creative_id: string,
+    action: 'failed',
+    errors: [{ code: 'INVALID_BRAND', message: 'Brand domain not found: nonexistent-brand.example' }],
+  }],
+})
+```
+
+**`get_media_buys`** — `GetMediaBuysRequestSchema.shape`
+
+```
+getMediaBuysResponse({
+  media_buys: [{
+    media_buy_id: string,
+    status: 'active' | 'pending_start' | ...,
+    currency: 'USD',
+    packages: [{ package_id: string }],
+  }]
+})
+```
+
+**`get_media_buy_delivery`** — `GetMediaBuyDeliveryRequestSchema.shape`
+
+```
+deliveryResponse({
+  reporting_period: { start: string, end: string },
+  media_buy_deliveries: [{
+    media_buy_id: string,
+    status: 'active',
+    totals: { impressions: number, spend: number },
+    by_package: [],
+  }]
+})
+```
+
+## Compliance Testing (Optional)
+
+Add `registerTestController` so the comply framework can deterministically test your state machines. One function call — the SDK handles request parsing, status validation, and response formatting.
+
+```
+import { registerTestController, TestControllerError } from '@adcp/sdk';
+import type { TestControllerStore } from '@adcp/sdk';
+
+const store: TestControllerStore = {
+  async forceAccountStatus(accountId, status) {
+    const prev = accounts.get(accountId);
+    if (!prev) throw new TestControllerError('NOT_FOUND', `Account ${accountId} not found`);
+    accounts.set(accountId, status);
+    return { success: true, previous_state: prev, current_state: status };
+  },
+  async forceMediaBuyStatus(mediaBuyId, status) { /* same pattern */ },
+  async forceCreativeStatus(creativeId, status) { /* same pattern */ },
+  // simulateDelivery, simulateBudgetSpend — implement as needed
+};
+
+registerTestController(server, store);
+```
+
+Declare `compliance_testing` in `supported_protocols` in your `get_adcp_capabilities` response. Only implement the store methods for scenarios your agent supports — unimplemented methods are excluded from `list_scenarios` automatically.
+
+Validate with: `adcp storyboard run <agent> deterministic_testing --json`
+
+## SDK Quick Reference
+
+| SDK piece                                               | Usage                                                               |
+| ------------------------------------------------------- | ------------------------------------------------------------------- |
+| `serve(createAgent)`                                    | Start HTTP server on `:3001/mcp`                                    |
+| `createTaskCapableServer(name, version, { taskStore })` | Create MCP server with task support                                 |
+| `server.tool(name, Schema.shape, handler)`              | Register tool — `.shape` unwraps Zod                                |
+| `capabilitiesResponse(data)`                            | Build `get_adcp_capabilities` response                              |
+| `productsResponse(data)`                                | Build `get_products` response                                       |
+| `mediaBuyResponse(data)`                                | Build `create_media_buy` response                                   |
+| `getMediaBuysResponse(data)`                            | Build `get_media_buys` response                                     |
+| `deliveryResponse(data)`                                | Build `get_media_buy_delivery` response                             |
+| `listCreativeFormatsResponse(data)`                     | Build `list_creative_formats` response                              |
+| `syncCreativesResponse(data)`                           | Build `sync_creatives` response                                     |
+| `taskToolResponse(data, summary)`                       | Build generic tool response (for tools without a dedicated builder) |
+| `adcpError(code, { message })`                          | Structured error                                                    |
+| `registerTestController(server, store)`                 | Add `comply_test_controller` for deterministic testing              |
+
+Import everything from `@adcp/sdk`. Types from `@adcp/sdk` with `import type`.
+
+## Setup
+
+```bash
+npm init -y
+npm install @adcp/sdk
+npm install -D typescript @types/node
+```
+
+Minimal `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "strict": true,
+    "skipLibCheck": true,
+    "outDir": "dist"
+  }
+}
+```
+
+`skipLibCheck: true` avoids false-positive errors from transitive `.d.ts` files (e.g., `@opentelemetry/api`).
+
+## Implementation
+
+1. Single `.ts` file — all tools in one file
+2. Always register `get_adcp_capabilities` as the **first** tool with empty `{}` schema
+3. Use `Schema.shape` (not `Schema`) when registering tools
+4. Use response builders — never return raw JSON
+5. Set `sandbox: true` on all mock/demo responses
+6. Use `ServeContext` pattern: `function createAgent({ taskStore }: ServeContext)`
+
+The skill contains everything you need. Do not read additional docs before writing code.
+
+### Key implementation detail: sync_creatives handler
+
+The sync_creatives handler must check the format_id to decide how to process:
+
+- If the format is generative (e.g., id contains "generative"): read the `brief` asset from the creative's assets
+- If the format is standard: read the image/video/html asset
+- Validate the brand domain from the account — return `action: 'failed'` with an error if invalid
+- Return `action: 'created'` for both generative and standard creatives
+
+## Validation
+
+**After writing the agent, validate it. Fix failures. Repeat.**
+
+**Full validation** (if you can bind ports):
+
+```bash
+npx tsx agent.ts &
+npx @adcp/sdk@latest storyboard run http://localhost:3001/mcp media_buy_generative_seller --json
+```
+
+**Sandbox validation** (if ports are blocked):
+
+```bash
+npx tsc --noEmit agent.ts
+```
+
+When storyboard output shows failures, fix each one:
+
+- `response_schema` → response doesn't match Zod schema
+- `field_present` → required field missing
+- MCP error → check tool registration (schema, name)
+
+**Keep iterating until all steps pass.**
+
+## Common Mistakes
+
+| Mistake                                       | Fix                                                   |
+| --------------------------------------------- | ----------------------------------------------------- |
+| Only generative formats, no standard IAB      | Programmatic sellers must accept pre-built assets too |
+| Ignore brand domain on brief sync             | Validate brand, reject if unresolvable                |
+| Same handler for brief and standard creatives | Check format_id to decide processing path             |
+| Skip `get_adcp_capabilities`                  | Must be the first tool registered                     |
+| Pass `Schema` instead of `Schema.shape`       | MCP SDK needs unwrapped Zod fields                    |
+| `sandbox: false` on mock data                 | Buyers may treat mock data as real                    |
+
+## Reference
+
+- `storyboards/media_buy_generative_seller.yaml` — full generative seller storyboard
+- `storyboards/media_buy_seller.yaml` — base seller storyboard (for standard seller parts)
+- `skills/build-seller-agent/SKILL.md` — standard seller skill (generative extends this)
+- `docs/guides/BUILD-AN-AGENT.md` — SDK patterns
+- `docs/TYPE-SUMMARY.md` — curated type signatures
+- `docs/llms.txt` — full protocol reference

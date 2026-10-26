@@ -1,0 +1,4320 @@
+/**
+ * Per-step validation engine for storyboard testing.
+ *
+ * Emits validation results conforming to the runner-output contract:
+ * failed validations carry RFC 6901 `json_pointer`, machine-readable
+ * `expected`/`actual`, and for `response_schema` checks the `schema_id`
+ * plus resolvable `schema_url`. See
+ * `static/compliance/source/universal/runner-output-contract.yaml`.
+ */
+
+import { prepareResponseForSchemaValidation, TOOL_RESPONSE_SCHEMAS } from '../../utils/response-schemas';
+import { injectLegacyEnvelopeStatus } from '../../utils/envelope-status-compat';
+import { TRANSPORT_SUFFIX_REGEX } from '../../utils/a2a-discovery';
+import { validateResponse, type ValidationIssue } from '../../validation/schema-validator';
+import {
+  hasSchemaBundle,
+  isExternalSchemaRootActive,
+  withServedValidationVersion,
+} from '../../validation/schema-loader';
+import { ADCP_VERSION, LIBRARY_VERSION } from '../../version';
+import { isPre31AdcpVersion } from '../../utils/adcp-version-config';
+import { gte as semverGte, valid as validSemver } from 'semver';
+import type { TaskResult } from '../types';
+import type {
+  A2ATaskEnvelope,
+  HttpProbeResult,
+  RunnerRequestRecord,
+  RunnerResponseRecord,
+  SchemaValidationError,
+  StoryboardContext,
+  StoryboardValidation,
+  StrictValidationVerdict,
+  UpstreamTrafficPayloadMatch,
+  ValidationResult,
+} from './types';
+import type { RecordedCall, UpstreamTrafficSuccess } from '../test-controller';
+import { isJsonContentType } from '../test-controller';
+import { globToRegExp } from '../../utils/glob';
+import {
+  parsePath,
+  parsePathWithWildcards,
+  resolvePath,
+  resolvePathAll,
+  resolvePortableIdentifierPathAll,
+  toJsonPointer,
+  validatePortableIdentifierPath,
+  WILDCARD,
+  type PortableIdentifierPathIssue,
+} from './path';
+import { canonicalTargetUri } from '../../signing/canonicalize';
+import { diffCollectionPairSets, normalizeCollectionSelectors, summarizeCollectionPairs } from './collection-selection';
+import { detectShapeDriftHints } from './shape-drift-hints';
+import { PROBE_TASK_ALLOWLIST } from './test-kit';
+import { validateCanonicalFormatSatisfaction } from './canonical-format-satisfaction';
+import { extractTaskAdcpError } from './rate-limit-trip';
+import type { OAuthMetadataGraphGrade } from './oauth-metadata-graph';
+import { normalizeOAuthResourceForComparison, redactOAuthUrlForOutput } from './oauth-metadata-graph';
+
+/**
+ * Broader validation context that carries the run-level state a single
+ * validation might need: the task result (for MCP tools), the HTTP probe
+ * result (for raw tasks), the agent URL (for cross-cutting checks like
+ * `resource_equals_agent_url`), and the accumulated contribution flags.
+ */
+export interface ValidationContext {
+  taskName: string;
+  /** AdCP schema bundle to use for strict AJV validation. */
+  adcpVersion?: string;
+  /** Server-declared AdCP version to use for response-shape compatibility decisions. */
+  responseAdcpVersion?: string;
+  /** Make a strict AJV response-schema rejection fail the validation. */
+  strictResponseSchemaValidation?: boolean;
+  taskResult?: TaskResult;
+  httpResult?: HttpProbeResult;
+  agentUrl: string;
+  contributions: Set<string>;
+  /**
+   * Storyboard-declared response schema reference, e.g.
+   * `"protocol/get-adcp-capabilities-response.json"`. When present the
+   * runner emits schema_id / schema_url conforming to the contract.
+   */
+  responseSchemaRef?: string;
+  /** Exact request the runner sent — echoed on failed validations. */
+  request?: RunnerRequestRecord;
+  /** Exact response observed — echoed on failed validations. */
+  response?: RunnerResponseRecord;
+  /**
+   * Accumulated storyboard context from prior steps. Exposed to cross-step
+   * checks (`refs_resolve`) that need to reference values extracted earlier
+   * in the run. Single-step checks ignore it.
+   */
+  storyboardContext?: StoryboardContext;
+  /**
+   * Captured A2A wire shape — populated by the runner when the protocol
+   * is `a2a` and the SDK fetch was wrapped with `withRawResponseCapture`.
+   * `a2a_submitted_artifact` and other wire-shape checks read this to
+   * assert on the JSON-RPC envelope; non-A2A runs leave it undefined and
+   * those checks self-skip with `not_applicable`.
+   */
+  a2aEnvelope?: A2ATaskEnvelope;
+  /**
+   * Most recent A2A envelope captured by a PRIOR step in the same run.
+   * Cross-step checks (`a2a_context_continuity`) read this to compare
+   * the current step's `Task.contextId` against the prior step's
+   * `Task.contextId` — A2A 0.3.0 mandates the server echo the
+   * client-supplied `contextId` on follow-up sends. Absent on the
+   * first A2A step in a run, on non-A2A runs, and when no prior step
+   * captured an envelope (e.g. all priors were probe steps).
+   */
+  priorA2aEnvelope?: A2ATaskEnvelope;
+  /**
+   * Step id of the prior step whose A2A envelope `priorA2aEnvelope`
+   * came from. Used by cross-step diagnostics to point operators at
+   * the exact prior step the continuity assertion is comparing
+   * against.
+   */
+  priorA2aStepId?: string;
+  /**
+   * Pre-fetched data for `upstream_traffic` validations. Populated by the
+   * runner before validations fire so the dispatcher stays synchronous.
+   * Keyed by `since_timestamp` so the runner can de-dupe identical
+   * windows across multiple validations on the same step. Absent when
+   * the step has no `upstream_traffic` validations. The `advertised`
+   * field is the controller's `list_scenarios` capability flag — when
+   * false, every `upstream_traffic` validation grades not_applicable.
+   * Per runner-output-contract.yaml v2.0.0, the missing-controller path
+   * is opt-in by adopter, not a conformance failure.
+   */
+  upstreamTraffic?: UpstreamTrafficValidationContext;
+  /**
+   * Storyboard step (raw YAML) — legacy fallback for direct validation
+   * callers. The runner's resolved `request.payload` is preferred for
+   * `upstream_traffic.identifier_paths` so context/generated tokens compare
+   * against values actually sent on the wire.
+   */
+  storyboardStep?: { sample_request?: Record<string, unknown> };
+  /**
+   * Resolved set of dispatch outcomes for a `parallel_dispatch` step.
+   * Populated only when the runner fanned out N concurrent requests through
+   * the `parallel_dispatch_runner` contract. `cross_response_field_equal`
+   * and `cross_response_count_distinct` read this to grade against the
+   * cross-response set; single-dispatch steps leave it undefined and those
+   * two checks grade `not_applicable`.
+   */
+  crossResponses?: CrossResponseSet;
+  /** Async-prefetched result consumed by the oauth_metadata_graph check. */
+  oauthMetadataGraph?: OAuthMetadataGraphGrade;
+}
+
+/**
+ * Aggregated cross-response data for `cross_response_*` validations on a
+ * `parallel_dispatch` step. Carries per-dispatch outcomes plus a derived
+ * `resolved` list of `TaskResult`s for paths that succeeded (after any
+ * in-flight retry resolution). The cross-response checks operate against
+ * `resolved`; per-response checks operate against the individual entries
+ * via the dispatcher's aggregation pass.
+ */
+export interface CrossResponseSet {
+  /** Every dispatch's terminal outcome, in fan-out order. */
+  dispatches: CrossResponseDispatch[];
+  /** Resolved task results for dispatches that terminated successfully. */
+  resolved: TaskResult[];
+}
+
+/**
+ * One dispatch's terminal record after any in-flight retry loop.
+ */
+export interface CrossResponseDispatch {
+  /** Per-dispatch correlation_id the runner attached. Excluded from the canonical hash. */
+  correlation_id: string;
+  /** Terminal task result, when the dispatch resolved within the barrier window. */
+  taskResult?: TaskResult;
+  /** Terminal error string, when the dispatch failed at the wire layer. */
+  error?: string;
+  /** True when the barrier window expired before the dispatch terminated. */
+  timed_out?: boolean;
+  /** Per-dispatch wall-clock duration in milliseconds. */
+  duration_ms: number;
+}
+
+/**
+ * Pre-fetched controller traffic data the runner stashes on the validation
+ * context so the synchronous dispatcher can grade `upstream_traffic`
+ * checks without making controller calls itself.
+ */
+export interface UpstreamTrafficValidationContext {
+  /** Whether the controller advertises `query_upstream_traffic` in `list_scenarios`. */
+  advertised: boolean;
+  /**
+   * Pre-fetched controller responses keyed by ISO `since_timestamp`. Each
+   * entry carries the request the runner issued, the response observed,
+   * and the parsed payload (or an error string when the call failed).
+   */
+  queries: Map<string, UpstreamTrafficQueryResult>;
+  /**
+   * The ISO timestamp the runner used as the default `since_timestamp`
+   * for THIS step (the step's own request start). Validations that don't
+   * declare `since: prior_step_id` use this key into `queries`.
+   */
+  thisStepSince: string;
+  /**
+   * Resolved ISO timestamps for `since: prior_step_id` references. The
+   * runner pre-resolves these so the validation can index `queries` by
+   * the same timestamp. Absent when the validation has no `since:`
+   * declaration or the named prior step did not record a timestamp.
+   */
+  priorStepSinceMap?: Map<string, string>;
+  /**
+   * `since:` step IDs declared by storyboard validations that did not
+   * resolve to any recorded prior step. Surfaced as a typed failure on
+   * the validation result rather than silently widened to the current
+   * step's window — a misspelled reference would otherwise pass vacuously
+   * (the contract treats unresolved references as authoring bugs).
+   */
+  unresolvedSinceRefs?: Set<string>;
+  /**
+   * SHA-256 digests the runner sent as `identifier_value_digests`, keyed by
+   * plaintext identifier values resolved from the step request. Used to pair
+   * digest-mode `identifier_match_proofs` back to storyboard vectors.
+   */
+  identifierDigestByValue?: Map<string, string>;
+  /**
+   * Set when the runner clipped identifier digest requests to its bounded
+   * buffer. Overflow vectors cannot be proven in digest mode and are reported
+   * as not_applicable rather than missing.
+   */
+  identifierDigestLimitExceeded?: { limit: number; clipped: number };
+}
+
+export interface UpstreamTrafficQueryResult {
+  request: RunnerRequestRecord;
+  response: RunnerResponseRecord;
+  /** Successful payload from the controller, or an error placeholder when the call failed. */
+  payload: UpstreamTrafficSuccess | { error: string; error_kind?: string };
+}
+
+/**
+ * Run all validations for a storyboard step.
+ */
+export function runValidations(validations: StoryboardValidation[], context: ValidationContext): ValidationResult[] {
+  return validations.map(v => decorateValidationResult(runValidation(v, context), context, v));
+}
+
+/** Capability semver emitted in run summaries and used for advisory expiry. */
+export const RUNNER_CAPABILITY_VERSION = LIBRARY_VERSION;
+
+/** True when a failed validation contributes to the owning step's grade. */
+export function validationFailsStep(result: ValidationResult): boolean {
+  return !result.passed && result.severity !== 'advisory';
+}
+
+/**
+ * Attach request / response records to a failed validation so implementors
+ * see the exact bytes the runner sent and observed. Passed validations stay
+ * minimal — carrying the full payload on every passing check bloats the
+ * JSON surface without diagnostic value.
+ */
+export function decorateValidationResult(
+  result: ValidationResult,
+  context: ValidationContext,
+  validation: StoryboardValidation
+): ValidationResult {
+  const declaredSeverity = validation.severity ?? 'required';
+  const expiry = validation.expires_after_version;
+  const shouldEvaluatePromotion = !result.not_applicable && declaredSeverity === 'advisory' && expiry !== undefined;
+  if (shouldEvaluatePromotion && validSemver(expiry) === null) {
+    throw new Error(`expires_after_version must be valid semver; received ${JSON.stringify(expiry)}`);
+  }
+  const promotionApplied =
+    shouldEvaluatePromotion &&
+    validSemver(RUNNER_CAPABILITY_VERSION) !== null &&
+    semverGte(RUNNER_CAPABILITY_VERSION, expiry);
+  const augmented: ValidationResult = {
+    ...result,
+    ...(validation.id !== undefined && { id: validation.id }),
+    severity: promotionApplied ? 'required' : declaredSeverity,
+    ...(shouldEvaluatePromotion && { severity_promoted_from_advisory: promotionApplied }),
+  };
+  if (augmented.passed) return augmented;
+  if (context.request && augmented.request === undefined) augmented.request = context.request;
+  if (context.response && augmented.response === undefined) augmented.response = context.response;
+  return augmented;
+}
+
+function runValidation(validation: StoryboardValidation, ctx: ValidationContext): ValidationResult {
+  switch (validation.check) {
+    case 'property_list_reference':
+      return {
+        check: validation.check,
+        passed: false,
+        description: validation.description,
+        error: 'property_list_reference requires the asynchronous, credential-isolated storyboard runner.',
+      };
+    case 'response_schema':
+      return requireTaskResult(ctx, validation, tr => validateResponseSchema(validation, ctx, tr));
+    case 'field_present':
+      // field_present runs against either MCP task result data OR an HTTP probe body —
+      // the storyboard's probe_protected_resource validates fields in the RFC 9728 JSON.
+      return validateFieldPresent(validation, resolveTarget(ctx));
+    case 'all_fields_present':
+      return validateAllFieldsPresent(validation, resolveTarget(ctx));
+    case 'field_absent':
+      return validateFieldAbsent(validation, resolveTarget(ctx));
+    case 'envelope_field_present':
+      // Envelope-scoped variants — runtime semantics identical to the
+      // un-prefixed checks (TaskResult exposes envelope fields like
+      // `status`, `task_id` and version-envelope fields like `adcp_version`
+      // at the surface level). The distinct check types exist primarily so
+      // static drift detection can walk the envelope schemas instead of the
+      // per-tool response. See adcp#3429 and adcp#5195.
+      return validateFieldPresent(validation, resolveTarget(ctx));
+    case 'envelope_field_absent':
+      return validateFieldAbsent(validation, resolveTarget(ctx));
+    case 'envelope_field_value':
+      return validateFieldValue(validation, resolveTarget(ctx));
+    case 'envelope_field_value_or_absent':
+      return validateFieldValueOrAbsent(validation, resolveTarget(ctx));
+    case 'envelope_field_pattern':
+      return validateFieldPattern(validation, resolveTarget(ctx));
+    case 'field_value':
+      return validateFieldValue(validation, resolveTarget(ctx));
+    case 'field_value_or_absent':
+      return validateFieldValueOrAbsent(validation, resolveTarget(ctx));
+    case 'field_pattern':
+      return validateFieldPattern(validation, resolveTarget(ctx));
+    case 'field_contains':
+      return validateFieldContains(validation, resolveTarget(ctx));
+    case 'status_code':
+      return requireTaskResult(ctx, validation, tr => validateStatusCode(validation, tr));
+    case 'error_code':
+      return requireTaskResult(ctx, validation, tr => validateErrorCode(validation, tr));
+    case 'http_status':
+      return requireHttpResult(ctx, validation, hr => validateHttpStatus(validation, hr));
+    case 'http_status_in':
+      return requireHttpResult(ctx, validation, hr => validateHttpStatusIn(validation, hr));
+    case 'probe_passed':
+      return requireHttpResult(ctx, validation, hr => validateProbePassed(validation, hr));
+    case 'on_401_require_header':
+      return requireHttpResult(ctx, validation, hr => validateOn401RequireHeader(validation, hr));
+    case 'resource_equals_agent_url':
+      return requireHttpResult(ctx, validation, hr => validateResourceEqualsAgentUrl(validation, hr, ctx.agentUrl));
+    case 'oauth_metadata_graph':
+      return validateOAuthMetadataGraph(validation, ctx.oauthMetadataGraph);
+    case 'any_of':
+      return validateAnyOf(validation, ctx.contributions);
+    case 'a2a_submitted_artifact':
+      return validateA2ASubmittedArtifact(validation, ctx);
+    case 'a2a_context_continuity':
+      return validateA2AContextContinuity(validation, ctx);
+    case 'refs_resolve':
+      return validateRefsResolve(validation, ctx);
+    case 'field_less_than':
+      return validateNumericComparison(validation, ctx, NUMERIC_OPS.less_than);
+    case 'field_greater_than':
+      return validateNumericComparison(validation, ctx, NUMERIC_OPS.greater_than);
+    case 'field_at_most':
+      return validateNumericComparison(validation, ctx, NUMERIC_OPS.at_most);
+    case 'field_at_least':
+      return validateNumericComparison(validation, ctx, NUMERIC_OPS.at_least);
+    case 'field_equals_context':
+      return validateFieldEqualsContext(validation, ctx);
+    case 'field_in_context_array':
+      return validateFieldInContextArray(validation, ctx);
+    case 'all_fields_in_context_array':
+      return validateAllFieldsInContextArray(validation, ctx);
+    case 'collection_set_equals_context':
+      return validateCollectionSetEqualsContext(validation, ctx);
+    case 'upstream_traffic':
+      return validateUpstreamTraffic(validation, ctx);
+    case 'replay_not_cached_rate_limit':
+      return validateReplayNotCachedRateLimit(validation, ctx);
+    case 'cross_response_field_equal':
+      return validateCrossResponseFieldEqual(validation, ctx);
+    case 'cross_response_count_distinct':
+      return validateCrossResponseCountDistinct(validation, ctx);
+    case 'canonical_format_satisfaction':
+      if (ctx.taskName !== 'create_media_buy') {
+        return {
+          check: validation.check,
+          passed: false,
+          description: validation.description,
+          error: 'canonical_format_satisfaction applies only to create_media_buy storyboard steps',
+          json_pointer: null,
+          expected: 'create_media_buy',
+          actual: ctx.taskName,
+        };
+      }
+      return requireTaskResult(ctx, validation, tr =>
+        validateCanonicalFormatSatisfaction(validation, ctx.request, ctx.storyboardContext, tr)
+      );
+    case 'array_length':
+      return validateArrayLength(validation, resolveTarget(ctx));
+    default:
+      // Forward compatibility is resolved before advisory expiry promotion:
+      // an older runner cannot grade a check it does not implement, so the
+      // result is not_applicable rather than evidence about the agent. This
+      // is the runtime forward-compat default defined by
+      // runner-output-contract.yaml (adcontextprotocol/adcp#3816); publish-time
+      // lint separately rejects unknown check kinds in authored storyboards.
+      return {
+        check: validation.check,
+        passed: true,
+        description: validation.description,
+        not_applicable: true,
+        note: `runner does not implement authored check type '${validation.check}'`,
+      };
+  }
+}
+
+function requireTaskResult(
+  ctx: ValidationContext,
+  validation: StoryboardValidation,
+  fn: (tr: TaskResult) => ValidationResult
+): ValidationResult {
+  if (!ctx.taskResult) {
+    return {
+      check: validation.check,
+      passed: false,
+      description: validation.description,
+      error: `Validation "${validation.check}" requires an MCP task result but this step was an HTTP probe.`,
+      json_pointer: null,
+    };
+  }
+  return fn(ctx.taskResult);
+}
+
+function requireHttpResult(
+  ctx: ValidationContext,
+  validation: StoryboardValidation,
+  fn: (hr: HttpProbeResult) => ValidationResult
+): ValidationResult {
+  if (!ctx.httpResult) {
+    return {
+      check: validation.check,
+      passed: false,
+      description: validation.description,
+      error: `Validation "${validation.check}" requires an HTTP probe result but this step was an MCP task.`,
+      json_pointer: null,
+    };
+  }
+  return fn(ctx.httpResult);
+}
+
+/**
+ * Resolve the object path-style validations should walk. Prefers the MCP
+ * task result's `data` and falls back to the HTTP probe body, so the same
+ * `field_present` / `field_value` validations work for both MCP tool steps
+ * and raw RFC 9728 / RFC 8414 metadata probes.
+ */
+function resolveTarget(ctx: ValidationContext): TaskResult {
+  if (ctx.taskResult) return ctx.taskResult;
+  if (ctx.httpResult) return { success: !ctx.httpResult.error, data: ctx.httpResult.body };
+  return { success: false, data: undefined };
+}
+
+// ────────────────────────────────────────────────────────────
+// Schema URL resolution
+// ────────────────────────────────────────────────────────────
+
+const SCHEMA_URL_BASE = 'https://adcontextprotocol.org';
+
+/**
+ * Build a `{ schema_id, schema_url }` pair from a storyboard-declared
+ * `response_schema_ref`. The id follows the `/schemas/<version>/<path>.json`
+ * convention used by `$id` in cached JSON schemas; the url dereferences
+ * against the public docs origin so implementors can fetch it.
+ */
+function resolveSchemaIdentity(
+  schemaRef: string | undefined,
+  adcpVersion: string = ADCP_VERSION
+): { schema_id: string | null; schema_url: string | null } {
+  if (!schemaRef) return { schema_id: null, schema_url: null };
+  const trimmed = schemaRef.replace(/^\/+/, '');
+  const schemaId = `/schemas/${adcpVersion}/${trimmed}`;
+  const schemaUrl = `${SCHEMA_URL_BASE}${schemaId}`;
+  return { schema_id: schemaId, schema_url: schemaUrl };
+}
+
+/**
+ * Convert a Zod error into the AJV-shaped `SchemaValidationError[]` the
+ * contract calls for. Each issue names the failing instance path, the
+ * schema keyword that rejected it (best-effort from Zod's `code`), and
+ * the original message.
+ */
+/**
+ * Escape a single Zod path segment as an RFC 6901 reference token: `~` → `~0`
+ * (done first), then `/` → `~1`. Numeric segments pass through as-is.
+ */
+function escapeJsonPointerSegment(seg: PropertyKey): string {
+  return String(seg).replace(/~/g, '~0').replace(/\//g, '~1');
+}
+
+function zodIssuePathToJsonPointer(path: ReadonlyArray<PropertyKey>): string {
+  return '/' + path.map(escapeJsonPointerSegment).join('/');
+}
+
+function zodIssuesToSchemaErrors(
+  issues: ReadonlyArray<{ path: ReadonlyArray<PropertyKey>; code: string; message: string }>
+): SchemaValidationError[] {
+  return issues.map(issue => {
+    const keyword = mapZodIssueToSchemaKeyword(issue);
+    const instancePointer = issue.path.map(escapeJsonPointerSegment).join('/');
+    return {
+      instance_path: '/' + instancePointer,
+      // Zod does not expose the schema-side pointer. Approximate AJV's
+      // `schema_path` (a JSON pointer into the schema) as
+      // `#/properties/<path>/<keyword>` so implementors can locate the
+      // rejecting keyword inside their schema.
+      schema_path: `#/properties/${instancePointer}/${keyword}`,
+      keyword,
+      message: issue.message,
+    };
+  });
+}
+
+/**
+ * Map a Zod issue to the JSON Schema keyword that failed. Critically,
+ * `invalid_type` with `received: 'undefined'` is a missing required field
+ * (keyword `required`), not a type mismatch (keyword `type`). The two cases
+ * call for different remediation — "set the field" vs. "fix the value /
+ * change the type" — so the evaluator must distinguish them.
+ */
+function mapZodIssueToSchemaKeyword(issue: { code: string; message: string }): string {
+  if (issue.code === 'invalid_type' && /received `?undefined`?/i.test(issue.message)) {
+    return 'required';
+  }
+  switch (issue.code) {
+    case 'invalid_type':
+      return 'type';
+    case 'invalid_value':
+      return 'enum';
+    case 'too_small':
+      return 'minimum';
+    case 'too_big':
+      return 'maximum';
+    case 'invalid_format':
+      return 'format';
+    case 'unrecognized_keys':
+      return 'additionalProperties';
+    case 'invalid_union':
+      return 'oneOf';
+    case 'not_multiple_of':
+      return 'multipleOf';
+    default:
+      return issue.code;
+  }
+}
+
+// ────────────────────────────────────────────────────────────
+// response_schema: validate against the active schema authority
+// ────────────────────────────────────────────────────────────
+
+function validateResponseSchema(
+  validation: StoryboardValidation,
+  ctx: ValidationContext,
+  taskResult: TaskResult
+): ValidationResult {
+  // Capabilities are negotiated before any pin applies: a 3.0 pin is served
+  // the agent's highest release in the major, echoed in `adcp_version`.
+  // Validate against that release (versioning spec, "Server echoes") when it
+  // is same-major, listed in the response's `supported_versions` and has a
+  // schema root, even when an external root is active for the pin. Otherwise
+  // keep the pin. Every other task stays on the pin.
+  const pinnedVersion = ctx.adcpVersion;
+  if (ctx.taskName === 'get_adcp_capabilities' && pinnedVersion !== undefined) {
+    return withServedValidationVersion(taskResult.data, pinnedVersion, validationVersion =>
+      validateResponseSchemaForVersion(
+        validation,
+        validationVersion === pinnedVersion
+          ? ctx
+          : { ...ctx, adcpVersion: validationVersion, responseAdcpVersion: validationVersion },
+        taskResult
+      )
+    );
+  }
+  return validateResponseSchemaForVersion(validation, ctx, taskResult);
+}
+
+function validateResponseSchemaForVersion(
+  validation: StoryboardValidation,
+  ctx: ValidationContext,
+  taskResult: TaskResult
+): ValidationResult {
+  const taskName = ctx.taskName;
+  const schemaIdentityVersion = ctx.adcpVersion ?? ctx.responseAdcpVersion ?? ADCP_VERSION;
+  const { schema_id, schema_url } = resolveSchemaIdentity(ctx.responseSchemaRef, schemaIdentityVersion);
+
+  // Keep the raw payload separately from the object-form one below so the
+  // shape-drift detector can recognize bare-array responses (a common drift
+  // pattern for list tools). Strip _message when it's a top-level property —
+  // bare arrays don't carry that field.
+  const rawData: unknown = taskResult.data ?? {};
+  const dataWithoutMessage = Array.isArray(rawData)
+    ? rawData
+    : (() => {
+        const { _message, ...rest } = rawData as Record<string, unknown>;
+        return rest;
+      })();
+  const schema = TOOL_RESPONSE_SCHEMAS[taskName];
+  // Evaluate the packaged validator for diagnostics even when an external
+  // bundle is authoritative. Its result must never gate that run, but it lets
+  // strict-summary consumers distinguish an actual strict/lenient delta from
+  // a response that both schema sources reject.
+  const responseAdcpVersion = ctx.responseAdcpVersion ?? ctx.adcpVersion;
+  const dataForValidation = Array.isArray(dataWithoutMessage)
+    ? dataWithoutMessage
+    : injectLegacyEnvelopeStatus(dataWithoutMessage as Record<string, unknown>, {
+        toolName: taskName,
+        adcpVersion: responseAdcpVersion,
+      });
+  const parseResult = schema?.safeParse(
+    prepareResponseForSchemaValidation(taskName, dataForValidation, responseAdcpVersion)
+  );
+  const computedStrict = computeStrictVerdict(taskName, dataWithoutMessage, ctx.adcpVersion, ctx.responseAdcpVersion);
+  const strict = computedStrict ? { ...computedStrict, lenient_valid: parseResult?.success ?? null } : undefined;
+  const externalSchemaIsAuthoritative = isExternalResponseSchemaAuthoritative(ctx);
+
+  // An explicit schemaRoot represents current source that may be newer than
+  // this SDK package's generated Zod snapshot. In that mode the external JSON
+  // Schema bundle is the source of truth for both known tools and tools added
+  // by the external build.
+  if (externalSchemaIsAuthoritative) {
+    if (!strict) {
+      return noResponseSchemaResult(validation, taskName, schema_id, schema_url);
+    }
+    if (strict.valid) {
+      const base: ValidationResult = {
+        check: 'response_schema',
+        passed: true,
+        description: validation.description,
+        schema_id,
+        schema_url,
+        strict,
+      };
+      const warning = buildStrictWarning(strict);
+      return warning ? { ...base, warning } : base;
+    }
+
+    const issues = strict.issues ?? [];
+    const firstIssue = issues[0];
+    return {
+      check: 'response_schema',
+      passed: false,
+      description: validation.description,
+      error:
+        issues.length > 0
+          ? issues
+              .slice(0, 5)
+              .map(issue => `${issue.instance_path || '/'}: ${issue.message}`)
+              .join('; ')
+          : `External JSON Schema rejected the ${taskName} response`,
+      json_pointer: firstIssue?.instance_path || null,
+      expected: schema_id ?? `response schema for ${taskName}`,
+      actual: issues,
+      schema_id,
+      schema_url,
+      strict,
+    };
+  }
+
+  if (!schema) {
+    return noResponseSchemaResult(validation, taskName, schema_id, schema_url, strict);
+  }
+  // `schema` is present, so optional chaining above necessarily produced a
+  // packaged verdict.
+  if (!parseResult) return noResponseSchemaResult(validation, taskName, schema_id, schema_url, strict);
+
+  // Strict (AJV) verdict runs alongside the lenient Zod check. Storyboard runs
+  // grade that verdict by default; direct validation callers and explicit
+  // migration runs can leave it informational. Explicit external bundles take
+  // the authoritative branch above instead.
+
+  // Shape-drift no longer rides on `ValidationResult.warning` — issue #935
+  // moved that diagnostic to `StoryboardStepResult.hints[]` as a structured
+  // `ShapeDriftHint`. The runner emits the structured hint via
+  // `detectShapeDriftHints` directly; this layer focuses on the strict /
+  // variant-fallback signal that doesn't yet have a hint kind.
+
+  if (parseResult.success) {
+    const base: ValidationResult = {
+      check: 'response_schema',
+      passed: true,
+      description: validation.description,
+      schema_id,
+      schema_url,
+    };
+    if (strict && !strict.valid && ctx.strictResponseSchemaValidation === true) {
+      const issues = strict.issues ?? [];
+      const firstIssue = issues[0];
+      return {
+        ...base,
+        passed: false,
+        error:
+          issues.length > 0
+            ? issues
+                .slice(0, 5)
+                .map(issue => `${issue.instance_path || '/'}: ${issue.message}`)
+                .join('; ')
+            : `Strict JSON Schema rejected the ${taskName} response`,
+        json_pointer: firstIssue?.instance_path || null,
+        expected: schema_id ?? `response schema for ${taskName}`,
+        actual: issues,
+        strict,
+      };
+    }
+    // Surface strict-only / variant-fallback signal via `warning` so step-
+    // level output (and LLM-driven self-correction that scans `error`/
+    // `warning` fields) sees something without flipping `passed`.
+    const warning = strict ? buildStrictWarning(strict) : undefined;
+    if (!strict && !warning) return base;
+    if (!strict) return { ...base, warning };
+    return warning ? { ...base, strict, warning } : { ...base, strict };
+  }
+
+  const schemaErrors = zodIssuesToSchemaErrors(parseResult.error.issues);
+  const firstIssue = parseResult.error.issues[0];
+  const jsonPointer = firstIssue ? zodIssuePathToJsonPointer(firstIssue.path) : null;
+  const issues = parseResult.error.issues
+    .slice(0, 5)
+    .map(i => `${i.path.join('.')}: ${i.message}`)
+    .join('; ');
+
+  const failed: ValidationResult = {
+    check: 'response_schema',
+    passed: false,
+    description: validation.description,
+    error: issues,
+    json_pointer: jsonPointer,
+    expected: schema_id ?? `response schema for ${taskName}`,
+    actual: schemaErrors,
+    schema_id,
+    schema_url,
+  };
+  return strict ? { ...failed, strict } : failed;
+}
+
+/** @internal Shared with the storyboard runner's Zod-rejection recovery path. */
+export function isExternalResponseSchemaAuthoritative(
+  ctx: Pick<ValidationContext, 'adcpVersion' | 'responseAdcpVersion'> &
+    Partial<Pick<ValidationContext, 'taskName' | 'taskResult'>>
+): boolean {
+  const validationVersion = responseSchemaValidationVersion(ctx.adcpVersion, ctx.responseAdcpVersion);
+  if (validationVersion !== undefined && isExternalSchemaRootActive(validationVersion)) return true;
+  // A capabilities response validated against its echoed release is
+  // authoritative when that release's root is external (registered, or
+  // supplied through servedReleaseSchemaRoots), same as a pinned external root.
+  const pinnedVersion = ctx.adcpVersion;
+  if (ctx.taskName !== 'get_adcp_capabilities' || pinnedVersion === undefined || !ctx.taskResult) return false;
+  return withServedValidationVersion(
+    ctx.taskResult.data,
+    pinnedVersion,
+    version => version !== pinnedVersion && isExternalSchemaRootActive(version)
+  );
+}
+
+function responseSchemaValidationVersion(
+  adcpVersion: string | undefined,
+  responseAdcpVersion: string | undefined
+): string | undefined {
+  // An explicit external root belongs to the caller-selected protocol source
+  // and must win over a packaged stable wire alias advertised by the server.
+  // The server version still feeds compatibility preparation separately.
+  if (adcpVersion && isExternalSchemaRootActive(adcpVersion)) return adcpVersion;
+  return responseAdcpVersion && hasSchemaBundle(responseAdcpVersion) ? responseAdcpVersion : adcpVersion;
+}
+
+function noResponseSchemaResult(
+  validation: StoryboardValidation,
+  taskName: string,
+  schema_id: string | null,
+  schema_url: string | null,
+  strict?: StrictValidationVerdict
+): ValidationResult {
+  const result: ValidationResult = {
+    check: 'response_schema',
+    passed: false,
+    description: validation.description,
+    error: `No schema registered for task "${taskName}"`,
+    json_pointer: null,
+    expected: schema_id ?? `response schema for ${taskName}`,
+    // The runner failed before observing the agent — distinguish that from
+    // "agent returned null" so implementors don't chase a phantom agent bug.
+    actual: { reason: 'no_schema_registered', task: taskName },
+    schema_id,
+    schema_url,
+  };
+  return strict ? { ...result, strict } : result;
+}
+
+/**
+ * Run the strict AJV validator for `taskName` against the response payload.
+ * Returns undefined when no AJV schema is available (the client can't
+ * observe a strictness delta for tools whose JSON-schema doesn't ship with
+ * the SDK — notably the brand-rights and governance schemas that live
+ * outside the `bundled/` tree the loader walks today).
+ */
+function computeStrictVerdict(
+  taskName: string,
+  payload: unknown,
+  adcpVersion?: string,
+  responseAdcpVersion?: string
+): StrictValidationVerdict | undefined {
+  const externalVersionSelected = adcpVersion !== undefined && isExternalSchemaRootActive(adcpVersion);
+  const validationVersion = responseSchemaValidationVersion(adcpVersion, responseAdcpVersion);
+  if (
+    !externalVersionSelected &&
+    responseAdcpVersion &&
+    isPre31AdcpVersion(responseAdcpVersion) &&
+    !hasSchemaBundle(responseAdcpVersion)
+  ) {
+    return undefined;
+  }
+  const payloadForValidation = prepareResponseForSchemaValidation(taskName, payload, responseAdcpVersion);
+  const outcome = validateResponse(taskName, payloadForValidation, validationVersion);
+  // `variant: 'skipped'` means no AJV validator compiled for this task (no
+  // strictness signal to emit); treat the same as "no AJV schema available".
+  if (outcome.variant === 'skipped') return undefined;
+  const fallbackFields: Pick<StrictValidationVerdict, 'variant_fallback_applied' | 'requested_variant'> =
+    outcome.variant_fallback_applied
+      ? { variant_fallback_applied: true, requested_variant: outcome.requested_variant }
+      : {};
+  if (outcome.valid) {
+    return { valid: true, variant: outcome.variant, ...fallbackFields };
+  }
+  return {
+    valid: false,
+    variant: outcome.variant,
+    issues: outcome.issues.slice(0, 10).map(ajvIssueToSchemaError),
+    ...fallbackFields,
+  };
+}
+
+function ajvIssueToSchemaError(issue: ValidationIssue): SchemaValidationError {
+  return {
+    instance_path: issue.pointer,
+    schema_path: issue.schemaPath,
+    keyword: issue.keyword,
+    message: issue.message,
+  };
+}
+
+/**
+ * Render the strict verdict into a non-fatal warning for step-level
+ * output. Two cases produce signal (both preserve `passed`):
+ *   - Strict-only failure: Zod accepted, AJV rejected. Top AJV issue.
+ *   - Variant fallback: agent advertised an async variant without a
+ *     compiled schema; validation fell back to sync. Conformance gap
+ *     worth flagging even when AJV ultimately accepted.
+ * When both apply, both are joined. Returns undefined when neither
+ * applies (strict accepted and no fallback).
+ */
+function buildStrictWarning(strict: StrictValidationVerdict): string | undefined {
+  const parts: string[] = [];
+  if (strict.variant_fallback_applied && strict.requested_variant) {
+    parts.push(
+      `agent advertised status="${strict.requested_variant}" but the tool has no schema for that variant — validated against sync fallback`
+    );
+  }
+  if (!strict.valid && strict.issues && strict.issues.length > 0) {
+    // Group `required` keyword issues under their parent path so sellers see
+    // "missing properties at /x: a, b, c" in one pass instead of one missing
+    // field per storyboard run. This is the single biggest onramp cliff for
+    // sellers filling out response schemas with N required fields —
+    // previously they iterated N times, learning one required field per run.
+    const requiredIssues = strict.issues.filter(i => i.keyword === 'required');
+    const otherIssues = strict.issues.filter(i => i.keyword !== 'required');
+    if (requiredIssues.length > 0) {
+      const grouped = new Map<string, string[]>();
+      for (const issue of requiredIssues) {
+        const at = issue.instance_path || '/';
+        // AJV's `required`-issue message format: `must have required property '<name>'`.
+        const match = issue.message.match(/required property ['"]([^'"]+)['"]/);
+        const field = match?.[1] ?? issue.message;
+        const list = grouped.get(at) ?? [];
+        list.push(field);
+        grouped.set(at, list);
+      }
+      for (const [at, fields] of grouped) {
+        parts.push(`strict JSON-schema missing required at ${at}: ${fields.join(', ')}`);
+      }
+    }
+    const MAX_OTHER = 5;
+    const shown = otherIssues.slice(0, MAX_OTHER);
+    const remaining = otherIssues.length - shown.length;
+    for (const issue of shown) {
+      const pointer = issue.instance_path || '/';
+      parts.push(`strict JSON-schema rejected ${pointer}: ${issue.message}`);
+    }
+    if (remaining > 0) {
+      parts.push(`(+${remaining} more AJV issue${remaining === 1 ? '' : 's'})`);
+    }
+  }
+  return parts.length > 0 ? parts.join('; ') : undefined;
+}
+
+/**
+ * Recognize common payload-shape mistakes and return the human-readable
+ * fix-recipe — `string` form retained for direct unit-test callers and
+ * for any external consumer that imported the shim before issue #935
+ * moved the canonical detector to `shape-drift-hints.ts`. Both forms
+ * reuse the same detection logic; this shim returns `hints[0]?.message`.
+ *
+ * Covers four shape-inversion patterns observed in real integrations:
+ *   - `build_creative` returning platform-native fields at the top level
+ *     (scope3 agentic-adapters#100 — `tag_url`, `creative_id`, `media_type`)
+ *   - `sync_creatives` returning a single creative's inner shape bubbled
+ *     up without the `creatives` array wrapper, OR the wrong wrapper key
+ *     (`{ results: [...] }` instead of `{ creatives: [...] }`)
+ *   - `preview_creative` returning raw render fields (`preview_url`,
+ *     `preview_html`) at the top level without the `previews[].renders[]`
+ *     nesting and `response_type` discriminator
+ *   - List tools (`list_creatives`, `list_creative_formats`, `list_accounts`,
+ *     `get_products`, `get_media_buys`, `get_signals`, `list_property_lists`,
+ *     `list_collection_lists`, `list_content_standards`) returning a bare
+ *     array at the top level instead of the `{ <key>: [...] }` envelope
+ *
+ * Run-path callers should consume the structured hint via the runner's
+ * `step.hints[]` surface (issue #935) — the structured fields drive
+ * per-case fix plans without re-parsing the message.
+ *
+ * @param taskName — tool name (snake_case) the storyboard dispatched under
+ * @param payload — raw response payload. `unknown` rather than
+ *   `Record<string, unknown>` so bare-array payloads are recognizable at
+ *   the top level.
+ */
+export function detectShapeDriftHint(taskName: string, payload: unknown): string | undefined {
+  return detectShapeDriftHints(taskName, payload)[0]?.message;
+}
+
+export { LIST_WRAPPER_TOOLS } from './shape-drift-hints';
+
+// ────────────────────────────────────────────────────────────
+// field_present: check a path exists
+// ────────────────────────────────────────────────────────────
+
+function validateFieldPresent(validation: StoryboardValidation, taskResult: TaskResult): ValidationResult {
+  // `check` is either `field_present` or `envelope_field_present` (adcp#3429);
+  // both share runtime semantics, but the result echoes the storyboard's
+  // choice verbatim so reporters can distinguish.
+  const checkName = validation.check;
+  if (!validation.path) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `No path specified for ${checkName} validation`,
+      json_pointer: null,
+      expected: 'path must be set in storyboard validation entry',
+      actual: null,
+    };
+  }
+  const wildcardError = rejectWildcardScalarPath(validation, checkName);
+  if (wildcardError) return wildcardError;
+
+  const value = resolvePath(taskResult.data, validation.path);
+  const present = value !== undefined && value !== null;
+  const pointer = toJsonPointer(validation.path);
+
+  if (present) {
+    return {
+      check: checkName,
+      passed: true,
+      description: validation.description,
+      path: validation.path,
+      json_pointer: pointer,
+    };
+  }
+
+  return {
+    check: checkName,
+    passed: false,
+    description: validation.description,
+    path: validation.path,
+    error: `Field not found at path: ${validation.path}`,
+    json_pointer: pointer,
+    expected: validation.path,
+    actual: value ?? null,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// all_fields_present: inspect every item without vacuous passes
+// ────────────────────────────────────────────────────────────
+
+function validateAllFieldsPresent(validation: StoryboardValidation, taskResult: TaskResult): ValidationResult {
+  const base = { check: validation.check, description: validation.description, path: validation.path };
+  const path = validation.path ?? '';
+  const segments = parsePathWithWildcards(path);
+  const wildcardIndex = segments.indexOf(WILDCARD);
+  const wildcardOffset = path.indexOf('[*].');
+  if (
+    wildcardOffset <= 0 ||
+    wildcardIndex <= 0 ||
+    typeof segments[wildcardIndex + 1] !== 'string' ||
+    segments.lastIndexOf(WILDCARD) !== wildcardIndex
+  ) {
+    return {
+      ...base,
+      passed: false,
+      error: 'all_fields_present requires an array path followed by exactly one [*] and a non-empty field path',
+      json_pointer: null,
+      expected: 'array[*].field',
+      actual: validation.path ?? null,
+    };
+  }
+
+  const arrayPath = path.slice(0, wildcardOffset);
+  const fieldPath = path.slice(wildcardOffset + '[*].'.length);
+  const arrayPointer = toJsonPointer(arrayPath);
+  const items = resolvePath(taskResult.data, arrayPath);
+  if (items == null || (Array.isArray(items) && items.length === 0)) {
+    return {
+      ...base,
+      passed: true,
+      not_applicable: true,
+      note: `Array '${arrayPath}' is absent, null, or empty; all_fields_present has no items to inspect`,
+    };
+  }
+  if (!Array.isArray(items)) {
+    return {
+      ...base,
+      passed: false,
+      error: `Expected an array at path: ${arrayPath}`,
+      json_pointer: arrayPointer,
+      expected: 'array',
+      actual: items,
+    };
+  }
+
+  const missing: string[] = [];
+  const fieldPointer = toJsonPointer(fieldPath);
+  for (let index = 0; index < items.length; index++) {
+    if (resolvePath(items[index], fieldPath) == null) {
+      missing.push(`${arrayPointer}/${index}${fieldPointer}`);
+    }
+  }
+  if (missing.length === 0) return { ...base, passed: true };
+  return {
+    ...base,
+    passed: false,
+    error: `${missing.length} of ${items.length} items lack a non-null '${fieldPath}' (first: ${missing[0]})`,
+    json_pointer: missing[0]!,
+    expected: validation.path,
+    actual: missing,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// field_absent / envelope_field_absent: check a path does NOT exist
+//
+// Pass when the field is absent (undefined or null). Fail when the field
+// is present with any value. The `envelope_field_absent` variant carries
+// the same runtime semantics but signals to the drift detector that the
+// path lives on the v3 envelope schema rather than the per-tool response.
+// Added per adcp#3429 alongside the `envelope_field_present` family.
+// ────────────────────────────────────────────────────────────
+
+function validateFieldAbsent(validation: StoryboardValidation, taskResult: TaskResult): ValidationResult {
+  const checkName = validation.check;
+  if (!validation.path) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `No path specified for ${checkName} validation`,
+      json_pointer: null,
+      expected: 'path must be set in storyboard validation entry',
+      actual: null,
+    };
+  }
+  const wildcardError = rejectWildcardScalarPath(validation, checkName);
+  if (wildcardError) return wildcardError;
+
+  const value = resolvePath(taskResult.data, validation.path);
+  const absent = value === undefined || value === null;
+  const pointer = toJsonPointer(validation.path);
+
+  if (absent) {
+    return {
+      check: checkName,
+      passed: true,
+      description: validation.description,
+      path: validation.path,
+      json_pointer: pointer,
+    };
+  }
+
+  return {
+    check: checkName,
+    passed: false,
+    description: validation.description,
+    path: validation.path,
+    error: `Field found at path: ${validation.path} (expected absent)`,
+    json_pointer: pointer,
+    expected: null,
+    actual: value,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// field_value: check a path equals expected value
+// ────────────────────────────────────────────────────────────
+
+function comparisonKeyFromPath(path: string): string | undefined {
+  const segments = parsePath(path);
+  for (let i = segments.length - 1; i >= 0; i -= 1) {
+    const segment = segments[i];
+    if (typeof segment === 'string') return segment;
+  }
+  return undefined;
+}
+
+function isAgentUrlComparisonKey(key: string | undefined): boolean {
+  const normalized = key?.toLowerCase();
+  return normalized === 'agent_url' || normalized?.endsWith('_agent_url') === true;
+}
+
+function agentUrlValuesMatch(actual: string, expected: string): boolean {
+  try {
+    // The 3.1.24 and 3.2 protocol bundles share this canonical target-URI
+    // profile, including empty-path normalization and byte-preserved query
+    // strings. Reuse its signed-vector-tested implementation here.
+    return canonicalTargetUri(actual, '3.2') === canonicalTargetUri(expected, '3.2');
+  } catch {
+    // agent_url fields are schema-declared URIs. Malformed values must
+    // not pass merely because the same malformed bytes appear on both sides.
+    return false;
+  }
+}
+
+function normalizeAgentUrlsForDistinctCount(
+  value: unknown,
+  comparisonKey?: string
+): { value: unknown; valid: boolean } {
+  if (isAgentUrlComparisonKey(comparisonKey)) {
+    if (typeof value !== 'string') return { value, valid: false };
+    try {
+      return { value: canonicalTargetUri(value, '3.2'), valid: true };
+    } catch {
+      return { value, valid: false };
+    }
+  }
+
+  if (Array.isArray(value)) {
+    const normalized: unknown[] = [];
+    for (const item of value) {
+      const result = normalizeAgentUrlsForDistinctCount(item, comparisonKey);
+      if (!result.valid) return { value, valid: false };
+      normalized.push(result.value);
+    }
+    return { value: normalized, valid: true };
+  }
+
+  if (typeof value === 'object' && value !== null) {
+    const normalized: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      const result = normalizeAgentUrlsForDistinctCount(item, key);
+      if (!result.valid) return { value, valid: false };
+      normalized[key] = result.value;
+    }
+    return { value: normalized, valid: true };
+  }
+
+  return { value, valid: true };
+}
+
+function valuesMatch(actual: unknown, expected: unknown, comparisonKey?: string): boolean {
+  if (isAgentUrlComparisonKey(comparisonKey)) {
+    return typeof actual === 'string' && typeof expected === 'string' && agentUrlValuesMatch(actual, expected);
+  }
+  if (typeof actual === 'object' && actual !== null) {
+    return deepEqualJsonValue(actual, expected, comparisonKey);
+  }
+  return actual === expected;
+}
+
+/**
+ * JSON deep equality for `field_value`-family checks: object member order is
+ * NOT significant (RFC 8259 section 4), array element order IS, and scalars
+ * are strict except for agent URL identity fields, which use AdCP URL
+ * canonicalization. Mirrors the sibling implementations in
+ * `webhook-receiver.ts` and `canonical-format-satisfaction.ts`. Previously this was a
+ * `JSON.stringify(a) === JSON.stringify(b)` comparison, which false-negatived
+ * content-equal objects whose members serialize in a different order (e.g. a
+ * format_id `{id, agent_url}` echoed by the agent as `{agent_url, id}`) —
+ * adcp-client#2327.
+ */
+function deepEqualJsonValue(a: unknown, b: unknown, comparisonKey?: string): boolean {
+  if (isAgentUrlComparisonKey(comparisonKey)) {
+    return typeof a === 'string' && typeof b === 'string' && agentUrlValuesMatch(a, b);
+  }
+  if (a === b) return true;
+  if (typeof a !== typeof b) return false;
+  if (a === null || b === null) return a === b;
+  if (typeof a !== 'object') return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b)) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!deepEqualJsonValue(a[i], b[i], comparisonKey)) return false;
+    }
+    return true;
+  }
+  const keysA = Object.keys(a as Record<string, unknown>);
+  const keysB = Object.keys(b as Record<string, unknown>);
+  if (keysA.length !== keysB.length) return false;
+  for (const k of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+    if (!deepEqualJsonValue((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k], k)) return false;
+  }
+  return true;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Matching used by `field_contains`.
+ *
+ * Scalar expectations keep exact equality, while object/array expectations are
+ * treated as deep subsets. This lets a storyboard assert the keyed parts of an
+ * unordered response entry such as:
+ *
+ *   path: products[0].allowed_actions[]
+ *   value: { action: "extend_flight", modes: ["requires_approval"] }
+ *
+ * without requiring the seller to omit additional optional fields or keep a
+ * fixed array order.
+ */
+function containsValueMatches(actual: unknown, expected: unknown, comparisonKey?: string): boolean {
+  if (Array.isArray(expected)) {
+    if (!Array.isArray(actual)) return false;
+    if (expected.length === 0) return actual.length === 0;
+    const used = new Set<number>();
+    return expected.every(expectedItem => {
+      const matchIndex = actual.findIndex(
+        (actualItem, index) => !used.has(index) && containsValueMatches(actualItem, expectedItem, comparisonKey)
+      );
+      if (matchIndex === -1) return false;
+      used.add(matchIndex);
+      return true;
+    });
+  }
+
+  if (isRecord(expected)) {
+    if (!isRecord(actual)) return false;
+    return Object.entries(expected).every(
+      ([key, expectedValue]) =>
+        Object.prototype.hasOwnProperty.call(actual, key) && containsValueMatches(actual[key], expectedValue, key)
+    );
+  }
+
+  return valuesMatch(actual, expected, comparisonKey);
+}
+
+function pathUsesWildcardSyntax(path: string): boolean {
+  return /\[(?:\*|)\]/.test(path);
+}
+
+function rejectWildcardScalarPath(validation: StoryboardValidation, checkName: string): ValidationResult | undefined {
+  if (!validation.path || !pathUsesWildcardSyntax(validation.path)) return undefined;
+  return {
+    check: checkName,
+    passed: false,
+    description: validation.description,
+    path: validation.path,
+    error: `${checkName} does not support wildcard path syntax (${validation.path}); use field_contains for array wildcard membership checks`,
+    json_pointer: toJsonPointer(validation.path),
+    expected: 'path without [] or [*] wildcard syntax',
+    actual: validation.path,
+  };
+}
+
+function validateFieldValue(validation: StoryboardValidation, taskResult: TaskResult): ValidationResult {
+  // `check` is either `field_value` or `envelope_field_value` (adcp#3429);
+  // result echoes the storyboard's choice so reporters can distinguish.
+  const checkName = validation.check;
+  if (!validation.path) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `No path specified for ${checkName} validation`,
+      json_pointer: null,
+      expected: 'path must be set in storyboard validation entry',
+      actual: null,
+    };
+  }
+  const wildcardError = rejectWildcardScalarPath(validation, checkName);
+  if (wildcardError) return wildcardError;
+
+  const actual = resolvePath(taskResult.data, validation.path);
+  const pointer = toJsonPointer(validation.path);
+
+  // allowed_values: pass if actual matches any value in the list
+  if (validation.allowed_values?.length) {
+    const comparisonKey = comparisonKeyFromPath(validation.path);
+    const passed = validation.allowed_values.some(v => valuesMatch(actual, v, comparisonKey));
+    if (passed) {
+      return {
+        check: checkName,
+        passed: true,
+        description: validation.description,
+        path: validation.path,
+        json_pointer: pointer,
+      };
+    }
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `Expected one of ${JSON.stringify(validation.allowed_values)}, got ${JSON.stringify(actual)}`,
+      json_pointer: pointer,
+      expected: validation.allowed_values,
+      actual: actual ?? null,
+    };
+  }
+
+  // Exact match against value
+  const passed = valuesMatch(actual, validation.value, comparisonKeyFromPath(validation.path));
+
+  if (passed) {
+    return {
+      check: checkName,
+      passed: true,
+      description: validation.description,
+      path: validation.path,
+      json_pointer: pointer,
+    };
+  }
+  return {
+    check: checkName,
+    passed: false,
+    description: validation.description,
+    path: validation.path,
+    error: `Expected ${JSON.stringify(validation.value)}, got ${JSON.stringify(actual)}`,
+    json_pointer: pointer,
+    expected: validation.value,
+    actual: actual ?? null,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// field_value_or_absent: envelope-tolerant variant of field_value
+//
+// Pass when the field is absent OR present-and-matching. Fail only when the
+// field is present with a disallowed value. Lets a storyboard keep positive
+// coverage on a spec-optional field without penalizing agents that omit it.
+// Spec: adcontextprotocol/adcp #3013 envelope `replayed` semantics.
+// ────────────────────────────────────────────────────────────
+
+function validateFieldValueOrAbsent(validation: StoryboardValidation, taskResult: TaskResult): ValidationResult {
+  // `check` is either `field_value_or_absent` or `envelope_field_value_or_absent`
+  // (adcp#3429); result echoes the storyboard's choice verbatim.
+  const checkName = validation.check;
+  if (!validation.path) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `No path specified for ${checkName} validation`,
+      json_pointer: null,
+      expected: 'path must be set in storyboard validation entry',
+      actual: null,
+    };
+  }
+  const wildcardError = rejectWildcardScalarPath(validation, checkName);
+  if (wildcardError) return wildcardError;
+
+  const rawActual = resolvePath(taskResult.data, validation.path);
+  const pointer = toJsonPointer(validation.path);
+  const actual =
+    validation.check === 'field_value_or_absent' &&
+    validation.path === 'status' &&
+    rawActual !== undefined &&
+    isTaskEnvelopeStatus(rawActual) &&
+    resolvePath(taskResult.data, 'media_buy_status') !== undefined
+      ? undefined
+      : rawActual;
+
+  // Absent → pass. The check only fires when the field is present.
+  if (actual === undefined) {
+    return {
+      check: checkName,
+      passed: true,
+      description: validation.description,
+      path: validation.path,
+      json_pointer: pointer,
+    };
+  }
+
+  // Present → fall through to the same value / allowed_values semantics as field_value.
+  if (validation.allowed_values?.length) {
+    const comparisonKey = comparisonKeyFromPath(validation.path);
+    const passed = validation.allowed_values.some(v => valuesMatch(actual, v, comparisonKey));
+    if (passed) {
+      return {
+        check: checkName,
+        passed: true,
+        description: validation.description,
+        path: validation.path,
+        json_pointer: pointer,
+      };
+    }
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `Expected absent or one of ${JSON.stringify(validation.allowed_values)}, got ${JSON.stringify(actual)}`,
+      json_pointer: pointer,
+      expected: validation.allowed_values,
+      actual,
+    };
+  }
+
+  const passed = valuesMatch(actual, validation.value, comparisonKeyFromPath(validation.path));
+  if (passed) {
+    return {
+      check: checkName,
+      passed: true,
+      description: validation.description,
+      path: validation.path,
+      json_pointer: pointer,
+    };
+  }
+  return {
+    check: checkName,
+    passed: false,
+    description: validation.description,
+    path: validation.path,
+    error: `Expected absent or ${JSON.stringify(validation.value)}, got ${JSON.stringify(actual)}`,
+    json_pointer: pointer,
+    expected: validation.value,
+    actual,
+  };
+}
+
+const TASK_ENVELOPE_STATUSES = new Set([
+  'submitted',
+  'working',
+  'input-required',
+  'completed',
+  'canceled',
+  'failed',
+  'rejected',
+  'auth-required',
+  'unknown',
+]);
+
+function isTaskEnvelopeStatus(value: unknown): boolean {
+  return typeof value === 'string' && TASK_ENVELOPE_STATUSES.has(value);
+}
+
+// ────────────────────────────────────────────────────────────
+// field_pattern / envelope_field_pattern: check a string matches
+// a storyboard-authored JavaScript regular expression source.
+// ────────────────────────────────────────────────────────────
+
+function validateFieldPattern(validation: StoryboardValidation, taskResult: TaskResult): ValidationResult {
+  const checkName = validation.check;
+  if (!validation.path) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `No path specified for ${checkName} validation`,
+      json_pointer: null,
+      expected: 'path must be set in storyboard validation entry',
+      actual: null,
+    };
+  }
+  const wildcardError = rejectWildcardScalarPath(validation, checkName);
+  if (wildcardError) return wildcardError;
+
+  const pointer = toJsonPointer(validation.path);
+  const expected = { pattern: validation.pattern };
+
+  if (typeof validation.pattern !== 'string' || validation.pattern.length === 0) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `${checkName} requires a non-empty \`pattern\` string`,
+      json_pointer: pointer,
+      expected: { pattern: 'non-empty JavaScript regular expression source' },
+      actual: validation.pattern ?? null,
+    };
+  }
+
+  let re: RegExp;
+  try {
+    re = new RegExp(validation.pattern);
+  } catch (err) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `Invalid ${checkName} pattern ${JSON.stringify(validation.pattern)}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+      json_pointer: pointer,
+      expected,
+      actual: validation.pattern ?? null,
+    };
+  }
+
+  const actual = resolvePath(taskResult.data, validation.path);
+  if (typeof actual !== 'string') {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error:
+        actual === undefined || actual === null
+          ? `Field not found at path: ${validation.path}`
+          : `Expected string at path: ${validation.path}, got ${Array.isArray(actual) ? 'array' : typeof actual}`,
+      json_pointer: pointer,
+      expected,
+      actual: actual ?? null,
+    };
+  }
+
+  if (re.test(actual)) {
+    return {
+      check: checkName,
+      passed: true,
+      description: validation.description,
+      path: validation.path,
+      json_pointer: pointer,
+    };
+  }
+
+  return {
+    check: checkName,
+    passed: false,
+    description: validation.description,
+    path: validation.path,
+    error: `Expected string at path ${validation.path} to match pattern ${JSON.stringify(validation.pattern)}, got ${JSON.stringify(actual)}`,
+    json_pointer: pointer,
+    expected,
+    actual,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// field_contains: wildcard-aware membership check
+//
+// Resolves `path` via `resolvePathAll` (which understands `[*]` and `[]`
+// segments) and passes when ANY resolved value matches `value` or any of
+// `allowed_values`. Object/array expectations are deep subset matches, so
+// keyed entries like `allowed_actions[]` can be asserted without pinning a
+// positional index or requiring exact object shape.
+// ────────────────────────────────────────────────────────────
+
+function validateFieldContains(validation: StoryboardValidation, taskResult: TaskResult): ValidationResult {
+  const checkName = validation.check;
+  if (!validation.path) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `No path specified for ${checkName} validation`,
+      json_pointer: null,
+      expected: 'path must be set in storyboard validation entry',
+      actual: null,
+    };
+  }
+
+  if (validation.value === undefined && !validation.allowed_values?.length) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `${checkName} requires either \`value\` or \`allowed_values\``,
+      json_pointer: toJsonPointer(validation.path),
+      expected: '`value` or `allowed_values` must be set',
+      actual: null,
+    };
+  }
+
+  const resolved = resolvePathAll(taskResult.data, validation.path);
+  const pointer = toJsonPointer(validation.path);
+
+  const candidates = validation.allowed_values?.length ? validation.allowed_values : [validation.value];
+  const comparisonKey = comparisonKeyFromPath(validation.path);
+  const matched = resolved.some(actual => candidates.some(c => containsValueMatches(actual, c, comparisonKey)));
+
+  if (matched) {
+    return {
+      check: checkName,
+      passed: true,
+      description: validation.description,
+      path: validation.path,
+      json_pointer: pointer,
+    };
+  }
+
+  const expected = validation.allowed_values?.length ? validation.allowed_values : validation.value;
+  const errMsg = validation.allowed_values?.length
+    ? `Expected one of ${JSON.stringify(validation.allowed_values)} to appear in path; got ${JSON.stringify(resolved)}`
+    : `Expected ${JSON.stringify(validation.value)} to appear in path; got ${JSON.stringify(resolved)}`;
+  return {
+    check: checkName,
+    passed: false,
+    description: validation.description,
+    path: validation.path,
+    error: errMsg,
+    json_pointer: pointer,
+    expected,
+    actual: resolved,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// array_length: assert cardinality of the array at `path`
+//
+// Configurations:
+//   - `value: N`       → exact match (array.length === N)
+//   - `min` / `max`    → inclusive bounds (either or both)
+//   - both             → misconfigured, fails the check
+//
+// Cardinality is unsound to express via `field_present arr[N-1]` +
+// `field_value_or_absent arr[N] value: null` because the second clause
+// passes when a seller emits a literal `null` pad at `arr[N]`. This check
+// reads `array.length` directly and rejects non-array resolutions instead.
+// Spec: adcp#4685; SDK adcp-client#1830.
+// ────────────────────────────────────────────────────────────
+
+function validateArrayLength(validation: StoryboardValidation, taskResult: TaskResult): ValidationResult {
+  const checkName = 'array_length' as const;
+  if (!validation.path) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: 'No path specified for array_length validation',
+      json_pointer: null,
+      expected: 'path must be set in storyboard validation entry',
+      actual: null,
+    };
+  }
+
+  const pointer = toJsonPointer(validation.path);
+
+  const hasExact = typeof validation.value === 'number';
+  const hasMin = typeof validation.min === 'number';
+  const hasMax = typeof validation.max === 'number';
+
+  if (!hasExact && !hasMin && !hasMax) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: 'array_length requires `value` (exact count) or `min`/`max` (bounds)',
+      json_pointer: pointer,
+      expected: '`value: N` or `min`/`max`',
+      actual: null,
+    };
+  }
+
+  if (hasExact && (hasMin || hasMax)) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: 'array_length accepts either `value` OR `min`/`max`, not both',
+      json_pointer: pointer,
+      expected: '`value` or `min`/`max`, not both',
+      actual: { value: validation.value, min: validation.min, max: validation.max },
+    };
+  }
+
+  // Reject NaN, fractional, and negative bounds at the config gate. `array.length`
+  // is always a non-negative integer, so any other comparand makes the check
+  // impossible to satisfy — fail loudly at authoring time rather than silently
+  // every run.
+  const isValidCount = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n) && n >= 0;
+  const badOperand = (label: string, n: number) =>
+    `array_length \`${label}\` must be a non-negative integer; got ${Number.isNaN(n) ? 'NaN' : String(n)}`;
+  if (hasExact && !isValidCount(validation.value)) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: badOperand('value', validation.value as unknown as number),
+      json_pointer: pointer,
+      expected: 'non-negative integer',
+      actual: (validation.value as unknown) ?? null,
+    };
+  }
+  if (hasMin && !isValidCount(validation.min)) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: badOperand('min', validation.min as unknown as number),
+      json_pointer: pointer,
+      expected: 'non-negative integer',
+      actual: (validation.min as unknown) ?? null,
+    };
+  }
+  if (hasMax && !isValidCount(validation.max)) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: badOperand('max', validation.max as unknown as number),
+      json_pointer: pointer,
+      expected: 'non-negative integer',
+      actual: (validation.max as unknown) ?? null,
+    };
+  }
+  if (hasMin && hasMax && (validation.min as number) > (validation.max as number)) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `array_length range is impossible: min ${validation.min} > max ${validation.max}`,
+      json_pointer: pointer,
+      expected: '`min <= max`',
+      actual: { min: validation.min, max: validation.max },
+    };
+  }
+
+  const resolved = resolvePath(taskResult.data, validation.path);
+  if (!Array.isArray(resolved)) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `array_length requires an array at path; got ${resolved === undefined ? 'undefined' : typeof resolved === 'object' && resolved !== null ? 'object' : typeof resolved}`,
+      json_pointer: pointer,
+      expected: 'array',
+      actual: resolved ?? null,
+    };
+  }
+
+  const length = resolved.length;
+
+  if (hasExact) {
+    const target = validation.value as number;
+    if (length === target) {
+      return {
+        check: checkName,
+        passed: true,
+        description: validation.description,
+        path: validation.path,
+        json_pointer: pointer,
+      };
+    }
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `Expected array length ${target}, got ${length}`,
+      json_pointer: pointer,
+      expected: target,
+      actual: length,
+    };
+  }
+
+  const min = hasMin ? (validation.min as number) : undefined;
+  const max = hasMax ? (validation.max as number) : undefined;
+
+  if (min !== undefined && length < min) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `Expected array length >= ${min}, got ${length}`,
+      json_pointer: pointer,
+      expected: { min, max },
+      actual: length,
+    };
+  }
+  if (max !== undefined && length > max) {
+    return {
+      check: checkName,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `Expected array length <= ${max}, got ${length}`,
+      json_pointer: pointer,
+      expected: { min, max },
+      actual: length,
+    };
+  }
+
+  return {
+    check: checkName,
+    passed: true,
+    description: validation.description,
+    path: validation.path,
+    json_pointer: pointer,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// status_code: check TaskResult status
+// ────────────────────────────────────────────────────────────
+
+function validateStatusCode(validation: StoryboardValidation, taskResult: TaskResult): ValidationResult {
+  const passed = taskResult.success;
+
+  if (passed) {
+    return {
+      check: 'status_code',
+      passed: true,
+      description: validation.description,
+    };
+  }
+  return {
+    check: 'status_code',
+    passed: false,
+    description: validation.description,
+    error: `Task failed: ${taskResult.error || 'unknown error'}`,
+    json_pointer: null,
+    expected: 'success',
+    actual: taskResult.error ?? 'failure',
+  };
+}
+
+// Strip the "CODE: message" prefix some transports produce, leaving just the
+// code. Returns undefined when the input doesn't look like a coded error.
+function extractCodeFromErrorString(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const match = /^([A-Z][A-Z0-9_]{2,}):\s/.exec(raw);
+  return match ? match[1] : raw;
+}
+
+// ────────────────────────────────────────────────────────────
+// error_code: check error code in error response
+// ────────────────────────────────────────────────────────────
+
+function validateErrorCode(validation: StoryboardValidation, taskResult: TaskResult): ValidationResult {
+  // Extract error code from various locations agents might put it.
+  // Prefer the spec-canonical `errors[0].code` envelope (core/error.json), then
+  // fall back to legacy/structured locations so we get a bare code instead of
+  // the "CODE: message" string materialized on taskResult.error.
+  //
+  // Guarded by `success === false` because AdCP async envelopes (`submitted`,
+  // `input-required`) explicitly permit an advisory `errors[]` on non-failed
+  // tasks for non-blocking warnings — reading it unconditionally would
+  // false-positive `error_code` validations on successful responses.
+  const data = taskResult.data as Record<string, unknown> | undefined;
+  const errors = data?.errors;
+  const firstError = !taskResult.success && Array.isArray(errors) ? errors[0] : undefined;
+  const firstErrorCode =
+    firstError && typeof firstError === 'object' && typeof (firstError as Record<string, unknown>).code === 'string'
+      ? ((firstError as Record<string, unknown>).code as string)
+      : undefined;
+  const taskAdcpError = taskResult.adcp_error as Record<string, unknown> | undefined;
+  const dataAdcpError = data?.adcp_error as Record<string, unknown> | undefined;
+  const adcpError = taskAdcpError ?? dataAdcpError;
+  const errorCode =
+    firstErrorCode ??
+    adcpError?.code ??
+    data?.error_code ??
+    data?.code ??
+    (data?.error as Record<string, unknown> | undefined)?.code ??
+    extractCodeFromErrorString(taskResult.error);
+
+  const pointer =
+    firstErrorCode !== undefined
+      ? '/errors/0/code'
+      : taskAdcpError?.code !== undefined
+        ? '/adcp_error/code'
+        : adcpError?.code !== undefined
+          ? '/adcp_error/code'
+          : data?.error_code !== undefined
+            ? '/error_code'
+            : null;
+
+  if (validation.allowed_values?.length) {
+    const actualCode = errorCode !== undefined && errorCode !== null ? String(errorCode) : undefined;
+    const passed = actualCode !== undefined && validation.allowed_values.some(v => String(v) === actualCode);
+    if (passed) {
+      return { check: 'error_code', passed: true, description: validation.description, json_pointer: pointer };
+    }
+    return {
+      check: 'error_code',
+      passed: false,
+      description: validation.description,
+      error: `Expected one of ${JSON.stringify(validation.allowed_values)}, got ${JSON.stringify(errorCode)}`,
+      json_pointer: pointer,
+      expected: validation.allowed_values,
+      actual: errorCode ?? null,
+    };
+  }
+
+  if (!validation.value) {
+    // Just check that an error code exists
+    const hasCode = errorCode !== undefined && errorCode !== null;
+    if (hasCode) {
+      return { check: 'error_code', passed: true, description: validation.description, json_pointer: pointer };
+    }
+    return {
+      check: 'error_code',
+      passed: false,
+      description: validation.description,
+      error: 'No error code found in response',
+      json_pointer: pointer,
+      expected: 'any error code',
+      actual: null,
+    };
+  }
+
+  const passed = String(errorCode) === String(validation.value);
+  if (passed) {
+    return { check: 'error_code', passed: true, description: validation.description, json_pointer: pointer };
+  }
+  return {
+    check: 'error_code',
+    passed: false,
+    description: validation.description,
+    error: `Expected error code "${validation.value}", got "${errorCode}"`,
+    json_pointer: pointer,
+    expected: validation.value,
+    actual: errorCode ?? null,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// http_status / http_status_in
+// ────────────────────────────────────────────────────────────
+
+function validateHttpStatus(validation: StoryboardValidation, hr: HttpProbeResult): ValidationResult {
+  const expected = validation.value as number | undefined;
+  const passed = typeof expected === 'number' && hr.status === expected;
+  if (passed) {
+    return { check: 'http_status', passed: true, description: validation.description };
+  }
+  return {
+    check: 'http_status',
+    passed: false,
+    description: validation.description,
+    error: `Expected HTTP ${expected}, got ${hr.status}${hr.error ? ` (${hr.error})` : ''}`,
+    json_pointer: null,
+    expected: expected ?? null,
+    actual: hr.status,
+  };
+}
+
+function validateHttpStatusIn(validation: StoryboardValidation, hr: HttpProbeResult): ValidationResult {
+  const allowed = Array.isArray(validation.allowed_values) ? validation.allowed_values : [];
+  const passed = allowed.some(v => v === hr.status);
+  if (passed) {
+    return { check: 'http_status_in', passed: true, description: validation.description };
+  }
+  // Disambiguate two failure modes that produce the same HTTP-status mismatch:
+  // (a) the kit's `probe_task` requires non-empty params, so the agent 400s on
+  // schema before auth ever runs (operator's fault), or (b) the agent really
+  // does evaluate schema before auth (agent's fault — itself a conformance
+  // gap). Both are real; the text names both so compliance reports don't
+  // unilaterally blame the operator for an agent that games the probe by
+  // returning a schema-shaped body.
+  const expectedAuthReject = allowed.includes(401) || allowed.includes(403);
+  const schemaRejected = (hr.status === 400 || hr.status === 422) && looksLikeSchemaValidationBody(hr.body);
+  if (expectedAuthReject && schemaRejected) {
+    return {
+      check: 'http_status_in',
+      passed: false,
+      description: validation.description,
+      error:
+        `Agent returned HTTP ${hr.status} with a schema-validation body before any auth response. ` +
+        `Two possible causes: (1) \`test_kit.auth.probe_task\` points at a task that requires ` +
+        `non-empty parameters, so schema validation rejected the probe before auth ran (fix: set ` +
+        `\`probe_task\` to one of ${PROBE_TASK_ALLOWLIST.join(', ')}); or (2) the agent evaluates ` +
+        `schema before auth, which is itself a conformance gap (protected endpoints must return ` +
+        `401/403 on invalid credentials regardless of body shape).`,
+      json_pointer: null,
+      expected: allowed,
+      actual: hr.status,
+    };
+  }
+  return {
+    check: 'http_status_in',
+    passed: false,
+    description: validation.description,
+    error: `Expected HTTP status in ${JSON.stringify(allowed)}, got ${hr.status}${hr.error ? ` (${hr.error})` : ''}`,
+    json_pointer: null,
+    expected: allowed,
+    actual: hr.status,
+  };
+}
+
+/**
+ * Grade a probe by the verdict it reported rather than by a wire status.
+ *
+ * Used by request-signing vectors the grader decides in-library (the
+ * `jwks_override` negatives): there is no HTTP exchange to assert on, and
+ * `HttpProbeResult.error` is the dispatch layer's carrier for "the grader
+ * failed this vector". Keeping the check status-free is deliberate — a
+ * synthetic 401 would conflate the library-verification plane with the wire
+ * plane (adcp-client#2955).
+ *
+ * The pass branch depends on the producing dispatch never reporting a failed
+ * grade with an empty `error`: `probeRequestSigningVector` enforces that with
+ * a `'vector grade failed'` fallback when the grader supplies no diagnostic.
+ * A dispatch that grades without honoring that invariant would pass here
+ * vacuously — keep the two in step.
+ */
+function validateProbePassed(validation: StoryboardValidation, hr: HttpProbeResult): ValidationResult {
+  if (!hr.error) {
+    return { check: 'probe_passed', passed: true, description: validation.description };
+  }
+  return {
+    check: 'probe_passed',
+    passed: false,
+    description: validation.description,
+    error: `Probe reported a failed grade: ${hr.error}`,
+    json_pointer: null,
+    expected: 'probe grade with no error',
+    actual: hr.error,
+  };
+}
+
+const SCHEMA_KEYWORD_RE = /invalid[_ ]?params|validation|schema|required|must be/i;
+const SCHEMA_CODE_RE = /VALIDATION|INVALID|SCHEMA|BAD_REQUEST/i;
+
+/**
+ * Detect bodies that look like JSON-RPC / MCP schema-validation rejections.
+ *
+ * Conservative: only returns true when the body has a recognizable error
+ * envelope AND either a JSON-RPC invalid-params code (-32602) or a
+ * message/field-level hint pointing at schema/validation. Returning true
+ * on a real auth response would hide genuine agent bugs, so we over-reject.
+ *
+ * Handles both parsed JSON object bodies and plain-text bodies — the HTTP
+ * probe returns a decoded string when content-type isn't JSON, and agents
+ * that 400 with `text/plain` short messages like "missing required field"
+ * deserve the same kit-config diagnostic. String detection is deliberately
+ * tight: a recognizable schema-keyword substring in a short body (≤ 1 KiB).
+ */
+function looksLikeSchemaValidationBody(body: unknown): boolean {
+  if (typeof body === 'string') {
+    return body.length > 0 && body.length <= 1024 && SCHEMA_KEYWORD_RE.test(body);
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+  const obj = body as Record<string, unknown>;
+  // JSON-RPC error envelope
+  const rpcError = obj.error as Record<string, unknown> | undefined;
+  if (rpcError && typeof rpcError === 'object') {
+    const code = rpcError.code;
+    if (typeof code === 'number' && (code === -32602 || code === -32600)) return true;
+    const msg = rpcError.message;
+    if (typeof msg === 'string' && SCHEMA_KEYWORD_RE.test(msg)) return true;
+  }
+  // AdCP / REST-style validation envelope
+  if (Array.isArray(obj.errors) && obj.errors.length > 0) return true;
+  if (Array.isArray(obj.validation_errors) && obj.validation_errors.length > 0) return true;
+  const topCode = obj.error_code ?? obj.code;
+  if (typeof topCode === 'string' && SCHEMA_CODE_RE.test(topCode)) return true;
+  return false;
+}
+
+// ────────────────────────────────────────────────────────────
+// on_401_require_header
+// ────────────────────────────────────────────────────────────
+
+function validateOn401RequireHeader(validation: StoryboardValidation, hr: HttpProbeResult): ValidationResult {
+  const header = typeof validation.value === 'string' ? validation.value.toLowerCase() : undefined;
+  if (!header) {
+    return {
+      check: 'on_401_require_header',
+      passed: false,
+      description: validation.description,
+      error: '`value` is required (the header name to require on 401 responses).',
+      json_pointer: null,
+      expected: 'header name',
+      actual: null,
+    };
+  }
+  // Silent pass when the response isn't a 401 — the conditional is part of
+  // the spec (RFC 6750 §3 only applies to 401s).
+  if (hr.status !== 401) {
+    return { check: 'on_401_require_header', passed: true, description: validation.description };
+  }
+  const value = hr.headers[header];
+  const passed = typeof value === 'string' && value.length > 0;
+  if (passed) {
+    return { check: 'on_401_require_header', passed: true, description: validation.description };
+  }
+  return {
+    check: 'on_401_require_header',
+    passed: false,
+    description: validation.description,
+    error: `401 response missing required header "${header}".`,
+    json_pointer: null,
+    expected: `response header "${header}" present`,
+    actual: value ?? null,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// resource_equals_agent_url
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Normalize a URL for RFC 9728 resource identity checks:
+ * lowercases scheme/host, strips userinfo, query, and fragment, and
+ * collapses trailing slashes while preserving the path. RFC 9728
+ * `resource` identifies the agent at its full endpoint, so paths are
+ * significant here — use `canonicalizeAgentUrlForScope` for `refs_resolve`
+ * scope comparisons where paths must be dropped.
+ */
+/**
+ * Canonical form of an agent URL for `refs_resolve` scope comparisons.
+ *
+ * AdCP's `agent_url` identifies the agent — which may live under a subpath
+ * like `https://publisher.com/.well-known/adcp/sales` (see core/format-id.json).
+ * Path is therefore significant and MUST be preserved; collapsing to origin
+ * would false-positive sibling agents on shared hosts.
+ *
+ * What must be stripped is the transport suffix the runner appends to reach
+ * the protocol endpoint (`/mcp`, `/a2a`, `/sse`) and the well-known agent-card
+ * path, so the runner's target URL canonicalizes to the same value the agent
+ * advertises in its refs. Mirrors `SingleAgentClient.computeBaseUrl` but as a
+ * pure string operation suitable for validation without an agent instance.
+ *
+ * Also: lowercase scheme/host, drop default ports, strip userinfo, query,
+ * fragment — normal RFC 3986 §6.2 canonicalization. Closes adcp-client#710.
+ */
+const AGENT_CARD_SUFFIX_RE = /\/\.well-known\/agent(?:-card)?\.json$/i;
+function canonicalizeAgentUrlForScope(url: string): string {
+  try {
+    const u = new URL(url);
+    u.hash = '';
+    u.search = '';
+    u.username = '';
+    u.password = '';
+    let path = u.pathname;
+    path = path.replace(AGENT_CARD_SUFFIX_RE, '');
+    path = path.replace(TRANSPORT_SUFFIX_REGEX, '');
+    // A bare `/` and the empty string denote the same origin-relative root;
+    // collapse them so `https://host` and `https://host/` canonicalize equally.
+    if (path === '/' || path === '') path = '';
+    else if (path.endsWith('/')) path = path.slice(0, -1);
+    const defaultPort = u.protocol === 'https:' ? '443' : u.protocol === 'http:' ? '80' : '';
+    const host = u.hostname.toLowerCase();
+    const port = u.port && u.port !== defaultPort ? `:${u.port}` : '';
+    return `${u.protocol.toLowerCase()}//${host}${port}${path}`;
+  } catch {
+    return url;
+  }
+}
+
+function validateResourceEqualsAgentUrl(
+  validation: StoryboardValidation,
+  hr: HttpProbeResult,
+  agentUrl: string
+): ValidationResult {
+  const body = (hr.body ?? {}) as { resource?: unknown };
+  const resource = typeof body.resource === 'string' ? body.resource : undefined;
+  if (!resource) {
+    return {
+      check: 'resource_equals_agent_url',
+      passed: false,
+      description: validation.description,
+      error: 'Response body missing string `resource` field.',
+      json_pointer: '/resource',
+      expected: redactOAuthUrlForOutput(normalizeOAuthResourceForComparison(agentUrl)),
+      actual: null,
+    };
+  }
+  const expected = normalizeOAuthResourceForComparison(agentUrl);
+  const actual = normalizeOAuthResourceForComparison(resource);
+  const displayExpected = redactOAuthUrlForOutput(expected);
+  const displayActual = redactOAuthUrlForOutput(actual);
+  const passed = actual === expected;
+  // Don't echo the advertised value verbatim in the human-readable message —
+  // compliance reports may be shared publicly and the raw diff helps attackers
+  // probe victim agents. Machine-readable expected/actual are fine: implementors
+  // consuming the JSON already hold both URLs.
+  let redactedError: string | undefined;
+  if (!passed) {
+    let actualHost = 'unknown';
+    try {
+      actualHost = new URL(resource).host;
+    } catch {
+      /* ignore */
+    }
+    const expectedHost = new URL(expected).host;
+    const hostDiffers = actualHost !== expectedHost;
+    redactedError =
+      `RFC 9728 \`resource\` does not equal the URL clients call (${displayExpected}). ` +
+      (hostDiffers
+        ? `Advertised host differs from the agent host — the most common cause is copying your authorization server origin into \`resource\`. `
+        : `Advertised path differs from the agent path. `) +
+      `Fix: set \`resource\` equal to the full agent URL in your protected-resource metadata document.`;
+  }
+  if (passed) {
+    return {
+      check: 'resource_equals_agent_url',
+      passed: true,
+      description: validation.description,
+      json_pointer: '/resource',
+    };
+  }
+  return {
+    check: 'resource_equals_agent_url',
+    passed: false,
+    description: validation.description,
+    error: redactedError,
+    json_pointer: '/resource',
+    expected: displayExpected,
+    actual: displayActual,
+  };
+}
+
+function validateOAuthMetadataGraph(
+  validation: StoryboardValidation,
+  grade: OAuthMetadataGraphGrade | undefined
+): ValidationResult {
+  const expected = {
+    profile: 'adcp/oauth-metadata-graph/v1',
+    require_authorization_servers: true,
+    follow_all_authorization_servers: true,
+    probe_advertised_endpoints: true,
+  };
+  if (!grade) {
+    return {
+      check: validation.check,
+      passed: false,
+      description: validation.description,
+      error: 'oauth_metadata_graph was not prefetched by the storyboard runner',
+      json_pointer: null,
+      expected,
+      actual: null,
+    };
+  }
+  if (grade.success) {
+    return {
+      check: validation.check,
+      passed: true,
+      description: validation.description,
+      json_pointer: null,
+      expected,
+      observations: grade.observations,
+    };
+  }
+  const primary = grade.findings[0];
+  return {
+    check: validation.check,
+    passed: false,
+    description: validation.description,
+    error: `${grade.error_code}: ${grade.error}`,
+    json_pointer: primary?.field ? findingFieldToJsonPointer(primary.field) : null,
+    expected,
+    actual: {
+      code: grade.error_code,
+      ...(primary?.url && { url: primary.url }),
+      ...(primary?.field && { field: primary.field }),
+      ...(primary?.message && { detail: primary.message }),
+    },
+    observations: grade.observations,
+  };
+}
+
+function findingFieldToJsonPointer(field: string): string {
+  const segments = field.replace(/\[(\d+)\]/g, '.$1').split('.');
+  return `/${segments.map(segment => segment.replace(/~/g, '~0').replace(/\//g, '~1')).join('/')}`;
+}
+
+// ────────────────────────────────────────────────────────────
+// any_of (contribution accumulator)
+// ────────────────────────────────────────────────────────────
+
+function validateAnyOf(validation: StoryboardValidation, contributions: Set<string>): ValidationResult {
+  const flags = Array.isArray(validation.allowed_values) ? validation.allowed_values.map(String) : [];
+  const passed = flags.some(f => contributions.has(f));
+  if (passed) {
+    return { check: 'any_of', passed: true, description: validation.description };
+  }
+  return {
+    check: 'any_of',
+    passed: false,
+    description: validation.description,
+    error: `None of the required contributions were recorded: ${JSON.stringify(flags)}`,
+    json_pointer: null,
+    expected: flags,
+    actual: Array.from(contributions),
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// a2a_submitted_artifact (A2A wire-shape regression guard)
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Assert the A2A 1.0 `Task` produced by the seller for an AdCP
+ * `submitted` arm matches the AdCP 3.2 profile:
+ *
+ *   1. `Task.state === 'TASK_STATE_COMPLETED'` — A2A Task.state tracks the
+ *      transport call, not the AdCP work. The HTTP request returned
+ *      successfully with a queued AdCP task; emitting `'submitted'`
+ *      here would be a non-conformant terminal transition (`submitted`
+ *      is the initial state, never terminal).
+ *
+ *   2. `artifact.parts[0].data.task_id` is a non-empty string — the
+ *      AdCP-level async handle is part of the typed Submitted response.
+ *
+ *   3. `artifact.parts[0].data.status === 'submitted'` — the AdCP
+ *      payload preserves its native `status` discriminator so buyers
+ *      can read the ad-tech state without parsing transport metadata.
+ *
+ * The check is A2A-specific: when no `a2aEnvelope` was captured (MCP
+ * runs, or A2A runs where the SDK fetch was bypassed), the result
+ * passes with `not_applicable: true` so the validation doesn't fail
+ * the step on transports that don't carry the envelope.
+ *
+ * Failure messages name the offending field so an agent that
+ * regressed to an invalid terminal `submitted` transport state gets
+ * a specific diagnostic, not a generic "wire-shape rejected".
+ */
+function validateA2ASubmittedArtifact(validation: StoryboardValidation, ctx: ValidationContext): ValidationResult {
+  const envelope = ctx.a2aEnvelope;
+  if (!envelope) {
+    // Non-A2A transport (MCP), or A2A path where the SDK fetch wasn't
+    // wrapped. Skip without failing — the storyboard step still grades
+    // on its other validations (e.g. MCP `field_value status === submitted`).
+    return {
+      check: 'a2a_submitted_artifact',
+      passed: true,
+      description: validation.description,
+      observations: [
+        'a2a_envelope_not_captured: no JSON-RPC envelope recorded (non-A2A transport, or A2A dispatch threw before envelope was parsed)',
+      ],
+    };
+  }
+
+  const failures: Array<{ pointer: string; expected: unknown; actual: unknown; detail: string }> = [];
+
+  // JSON-RPC error envelopes never satisfy the submitted-artifact
+  // contract. We fail the check (skipping would silently hide a
+  // server-side regression where submitted arms 500 instead of
+  // returning Tasks), but emit a distinct error_code so dashboards
+  // can separate transport rejections from submitted-arm shape drift.
+  if (envelope.envelope.error !== undefined) {
+    return {
+      check: 'a2a_submitted_artifact',
+      passed: false,
+      description: validation.description,
+      error: 'Expected a JSON-RPC success envelope carrying an A2A Task; observed an error envelope.',
+      json_pointer: '/error',
+      expected: { result: { kind: 'task', status: { state: 'completed' } } },
+      actual: { error_code: 'a2a_jsonrpc_error_envelope', error: envelope.envelope.error },
+    };
+  }
+
+  const result = envelope.result;
+  if (result == null || typeof result !== 'object' || Array.isArray(result)) {
+    return {
+      check: 'a2a_submitted_artifact',
+      passed: false,
+      description: validation.description,
+      error: 'JSON-RPC `result` is not an object — A2A `message/send` must return a Task.',
+      json_pointer: '/result',
+      expected: 'object (A2A Task)',
+      actual: result,
+    };
+  }
+  const task = result as Record<string, unknown>;
+
+  const isA2A1 = task.kind === undefined;
+  if (!isA2A1 && task.kind !== 'task') {
+    failures.push({
+      pointer: '/result/kind',
+      expected: 'task',
+      actual: task.kind,
+      detail: `Expected result.kind === 'task'; got ${JSON.stringify(task.kind)}.`,
+    });
+  }
+
+  // Task.id non-empty — buyers can't address `tasks/get` or
+  // `tasks/cancel` without it, so an empty / missing id is a
+  // wire-shape regression even if the transport call succeeded.
+  if (typeof task.id !== 'string' || task.id.length === 0) {
+    failures.push({
+      pointer: '/result/id',
+      expected: 'non-empty string',
+      actual: task.id,
+      detail:
+        'A2A `Task.id` must be a non-empty string — buyers address follow-up `tasks/get` / `tasks/cancel` calls by this id.',
+    });
+  }
+
+  // Task.contextId non-empty — A2A binds follow-ups (subsequent
+  // sends, status streams) to the context; an empty contextId
+  // breaks correlation across calls.
+  if (typeof task.contextId !== 'string' || task.contextId.length === 0) {
+    failures.push({
+      pointer: '/result/contextId',
+      expected: 'non-empty string',
+      actual: task.contextId,
+      detail: 'A2A `Task.contextId` must be a non-empty string to correlate follow-up sends and status streams.',
+    });
+  }
+
+  // Invariant 1 — A2A `Task.state` for a submitted AdCP arm is
+  // `'completed'` (the HTTP call completed). Pre-#899 emitted
+  // `'submitted'` with `final: true`, which is the regression we want
+  // to catch.
+  const status = task.status;
+  const state =
+    status != null && typeof status === 'object' && !Array.isArray(status)
+      ? (status as Record<string, unknown>).state
+      : undefined;
+  const completedState = isA2A1 ? 'TASK_STATE_COMPLETED' : 'completed';
+  if (state !== completedState) {
+    failures.push({
+      pointer: '/result/status/state',
+      expected: completedState,
+      actual: state,
+      detail:
+        `Expected Task.state === ${JSON.stringify(completedState)} (transport lifecycle); got ${JSON.stringify(state)}. ` +
+        "A2A forbids 'submitted' as a terminal state — for AdCP submitted arms the transport call has completed while the typed response carries the AdCP work handle.",
+    });
+  }
+
+  // Invariants 2 + 3 — artifact.metadata.adcp_task_id placement and
+  // artifact.parts[0].data.status preservation. Walk the artifact
+  // chain, collecting failures rather than short-circuiting so the
+  // error block names every divergence at once.
+  const artifacts = task.artifacts;
+  if (!Array.isArray(artifacts) || artifacts.length === 0) {
+    failures.push({
+      pointer: '/result/artifacts',
+      expected: 'non-empty array',
+      actual: artifacts,
+      detail: 'A2A submitted arm must produce at least one artifact carrying the AdCP response.',
+    });
+  } else {
+    const artifact = artifacts[0] as Record<string, unknown> | null;
+    if (artifact == null || typeof artifact !== 'object' || Array.isArray(artifact)) {
+      failures.push({
+        pointer: '/result/artifacts/0',
+        expected: 'object',
+        actual: artifact,
+        detail: 'First artifact must be an object.',
+      });
+    } else {
+      // artifact.artifactId non-empty — needed for chunked-artifact
+      // resumption and for buyers that key local state by artifact
+      // id (e.g. caching the AdCP payload while the task continues).
+      if (typeof artifact.artifactId !== 'string' || artifact.artifactId.length === 0) {
+        failures.push({
+          pointer: '/result/artifacts/0/artifactId',
+          expected: 'non-empty string',
+          actual: artifact.artifactId,
+          detail:
+            'A2A `Artifact.artifactId` must be a non-empty string — chunked-artifact resumption and buyer-side caching key off this id.',
+        });
+      }
+
+      // A2A 0.3 compatibility carried the work handle in artifact metadata.
+      const metadata = artifact.metadata;
+      const metadataTaskId =
+        metadata != null && typeof metadata === 'object' && !Array.isArray(metadata)
+          ? (metadata as Record<string, unknown>).adcp_task_id
+          : undefined;
+      if (!isA2A1 && (typeof metadataTaskId !== 'string' || metadataTaskId.length === 0)) {
+        failures.push({
+          pointer: '/result/artifacts/0/metadata/adcp_task_id',
+          expected: 'non-empty string',
+          actual: metadataTaskId,
+          detail:
+            'Expected `adcp_task_id` on `artifact.metadata` (per A2A 0.3.0 metadata-extension convention). Pre-#899 placed this in `artifact.parts[0].data.adcp_task_id` — that path is non-conformant; transport metadata pollutes the typed AdCP payload shape.',
+        });
+      }
+
+      // Invariant 3 — artifact.parts[0].data.status === 'submitted'.
+      const parts = artifact.parts;
+      if (!Array.isArray(parts) || parts.length === 0) {
+        failures.push({
+          pointer: '/result/artifacts/0/parts',
+          expected: 'non-empty array with a DataPart',
+          actual: parts,
+          detail: 'A2A submitted arm must include a DataPart carrying the AdCP response.',
+        });
+      } else {
+        const firstPart = parts[0] as Record<string, unknown> | null;
+        if (firstPart == null || typeof firstPart !== 'object' || Array.isArray(firstPart)) {
+          failures.push({
+            pointer: '/result/artifacts/0/parts/0',
+            expected: 'object',
+            actual: firstPart,
+            detail: 'First artifact part must be an object.',
+          });
+        } else {
+          if (firstPart.kind !== 'data' && !Object.hasOwn(firstPart, 'data')) {
+            failures.push({
+              pointer: '/result/artifacts/0/parts/0/kind',
+              expected: 'data',
+              actual: firstPart.kind,
+              detail: `Expected the first artifact part to be a DataPart (kind === 'data'); got ${JSON.stringify(firstPart.kind)}.`,
+            });
+          }
+          const data = firstPart.data;
+          const dataStatus =
+            data != null && typeof data === 'object' && !Array.isArray(data)
+              ? (data as Record<string, unknown>).status
+              : undefined;
+          if (dataStatus !== 'submitted') {
+            failures.push({
+              pointer: '/result/artifacts/0/parts/0/data/status',
+              expected: 'submitted',
+              actual: dataStatus,
+              detail:
+                `Expected the AdCP payload's status to round-trip as 'submitted'; got ${JSON.stringify(dataStatus)}. ` +
+                'The DataPart must carry the AdCP tool response verbatim — buyers read the ad-tech state from `data.status`, not from `Task.state`.',
+            });
+          }
+          const dataTaskId =
+            data != null && typeof data === 'object' && !Array.isArray(data)
+              ? (data as Record<string, unknown>).task_id
+              : undefined;
+          if (isA2A1 && (typeof dataTaskId !== 'string' || dataTaskId.length === 0)) {
+            failures.push({
+              pointer: '/result/artifacts/0/parts/0/data/task_id',
+              expected: 'non-empty string',
+              actual: dataTaskId,
+              detail: 'AdCP 3.2 Submitted responses must retain their typed `task_id` inside the DataPart.',
+            });
+          }
+          // Dual-write detection: catches the pre-#899 regression
+          // where the agent leaked the transport handle into the
+          // payload. A future AdCP tool whose response schema
+          // legitimately includes `adcp_task_id` is allowed to
+          // surface it inside `data` AS LONG AS it equals the
+          // metadata value — a divergent or solo-payload write is
+          // still the regression class issue #904 catches.
+          const dataAdcpTaskId =
+            data != null && typeof data === 'object' && !Array.isArray(data)
+              ? (data as Record<string, unknown>).adcp_task_id
+              : undefined;
+          if (dataAdcpTaskId !== undefined) {
+            const equalsMetadata =
+              typeof metadataTaskId === 'string' &&
+              typeof dataAdcpTaskId === 'string' &&
+              dataAdcpTaskId === metadataTaskId;
+            if (!equalsMetadata) {
+              failures.push({
+                pointer: '/result/artifacts/0/parts/0/data/adcp_task_id',
+                expected: 'absent OR equal to artifact.metadata.adcp_task_id',
+                actual: dataAdcpTaskId,
+                detail:
+                  typeof metadataTaskId === 'string'
+                    ? `Pre-#899 dual-write detected: \`data.adcp_task_id\` (${JSON.stringify(dataAdcpTaskId)}) diverges from \`artifact.metadata.adcp_task_id\` (${JSON.stringify(metadataTaskId)}).`
+                    : 'Pre-#899 shape detected: `adcp_task_id` appeared inside `artifact.parts[0].data` without a matching `artifact.metadata.adcp_task_id`. Transport metadata belongs on `artifact.metadata`.',
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (failures.length === 0) {
+    return {
+      check: 'a2a_submitted_artifact',
+      passed: true,
+      description: validation.description,
+    };
+  }
+
+  // Surface every failure at once. The first one anchors json_pointer /
+  // expected / actual for tools that read those scalar fields; the full
+  // list lands in `actual.failures` so all regressions are visible in
+  // a single grading run. Multi-failure runs prepend the first detail
+  // to the error string so consumers reading only `error` still get a
+  // pointer to the most-actionable diagnostic.
+  const first = failures[0]!;
+  return {
+    check: 'a2a_submitted_artifact',
+    passed: false,
+    description: validation.description,
+    error:
+      failures.length === 1
+        ? first.detail
+        : `${failures.length} A2A wire-shape invariants failed; first: ${first.detail}`,
+    json_pointer: first.pointer,
+    expected: first.expected,
+    actual: { failures },
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// refs_resolve (cross-step integrity check)
+// ────────────────────────────────────────────────────────────
+
+// ────────────────────────────────────────────────────────────
+// a2a_context_continuity (cross-step A2A session-binding guard)
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Assert that the A2A `Task.contextId` on this step's response
+ * matches the prior step's response. A2A 0.3.0 §7.1 binds follow-up
+ * sends to a server-side conversation via `Message.contextId`; the
+ * server MUST echo it on the response Task. The `@a2a-js/sdk`'s
+ * `DefaultRequestHandler` does this automatically — `createA2AAdapter`
+ * passes through `requestContext.contextId`, so a passing seller built
+ * on the SDK won't trip a single-call check. The regression class is
+ * sellers that bypass the SDK's request handler and stamp their own
+ * `contextId` on the response, breaking buyer-side correlation across
+ * a multi-turn flow (proposal refinement, IO signing, async approval).
+ *
+ * The check compares the current step's
+ * `ctx.a2aEnvelope.result.contextId` against the prior step's
+ * `ctx.priorA2aEnvelope.result.contextId`. Skip semantics:
+ *
+ *   - Non-A2A run (`a2aEnvelope` undefined) → skip
+ *   - First A2A step in a run (`priorA2aEnvelope` undefined) → skip
+ *   - Either envelope had no extractable `contextId` → skip
+ *   - JSON-RPC error envelope (`envelope.error` present) → skip
+ *
+ * Skips emit a single observation noting which condition triggered so
+ * triage can distinguish "validator self-skipped" from "validator
+ * passed because contexts matched".
+ */
+function validateA2AContextContinuity(validation: StoryboardValidation, ctx: ValidationContext): ValidationResult {
+  const current = ctx.a2aEnvelope;
+  const prior = ctx.priorA2aEnvelope;
+  const passResult = (observation: string): ValidationResult => ({
+    check: 'a2a_context_continuity',
+    passed: true,
+    description: validation.description,
+    observations: [observation],
+  });
+
+  if (!current)
+    return passResult('a2a_envelope_not_captured: skipped on non-A2A transport (or capture-bypassing dispatch path)');
+  if (!prior) return passResult('first_a2a_step: no prior A2A envelope to compare against; skipped');
+  if (current.envelope.error !== undefined || prior.envelope.error !== undefined) {
+    return passResult('jsonrpc_error_envelope: skipped — continuity is undefined for transport-rejected calls');
+  }
+
+  const currentContextId = extractContextIdFromEnvelope(current);
+  const priorContextId = extractContextIdFromEnvelope(prior);
+
+  if (priorContextId == null)
+    return passResult('prior_contextId_absent: prior step did not surface a Task.contextId; skipped');
+  if (currentContextId == null) {
+    return {
+      check: 'a2a_context_continuity',
+      passed: false,
+      description: validation.description,
+      error:
+        `Current step's response Task is missing \`contextId\` (prior step had ${JSON.stringify(priorContextId)}). ` +
+        'A2A 0.3.0 requires the server to echo the client-supplied contextId on every follow-up send; an empty/missing ' +
+        'contextId on a non-first send breaks buyer-side session correlation.',
+      json_pointer: '/result/contextId',
+      expected: priorContextId,
+      actual: currentContextId,
+    };
+  }
+  if (currentContextId !== priorContextId) {
+    const priorStepNote = ctx.priorA2aStepId ? ` (prior step: ${ctx.priorA2aStepId})` : '';
+    return {
+      check: 'a2a_context_continuity',
+      passed: false,
+      description: validation.description,
+      error:
+        `A2A \`Task.contextId\` diverged across steps${priorStepNote}: expected ${JSON.stringify(priorContextId)}, got ${JSON.stringify(currentContextId)}. ` +
+        "Per A2A 0.3.0 §7.1 the server MUST echo the client-supplied contextId on follow-up sends. A divergent value indicates the seller bypassed the SDK's request handler and stamped its own contextId — buyer-side session correlation is broken.",
+      json_pointer: '/result/contextId',
+      expected: priorContextId,
+      actual: currentContextId,
+    };
+  }
+  return { check: 'a2a_context_continuity', passed: true, description: validation.description };
+}
+
+function extractContextIdFromEnvelope(envelope: A2ATaskEnvelope): string | undefined {
+  const result = envelope.result;
+  if (result == null || typeof result !== 'object' || Array.isArray(result)) return undefined;
+  const ctxId = (result as Record<string, unknown>).contextId;
+  return typeof ctxId === 'string' && ctxId.length > 0 ? ctxId : undefined;
+}
+
+/**
+ * Assert every ref in a source set resolves to a member of a target set.
+ *
+ * Used by `media_buy_seller` to check that every `format_id` returned on
+ * `get_products` products actually resolves to a format in the subsequent
+ * `list_creative_formats` response — catches invalid references before
+ * `sync_creatives` fails at runtime.
+ *
+ * `scope` lets the check distinguish refs the agent under test owns
+ * (`agent_url` matches) from third-party refs (pointing at a different
+ * creative agent). Third-party refs can't be verified without calling
+ * that agent's `list_creative_formats`, so `on_out_of_scope` controls
+ * whether they pass (`warn` with observations, `ignore` silently) or
+ * fail.
+ */
+function validateRefsResolve(validation: StoryboardValidation, ctx: ValidationContext): ValidationResult {
+  const source = validation.source;
+  const target = validation.target;
+  const matchKeys = validation.match_keys;
+
+  if (!source || !target || !matchKeys?.length) {
+    return {
+      check: 'refs_resolve',
+      passed: false,
+      description: validation.description,
+      error: '`source`, `target`, and `match_keys` are all required for refs_resolve.',
+      json_pointer: null,
+      expected: '{ source, target, match_keys }',
+      actual: {
+        source: source ?? null,
+        target: target ?? null,
+        match_keys: matchKeys ?? null,
+      },
+    };
+  }
+
+  const sourceRoot = resolveRefsRoot(source.from, ctx);
+  const targetRoot = resolveRefsRoot(target.from, ctx);
+  const sourceRaw = resolvePathAll(sourceRoot, source.path);
+  const targetRaw = resolvePathAll(targetRoot, target.path);
+  const sourceRefs = sourceRaw.filter(isRefObject);
+  const targetRefs = targetRaw.filter(isRefObject);
+
+  const metaObservations: Array<Record<string, unknown>> = [];
+  if (sourceRaw.length > 0 && sourceRefs.length === 0) {
+    metaObservations.push({ kind: 'non_object_values_filtered', side: 'source', count: sourceRaw.length });
+  }
+  if (targetRaw.length > 0 && targetRefs.length === 0) {
+    metaObservations.push({ kind: 'non_object_values_filtered', side: 'target', count: targetRaw.length });
+  }
+
+  // adcp-client#712: when the current-step target response carries
+  // pagination metadata with more pages available, the target set is
+  // incomplete and missing refs may legitimately live on later pages.
+  // Surface a meta-observation AND demote unresolved refs to
+  // observations so partial-page reads don't false-fail the check.
+  // The stricter fix (spec Option A: "compliance mode returns everything
+  // referenced by products") needs an AdCP spec change — until that
+  // lands, the runner must not penalize conformant paginating sellers.
+  const targetPaginated = target.from === 'current_step' && hasMorePages(targetRoot);
+  if (targetPaginated) {
+    metaObservations.push({ kind: 'target_paginated', side: 'target' });
+  }
+
+  const scope = validation.scope;
+  const outOfScopeMode = validation.on_out_of_scope ?? 'warn';
+  const scopeEquals = scope ? resolveScopeEquals(scope.equals, scope.key, ctx.agentUrl) : undefined;
+
+  const inScope: Array<Record<string, unknown>> = [];
+  const outOfScope: Array<Record<string, unknown>> = [];
+
+  for (const ref of sourceRefs) {
+    if (!scope) {
+      inScope.push(ref);
+      continue;
+    }
+    const refValue = ref[scope.key];
+    const normalized = normalizeIfUrlKey(refValue, scope.key);
+    if (scopeEquals !== undefined && normalized === scopeEquals) {
+      inScope.push(ref);
+    } else {
+      outOfScope.push(ref);
+    }
+  }
+
+  // adcp-client#711: catch the silent-no-op case where a scope filter
+  // excludes 100% of source refs. Independent of whether the partition
+  // is "correct" — if every ref falls out of scope, the check enforces
+  // nothing and the grader deserves to see that structural smell.
+  // Suppressed under `on_out_of_scope: 'ignore'` because that mode
+  // explicitly opts out of scope-related warnings.
+  if (scope && outOfScopeMode !== 'ignore' && sourceRefs.length > 0 && inScope.length === 0) {
+    metaObservations.push({
+      kind: 'scope_excluded_all_refs',
+      count: sourceRefs.length,
+      scope_key: scope.key,
+    });
+  }
+
+  const unresolved = dedupRefs(
+    inScope.filter(s => !targetRefs.some(t => refsMatch(s, t, matchKeys))),
+    matchKeys
+  );
+
+  // When the target was paginated and refs are unresolved, demote those
+  // refs from `missing` to `unresolved_with_pagination` observations so a
+  // conformant paginating seller passes. The meta-observation still fires.
+  const missing = targetPaginated ? [] : unresolved;
+  const paginatedUnresolved = targetPaginated ? unresolved : [];
+
+  // `fail` mode promotes out-of-scope refs into the missing set so compliance
+  // reports name them the same way they name truly broken refs.
+  const failOutOfScope = outOfScopeMode === 'fail' ? dedupRefs(outOfScope, matchKeys) : [];
+  const allMissing = [...missing, ...failOutOfScope];
+
+  const warnObservations =
+    outOfScopeMode === 'warn' && outOfScope.length > 0
+      ? dedupRefs(outOfScope, matchKeys).map(ref => ({
+          kind: 'out_of_scope_ref',
+          ref: projectRefForReport(ref, matchKeys),
+        }))
+      : [];
+  const paginatedObservations = paginatedUnresolved.map(ref => ({
+    kind: 'unresolved_with_pagination',
+    ref: projectRefForReport(ref, matchKeys),
+  }));
+
+  // adcp-client#718: when target_paginated AND at least one ref is
+  // unresolved-with-pagination, emit a neutral structural meta-observation
+  // naming the co-occurrence. A seller that unconditionally returns
+  // pagination.has_more: true masks unresolved refs via the pagination
+  // demotion (#712/#717) and passes refs_resolve cleanly; graders keying
+  // on `passed` alone wouldn't see the problem. This gives dashboards an
+  // independent signal without changing pass/fail semantics. Becomes
+  // redundant when adcp#2601's "compliance mode returns everything
+  // referenced" rule lands.
+  if (targetPaginated && paginatedUnresolved.length > 0) {
+    metaObservations.push({
+      kind: 'unresolved_hidden_by_pagination',
+      unresolved_count: paginatedUnresolved.length,
+    });
+  }
+
+  // Meta-observations precede per-ref observations so the array cap never
+  // drops the grader-signal primitives (scope_excluded_all_refs,
+  // target_paginated, unresolved_hidden_by_pagination) in favor of
+  // redundant out-of-scope entries.
+  const observations = capObservations([...metaObservations, ...paginatedObservations, ...warnObservations]);
+
+  if (allMissing.length === 0) {
+    return {
+      check: 'refs_resolve',
+      passed: true,
+      description: validation.description,
+      ...(observations && { observations }),
+    };
+  }
+
+  const preview = allMissing
+    .slice(0, 3)
+    .map(r => JSON.stringify(projectRefForReport(r, matchKeys)))
+    .join(', ');
+  const errorMsg =
+    allMissing.length > 3
+      ? `${allMissing.length} ref(s) did not resolve; first 3: ${preview}`
+      : `${allMissing.length} ref(s) did not resolve: ${preview}`;
+
+  return {
+    check: 'refs_resolve',
+    passed: false,
+    description: validation.description,
+    path: source.path,
+    error: errorMsg,
+    json_pointer: null,
+    expected: `every source ref resolves to a target ref matched on [${matchKeys.join(', ')}]`,
+    actual: {
+      missing: allMissing.map(r => projectRefForReport(r, matchKeys)),
+      ...(failOutOfScope.length > 0 && {
+        out_of_scope_failed: failOutOfScope.map(r => projectRefForReport(r, matchKeys)),
+      }),
+    },
+    ...(observations && { observations }),
+  };
+}
+
+/**
+ * Detect whether the response at `root` advertises additional pages.
+ * Accepts the AdCP-standard `pagination.has_more` flag; conservative
+ * otherwise (false on non-objects, missing fields, or unparseable shapes).
+ */
+function hasMorePages(root: unknown): boolean {
+  if (!root || typeof root !== 'object' || Array.isArray(root)) return false;
+  const pagination = (root as Record<string, unknown>).pagination;
+  if (!pagination || typeof pagination !== 'object' || Array.isArray(pagination)) return false;
+  return (pagination as Record<string, unknown>).has_more === true;
+}
+
+function resolveRefsRoot(from: 'current_step' | 'context', ctx: ValidationContext): unknown {
+  if (from === 'context') return ctx.storyboardContext ?? {};
+  if (ctx.taskResult) return ctx.taskResult.data;
+  if (ctx.httpResult) return ctx.httpResult.body;
+  return undefined;
+}
+
+function resolveScopeEquals(equals: string, key: string, agentUrl: string): string {
+  const raw = equals === '$agent_url' ? agentUrl : equals;
+  return key.toLowerCase().endsWith('url') ? canonicalizeAgentUrlForScope(raw) : raw;
+}
+
+function normalizeIfUrlKey(value: unknown, key: string): unknown {
+  return typeof value === 'string' && key.toLowerCase().endsWith('url') ? canonicalizeAgentUrlForScope(value) : value;
+}
+
+function isRefObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function refsMatch(a: Record<string, unknown>, b: Record<string, unknown>, keys: string[]): boolean {
+  for (const key of keys) {
+    // Own-property only: a storyboard author supplying `match_keys: ['constructor']`
+    // must not match every object via prototype chain.
+    if (!Object.prototype.hasOwnProperty.call(a, key) || !Object.prototype.hasOwnProperty.call(b, key)) {
+      return false;
+    }
+    const av = a[key];
+    const bv = b[key];
+    // Missing match-key on either side is NOT a match — agents that omit a
+    // key shouldn't fuzzy-match other agents that also happen to omit it.
+    if (av === undefined || bv === undefined) return false;
+    // URL-ish fields get trailing-slash / case normalization so declared
+    // and probed URLs compare equal even when one side includes a trailing
+    // "/". `format_id` fields are exact-compare.
+    const normA = normalizeIfUrlKey(av, key);
+    const normB = normalizeIfUrlKey(bv, key);
+    if (normA !== normB) return false;
+  }
+  return true;
+}
+
+function projectRef(ref: Record<string, unknown>, keys: string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(ref, key)) out[key] = ref[key];
+  }
+  return out;
+}
+
+// Observation hygiene caps (adcp-client#714). Compliance reports may be
+// published or forwarded to third parties, so every ref field emitted in
+// observations / actual.missing is length-bounded and URL fields have
+// credentials scrubbed before they leave the runner.
+const REF_FIELD_MAX_LEN = 512;
+const MAX_OBSERVATIONS = 50;
+
+/**
+ * Projection of a ref intended for grader-visible output (observations,
+ * `actual.missing`). Strips userinfo from URL fields, caps string length,
+ * and passes non-string values through untouched. Kept distinct from the
+ * internal `projectRef` because dedup relies on stable JSON projection —
+ * truncating strings would false-collapse refs that differ only in their
+ * truncated suffix.
+ */
+function projectRefForReport(ref: Record<string, unknown>, keys: string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(ref, key)) continue;
+    const v = ref[key];
+    if (typeof v === 'string') {
+      out[key] = sanitizeFieldString(v, key.toLowerCase().endsWith('url'));
+    } else {
+      out[key] = v;
+    }
+  }
+  return out;
+}
+
+// Regex fallback that scrubs `scheme://user:pass@host` credential shapes
+// in free-text fields — covers cases where `new URL()` can't parse the value
+// (partial URL, extra prose, trailing whitespace) but a user:pass@ substring
+// still leaks credentials to grader reports.
+const CREDENTIAL_SHAPE_RE = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/\s@]+@/g;
+
+function sanitizeFieldString(value: string, isUrlField: boolean): string {
+  // Truncate first so a multi-MB hostile string doesn't force URL parsing
+  // over the whole payload. Truncation uses code points so surrogate pairs
+  // aren't cleaved into invalid UTF-16 strings.
+  let out = value;
+  if (out.length > REF_FIELD_MAX_LEN) {
+    out =
+      Array.from(out)
+        .slice(0, REF_FIELD_MAX_LEN - 1)
+        .join('') + '…';
+  }
+  if (isUrlField) {
+    try {
+      const u = new URL(out);
+      // Reject dangerous schemes in URL-keyed fields: downstream compliance
+      // UIs that render `agent_url` as a clickable link otherwise inherit
+      // `javascript:` / `data:` / `file:` as a stored-XSS vector.
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+        return `<non-http scheme: ${u.protocol.replace(/[^a-z+.-]/gi, '')}>`;
+      }
+      if (u.username || u.password) {
+        u.username = '';
+        u.password = '';
+        out = u.toString();
+      }
+    } catch {
+      // Not a parseable URL — fall through to the regex scrub below.
+    }
+  }
+  // Belt-and-suspenders: strip any remaining `scheme://user:pass@` shapes,
+  // whether or not the field is URL-keyed. A hostile agent may plant
+  // credential-shaped substrings inside an `id` or a non-URL ref field.
+  out = out.replace(CREDENTIAL_SHAPE_RE, '$1');
+  return out;
+}
+
+function capObservations(observations: Array<Record<string, unknown>>): Array<Record<string, unknown>> | undefined {
+  if (observations.length === 0) return undefined;
+  if (observations.length <= MAX_OBSERVATIONS) return observations;
+  const kept = observations.slice(0, MAX_OBSERVATIONS - 1);
+  kept.push({ kind: 'observations_truncated', dropped: observations.length - kept.length });
+  return kept;
+}
+
+/**
+ * Deduplicate refs by their projected match-key tuple so a single broken
+ * reference in a 50-product response doesn't show up 50× in `actual.missing`.
+ */
+function dedupRefs(refs: Array<Record<string, unknown>>, keys: string[]): Array<Record<string, unknown>> {
+  const seen = new Map<string, Record<string, unknown>>();
+  for (const ref of refs) {
+    const k = JSON.stringify(projectRef(ref, keys));
+    if (!seen.has(k)) seen.set(k, ref);
+  }
+  return Array.from(seen.values());
+}
+
+// ────────────────────────────────────────────────────────────
+// Numeric comparison + cross-step value checks
+//
+// field_less_than (strict <), field_at_most (≤), field_at_least (≥),
+// and field_equals_context (deep-equals) all read their comparand
+// from `ctx.storyboardContext` — the accumulator populated by
+// `context_outputs` rules across step boundaries — and fall back
+// to the literal `value` field when no `context_key` is set. The
+// precedent for context resolution is refs_resolve's
+// `resolveRefsRoot('context', ctx)` path. The three numeric checks
+// share `validateNumericComparison`; field_equals_context has its
+// own path because its operands aren't required to be numeric.
+// Added for adcp#2642 (less_than, equals_context) and
+// adcp-client#1839 (at_most, at_least).
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Resolve the comparand for a cross-step check from the storyboard context.
+ *
+ * Returns `{ found: true, value }` when the context key is set and present,
+ * `{ found: false, observation }` when context_key is set but absent (the
+ * prior step may have been skipped on a branch-set path — not an error),
+ * and `{ found: true, value: validation.value }` when no context_key is
+ * given (fall back to literal comparand).
+ */
+function resolveContextComparand(
+  validation: StoryboardValidation,
+  ctx: ValidationContext
+): { found: true; value: unknown } | { found: false; observation: string } {
+  if (!validation.context_key) {
+    return { found: true, value: validation.value };
+  }
+  if (!ctx.storyboardContext) {
+    return {
+      found: false,
+      observation: `context_key_absent: storyboardContext not available for key "${validation.context_key}"`,
+    };
+  }
+  const ctxValue = ctx.storyboardContext[validation.context_key];
+  if (!(validation.context_key in ctx.storyboardContext) || ctxValue === undefined) {
+    return {
+      found: false,
+      observation: `context_key_absent: key "${validation.context_key}" not found in storyboard context (prior step may have been skipped)`,
+    };
+  }
+  return { found: true, value: ctxValue };
+}
+
+interface NumericOp {
+  /** Check name surfaced in result.check and error prose. */
+  check: 'field_less_than' | 'field_greater_than' | 'field_at_most' | 'field_at_least';
+  /** Human-readable operator (`<`, `>`, `<=`, `>=`) used in error messages. */
+  symbol: string;
+  /** Comparator returning true when `actual` satisfies the assertion vs `comparand`. */
+  compare: (actual: number, comparand: number) => boolean;
+}
+
+const NUMERIC_OPS = {
+  less_than: { check: 'field_less_than', symbol: '<', compare: (a, c) => a < c },
+  greater_than: { check: 'field_greater_than', symbol: '>', compare: (a, c) => a > c },
+  at_most: { check: 'field_at_most', symbol: '<=', compare: (a, c) => a <= c },
+  at_least: { check: 'field_at_least', symbol: '>=', compare: (a, c) => a >= c },
+} as const satisfies Record<string, NumericOp>;
+
+function validateNumericComparison(
+  validation: StoryboardValidation,
+  ctx: ValidationContext,
+  op: NumericOp
+): ValidationResult {
+  if (!validation.path) {
+    return {
+      check: op.check,
+      passed: false,
+      description: validation.description,
+      error: `No path specified for ${op.check} validation`,
+      json_pointer: null,
+      expected: 'path must be set in storyboard validation entry',
+      actual: null,
+    };
+  }
+
+  const comparandResult = resolveContextComparand(validation, ctx);
+  if (!comparandResult.found) {
+    return {
+      check: op.check,
+      passed: true,
+      description: validation.description,
+      observations: [comparandResult.observation],
+    };
+  }
+
+  const actual = resolvePath(resolveTarget(ctx).data, validation.path);
+  const comparand = comparandResult.value;
+  const pointer = toJsonPointer(validation.path);
+
+  if (actual === undefined || actual === null) {
+    return {
+      check: op.check,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `Field not found at path: ${validation.path}`,
+      json_pointer: pointer,
+      expected: `numeric value ${op.symbol} ${JSON.stringify(comparand)}`,
+      actual: null,
+    };
+  }
+  if (typeof actual !== 'number' || !Number.isFinite(actual)) {
+    return {
+      check: op.check,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `${op.check} requires a finite number at path "${validation.path}"; got ${typeof actual} ${JSON.stringify(actual)}`,
+      json_pointer: pointer,
+      expected: `finite number ${op.symbol} ${JSON.stringify(comparand)}`,
+      actual: actual ?? null,
+    };
+  }
+  if (typeof comparand !== 'number' || !Number.isFinite(comparand)) {
+    return {
+      check: op.check,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `${op.check} comparand must be a finite number; got ${typeof comparand} ${JSON.stringify(comparand)}`,
+      json_pointer: pointer,
+      expected: `finite number (comparand)`,
+      actual: actual,
+    };
+  }
+
+  if (op.compare(actual, comparand)) {
+    return {
+      check: op.check,
+      passed: true,
+      description: validation.description,
+      path: validation.path,
+      json_pointer: pointer,
+    };
+  }
+  return {
+    check: op.check,
+    passed: false,
+    description: validation.description,
+    path: validation.path,
+    error: `Expected ${JSON.stringify(actual)} ${op.symbol} ${JSON.stringify(comparand)}`,
+    json_pointer: pointer,
+    expected: `${op.symbol} ${JSON.stringify(comparand)}`,
+    actual,
+  };
+}
+
+function validateFieldEqualsContext(validation: StoryboardValidation, ctx: ValidationContext): ValidationResult {
+  if (!validation.path) {
+    return {
+      check: 'field_equals_context',
+      passed: false,
+      description: validation.description,
+      error: 'No path specified for field_equals_context validation',
+      json_pointer: null,
+      expected: 'path must be set in storyboard validation entry',
+      actual: null,
+    };
+  }
+  if (!validation.context_key) {
+    return {
+      check: 'field_equals_context',
+      passed: false,
+      description: validation.description,
+      error: 'field_equals_context requires context_key to be set',
+      json_pointer: null,
+      expected: 'context_key must be set in storyboard validation entry',
+      actual: null,
+    };
+  }
+
+  const comparandResult = resolveContextComparand(validation, ctx);
+  if (!comparandResult.found) {
+    return {
+      check: 'field_equals_context',
+      passed: true,
+      description: validation.description,
+      observations: [comparandResult.observation],
+    };
+  }
+
+  const actual = resolvePath(resolveTarget(ctx).data, validation.path);
+  const expected = comparandResult.value;
+  const pointer = toJsonPointer(validation.path);
+
+  const passed = valuesMatch(actual, expected, comparisonKeyFromPath(validation.path));
+  if (passed) {
+    return {
+      check: 'field_equals_context',
+      passed: true,
+      description: validation.description,
+      path: validation.path,
+      json_pointer: pointer,
+    };
+  }
+  return {
+    check: 'field_equals_context',
+    passed: false,
+    description: validation.description,
+    path: validation.path,
+    error: `Expected ${JSON.stringify(expected)} (from context["${validation.context_key}"]); got ${JSON.stringify(actual ?? null)}`,
+    json_pointer: pointer,
+    expected,
+    actual: actual ?? null,
+  };
+}
+
+/**
+ * Namespace-aware collection set equality.
+ *
+ * Grouping and ordering are normalized away; publisher namespaces are not.
+ * Unlike the branch-safe `field_equals_context` family this check treats a
+ * missing `context_key` as a setup failure, because a mandatory set
+ * comparison that passes when its expected state was never captured
+ * certifies the exact substitution it exists to detect.
+ */
+function validateCollectionSetEqualsContext(
+  validation: StoryboardValidation,
+  ctx: ValidationContext
+): ValidationResult {
+  const check = 'collection_set_equals_context';
+  // `schema_id` / `schema_url` are required_on_failure for every check and
+  // MUST be null outside `response_schema`. Carried on the shared base so
+  // no arm of this validator can forget them.
+  const base = {
+    check,
+    description: validation.description,
+    ...(validation.context_key !== undefined && { context_key: validation.context_key }),
+    schema_id: null,
+    schema_url: null,
+  } as const;
+  if (!validation.path) {
+    return {
+      ...base,
+      passed: false,
+      error:
+        'collection_set_equals_context is missing "path" — set it to the response array of CollectionSelector objects to compare, e.g. packages[0].targeting_overlay.collection_selection.collections',
+      json_pointer: null,
+      expected: 'a response path pointing at a CollectionSelector[]',
+      actual: null,
+    };
+  }
+  if (!validation.context_key) {
+    return {
+      ...base,
+      passed: false,
+      error:
+        'collection_set_equals_context is missing "context_key" — set it to the __adcp_fixture_* key captured by the fixture declaration whose selection this step reads back, e.g. __adcp_fixture_subset',
+      json_pointer: null,
+      expected: 'a reserved fixture capture key holding the expected selector array',
+      actual: null,
+    };
+  }
+  const pointer = toJsonPointer(validation.path);
+  const storyboardContext = ctx.storyboardContext;
+  // Own-key, not `in`: this is the one validator whose purpose is to refuse
+  // when the expected set was never captured, so a prototype-chain read is
+  // exactly the wrong lookup here.
+  if (!storyboardContext || !Object.hasOwn(storyboardContext, validation.context_key)) {
+    return {
+      ...base,
+      passed: false,
+      path: validation.path,
+      error:
+        `expected_context_absent: context key "${validation.context_key}" was never published, so there is no expected set to compare against. ` +
+        `Declare it as a capture on the fixture_resolution entry that pins this product — ` +
+        `context_outputs: [{ key: ${validation.context_key}, witness: strict_subset }] — and confirm the whole fixture ` +
+        `graph resolved (captures publish all-or-nothing). Unlike field_equals_context, this check FAILS rather than ` +
+        `skipping on a missing key: silently passing would certify exactly the substitution it exists to catch.`,
+      json_pointer: pointer,
+      expected: `context["${validation.context_key}"]`,
+      actual: null,
+    };
+  }
+  const expectedRaw = storyboardContext[validation.context_key];
+  // `distinct_pairs` is a DIAGNOSTIC shape, not a wire shape: its entries
+  // carry singular `collection_id`, not `collection_ids`. The normalizer
+  // reads a missing `collection_ids` as a domain-only bulk grant, so the
+  // expected set silently becomes `"d":*` and the diff reads
+  // `missing "d":*; unexpected "d":"x"` — the exact "an id flattened away
+  // from its domain" failure this module exists to prevent, reintroduced
+  // through one of its own witnesses. Name it instead of diffing it.
+  if (
+    Array.isArray(expectedRaw) &&
+    expectedRaw.length > 0 &&
+    expectedRaw.every(
+      entry => entry !== null && typeof entry === 'object' && 'collection_id' in entry && !('collection_ids' in entry)
+    )
+  ) {
+    return {
+      ...base,
+      passed: false,
+      path: validation.path,
+      error:
+        `expected_context_malformed: context["${validation.context_key}"] looks like a \`distinct_pairs\` witness, ` +
+        `which is a diagnostic shape carrying singular \`collection_id\` — not the \`collection_ids\` arrays the wire ` +
+        `and this check compare. Capture \`witness: declared_selectors\` (every selector the product declared) or ` +
+        `\`witness: strict_subset\` (a proper subset of them) instead.`,
+      json_pointer: pointer,
+      expected: 'an array of { publisher_domain, collection_ids } selectors',
+      actual: 'distinct_pairs_witness',
+    };
+  }
+  const expected = normalizeCollectionSelectors(expectedRaw);
+  if (!expected.ok) {
+    return {
+      ...base,
+      passed: false,
+      path: validation.path,
+      error: `expected_context_malformed: context["${validation.context_key}"] is not a usable collection selector array — ${expected.failure.detail}`,
+      json_pointer: pointer,
+      expected: 'an array of { publisher_domain, collection_ids } selectors',
+      actual: null,
+    };
+  }
+  const actualRaw = resolvePath(resolveTarget(ctx).data, validation.path);
+  const actual = normalizeCollectionSelectors(actualRaw);
+  if (!actual.ok) {
+    return {
+      ...base,
+      passed: false,
+      path: validation.path,
+      error: `actual_collections_malformed: ${actual.failure.detail}`,
+      json_pointer: pointer,
+      expected: 'an array of { publisher_domain, collection_ids } selectors',
+      actual: actualRaw ?? null,
+    };
+  }
+  const diff = diffCollectionPairSets(actual.value.pairs, expected.value.pairs);
+  if (diff.equal) {
+    return { ...base, passed: true, path: validation.path, json_pointer: pointer };
+  }
+  const parts: string[] = [];
+  if (diff.missing.length > 0) parts.push(`missing ${summarizeCollectionPairs(diff.missing)}`);
+  if (diff.unexpected.length > 0) parts.push(`unexpected ${summarizeCollectionPairs(diff.unexpected)}`);
+  return {
+    ...base,
+    passed: false,
+    path: validation.path,
+    error: `collection sets differ: ${parts.join('; ')}`,
+    json_pointer: pointer,
+    expected: expected.value.pairs,
+    actual: actual.value.pairs,
+  };
+}
+
+function validateFieldInContextArray(validation: StoryboardValidation, ctx: ValidationContext): ValidationResult {
+  if (!validation.path) {
+    return {
+      check: 'field_in_context_array',
+      passed: false,
+      description: validation.description,
+      error: 'No path specified for field_in_context_array validation',
+      json_pointer: null,
+      expected: 'path must be set in storyboard validation entry',
+      actual: null,
+    };
+  }
+  if (!validation.context_key) {
+    return {
+      check: 'field_in_context_array',
+      passed: false,
+      description: validation.description,
+      error: 'field_in_context_array requires context_key to be set',
+      json_pointer: null,
+      expected: 'context_key must be set in storyboard validation entry',
+      actual: null,
+    };
+  }
+
+  const comparandResult = resolveContextComparand(validation, ctx);
+  if (!comparandResult.found) {
+    return {
+      check: 'field_in_context_array',
+      passed: true,
+      description: validation.description,
+      observations: [comparandResult.observation],
+    };
+  }
+
+  const allowed = comparandResult.value;
+  const actual = resolvePath(resolveTarget(ctx).data, validation.path);
+  const pointer = toJsonPointer(validation.path);
+  if (!Array.isArray(allowed)) {
+    return {
+      check: 'field_in_context_array',
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `Expected context["${validation.context_key}"] to be an array; got ${JSON.stringify(allowed)}`,
+      json_pointer: pointer,
+      expected: 'context value must be an array',
+      actual: allowed,
+    };
+  }
+
+  const comparisonKey = comparisonKeyFromPath(validation.path);
+  if (allowed.some(candidate => valuesMatch(actual, candidate, comparisonKey))) {
+    return {
+      check: 'field_in_context_array',
+      passed: true,
+      description: validation.description,
+      path: validation.path,
+      json_pointer: pointer,
+    };
+  }
+  return {
+    check: 'field_in_context_array',
+    passed: false,
+    description: validation.description,
+    path: validation.path,
+    error: `Expected ${JSON.stringify(actual ?? null)} to be a member of context["${validation.context_key}"] (${JSON.stringify(allowed)})`,
+    json_pointer: pointer,
+    expected: allowed,
+    actual: actual ?? null,
+  };
+}
+
+function validateAllFieldsInContextArray(validation: StoryboardValidation, ctx: ValidationContext): ValidationResult {
+  const check = 'all_fields_in_context_array';
+  if (!validation.path) {
+    return {
+      check,
+      passed: false,
+      description: validation.description,
+      error: `No path specified for ${check} validation`,
+      json_pointer: null,
+      expected: 'path must be set in storyboard validation entry',
+      actual: null,
+    };
+  }
+  if (!validation.context_key) {
+    return {
+      check,
+      passed: false,
+      description: validation.description,
+      error: `${check} requires context_key to be set`,
+      json_pointer: null,
+      expected: 'context_key must be set in storyboard validation entry',
+      actual: null,
+    };
+  }
+
+  const comparandResult = resolveContextComparand(validation, ctx);
+  if (!comparandResult.found) {
+    return {
+      check,
+      passed: true,
+      description: validation.description,
+      observations: [comparandResult.observation],
+    };
+  }
+
+  const allowed = comparandResult.value;
+  const actual = resolvePathAll(resolveTarget(ctx).data, validation.path);
+  const pointer = toJsonPointer(validation.path);
+  if (!Array.isArray(allowed)) {
+    return {
+      check,
+      passed: false,
+      description: validation.description,
+      path: validation.path,
+      error: `Expected context["${validation.context_key}"] to be an array; got ${JSON.stringify(allowed)}`,
+      json_pointer: pointer,
+      expected: 'context value must be an array',
+      actual: allowed,
+    };
+  }
+
+  const comparisonKey = comparisonKeyFromPath(validation.path);
+  const passed = actual.every(value => allowed.some(candidate => deepEqualJsonValue(value, candidate, comparisonKey)));
+  if (passed) {
+    return {
+      check,
+      passed: true,
+      description: validation.description,
+      path: validation.path,
+      json_pointer: pointer,
+    };
+  }
+  return {
+    check,
+    passed: false,
+    description: validation.description,
+    path: validation.path,
+    error: `Expected every value at ${validation.path} to be a member of context["${validation.context_key}"]`,
+    json_pointer: pointer,
+    expected: allowed,
+    actual,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// upstream_traffic — anti-façade side-effect assertion
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Authored check that asserts side-effects against the adopter's
+ * `comply_test_controller`'s `query_upstream_traffic` scenario.
+ *
+ * Adopters who do not advertise `query_upstream_traffic` in
+ * `list_scenarios` opt out — every `upstream_traffic` validation grades
+ * `not_applicable`. Adopters who advertise it but return zero recorded
+ * calls in the assertion window grade `failed` (the façade signal).
+ *
+ * The runner pre-fetches the controller's response per
+ * `since_timestamp` window and stashes it on `ctx.upstreamTraffic` so
+ * this synchronous dispatcher can grade without itself making controller
+ * calls. Per runner-output-contract.yaml v2.0.0, `request` / `response`
+ * on the validation_result point to the CONTROLLER call, not the
+ * storyboard step's AdCP request.
+ */
+function validateUpstreamTraffic(validation: StoryboardValidation, ctx: ValidationContext): ValidationResult {
+  const expected = buildUpstreamTrafficExpected(validation);
+  const invalidIdentifierPaths = collectInvalidIdentifierPaths(validation.identifier_paths);
+  if (invalidIdentifierPaths.length > 0) {
+    return {
+      check: 'upstream_traffic',
+      passed: false,
+      description: validation.description,
+      error:
+        'storyboard authoring error: invalid upstream_traffic.identifier_paths: ' +
+        invalidIdentifierPaths.map(issue => `${issue.path} (${issue.reason})`).join('; '),
+      json_pointer: null,
+      expected,
+      actual: {
+        matched_count: 0,
+        total_calls: 0,
+        missing_payload_paths: [],
+        missing_identifier_values: [],
+        invalid_identifier_paths: invalidIdentifierPaths,
+      },
+      schema_id: null,
+      schema_url: null,
+    };
+  }
+
+  const upstream = ctx.upstreamTraffic;
+  // Adopter opted out (or controller wasn't detected): grade not_applicable.
+  // missing_test_controller controller-side, not failed — opt-in by adopter
+  // capability per the spec.
+  if (!upstream || !upstream.advertised) {
+    return {
+      check: 'upstream_traffic',
+      passed: true,
+      not_applicable: true,
+      description: validation.description,
+      note: 'adopter did not advertise query_upstream_traffic in list_scenarios — graded as not_applicable',
+      json_pointer: null,
+      expected,
+      actual: null,
+      schema_id: null,
+      schema_url: null,
+    };
+  }
+
+  // A `since: prior_step_id` reference that didn't resolve to any recorded
+  // prior step is a storyboard authoring bug — fail loudly rather than
+  // silently widen to this step's window (which would let misspelled refs
+  // pass vacuously).
+  if (validation.since && upstream.unresolvedSinceRefs?.has(validation.since)) {
+    return {
+      check: 'upstream_traffic',
+      passed: false,
+      description: validation.description,
+      error: `since: "${validation.since}" did not resolve to any prior step's recorded request timestamp.`,
+      json_pointer: null,
+      expected,
+      actual: null,
+      schema_id: null,
+      schema_url: null,
+    };
+  }
+
+  const sinceKey = upstream.priorStepSinceMap?.get(validation.since ?? '') ?? upstream.thisStepSince;
+  const query = upstream.queries.get(sinceKey);
+  if (!query) {
+    return {
+      check: 'upstream_traffic',
+      passed: false,
+      description: validation.description,
+      error: `Runner did not pre-fetch query_upstream_traffic for since_timestamp=${sinceKey}.`,
+      json_pointer: null,
+      expected,
+      actual: null,
+      schema_id: null,
+      schema_url: null,
+    };
+  }
+
+  // Controller call itself errored (transport or controller-side fault).
+  // Surface the error rather than treating an empty result as "no traffic".
+  // Truncate the agent-controlled error string to match the runner's
+  // `MAX_ERROR_LENGTH` posture on every other validation_result.error.
+  if (!('success' in query.payload) || query.payload.success !== true) {
+    const errMsg = 'error' in query.payload ? query.payload.error : 'controller returned a non-success response';
+    if ('error_kind' in query.payload && query.payload.error_kind === 'jcs_non_finite') {
+      return {
+        check: 'upstream_traffic',
+        passed: true,
+        not_applicable: true,
+        description: validation.description,
+        note: 'digest attestation could not canonicalize a non-finite JSON number - graded not_applicable',
+        json_pointer: null,
+        expected,
+        actual: { matched_count: 0, total_calls: 0, missing_payload_paths: [], missing_identifier_values: [] },
+        schema_id: null,
+        schema_url: null,
+        request: query.request,
+        response: query.response,
+      };
+    }
+    return {
+      check: 'upstream_traffic',
+      passed: false,
+      description: validation.description,
+      error: truncateValidationError(`query_upstream_traffic failed: ${errMsg}`),
+      json_pointer: null,
+      expected,
+      actual: { matched_count: 0, total_calls: 0, missing_payload_paths: [], missing_identifier_values: [] },
+      schema_id: null,
+      schema_url: null,
+      request: query.request,
+      response: query.response,
+    };
+  }
+
+  const all = query.payload.recorded_calls ?? [];
+  const totalCalls = all.length;
+  const matched = filterByEndpointPattern(all, validation.endpoint_pattern);
+  const matchedCount = matched.length;
+  const minCount = validation.min_count ?? 1;
+
+  // payload_must_contain results bucket two ways: paths that no matched
+  // call satisfied despite inspectable raw JSON evidence (failure), and
+  // paths with no portable payload evidence to inspect (`not_applicable`).
+  // Any actionable raw JSON miss keeps the validation failed; otherwise any
+  // not_applicable path downgrades the validation from pass to not_applicable.
+  const missingPayloadPaths: string[] = [];
+  const notApplicablePaths: string[] = [];
+  if (validation.payload_must_contain && validation.payload_must_contain.length > 0) {
+    for (const spec of validation.payload_must_contain) {
+      const result = anyMatchedCallSatisfies(matched, spec);
+      if (result.satisfied) continue;
+      if (result.not_applicable) {
+        notApplicablePaths.push(spec.path);
+      } else {
+        missingPayloadPaths.push(spec.path);
+      }
+    }
+  }
+
+  // identifier_paths: extract every value at each declared path against the
+  // storyboard's sample_request (author-controlled vectors), then assert each
+  // resolved value appears at any depth in some matched call's payload. Spec
+  // is explicit: ALL resolved values must be present — single-placeholder
+  // fabrication is the threat. Replaces the earlier `buyer_identifier_echo`
+  // boolean shorthand per spec PR adcp#3816.
+  const missingIdentifierValues: unknown[] = [];
+  const notApplicableIdentifierValues: unknown[] = [];
+  if (validation.identifier_paths && validation.identifier_paths.length > 0) {
+    const requestPayload = ctx.request?.payload;
+    const sample =
+      requestPayload && typeof requestPayload === 'object' && !Array.isArray(requestPayload)
+        ? (requestPayload as Record<string, unknown>)
+        : ctx.storyboardStep?.sample_request;
+    for (const path of validation.identifier_paths) {
+      const vectors = sample !== undefined ? resolvePortableIdentifierPathAll(sample, path) : [];
+      for (const vector of vectors) {
+        if (vector === undefined || vector === null) continue;
+        const digest = typeof vector === 'string' ? upstream.identifierDigestByValue?.get(vector) : undefined;
+        const result = anyMatchedCallEchoesValue(matched, vector, digest);
+        if (result.satisfied) continue;
+        if (result.not_applicable) {
+          notApplicableIdentifierValues.push(vector);
+        } else {
+          missingIdentifierValues.push(vector);
+        }
+      }
+    }
+  }
+
+  const hasRawIntrospectionAssertions =
+    (validation.payload_must_contain?.length ?? 0) > 0 || (validation.identifier_paths?.length ?? 0) > 0;
+  const rawRequiredDigestDowngrade =
+    validation.attestation_mode_required === 'raw' &&
+    hasRawIntrospectionAssertions &&
+    matched.length > 0 &&
+    matched.every(call => call.attestation_mode === 'digest');
+
+  if (rawRequiredDigestDowngrade) {
+    missingPayloadPaths.length = 0;
+    missingIdentifierValues.length = 0;
+  }
+
+  const countOk = minCount === 0 ? matchedCount === 0 : matchedCount >= minCount;
+  const payloadOk = missingPayloadPaths.length === 0;
+  const echoOk = missingIdentifierValues.length === 0;
+  const passed = countOk && (rawRequiredDigestDowngrade || (payloadOk && echoOk));
+
+  // Per spec: a payload_must_contain assertion whose only available evidence
+  // is not portable to inspect grades not_applicable. When any required path
+  // lands in that bucket (and count + echo passed with no actionable payload
+  // misses), the whole validation grades not_applicable rather than passed.
+  const anyPayloadNotApplicable =
+    (validation.payload_must_contain?.length ?? 0) > 0 &&
+    notApplicablePaths.length > 0 &&
+    missingPayloadPaths.length === 0;
+  const hasMeaningfulPayloadPass =
+    (validation.payload_must_contain?.length ?? 0) > 0 && payloadOk && !anyPayloadNotApplicable;
+  const allIdentifiersNotApplicable =
+    (validation.identifier_paths?.length ?? 0) > 0 &&
+    missingIdentifierValues.length === 0 &&
+    notApplicableIdentifierValues.length > 0;
+  const not_applicable =
+    passed &&
+    countOk &&
+    (rawRequiredDigestDowngrade ||
+      anyPayloadNotApplicable ||
+      (allIdentifiersNotApplicable && !hasMeaningfulPayloadPass));
+
+  const actual = {
+    matched_count: matchedCount,
+    total_calls: totalCalls,
+    missing_payload_paths: missingPayloadPaths,
+    missing_identifier_values: missingIdentifierValues,
+    not_applicable_payload_paths: notApplicablePaths,
+    not_applicable_identifier_values: notApplicableIdentifierValues,
+    ...(upstream.identifierDigestLimitExceeded && {
+      identifier_digest_limit_exceeded: upstream.identifierDigestLimitExceeded,
+    }),
+  };
+
+  // RFC 6901 pointer: when one specific call's payload failed
+  // payload_must_contain, point at that call's payload; null when the
+  // failure is a count mismatch or no specific call is implicated.
+  let jsonPointer: string | null = null;
+  if (!payloadOk && matched.length > 0) {
+    const actionableMiss = matched.find(
+      call => call.attestation_mode === 'raw' && isJsonContentType(call.content_type)
+    );
+    const idx = all.indexOf(actionableMiss ?? matched[0]!);
+    if (idx >= 0) jsonPointer = `/recorded_calls/${idx}/payload`;
+  }
+
+  if (passed) {
+    return {
+      check: 'upstream_traffic',
+      passed: true,
+      ...(not_applicable && { not_applicable: true }),
+      ...(not_applicable && {
+        note: rawRequiredDigestDowngrade
+          ? `attestation_mode_required: raw but controller returned digest attestations — graded not_applicable`
+          : allIdentifiersNotApplicable
+            ? upstream.identifierDigestLimitExceeded
+              ? `identifier_paths exceeded the runner digest buffer; recorder buffer capped at ${upstream.identifierDigestLimitExceeded.limit} unique digests with ${upstream.identifierDigestLimitExceeded.clipped} overflow value(s) clipped — graded not_applicable`
+              : `identifier_paths only matched digest attestations without portable proofs — graded not_applicable`
+            : `payload_must_contain paths could not be fully inspected in raw JSON attestations — graded not_applicable`,
+      }),
+      description: validation.description,
+      json_pointer: null,
+      expected,
+      actual,
+      schema_id: null,
+      schema_url: null,
+    };
+  }
+
+  const errParts: string[] = [];
+  if (!countOk) {
+    errParts.push(
+      minCount === 0
+        ? `expected zero matching call(s); observed ${matchedCount}`
+        : `expected at least ${minCount} matching call(s); observed ${matchedCount}`
+    );
+  }
+  if (!payloadOk) errParts.push(`missing payload paths: ${missingPayloadPaths.join(', ')}`);
+  if (!echoOk)
+    errParts.push(`identifier values not echoed: ${missingIdentifierValues.map(v => JSON.stringify(v)).join(', ')}`);
+
+  return {
+    check: 'upstream_traffic',
+    passed: false,
+    description: validation.description,
+    error: errParts.join('; '),
+    json_pointer: jsonPointer,
+    expected,
+    actual,
+    schema_id: null,
+    schema_url: null,
+    request: query.request,
+    response: query.response,
+  };
+}
+
+function collectInvalidIdentifierPaths(paths: string[] | undefined): PortableIdentifierPathIssue[] {
+  const invalid: PortableIdentifierPathIssue[] = [];
+  for (const path of paths ?? []) {
+    const reason = validatePortableIdentifierPath(path);
+    if (reason) invalid.push({ path, reason });
+  }
+  return invalid;
+}
+
+/**
+ * Cap on agent / controller-controlled error strings inlined into a
+ * `validation_result.error` field. Mirrors the runner's `MAX_ERROR_LENGTH`
+ * posture so a hostile or buggy controller can't bloat the compliance
+ * report (or LLM context window) by returning a megabyte error message.
+ */
+const VALIDATION_ERROR_MAX_LENGTH = 2000;
+
+function truncateValidationError(s: string): string {
+  return s.length > VALIDATION_ERROR_MAX_LENGTH ? s.slice(0, VALIDATION_ERROR_MAX_LENGTH) + '...[truncated]' : s;
+}
+
+function buildUpstreamTrafficExpected(validation: StoryboardValidation): Record<string, unknown> {
+  const expected: Record<string, unknown> = {};
+  if (validation.min_count !== undefined) expected.min_count = validation.min_count;
+  else expected.min_count = 1;
+  if (validation.endpoint_pattern !== undefined) expected.endpoint_pattern = validation.endpoint_pattern;
+  if (validation.payload_must_contain !== undefined) expected.payload_must_contain = validation.payload_must_contain;
+  if (validation.attestation_mode_required !== undefined) {
+    expected.attestation_mode_required = validation.attestation_mode_required;
+  }
+  if (validation.preferred_attestation_mode !== undefined) {
+    expected.preferred_attestation_mode = validation.preferred_attestation_mode;
+  }
+  if (validation.identifier_paths !== undefined) expected.identifier_paths = validation.identifier_paths;
+  return expected;
+}
+
+/**
+ * Filter `recorded_calls` by an `endpoint_pattern` glob. The pattern is
+ * matched against `recorded_calls[].endpoint` (`<METHOD> <URL>`). `*`
+ * expands to any-character-run; other regex metacharacters are escaped
+ * literally. Returns the input unchanged when no pattern is set.
+ */
+function filterByEndpointPattern(calls: RecordedCall[], pattern: string | undefined): RecordedCall[] {
+  if (!pattern) return calls;
+  const re = globToRegExp(pattern);
+  return calls.filter(c => re.test(c.endpoint));
+}
+
+/**
+ * Returns whether at least one matched call's payload satisfies the
+ * `payload_must_contain` predicate, plus a flag indicating the assertion
+ * graded `not_applicable` (no matched call had a JSON payload to inspect).
+ *
+ * Per spec PRs adcp#3816 (initial JSONPath restriction) and adcp#3987
+ * (closes the substring-fallback ambiguity #3845):
+ *
+ *   - JSONPath path-based matching is valid ONLY when `content_type` is
+ *     `application/json` or `*\/*+json` (RFC 6839 §3.1 structured-syntax
+ *     suffix).
+ *   - Non-JSON calls + ANY match mode (`present` / `equals` /
+ *     `contains_any`): grade `not_applicable`. Earlier sketches downgraded
+ *     `match: present` to a terminal-key substring search of the raw
+ *     payload — that heuristic created false positives (a payload
+ *     mentioning the key name in any context — URL fragment, comment,
+ *     unrelated metadata field — would pass), exactly the kind of
+ *     loophole the anti-façade contract exists to close. Storyboards
+ *     needing a non-JSON value-carried signal use `identifier_paths`
+ *     instead — substring-searches storyboard-supplied VALUES (not
+ *     path-derived strings), encoding-agnostic, no false-positive
+ *     surface.
+ *
+ * Path syntax is dotted-with-`[*]` only; RFC 9535 descendant operator
+ * (`$..foo`) is explicitly NOT supported per the storyboard-schema patch.
+ */
+function anyMatchedCallSatisfies(
+  calls: RecordedCall[],
+  spec: UpstreamTrafficPayloadMatch
+): { satisfied: boolean; not_applicable: boolean } {
+  let sawApplicableCall = false;
+  for (const call of calls) {
+    if (call.attestation_mode !== 'raw') {
+      continue;
+    }
+    const isJson = isJsonContentType(call.content_type);
+    // All match modes require a structured-JSON payload — non-JSON calls
+    // don't contribute regardless of mode (adcp#3987).
+    if (!isJson) {
+      continue;
+    }
+    sawApplicableCall = true;
+    const candidates = resolveJsonPathLite(call.payload, spec.path);
+    if (candidates.length === 0) continue;
+    if (spec.match === 'present') {
+      return { satisfied: true, not_applicable: false };
+    } else if (spec.match === 'equals') {
+      if (candidates.some(v => deepEqual(v, spec.value))) return { satisfied: true, not_applicable: false };
+    } else if (spec.match === 'contains_any') {
+      const allowed = spec.allowed_values ?? [];
+      if (candidates.some(v => allowed.some(a => deepEqual(v, a)))) return { satisfied: true, not_applicable: false };
+    }
+  }
+  return { satisfied: false, not_applicable: !sawApplicableCall };
+}
+
+/**
+ * JSONPath-lite resolver — dotted-with-`[*]` form only, per spec PR
+ * adcp#3816's pin to `parsePathWithWildcards` semantics. RFC 9535
+ * descendant operator (`$..foo`) is explicitly NOT supported. A leading
+ * `$.` / `$` prefix is tolerated and stripped; the canonical form authors
+ * are encouraged to write is the bare positional path.
+ */
+function resolveJsonPathLite(root: unknown, path: string): unknown[] {
+  if (!path) return [];
+  let p = path.trim();
+  if (p.startsWith('$.')) p = p.slice(2);
+  else if (p.startsWith('$')) p = p.slice(1);
+  if (p.startsWith('.')) p = p.slice(1);
+  return walkLitePath(root, p);
+}
+
+/**
+ * Cap on the number of terminal values JSONPath-lite emission can produce
+ * across all wildcard fan-out, defending the runner against a hostile
+ * `recorded_calls[].payload` shaped to maximize fan-out. Mirrors the
+ * existing `RESOLVE_PATH_ALL_MAX` cap in path.ts.
+ */
+const JSONPATH_LITE_MAX_RESULTS = 10_000;
+
+function walkLitePath(root: unknown, path: string): unknown[] {
+  if (path === '') return root === undefined ? [] : [root];
+  // Split on `.` but keep `[*]` and `[N]` attached to their keys.
+  const tokens = path.split(/(?=\.)|(?<=\])/g).filter(Boolean);
+  let frontier: unknown[] = [root];
+  for (const rawToken of tokens) {
+    const token = rawToken.startsWith('.') ? rawToken.slice(1) : rawToken;
+    const next: unknown[] = [];
+    for (const cur of frontier) {
+      if (next.length >= JSONPATH_LITE_MAX_RESULTS) break;
+      if (cur === undefined || cur === null) continue;
+      if (token === '[*]') {
+        if (Array.isArray(cur)) next.push(...cur);
+      } else if (/^\[\d+\]$/.test(token)) {
+        const idx = parseInt(token.slice(1, -1), 10);
+        if (Array.isArray(cur)) next.push(cur[idx]);
+      } else if (token.includes('[*]')) {
+        const [key, ...rest] = token.split('[*]');
+        const keyVal = key && typeof cur === 'object' && cur !== null ? (cur as Record<string, unknown>)[key] : cur;
+        if (Array.isArray(keyVal)) {
+          const tail = rest.join('[*]');
+          if (tail === '') next.push(...keyVal);
+          else next.push(...keyVal.flatMap(v => walkLitePath(v, tail)));
+        }
+      } else if (typeof cur === 'object' && cur !== null) {
+        next.push((cur as Record<string, unknown>)[token]);
+      }
+    }
+    frontier = next.slice(0, JSONPATH_LITE_MAX_RESULTS).filter(v => v !== undefined);
+  }
+  return frontier;
+}
+
+/**
+ * Depth cap for any-depth value containment check. Defends the runner
+ * against a hostile `recorded_calls[].payload` shaped as a 100k-deep
+ * nested object that would blow the recursion stack.
+ */
+const CONTAINS_VALUE_MAX_DEPTH = 256;
+
+function anyMatchedCallEchoesValue(
+  calls: RecordedCall[],
+  value: unknown,
+  valueDigest?: string
+): { satisfied: boolean; not_applicable: boolean } {
+  let sawApplicableCall = false;
+  for (const call of calls) {
+    if (call.attestation_mode === 'digest') {
+      if (!isJsonContentType(call.content_type)) continue;
+      if (!valueDigest) continue;
+      sawApplicableCall = true;
+      if (call.identifier_match_proofs?.some(proof => proof.identifier_value_sha256 === valueDigest && proof.found)) {
+        return { satisfied: true, not_applicable: false };
+      }
+      continue;
+    }
+
+    sawApplicableCall = true;
+    // Non-JSON payloads land as raw strings — substring-match the
+    // stringified vector. Defensible best-effort downgrade per the spec's
+    // non-JSON fallback note.
+    if (typeof call.payload === 'string') {
+      if (typeof value === 'string' && call.payload.includes(value)) {
+        return { satisfied: true, not_applicable: false };
+      }
+      continue;
+    }
+    if (containsValueAnyDepth(call.payload, value, 0)) return { satisfied: true, not_applicable: false };
+  }
+  return { satisfied: false, not_applicable: !sawApplicableCall };
+}
+
+function containsValueAnyDepth(root: unknown, target: unknown, depth: number): boolean {
+  if (depth > CONTAINS_VALUE_MAX_DEPTH) return false;
+  if (deepEqual(root, target)) return true;
+  if (Array.isArray(root)) {
+    for (const item of root) if (containsValueAnyDepth(item, target, depth + 1)) return true;
+    return false;
+  }
+  if (root !== null && typeof root === 'object') {
+    for (const v of Object.values(root as Record<string, unknown>)) {
+      if (containsValueAnyDepth(v, target, depth + 1)) return true;
+    }
+  }
+  return false;
+}
+
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null || typeof a !== typeof b) return false;
+  if (typeof a !== 'object') return false;
+  if (Array.isArray(a)) {
+    if (!Array.isArray(b) || a.length !== (b as unknown[]).length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!deepEqual(a[i], (b as unknown[])[i])) return false;
+    }
+    return true;
+  }
+  if (Array.isArray(b)) return false;
+  const ao = a as Record<string, unknown>;
+  const bo = b as Record<string, unknown>;
+  const ak = Object.keys(ao);
+  const bk = Object.keys(bo);
+  if (ak.length !== bk.length) return false;
+  for (const k of ak) {
+    if (!Object.prototype.hasOwnProperty.call(bo, k)) return false;
+    if (!deepEqual(ao[k], bo[k])) return false;
+  }
+  return true;
+}
+
+/**
+ * Cross-response: every resolved dispatch carries the same value at `path`.
+ * Spec: test-kits/parallel-dispatch-runner.yaml (rule 9 / first-insert-wins).
+ *
+ * Grading rules:
+ *   - `ctx.crossResponses` absent → not_applicable (single-dispatch step).
+ *   - Fewer than 2 dispatches resolved → fail (the assertion requires a
+ *     cross-response comparison; one survivor doesn't prove the seller
+ *     deterministically resolved the race).
+ *   - All resolved values equal → pass.
+ *   - Any disagreement → fail; the result lists the distinct values observed
+ *     so reviewers can spot the duplicate-resource case at a glance.
+ */
+function validateCrossResponseFieldEqual(validation: StoryboardValidation, ctx: ValidationContext): ValidationResult {
+  const cr = ctx.crossResponses;
+  const path = validation.path ?? '';
+  if (!cr) {
+    return {
+      check: validation.check,
+      passed: true,
+      not_applicable: true,
+      description: validation.description,
+      note: 'step has no parallel_dispatch fan-out; cross-response checks grade not_applicable on single-dispatch steps',
+      json_pointer: toJsonPointer(path),
+    };
+  }
+  if (cr.resolved.length < 2) {
+    return {
+      check: validation.check,
+      passed: false,
+      description: validation.description,
+      json_pointer: toJsonPointer(path),
+      expected: 'at least 2 resolved dispatches with equal values at the path',
+      actual: `${cr.resolved.length} dispatch(es) resolved out of ${cr.dispatches.length}`,
+      schema_id: null,
+      schema_url: null,
+    };
+  }
+  const values = cr.resolved.map(tr => resolvePath(tr.data as Record<string, unknown> | undefined, path));
+  const first = values[0];
+  const comparisonKey = comparisonKeyFromPath(path);
+  const allEqual = values.every(v => valuesMatch(v, first, comparisonKey));
+  if (allEqual) {
+    return {
+      check: validation.check,
+      passed: true,
+      description: validation.description,
+      json_pointer: toJsonPointer(path),
+      actual: first,
+    };
+  }
+  return {
+    check: validation.check,
+    passed: false,
+    description: validation.description,
+    json_pointer: toJsonPointer(path),
+    expected: 'all resolved dispatches return the same value at the path',
+    actual: values,
+    schema_id: null,
+    schema_url: null,
+  };
+}
+
+function validateReplayNotCachedRateLimit(validation: StoryboardValidation, ctx: ValidationContext): ValidationResult {
+  const payload = resolveTarget(ctx).data as Record<string, unknown> | undefined;
+  const tripResponse = payload?.trip_response;
+  const replayResponse = payload?.replay_response;
+  const targetTask = typeof payload?.target_task === 'string' ? payload.target_task : undefined;
+  if (!tripResponse || typeof tripResponse !== 'object' || !replayResponse || typeof replayResponse !== 'object') {
+    const missing = [
+      !tripResponse || typeof tripResponse !== 'object' ? 'trip_response' : undefined,
+      !replayResponse || typeof replayResponse !== 'object' ? 'replay_response' : undefined,
+    ].filter((field): field is string => typeof field === 'string');
+    return {
+      check: validation.check,
+      passed: true,
+      not_applicable: true,
+      description: validation.description,
+      note: `step did not produce rate_limit_trip_runner ${missing.join(' and ')}; replay_not_cached_rate_limit grades not_applicable`,
+      json_pointer: null,
+    };
+  }
+
+  const tripCode = extractSnapshotErrorCode(tripResponse as Record<string, unknown>, targetTask);
+  const replayCode = extractSnapshotErrorCode(replayResponse as Record<string, unknown>, targetTask);
+  if (tripCode !== 'RATE_LIMITED') {
+    return {
+      check: validation.check,
+      passed: false,
+      description: validation.description,
+      json_pointer: '/trip_response/error/code',
+      expected: 'RATE_LIMITED trip_response error code',
+      actual: tripCode ?? null,
+      schema_id: null,
+      schema_url: null,
+    };
+  }
+  if (replayCode === 'RATE_LIMITED') {
+    return {
+      check: validation.check,
+      passed: false,
+      description: validation.description,
+      error: 'rate_limit_response_cached_as_replay',
+      json_pointer: '/replay_response/error/code',
+      expected: 'replay_response must not return RATE_LIMITED from the idempotency cache',
+      actual: replayCode,
+      schema_id: null,
+      schema_url: null,
+    };
+  }
+  return {
+    check: validation.check,
+    passed: true,
+    description: validation.description,
+    json_pointer: '/replay_response/error/code',
+    actual: replayCode ?? null,
+  };
+}
+
+function extractSnapshotErrorCode(snapshot: Record<string, unknown>, taskName?: string): string | undefined {
+  const structuredError = snapshot.error;
+  if (structuredError && typeof structuredError === 'object') {
+    const code = (structuredError as Record<string, unknown>).code;
+    if (typeof code === 'string') return code;
+  }
+  const adcpError = snapshot.adcp_error;
+  if (adcpError && typeof adcpError === 'object') {
+    const code = (adcpError as Record<string, unknown>).code;
+    if (typeof code === 'string') return code;
+  }
+  const data = snapshot.data;
+  if (data && typeof data === 'object') {
+    const extracted = extractTaskAdcpError({ success: snapshot.success === true, data }, taskName);
+    if (extracted) return extracted.code;
+  }
+  return undefined;
+}
+
+/**
+ * Cross-response: the cardinality of distinct values at `path` across all
+ * resolved dispatches is in `allowed_values`. Spec:
+ * test-kits/parallel-dispatch-runner.yaml.
+ *
+ * Grading rules:
+ *   - `ctx.crossResponses` absent → not_applicable.
+ *   - No dispatch resolved → fail.
+ *   - `allowed_values` missing or non-array → fail (authoring error).
+ *   - Distinct count ∈ allowed_values → pass.
+ *   - Otherwise → fail.
+ */
+function validateCrossResponseCountDistinct(
+  validation: StoryboardValidation,
+  ctx: ValidationContext
+): ValidationResult {
+  const cr = ctx.crossResponses;
+  const path = validation.path ?? '';
+  if (!cr) {
+    return {
+      check: validation.check,
+      passed: true,
+      not_applicable: true,
+      description: validation.description,
+      note: 'step has no parallel_dispatch fan-out; cross-response checks grade not_applicable on single-dispatch steps',
+      json_pointer: toJsonPointer(path),
+    };
+  }
+  if (!Array.isArray(validation.allowed_values) || validation.allowed_values.length === 0) {
+    return {
+      check: validation.check,
+      passed: false,
+      description: validation.description,
+      json_pointer: toJsonPointer(path),
+      expected: 'allowed_values: [<integer>, ...] declaring acceptable distinct counts',
+      actual: validation.allowed_values,
+      schema_id: null,
+      schema_url: null,
+    };
+  }
+  if (cr.resolved.length === 0) {
+    return {
+      check: validation.check,
+      passed: false,
+      description: validation.description,
+      json_pointer: toJsonPointer(path),
+      expected: 'at least one resolved dispatch',
+      actual: `0 / ${cr.dispatches.length} dispatches resolved`,
+      schema_id: null,
+      schema_url: null,
+    };
+  }
+  const comparisonKey = comparisonKeyFromPath(path);
+  const exactValues = new Set<string>();
+  for (const tr of cr.resolved) {
+    const v = resolvePath(tr.data as Record<string, unknown> | undefined, path);
+    if (v === undefined || (v === null && !isAgentUrlComparisonKey(comparisonKey))) continue;
+    const normalized = normalizeAgentUrlsForDistinctCount(v, comparisonKey);
+    if (!normalized.valid) {
+      return {
+        check: validation.check,
+        passed: false,
+        description: validation.description,
+        json_pointer: toJsonPointer(path),
+        expected: 'valid URI strings in all agent URL identity fields',
+        actual: v,
+        schema_id: null,
+        schema_url: null,
+      };
+    }
+    // Preserve the check's historical serialization distinctness for all
+    // non-agent fields; object member order remains observable here.
+    exactValues.add(JSON.stringify(normalized.value));
+  }
+  const distinctCount = exactValues.size;
+  const allowed = validation.allowed_values as number[];
+  if (allowed.includes(distinctCount)) {
+    return {
+      check: validation.check,
+      passed: true,
+      description: validation.description,
+      json_pointer: toJsonPointer(path),
+      actual: distinctCount,
+    };
+  }
+  return {
+    check: validation.check,
+    passed: false,
+    description: validation.description,
+    json_pointer: toJsonPointer(path),
+    expected: `distinct count ∈ ${JSON.stringify(allowed)}`,
+    actual: distinctCount,
+    schema_id: null,
+    schema_url: null,
+  };
+}
+
+// resolvePath re-exported from ./path for backwards compat
+export { resolvePath } from './path';

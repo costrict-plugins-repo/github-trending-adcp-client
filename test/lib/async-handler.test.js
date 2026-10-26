@@ -1,0 +1,581 @@
+const { test } = require('node:test');
+const assert = require('node:assert');
+const { AsyncHandler } = require('../../dist/lib/core/AsyncHandler');
+
+/**
+ * Tests for AsyncHandler status change callbacks
+ *
+ * These tests verify that the refactored onXXXStatusChange handlers
+ * are called correctly for all status types (completed, failed, needs_input, working, etc)
+ */
+
+test('onGetProductsStatusChange called with completed status', async () => {
+  let handlerCalled = false;
+  let receivedStatus = null;
+  let receivedResponse = null;
+
+  const handler = new AsyncHandler({
+    onGetProductsStatusChange: (response, metadata) => {
+      handlerCalled = true;
+      receivedStatus = metadata.status;
+      receivedResponse = response;
+    },
+  });
+
+  await handler.handleWebhook({
+    result: { products: [{ id: 'prod_1', name: 'Product 1' }] },
+    metadata: {
+      operation_id: 'op_123',
+      task_id: 'task_1',
+      agent_id: 'agent_1',
+      task_type: 'get_products',
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+    },
+  });
+
+  assert.strictEqual(handlerCalled, true, 'Handler should be called');
+  assert.strictEqual(receivedStatus, 'completed', 'Should receive completed status');
+  assert.strictEqual(receivedResponse.products.length, 1, 'Should receive products');
+});
+
+test('onGetProductsStatusChange called with failed status', async () => {
+  let handlerCalled = false;
+  let receivedStatus = null;
+  let receivedMessage = null;
+
+  const handler = new AsyncHandler({
+    onGetProductsStatusChange: (response, metadata) => {
+      handlerCalled = true;
+      receivedStatus = metadata.status;
+      receivedMessage = metadata.message;
+    },
+  });
+
+  await handler.handleWebhook({
+    result: null,
+    metadata: {
+      operation_id: 'op_123',
+      task_id: 'task_1',
+      agent_id: 'agent_1',
+      task_type: 'get_products',
+      status: 'failed',
+      message: 'Agent timeout',
+      timestamp: new Date().toISOString(),
+    },
+  });
+
+  assert.strictEqual(handlerCalled, true, 'Handler should be called');
+  assert.strictEqual(receivedStatus, 'failed', 'Should receive failed status');
+  assert.strictEqual(receivedMessage, 'Agent timeout', 'Should receive error message');
+});
+
+test('onGetProductsStatusChange called with needs_input status', async () => {
+  let handlerCalled = false;
+  let receivedStatus = null;
+
+  const handler = new AsyncHandler({
+    onGetProductsStatusChange: (response, metadata) => {
+      handlerCalled = true;
+      receivedStatus = metadata.status;
+    },
+  });
+
+  await handler.handleWebhook({
+    result: { message: 'Please specify product category' },
+    metadata: {
+      operation_id: 'op_123',
+      task_id: 'task_1',
+      agent_id: 'agent_1',
+      task_type: 'get_products',
+      status: 'needs_input',
+      timestamp: new Date().toISOString(),
+    },
+  });
+
+  assert.strictEqual(handlerCalled, true, 'Handler should be called');
+  assert.strictEqual(receivedStatus, 'needs_input', 'Should receive needs_input status');
+});
+
+test('onGetProductsStatusChange called with working status', async () => {
+  let handlerCalled = false;
+  let receivedStatus = null;
+
+  const handler = new AsyncHandler({
+    onGetProductsStatusChange: (response, metadata) => {
+      handlerCalled = true;
+      receivedStatus = metadata.status;
+    },
+  });
+
+  await handler.handleWebhook({
+    result: { message: 'Fetching products...' },
+    metadata: {
+      operation_id: 'op_123',
+      task_id: 'task_1',
+      agent_id: 'agent_1',
+      task_type: 'get_products',
+      status: 'working',
+      timestamp: new Date().toISOString(),
+    },
+  });
+
+  assert.strictEqual(handlerCalled, true, 'Handler should be called');
+  assert.strictEqual(receivedStatus, 'working', 'Should receive working status');
+});
+
+for (const [taskType, handlerName] of [
+  ['get_principal', 'onGetPrincipalStatusChange'],
+  ['sync_principal', 'onSyncPrincipalStatusChange'],
+]) {
+  test(`${handlerName} receives ${taskType} webhooks`, async () => {
+    let received;
+    const handler = new AsyncHandler({
+      [handlerName]: (response, metadata) => {
+        received = { response, metadata };
+      },
+    });
+
+    await handler.handleWebhook({
+      result: { status: 'completed', result: { kind: 'current' } },
+      metadata: {
+        operation_id: `op_${taskType}`,
+        task_id: `task_${taskType}`,
+        agent_id: 'agent_principal',
+        task_type: taskType,
+        status: 'completed',
+        timestamp: new Date().toISOString(),
+      },
+    });
+
+    assert.deepStrictEqual(received.response, { status: 'completed', result: { kind: 'current' } });
+    assert.strictEqual(received.metadata.task_type, taskType);
+  });
+}
+
+test('onCreateMediaBuyStatusChange called with completed status', async () => {
+  let handlerCalled = false;
+  let receivedMediaBuyId = null;
+
+  const handler = new AsyncHandler({
+    onCreateMediaBuyStatusChange: (response, metadata) => {
+      handlerCalled = true;
+      receivedMediaBuyId = response.media_buy_id;
+    },
+  });
+
+  await handler.handleWebhook({
+    result: { media_buy_id: 'mb_789', status: 'active' },
+    metadata: {
+      operation_id: 'op_456',
+      task_id: 'task_1',
+      agent_id: 'agent_2',
+      task_type: 'create_media_buy',
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+    },
+  });
+
+  assert.strictEqual(handlerCalled, true, 'Handler should be called');
+  assert.strictEqual(receivedMediaBuyId, 'mb_789', 'Should receive media buy ID');
+});
+
+test('explicit legacy handlers receive asynchronous creative and content-standard completions', async () => {
+  const received = [];
+  let fallbackCalled = false;
+  const handler = new AsyncHandler({
+    onPreviewCreativeLegacyStatusChange: (_response, metadata) => received.push(metadata.task_type),
+    onBuildCreativeLegacyStatusChange: (_response, metadata) => received.push(metadata.task_type),
+    onListContentStandardsLegacyStatusChange: (_response, metadata) => received.push(metadata.task_type),
+    onGetContentStandardsLegacyStatusChange: (_response, metadata) => received.push(metadata.task_type),
+    onCalibrateContentLegacyStatusChange: (_response, metadata) => received.push(metadata.task_type),
+    onValidateContentDeliveryLegacyStatusChange: (_response, metadata) => received.push(metadata.task_type),
+    onTaskStatusChange: () => {
+      fallbackCalled = true;
+    },
+  });
+
+  const taskTypes = [
+    'preview_creative',
+    'build_creative',
+    'list_content_standards',
+    'get_content_standards',
+    'calibrate_content',
+    'validate_content_delivery',
+  ];
+  for (const [index, taskType] of taskTypes.entries()) {
+    await handler.handleWebhook({
+      result: { status: 'completed' },
+      metadata: {
+        operation_id: `op_legacy_${index}`,
+        task_id: `task_legacy_${index}`,
+        agent_id: 'agent_legacy',
+        task_type: taskType,
+        status: 'completed',
+        timestamp: '2026-07-24T12:00:00.000Z',
+      },
+    });
+  }
+
+  assert.deepStrictEqual(received, taskTypes);
+  assert.strictEqual(fallbackCalled, false, 'Legacy task-specific handlers should win over the fallback');
+});
+
+test('canonical preview handler takes precedence for asynchronous preview completions', async () => {
+  const received = [];
+  const handler = new AsyncHandler({
+    onPreviewCreativeStatusChange: () => received.push('canonical'),
+    onPreviewCreativeLegacyStatusChange: () => received.push('legacy'),
+  });
+
+  await handler.handleWebhook({
+    result: { response_type: 'single', previews: [] },
+    metadata: {
+      operation_id: 'op_preview',
+      task_id: 'task_preview',
+      agent_id: 'agent_preview',
+      task_type: 'preview_creative',
+      status: 'completed',
+      timestamp: '2026-08-20T12:00:00.000Z',
+    },
+  });
+
+  assert.deepStrictEqual(received, ['canonical']);
+});
+
+test('tracked legacy preview completion preserves the legacy callback identity', async () => {
+  const received = [];
+  const handler = new AsyncHandler({
+    onPreviewCreativeStatusChange: () => received.push('canonical'),
+    onPreviewCreativeLegacyStatusChange: () => received.push('legacy'),
+  });
+
+  await handler.handleWebhook({
+    result: { response_type: 'single', previews: [] },
+    metadata: {
+      operation_id: 'op_preview_legacy',
+      task_id: 'task_preview_legacy',
+      agent_id: 'agent_preview',
+      task_type: 'preview_creative',
+      status: 'completed',
+      timestamp: '2026-08-20T12:00:00.000Z',
+    },
+    previewHandler: 'legacy',
+  });
+
+  assert.deepStrictEqual(received, ['legacy']);
+});
+
+test('onTaskStatusChange fallback handler called for unmapped task type', async () => {
+  let fallbackCalled = false;
+  let receivedTaskType = null;
+
+  const handler = new AsyncHandler({
+    onTaskStatusChange: (response, metadata) => {
+      fallbackCalled = true;
+      receivedTaskType = metadata.task_type;
+    },
+  });
+
+  await handler.handleWebhook({
+    result: { data: 'test' },
+    metadata: {
+      operation_id: 'op_999',
+      task_id: 'task_1',
+      agent_id: 'agent_3',
+      task_type: 'unknown_task',
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+    },
+  });
+
+  assert.strictEqual(fallbackCalled, true, 'Fallback handler should be called');
+  assert.strictEqual(receivedTaskType, 'unknown_task', 'Should receive task type');
+});
+
+test('onMediaBuyDeliveryNotification called for delivery notifications', async () => {
+  let notificationCalled = false;
+  let receivedNotificationType = null;
+  let receivedSequence = null;
+
+  const handler = new AsyncHandler({
+    onMediaBuyDeliveryNotification: (notification, metadata) => {
+      notificationCalled = true;
+      receivedNotificationType = metadata.notification_type;
+      receivedSequence = metadata.sequence_number;
+    },
+  });
+
+  await handler.handleWebhook({
+    result: {
+      notification_type: 'scheduled',
+      sequence_number: 3,
+      media_buy_deliveries: [{ media_buy_id: 'mb_1', impressions: 1000, clicks: 50 }],
+    },
+    metadata: {
+      operation_id: 'delivery_report_agent1_2025-10',
+      task_id: 'task_1',
+      agent_id: 'agent_1',
+      task_type: 'media_buy_delivery',
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+    },
+  });
+
+  assert.strictEqual(notificationCalled, true, 'Notification handler should be called');
+  assert.strictEqual(receivedNotificationType, 'scheduled', 'Should receive notification type');
+  assert.strictEqual(receivedSequence, 3, 'Should receive sequence number');
+});
+
+test('onMediaBuyDeliveryNotification called for final notification', async () => {
+  let notificationCalled = false;
+  let receivedNotificationType = null;
+
+  const handler = new AsyncHandler({
+    onMediaBuyDeliveryNotification: (notification, metadata) => {
+      notificationCalled = true;
+      receivedNotificationType = metadata.notification_type;
+    },
+  });
+
+  await handler.handleWebhook({
+    result: {
+      notification_type: 'final',
+      sequence_number: 10,
+      media_buy_deliveries: [{ media_buy_id: 'mb_1', impressions: 10000, clicks: 500 }],
+    },
+    metadata: {
+      operation_id: 'delivery_report_agent1_2025-10',
+      task_id: 'task_1',
+      agent_id: 'agent_1',
+      task_type: 'media_buy_delivery',
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+    },
+  });
+
+  assert.strictEqual(notificationCalled, true, 'Notification handler should be called');
+  assert.strictEqual(receivedNotificationType, 'final', 'Should receive final notification type');
+});
+
+test('onActivity called for webhook received event', async () => {
+  let activityCalled = false;
+  let receivedActivityType = null;
+  let receivedOperationId = null;
+
+  const handler = new AsyncHandler({
+    onActivity: activity => {
+      activityCalled = true;
+      receivedActivityType = activity.type;
+      receivedOperationId = activity.operation_id;
+    },
+    onGetProductsStatusChange: () => {}, // Need this to avoid error
+  });
+
+  await handler.handleWebhook({
+    result: { products: [] },
+    metadata: {
+      operation_id: 'op_activity_test',
+      task_id: 'task_1',
+      agent_id: 'agent_1',
+      task_type: 'get_products',
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+    },
+  });
+
+  assert.strictEqual(activityCalled, true, 'Activity callback should be called');
+  assert.strictEqual(receivedActivityType, 'webhook_received', 'Should receive webhook_received event');
+  assert.strictEqual(receivedOperationId, 'op_activity_test', 'Should receive operation ID');
+});
+
+test('metadata includes all webhook fields', async () => {
+  let receivedMetadata = null;
+
+  const handler = new AsyncHandler({
+    onGetProductsStatusChange: (response, metadata) => {
+      receivedMetadata = metadata;
+    },
+  });
+
+  await handler.handleWebhook({
+    result: { products: [] },
+    metadata: {
+      operation_id: 'op_meta_test',
+      context_id: 'ctx_123',
+      task_id: 'task_456',
+      agent_id: 'agent_meta',
+      task_type: 'get_products',
+      status: 'completed',
+      timestamp: '2025-10-05T12:00:00Z',
+    },
+  });
+
+  assert.strictEqual(receivedMetadata.operation_id, 'op_meta_test', 'Should have operation_id');
+  assert.strictEqual(receivedMetadata.context_id, 'ctx_123', 'Should have context_id');
+  assert.strictEqual(receivedMetadata.task_id, 'task_456', 'Should have task_id');
+  assert.strictEqual(receivedMetadata.agent_id, 'agent_meta', 'Should have agent_id');
+  assert.strictEqual(receivedMetadata.task_type, 'get_products', 'Should have task_type');
+  assert.strictEqual(receivedMetadata.status, 'completed', 'Should have status');
+  assert.strictEqual(receivedMetadata.timestamp, '2025-10-05T12:00:00Z', 'Should have timestamp');
+});
+
+test('handler can be async', async () => {
+  let asyncCompleted = false;
+
+  const handler = new AsyncHandler({
+    onGetProductsStatusChange: async (response, metadata) => {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      asyncCompleted = true;
+    },
+  });
+
+  await handler.handleWebhook({
+    result: { products: [] },
+    metadata: {
+      operation_id: 'op_async',
+      task_id: 'task_1',
+      agent_id: 'agent_1',
+      task_type: 'get_products',
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+    },
+  });
+
+  assert.strictEqual(asyncCompleted, true, 'Async handler should complete');
+});
+
+test('multiple handlers can be configured', async () => {
+  let getProductsCalled = false;
+  let createMediaBuyCalled = false;
+  let activityCalled = false;
+
+  const handler = new AsyncHandler({
+    onGetProductsStatusChange: () => {
+      getProductsCalled = true;
+    },
+    onCreateMediaBuyStatusChange: () => {
+      createMediaBuyCalled = true;
+    },
+    onActivity: () => {
+      activityCalled = true;
+    },
+  });
+
+  await handler.handleWebhook({
+    result: { products: [] },
+    metadata: {
+      operation_id: 'op_1',
+      task_id: 'task_1',
+      agent_id: 'agent_1',
+      task_type: 'get_products',
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+    },
+  });
+
+  await handler.handleWebhook({
+    result: { media_buy_id: 'mb_1' },
+    metadata: {
+      operation_id: 'op_2',
+      task_id: 'task_2',
+      agent_id: 'agent_1',
+      task_type: 'create_media_buy',
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+    },
+  });
+
+  assert.strictEqual(getProductsCalled, true, 'GetProducts handler should be called');
+  assert.strictEqual(createMediaBuyCalled, true, 'CreateMediaBuy handler should be called');
+  assert.strictEqual(activityCalled, true, 'Activity handler should be called for both');
+});
+
+// Error handling tests
+test('handler error propagates so webhook delivery remains retryable', async () => {
+  let errorThrown = false;
+
+  const handler = new AsyncHandler({
+    onGetProductsStatusChange: () => {
+      errorThrown = true;
+      throw new Error('Handler error');
+    },
+  });
+
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    await assert.rejects(
+      handler.handleWebhook({
+        result: { products: [] },
+        metadata: {
+          operation_id: 'op_123',
+          task_id: 'task_1',
+          agent_id: 'agent_1',
+          task_type: 'get_products',
+          status: 'completed',
+          timestamp: new Date().toISOString(),
+        },
+      }),
+      /Handler error/
+    );
+  } finally {
+    console.error = originalError;
+  }
+
+  assert.strictEqual(errorThrown, true, 'Handler should have thrown error');
+});
+
+test('missing handler configuration handled gracefully', async () => {
+  let fallbackCalled = false;
+
+  // No specific handler, only fallback
+  const handler = new AsyncHandler({
+    onTaskStatusChange: (response, metadata) => {
+      fallbackCalled = true;
+      assert.strictEqual(metadata.task_type, 'get_products', 'Should receive task_type');
+    },
+  });
+
+  await handler.handleWebhook({
+    result: { products: [] },
+    metadata: {
+      operation_id: 'op_123',
+      task_id: 'task_1',
+      agent_id: 'agent_1',
+      task_type: 'get_products',
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+    },
+  });
+
+  assert.strictEqual(fallbackCalled, true, 'Fallback handler should be called');
+});
+
+test('invalid webhook payload does not crash', async () => {
+  const handler = new AsyncHandler({
+    onGetProductsStatusChange: () => {
+      assert.fail('Handler should not be called for invalid payload');
+    },
+  });
+
+  // Missing required fields in the new format
+  const invalidPayloads = [
+    null,
+    undefined,
+    {},
+    { result: {} }, // missing metadata
+    { metadata: {} }, // missing required metadata fields
+    { result: {}, metadata: { operation_id: 'op_1' } }, // missing task_type
+  ];
+
+  for (const payload of invalidPayloads) {
+    try {
+      await handler.handleWebhook(payload);
+      // If no error is thrown, that's acceptable - handler should be defensive
+    } catch (error) {
+      // Errors are acceptable for invalid payloads, but should not crash the process
+      assert.ok(error instanceof Error, 'Should throw Error type');
+    }
+  }
+});

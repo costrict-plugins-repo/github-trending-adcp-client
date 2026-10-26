@@ -1,0 +1,827 @@
+/**
+ * Opaque AdCP server handle.
+ *
+ * `createAdcpServer()` returns a value typed as `AdcpServer` rather than the
+ * underlying `@modelcontextprotocol/sdk` `McpServer`. Two reasons:
+ *
+ *   1. **Dual-package hazard.** Re-exporting the SDK's `McpServer` type from
+ *      our public API forces downstream consumers through a specific SDK
+ *      resolution path (ESM or CJS). When a TypeScript ESM consumer
+ *      imports `@adcp/sdk` (CJS) and separately imports the SDK (ESM),
+ *      the two `McpServer` types are structurally identical but distinct
+ *      — the SDK's private `_serverInfo` field breaks assignment
+ *      compatibility between them. Owning the type on our side
+ *      eliminates the hazard: `AdcpServer` resolves the same way for
+ *      every consumer because it comes from a single package.
+ *
+ *   2. **Test ergonomics.** Downstream test harnesses have been reaching
+ *      into `(server as any)._requestHandlers` and
+ *      `server.server._requestHandlers` to dispatch tool calls in-process.
+ *      `dispatchTestRequest()` moves that private-field access into a
+ *      single encapsulated helper so consumers don't have to repeat it.
+ *
+ * To register additional tools or resources, configure them through
+ * `createAdcpServer()`'s domain-grouped handler config. The opaque
+ * surface intentionally doesn't expose `registerTool()` — keeping it off the
+ * public API lets the framework own tool registration conventions
+ * (idempotency, governance, validation, response shape).
+ */
+
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { McpToolResponse } from './responses';
+import type { AdcpMcpResourceDefinition } from './mcp-app';
+import { ADCP_VERSION } from '../version';
+import {
+  applyStructuredContentTextFallback,
+  type StructuredContentTextFallback,
+  type StructuredContentTextFallbackContext,
+} from './structured-content-fallback';
+
+/**
+ * Structural shape of an MCP transport the server can connect to.
+ *
+ * Matches `@modelcontextprotocol/sdk/shared/transport.js` Transport without
+ * importing it — keeping the SDK type off our public API surface.
+ * `StreamableHTTPServerTransport`, `StdioServerTransport`, and
+ * `InMemoryTransport` from the SDK all satisfy this shape.
+ *
+ * `message` / callback parameters are typed with `any` (not `unknown`) so
+ * SDK-specific transports with narrower message types (JSONRPCMessage) are
+ * assignable bi-directionally without forcing downstream consumers to
+ * widen their own transport types.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export interface AdcpServerTransport {
+  start(): Promise<void>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  send(message: any, options?: any): Promise<void>;
+  close(): Promise<void>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  onmessage?: (message: any, extra?: any) => void;
+  onclose?: () => void;
+  onerror?: (error: Error) => void;
+  sessionId?: string;
+  setProtocolVersion?: (version: string) => void;
+}
+
+/**
+ * Request envelope accepted by `AdcpServer.dispatchTestRequest()`.
+ *
+ * Mirrors the JSON-RPC method/params shape so tests can target the same
+ * methods the transport would — `tools/call`, `tools/list`, etc.
+ */
+export interface AdcpTestRequest {
+  method: string;
+  params?: Record<string, unknown>;
+}
+
+/**
+ * Typed variant of {@link AdcpTestRequest} for `tools/call`. Used by the
+ * `dispatchTestRequest` overload that returns a typed `CallToolResult`.
+ */
+export interface AdcpTestToolsCallRequest {
+  method: 'tools/call';
+  params: { name: string; arguments?: Record<string, unknown> };
+}
+
+/**
+ * Response returned by `AdcpServer.dispatchTestRequest()`.
+ *
+ * The shape depends on the `method` — for `tools/call` this is the
+ * `CallToolResult` (content + structuredContent + optional isError);
+ * for other methods it's the method-specific result. Left as `unknown`
+ * so callers narrow with type guards or schema validation relevant to
+ * the specific method they're dispatching.
+ */
+export type AdcpTestResponse = unknown;
+
+/**
+ * Auth principal visible to handlers and `resolveAccount`. Mirrors the
+ * shape `serve()` produces from its `authenticate` hook, and what the
+ * A2A adapter's `authenticate` callback should return.
+ */
+export interface AdcpAuthInfo {
+  token: string;
+  clientId: string;
+  scopes: string[];
+  expiresAt?: number;
+  extra?: Record<string, unknown>;
+}
+
+/**
+ * Optional per-call overrides for `dispatchTestRequest()`. Lets tests
+ * simulate transport-level state — most importantly the `authInfo` that
+ * `serve()` populates from its `authenticate` hook — without spinning up
+ * a real HTTP transport.
+ */
+export interface AdcpTestRequestExtras {
+  authInfo?: AdcpAuthInfo;
+  sessionId?: string;
+  signal?: AbortSignal;
+  /** Override client/transport facts used by response-decoration tests. */
+  responseContext?: StructuredContentTextFallbackContext;
+}
+
+/**
+ * Arguments accepted by `AdcpServer.invoke()`. A transport adapter (MCP
+ * `serve()`, `createA2AAdapter()`, etc.) authenticates the incoming
+ * request, maps it to one of the registered AdCP tool names, then calls
+ * this surface to run the framework pipeline (idempotency, account
+ * resolution, validation, governance, response-union narrowing).
+ */
+export interface AdcpInvokeOptions {
+  /** AdCP tool name (`get_products`, `create_media_buy`, ...). */
+  toolName: string;
+  /** Tool arguments as received from the transport, pre-schema-validation. */
+  args: Record<string, unknown>;
+  /**
+   * Auth principal the transport produced from its `authenticate` hook.
+   * Handlers and `resolveAccount` see it as `ctx.authInfo`. Transports
+   * MUST verify the principal before calling `invoke()` — `invoke()`
+   * does NOT re-check the token.
+   */
+  authInfo?: AdcpAuthInfo;
+  /** Abort signal for cancellation; defaults to a fresh controller. */
+  signal?: AbortSignal;
+  /**
+   * Require the framework to enforce the bundled request schema even when the
+   * server's general validation mode is `warn` or `off`. Transport adapters
+   * that advertise the exact official schema use this strengthening-only flag
+   * so failures retain the structured AdCP error envelope.
+   */
+  enforceRequestSchema?: true;
+  /**
+   * Transport/session facts used only after the canonical response has been
+   * finalized and cached. Omit for direct embedding; the fail-safe direct path
+   * mirrors structured content for compatibility.
+   */
+  responseContext?: StructuredContentTextFallbackContext;
+}
+
+/**
+ * Test-harness hooks attached to every `AdcpServer`. Namespaced under
+ * `compliance` so production code paths don't accidentally reach for
+ * them — `reset()` drops cached state and is intended for storyboard
+ * runners that exercise many scenarios in one process.
+ */
+export interface AdcpServerComplianceApi {
+  /**
+   * Drop session state and the idempotency cache so subsequent
+   * storyboards don't inherit plans, media buys, or cached replies from
+   * earlier runs. Conformance storyboards share brand domains across
+   * test kits — without this hook, a $10K governance plan seeded by
+   * `media_buy_seller/governance_denied` would intercept a $50K buy in
+   * `sales_guaranteed`.
+   *
+   * Refuses to run by default unless BOTH guardrails hold:
+   *   - `NODE_ENV !== 'production'` (opt out with `allowProduction: true`)
+   *   - The configured stores are the in-memory SDK defaults
+   *     (`InMemoryStateStore` + memory idempotency backend). Opt out
+   *     with `force: true` when you've wired a disposable test
+   *     Postgres cluster and know the flush is safe.
+   *
+   * The two flags are independent on purpose: `force` lets you flush
+   * a non-memory store you've verified is a test DB, WITHOUT also
+   * opening the door to running against a production `NODE_ENV`.
+   * Same the other way: `allowProduction` lets you run in a prod-
+   * labeled CI environment against memory stores, without bypassing
+   * the store-shape safety check.
+   */
+  reset(options?: { force?: boolean; allowProduction?: boolean }): Promise<void>;
+}
+
+/**
+ * Phantom brand for {@link AdcpServer}. Makes the type nominal — a plain
+ * object that has the same methods structurally cannot be assigned to
+ * `AdcpServer` because it lacks this symbol-keyed property. Closes the
+ * door on `(plainObject as AdcpServer).registerTool(...)` patterns that
+ * tried to reach for an MCP-SDK method the framework intentionally
+ * doesn't expose.
+ *
+ * The brand is `never`-typed and never set on the runtime object, so
+ * `Object.getOwnPropertySymbols(server)` won't expose it — only the
+ * wrapper produced by `createAdcpServer()` carries the type-level
+ * signature, via the `as AdcpServerInternal` cast in `wrapMcpServer()`.
+ *
+ * Must be a real (non-`declare`) const so the d.ts emit retains it. An
+ * `export declare const X: unique symbol` in a `.ts` source file does
+ * not survive emit — the binding gets dropped from the published d.ts
+ * while consumers (the public `AdcpServer` interface) keep referencing
+ * it, which produces `TS2304: Cannot find name 'ADCP_SERVER_BRAND'` on
+ * any adopter `tsc --noEmit` against `@adcp/sdk/server` (issue #1236).
+ */
+export const ADCP_SERVER_BRAND: unique symbol = Symbol('ADCP_SERVER_BRAND');
+
+/**
+ * Opaque handle returned by `createAdcpServer()`.
+ *
+ * Pass to `serve()` to mount on an HTTP transport, or use
+ * `dispatchTestRequest()` from a test harness to exercise handlers
+ * in-process without opening a socket.
+ */
+export interface AdcpServer {
+  /**
+   * Phantom brand — type-level only, never present at runtime. See
+   * {@link ADCP_SERVER_BRAND}. Tagged `never` so `(x as AdcpServer)`
+   * casts from structurally-similar objects fail; a real `AdcpServer`
+   * is only obtainable via `createAdcpServer()`.
+   */
+  readonly [ADCP_SERVER_BRAND]?: never;
+
+  /**
+   * Connect the server to an MCP transport.
+   *
+   * Takes ownership of the transport — any callbacks previously
+   * registered on it are replaced. Matches the semantics of the SDK's
+   * `McpServer.connect()`.
+   */
+  connect(transport: AdcpServerTransport): Promise<void>;
+
+  /** Close the server and release resources. */
+  close(): Promise<void>;
+
+  /**
+   * Test-harness hooks — see {@link AdcpServerComplianceApi}. Not
+   * intended for production call sites; production code paths should
+   * use `close()` to release resources.
+   */
+  readonly compliance: AdcpServerComplianceApi;
+
+  /**
+   * Invoke a registered handler in-process and return its response.
+   *
+   * Bypasses the transport layer — no sockets, no JSON-RPC framing.
+   * Intended for test harnesses only; production callers should go
+   * through a transport so protocol invariants (request ID linking,
+   * task progress, notifications) are enforced.
+   *
+   * Throws when no handler is registered for the requested method,
+   * or when a `tools/call` request targets an unknown tool. Arguments
+   * default to `{}` when `params.arguments` is omitted — a validation
+   * error from the tool's input schema (not from dispatch) is the
+   * expected failure mode for a missing required field.
+   *
+   * **Never mount this behind an HTTP route.** `extras.authInfo` is
+   * written directly onto the MCP handler's `extra` without any check
+   * against `serve({ authenticate })` — exposing it externally lets a
+   * caller impersonate any principal. This API is for in-process test
+   * harnesses and storyboard runners only.
+   *
+   * @example
+   * ```typescript
+   * const result = await server.dispatchTestRequest({
+   *   method: 'tools/call',
+   *   params: {
+   *     name: 'get_products',
+   *     arguments: { brief: 'premium sports inventory' },
+   *   },
+   * });
+   * ```
+   */
+  dispatchTestRequest(request: AdcpTestToolsCallRequest, extras?: AdcpTestRequestExtras): Promise<CallToolResult>;
+  dispatchTestRequest(request: AdcpTestRequest, extras?: AdcpTestRequestExtras): Promise<AdcpTestResponse>;
+
+  /**
+   * Production-safe tool invocation surface for transport adapters.
+   *
+   * Runs the full framework pipeline against a registered tool:
+   * request schema validation → account resolution → idempotency →
+   * handler dispatch → response narrowing → response validation.
+   * Returns the same `McpToolResponse` envelope the MCP transport
+   * observes — a transport adapter layers its own protocol framing on
+   * top (JSON-RPC result for MCP, A2A `Task` artifact for A2A, etc.).
+   *
+   * **Auth is the caller's responsibility.** `invoke()` forwards the
+   * provided `authInfo` verbatim to handlers and `resolveAccount`
+   * without re-verifying. Mount it only behind a transport that has
+   * already authenticated the principal (e.g. `serve({ authenticate })`
+   * for MCP, `createA2AAdapter({ authenticate })` for A2A). Do not call
+   * it directly from an HTTP handler — that path skips auth.
+   *
+   * For in-process tests that want to synthesize an `authInfo` without
+   * running a transport, reach for {@link dispatchTestRequest} instead
+   * — it takes the same principal shape but is explicitly marked
+   * test-only in its docstring.
+   *
+   * Throws when `toolName` is not registered; schema errors round-trip
+   * as structured `VALIDATION_ERROR` envelopes inside the return value.
+   */
+  invoke(options: AdcpInvokeOptions): Promise<McpToolResponse>;
+
+  /**
+   * Returns the newest AdCP protocol version this server can serve.
+   *
+   * Defaults to {@link ADCP_VERSION} (the GA version the SDK ships against)
+   * unless overridden via `createAdcpServer({ adcpVersion })`. This is the
+   * protocol version, **not** the publisher's app version (`config.version`).
+   *
+   * Plumbing surface — Stage 2 of the multi-version refactor exposes the
+   * configured ceiling but does not yet vary validator/schema selection by
+   * version. Wire-shape adapters key off this getter in subsequent stages.
+   */
+  getAdcpVersion(): string;
+
+  /**
+   * Returns the AdCP protocol version selected when a caller supplies no
+   * `adcp_version` or `adcp_major_version` claim.
+   *
+   * Defaults to {@link getAdcpVersion} unless the server config declares a
+   * lower `defaultAdcpVersion`. This lets one endpoint retain a conservative
+   * wire default while making newer explicitly versioned routes reachable.
+   */
+  getDefaultAdcpVersion(): string;
+}
+
+/**
+ * Symbol-keyed accessor for the underlying SDK `McpServer`. Used by
+ * `serve()` to reach through the opaque wrapper when SDK-specific
+ * operations are needed. Not part of the public API — typed on a
+ * separate internal interface so downstream consumers can't discover
+ * it through the `AdcpServer` type.
+ *
+ * @internal
+ */
+export const ADCP_SDK_SERVER: unique symbol = Symbol.for('@adcp/client.sdkServer');
+
+/**
+ * Symbol-keyed accessor for the state store backing an `AdcpServer`.
+ * Test harnesses and helpers like
+ * `@adcp/sdk/compliance-fixtures`'s `seedComplianceFixtures` need
+ * to reach the store without widening the public `AdcpServer`
+ * interface (handlers already get `ctx.store`; production code paths
+ * don't need a second accessor).
+ *
+ * @internal
+ */
+export const ADCP_STATE_STORE: unique symbol = Symbol.for('@adcp/client.stateStore');
+
+/**
+ * Symbol-keyed accessor for the capabilities object `createAdcpServer`
+ * assembles and the auto-wired `get_adcp_capabilities` handler reads from.
+ * Mutating this object mutates what subsequent capability-discovery calls
+ * return — `registerTestController` uses this to add a
+ * `compliance_testing` capability block after registration so the server
+ * advertises its controller scenarios even though `registerTestController`
+ * runs after `createAdcpServer`.
+ *
+ * @internal
+ */
+export const ADCP_CAPABILITIES: unique symbol = Symbol.for('@adcp/client.capabilities');
+
+/** Per-request tool visibility policy consumed by transport adapters. @internal */
+export const ADCP_TOOL_VISIBILITY: unique symbol = Symbol.for('@adcp/client.toolVisibility');
+
+/** Framework-owned per-tool protocol-release availability. @internal */
+export const ADCP_TOOL_VERSION_AVAILABILITY: unique symbol = Symbol.for('@adcp/client.toolVersionAvailability');
+
+/** Negotiated/default AdCP release used by transport discovery. @internal */
+export const ADCP_DISCOVERY_VERSION_RESOLVER: unique symbol = Symbol.for('@adcp/client.discoveryVersionResolver');
+
+/** Resolved MCP tool catalog attached by createAdcpServer. @internal */
+export const ADCP_MCP_TOOL_PROFILE: unique symbol = Symbol.for('@adcp/client.mcpToolProfile');
+
+/** Configured MCP App resources mirrored into modern per-request servers. @internal */
+export const ADCP_MCP_APP_RESOURCES: unique symbol = Symbol.for('@adcp/client.mcpAppResources');
+
+/** The concrete profile after createAdcpServer resolves `mcpToolProfile: "auto"`. @internal */
+export type ResolvedAdcpMcpToolProfile = 'media-buy' | 'all';
+
+/** @internal */
+export type AdcpToolVisibilityResolver = (options: {
+  toolName: string;
+  authInfo?: AdcpAuthInfo;
+  input?: Readonly<Record<string, unknown>>;
+}) => boolean | Promise<boolean>;
+
+/** @internal */
+export type AdcpToolVersionAvailabilityResolver = (toolName: string, adcpVersion: string) => boolean;
+
+/** @internal */
+export type AdcpDiscoveryVersionResolver = (requestedVersion?: string) => string;
+
+/** @internal */
+export interface AdcpServerInternal extends AdcpServer {
+  readonly [ADCP_SDK_SERVER]: McpServer;
+  [ADCP_TOOL_VISIBILITY]?: AdcpToolVisibilityResolver;
+  [ADCP_TOOL_VERSION_AVAILABILITY]?: AdcpToolVersionAvailabilityResolver;
+  [ADCP_DISCOVERY_VERSION_RESOLVER]?: AdcpDiscoveryVersionResolver;
+  [ADCP_MCP_TOOL_PROFILE]?: ResolvedAdcpMcpToolProfile;
+  [ADCP_MCP_APP_RESOURCES]?: readonly AdcpMcpResourceDefinition[];
+}
+
+/**
+ * Return the underlying `McpServer` for a wrapped `AdcpServer`, or
+ * `undefined` if the value is not an `AdcpServer` produced by
+ * `createAdcpServer()`.
+ *
+ * @internal
+ */
+export function getSdkServer(server: AdcpServer | McpServer): McpServer | undefined {
+  const candidate = (server as unknown as Partial<AdcpServerInternal>)[ADCP_SDK_SERVER];
+  return candidate;
+}
+
+/** Attach a transport-independent per-request tool visibility policy. @internal */
+export function setToolVisibilityResolver(server: AdcpServer, resolver: AdcpToolVisibilityResolver): void {
+  (server as AdcpServerInternal)[ADCP_TOOL_VISIBILITY] = resolver;
+}
+
+/** Attach framework-owned per-tool release availability for transport discovery. @internal */
+export function setToolVersionAvailabilityResolver(
+  server: AdcpServer,
+  resolver: AdcpToolVersionAvailabilityResolver
+): void {
+  Object.defineProperty(server, ADCP_TOOL_VERSION_AVAILABILITY, {
+    value: resolver,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+}
+
+/** Resolve whether a tool is available in a selected AdCP release. @internal */
+export function isToolAvailableForVersion(server: AdcpServer, toolName: string, adcpVersion: string): boolean {
+  const resolver = (server as AdcpServerInternal)[ADCP_TOOL_VERSION_AVAILABILITY];
+  return resolver ? resolver(toolName, adcpVersion) : true;
+}
+
+/** Attach the global-version negotiation used by transport discovery. @internal */
+export function setDiscoveryVersionResolver(server: AdcpServer, resolver: AdcpDiscoveryVersionResolver): void {
+  Object.defineProperty(server, ADCP_DISCOVERY_VERSION_RESOLVER, {
+    value: resolver,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+}
+
+/** Resolve a requested discovery version, falling back to the server default. @internal */
+export function resolveDiscoveryVersion(server: AdcpServer, requestedVersion?: string): string {
+  const resolver = (server as AdcpServerInternal)[ADCP_DISCOVERY_VERSION_RESOLVER];
+  // The getter is required on current AdcpServer instances. Keep the runtime
+  // fallback for mixed dependency graphs that pass a wrapper created by an
+  // older SDK copy, while the public type exposes the new API as required.
+  return resolver ? resolver(requestedVersion) : (server.getDefaultAdcpVersion?.() ?? server.getAdcpVersion());
+}
+
+/** Attach the resolved static MCP catalog for transport adapters. @internal */
+export function setMcpToolProfile(server: AdcpServer, profile: ResolvedAdcpMcpToolProfile): void {
+  Object.defineProperty(server, ADCP_MCP_TOOL_PROFILE, {
+    value: profile,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+}
+
+/** Read the resolved MCP catalog; hand-wrapped servers retain the full surface. @internal */
+export function getMcpToolProfile(server: AdcpServer): ResolvedAdcpMcpToolProfile {
+  return (server as AdcpServerInternal)[ADCP_MCP_TOOL_PROFILE] ?? 'all';
+}
+
+/** Attach validated resource definitions for transport adapters. @internal */
+export function setMcpAppResources(server: AdcpServer, resources: readonly AdcpMcpResourceDefinition[]): void {
+  Object.defineProperty(server, ADCP_MCP_APP_RESOURCES, {
+    value: resources,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+}
+
+/** Read validated resource definitions for transport adapters. @internal */
+export function listMcpAppResources(server: AdcpServer): readonly AdcpMcpResourceDefinition[] {
+  return (server as AdcpServerInternal)[ADCP_MCP_APP_RESOURCES] ?? [];
+}
+
+/** Resolve whether a registered tool may be exposed to this request. @internal */
+export async function isRegisteredToolVisible(
+  server: AdcpServer,
+  options: Parameters<AdcpToolVisibilityResolver>[0]
+): Promise<boolean> {
+  const resolver = (server as AdcpServerInternal)[ADCP_TOOL_VISIBILITY];
+  return resolver ? resolver(options) : true;
+}
+
+/**
+ * True when `value` is an `AdcpServer` produced by `createAdcpServer()`.
+ *
+ * @internal
+ */
+export function isAdcpServer(value: unknown): value is AdcpServerInternal {
+  return (
+    value != null &&
+    typeof value === 'object' &&
+    ADCP_SDK_SERVER in (value as Record<PropertyKey, unknown>) &&
+    typeof (value as AdcpServer).dispatchTestRequest === 'function'
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Private-field access — centralized
+// ---------------------------------------------------------------------------
+//
+// The MCP SDK marks `_requestHandlers` and `_registeredTools` as private.
+// Dispatching a request in-process from a test needs them. Doing it once
+// here means downstream harnesses don't each repeat the (server as any)
+// dance, which is the whole point of exposing `dispatchTestRequest()`.
+//
+// If/when the SDK ships a public in-process dispatch API, swap these two
+// helpers for that API. The AdcpServer surface stays the same.
+
+interface RegisteredTool {
+  title?: string;
+  description?: string;
+  inputSchema?: unknown;
+  outputSchema?: unknown;
+  annotations?: unknown;
+  _meta?: Record<string, unknown>;
+  enabled?: boolean;
+  handler: (args: unknown, extra: unknown) => unknown | Promise<unknown>;
+}
+
+interface McpServerPrivates {
+  _registeredTools?: Record<string, RegisteredTool | undefined>;
+  server?: {
+    _requestHandlers?: Map<
+      string,
+      (request: { method: string; params?: unknown }, extra: unknown) => unknown | Promise<unknown>
+    >;
+    _serverInfo?: { name: string; version: string; [key: string]: unknown };
+    _instructions?: string;
+  };
+}
+
+/** Tool metadata needed to mirror the registered AdCP surface into another official MCP transport. @internal */
+export interface RegisteredToolDefinition {
+  name: string;
+  title?: string;
+  description?: string;
+  inputSchema?: unknown;
+  outputSchema?: unknown;
+  annotations?: unknown;
+  _meta?: Record<string, unknown>;
+}
+
+/** @internal */
+type McpRequestHandler = (request: { method: string; params?: unknown }, extra: unknown) => unknown | Promise<unknown>;
+
+/**
+ * Write the instructions string onto the low-level SDK server backing
+ * `mcpServer`. Called by the async-function-form instructions hook to
+ * inject the resolved string just before the MCP `initialize` response.
+ *
+ * @internal
+ * @remarks Pokes an SDK private field — see the "Private-field access" note above.
+ */
+export function setSdkServerInstructions(mcpServer: McpServer, value: string | undefined): void {
+  const priv = mcpServer as unknown as McpServerPrivates;
+  if (priv.server) {
+    priv.server._instructions = value;
+  }
+}
+
+/**
+ * Wrap the `initialize` request handler on `mcpServer` so that `wrapper`
+ * runs (and can await async work) before the original handler responds.
+ * The wrapper receives the original handler as its first argument and must
+ * call it to complete the handshake.
+ *
+ * The wrapper is invoked once per MCP `initialize` call on this server
+ * instance. Under `serve({ reuseAgent: false })` the server is created
+ * fresh per request, so the wrapper fires once per session. Under
+ * `reuseAgent: true` the `ADCP_INSTRUCTIONS_FN` check in `serve.ts`
+ * blocks the combination before the wrapper can be called a second time.
+ *
+ * @internal
+ * @remarks Pokes an SDK private field — see the "Private-field access" note above.
+ */
+export function wrapInitializeHandler(
+  mcpServer: McpServer,
+  wrapper: (
+    origHandler: McpRequestHandler,
+    req: { method: string; params?: unknown },
+    extra: unknown
+  ) => unknown | Promise<unknown>
+): void {
+  const priv = mcpServer as unknown as McpServerPrivates;
+  const handlers = priv.server?._requestHandlers;
+  if (!handlers) return;
+  const orig = handlers.get('initialize');
+  if (!orig) return;
+  handlers.set('initialize', (req, extra) => wrapper(orig, req, extra));
+}
+
+function getRegisteredTool(server: McpServer, name: string): RegisteredTool | undefined {
+  return (server as unknown as McpServerPrivates)._registeredTools?.[name];
+}
+
+/**
+ * Wrap a registered MCP tool handler without changing the tool definition
+ * advertised by the SDK server.
+ *
+ * @internal
+ * @remarks Pokes an SDK private field — see the "Private-field access" note above.
+ */
+export function wrapRegisteredToolHandler(
+  server: McpServer,
+  name: string,
+  wrapper: (orig: RegisteredTool['handler'], args: unknown, extra: unknown) => unknown | Promise<unknown>
+): boolean {
+  const tool = getRegisteredTool(server, name);
+  if (!tool) return false;
+  const orig = tool.handler;
+  tool.handler = (args, extra) => wrapper(orig, args, extra);
+  return true;
+}
+
+/**
+ * Enumerate the tool names registered on the underlying SDK server.
+ * Used by transport adapters that need to derive discovery metadata
+ * (agent cards, capability listings) from the registered surface
+ * without reaching into private SDK fields at every call site.
+ *
+ * @internal
+ */
+export function listRegisteredToolNames(server: McpServer): string[] {
+  const registered = (server as unknown as McpServerPrivates)._registeredTools ?? {};
+  return Object.keys(registered);
+}
+
+/**
+ * Return enabled registered-tool metadata for the modern MCP server adapter.
+ * Handler functions stay private; the adapter dispatches through
+ * {@link AdcpServer.invoke} so the framework pipeline remains authoritative.
+ *
+ * @internal
+ */
+export function listRegisteredToolDefinitions(server: McpServer): RegisteredToolDefinition[] {
+  const registered = (server as unknown as McpServerPrivates)._registeredTools ?? {};
+  return Object.entries(registered).flatMap(([name, tool]) => {
+    if (!tool || tool.enabled === false) return [];
+    return [
+      {
+        name,
+        ...(tool.title !== undefined && { title: tool.title }),
+        ...(tool.description !== undefined && { description: tool.description }),
+        ...(tool.inputSchema !== undefined && { inputSchema: tool.inputSchema }),
+        ...(tool.outputSchema !== undefined && { outputSchema: tool.outputSchema }),
+        ...(tool.annotations !== undefined && { annotations: tool.annotations }),
+        ...(tool._meta !== undefined && { _meta: tool._meta }),
+      },
+    ];
+  });
+}
+
+/** Return the SDK server identity advertised during MCP discovery. @internal */
+export function getSdkServerInfo(server: McpServer): { name: string; version: string; [key: string]: unknown } {
+  return (
+    (server as unknown as McpServerPrivates).server?._serverInfo ?? {
+      name: 'AdCP Server',
+      version: 'unknown',
+    }
+  );
+}
+
+/** Return static or already-resolved server instructions. @internal */
+export function getSdkServerInstructions(server: McpServer): string | undefined {
+  return (server as unknown as McpServerPrivates).server?._instructions;
+}
+
+function getRequestHandler(
+  server: McpServer,
+  method: string
+): ((request: { method: string; params?: unknown }, extra: unknown) => unknown | Promise<unknown>) | undefined {
+  return (server as unknown as McpServerPrivates).server?._requestHandlers?.get(method);
+}
+
+/**
+ * Wrap an SDK request handler such as `tools/list` while preserving the
+ * original handler's request/extra contract.
+ *
+ * @internal
+ * @remarks Pokes an SDK private field — see the "Private-field access" note above.
+ */
+export function wrapSdkRequestHandler(
+  server: McpServer,
+  method: string,
+  wrapper: (
+    orig: McpRequestHandler,
+    req: { method: string; params?: unknown },
+    extra: unknown
+  ) => unknown | Promise<unknown>
+): boolean {
+  const handlers = (server as unknown as McpServerPrivates).server?._requestHandlers;
+  const orig = handlers?.get(method);
+  if (!handlers || !orig) return false;
+  handlers.set(method, (req, extra) => wrapper(orig, req, extra));
+  return true;
+}
+
+/**
+ * Wrap an SDK `McpServer` into the opaque `AdcpServer` handle returned by
+ * `createAdcpServer()`. Consumers should prefer `createAdcpServer()` and
+ * treat this as an internal utility; it's exported for framework code
+ * that needs to produce an `AdcpServer` around a hand-built server.
+ *
+ * Idempotent — passing an already-wrapped `AdcpServer` returns it
+ * unchanged rather than nesting wrappers (which would leave
+ * `ADCP_SDK_SERVER` pointing at the outer wrapper instead of the SDK
+ * handle and break `getSdkServer()` round-trips).
+ *
+ * @internal
+ */
+export function wrapMcpServer(
+  inner: McpServer | AdcpServerInternal,
+  compliance?: AdcpServerComplianceApi,
+  adcpVersion: string = ADCP_VERSION,
+  options: {
+    structuredContentTextFallback?: StructuredContentTextFallback;
+    defaultAdcpVersion?: string;
+  } = {}
+): AdcpServerInternal {
+  if (isAdcpServer(inner)) return inner;
+  const mcp = inner as McpServer;
+  const structuredContentTextFallback = options.structuredContentTextFallback ?? 'always';
+  const resolvedCompliance: AdcpServerComplianceApi = compliance ?? {
+    async reset() {
+      throw new Error(
+        'AdcpServer.compliance.reset: no-op handle returned by `wrapMcpServer` without a compliance implementation. ' +
+          'Use `createAdcpServer()` to get a server whose `compliance.reset()` flushes the state and idempotency stores.'
+      );
+    },
+  };
+  const dispatch = async (request: AdcpTestRequest, extras?: AdcpTestRequestExtras): Promise<AdcpTestResponse> => {
+    const extra: { signal: AbortSignal; authInfo?: AdcpTestRequestExtras['authInfo']; sessionId?: string } = {
+      signal: extras?.signal ?? new AbortController().signal,
+    };
+    if (extras?.authInfo) extra.authInfo = extras.authInfo;
+    if (extras?.sessionId) extra.sessionId = extras.sessionId;
+
+    if (request.method === 'tools/call') {
+      const params = (request.params ?? {}) as { name?: string; arguments?: Record<string, unknown> };
+      if (typeof params.name !== 'string') {
+        throw new Error("dispatchTestRequest: 'tools/call' requires params.name (string)");
+      }
+      const tool = getRegisteredTool(mcp, params.name);
+      if (!tool) {
+        throw new Error(`dispatchTestRequest: tool "${params.name}" is not registered`);
+      }
+      const result = await tool.handler(params.arguments ?? {}, extra);
+      return applyStructuredContentTextFallback(
+        result,
+        structuredContentTextFallback,
+        extras?.responseContext ?? { transport: 'mcp' }
+      );
+    }
+
+    const handler = getRequestHandler(mcp, request.method);
+    if (!handler) {
+      throw new Error(`dispatchTestRequest: no handler registered for method "${request.method}"`);
+    }
+    return handler({ method: request.method, params: request.params ?? {} }, extra);
+  };
+  const invoke = async (options: AdcpInvokeOptions): Promise<McpToolResponse> => {
+    if (options.authInfo?.extra?.identity33 || options.authInfo?.extra?.webBotAuthAuthorization) {
+      const { getWebBotAuthAuthorizationFailure, webBotAuthToolFailure } =
+        require('../signing/web-bot-auth') as typeof import('../signing/web-bot-auth');
+      const failure = getWebBotAuthAuthorizationFailure(options.authInfo.extra);
+      if (failure) return webBotAuthToolFailure(failure, adcpVersion);
+    }
+    const tool = getRegisteredTool(mcp, options.toolName);
+    if (!tool) {
+      throw new Error(`AdcpServer.invoke: tool "${options.toolName}" is not registered`);
+    }
+    const extra: { signal: AbortSignal; authInfo?: AdcpAuthInfo; enforceRequestSchema?: true } = {
+      signal: options.signal ?? new AbortController().signal,
+    };
+    if (options.authInfo) extra.authInfo = options.authInfo;
+    if (options.enforceRequestSchema === true) extra.enforceRequestSchema = true;
+    const response = (await tool.handler(options.args, extra)) as McpToolResponse;
+    return applyStructuredContentTextFallback(
+      response,
+      structuredContentTextFallback,
+      options.responseContext ?? { transport: 'direct' }
+    );
+  };
+  const wrapper: AdcpServerInternal = {
+    [ADCP_SDK_SERVER]: mcp,
+    connect(transport) {
+      // The SDK's Transport interface is structurally compatible with
+      // AdcpServerTransport — the cast is boundary-crossing, not lossy.
+      return mcp.connect(transport as unknown as Parameters<McpServer['connect']>[0]);
+    },
+    close() {
+      return mcp.close();
+    },
+    compliance: resolvedCompliance,
+    // Satisfies both overloads (typed tools/call + generic fallback) — the
+    // runtime dispatcher is a single function that narrows by method.
+    dispatchTestRequest: dispatch as AdcpServerInternal['dispatchTestRequest'],
+    invoke,
+    getAdcpVersion: () => adcpVersion,
+    getDefaultAdcpVersion: () => options.defaultAdcpVersion ?? adcpVersion,
+  };
+  return wrapper;
+}

@@ -1,0 +1,544 @@
+#!/usr/bin/env tsx
+
+import { readFileSync, writeFileSync, existsSync } from 'fs';
+import path from 'path';
+import { inc as incrementSemver, parse as parseSemver, type SemVer } from 'semver';
+
+// Write file only if content differs (excluding generated timestamp)
+function writeFileIfChanged(filePath: string, newContent: string): boolean {
+  const contentWithoutTimestamp = (content: string) => {
+    return content.replace(/generatedAt: '.*?'/, "generatedAt: '[TIMESTAMP]'");
+  };
+
+  let hasChanged = true;
+  if (existsSync(filePath)) {
+    const existingContent = readFileSync(filePath, 'utf8');
+    const existingWithoutTimestamp = contentWithoutTimestamp(existingContent);
+    const newWithoutTimestamp = contentWithoutTimestamp(newContent);
+
+    if (existingWithoutTimestamp === newWithoutTimestamp) {
+      hasChanged = false;
+    }
+  }
+
+  if (hasChanged) {
+    writeFileSync(filePath, newContent);
+  }
+
+  return hasChanged;
+}
+
+// Get target AdCP version from ADCP_VERSION file (source of truth)
+function getTargetAdCPVersion(): string {
+  try {
+    const versionFilePath = path.join(__dirname, '../ADCP_VERSION');
+    if (!existsSync(versionFilePath)) {
+      throw new Error('ADCP_VERSION file not found. This file defines which AdCP version to use.');
+    }
+    const version = readFileSync(versionFilePath, 'utf8').trim();
+    if (!version) {
+      throw new Error('ADCP_VERSION file is empty');
+    }
+    return version;
+  } catch (error) {
+    console.error(`❌ Failed to read ADCP_VERSION file:`, error.message);
+    process.exit(1);
+  }
+}
+
+// Get current package.json version
+function getCurrentPackageVersion(): { version: string; adcpVersion?: string } {
+  try {
+    const packagePath = path.join(__dirname, '../package.json');
+    const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
+    return {
+      version: packageJson.version,
+      adcpVersion: packageJson.adcp_version,
+    };
+  } catch (error) {
+    console.error(`❌ Failed to read package.json:`, error.message);
+    process.exit(1);
+  }
+}
+
+function requireSemver(value: string, source: string): SemVer {
+  const parsed = parseSemver(value);
+  if (!parsed) {
+    throw new Error(`${source} must be a valid semantic version; received ${JSON.stringify(value)}`);
+  }
+  return parsed;
+}
+
+/**
+ * Calculate the library version used by the legacy `--auto-update` path.
+ *
+ * Changesets normally owns package versions, but the scheduled schema-sync
+ * workflow still uses this path when the AdCP pin changes. Preserve an active
+ * prerelease train instead of parsing the `0-beta` component as a number and
+ * producing an invalid version such as `14.0.NaN`.
+ */
+function nextLibraryVersion(
+  currentLibraryVersion: string,
+  currentAdcpVersion: string | undefined,
+  nextAdcpVersion: string
+): string {
+  const library = requireSemver(currentLibraryVersion, 'package.json version');
+  const currentAdcp = requireSemver(currentAdcpVersion || '0.0.0', 'current adcp_version');
+  const nextAdcp = requireSemver(nextAdcpVersion, 'next adcp_version');
+  const prereleaseTag = typeof library.prerelease[0] === 'string' ? library.prerelease[0] : undefined;
+
+  let nextRelease: string | undefined;
+  if (nextAdcp.major > currentAdcp.major) {
+    nextRelease = `${library.major + 1}.0.0`;
+  } else if (nextAdcp.major === currentAdcp.major && nextAdcp.minor > currentAdcp.minor) {
+    nextRelease = `${library.major}.${library.minor + 1}.0`;
+  }
+
+  if (nextRelease) {
+    if (library.prerelease.length === 0) return nextRelease;
+    return prereleaseTag ? `${nextRelease}-${prereleaseTag}.0` : `${nextRelease}-0`;
+  }
+
+  if (library.prerelease.length > 0) {
+    const incremented = incrementSemver(library.version, 'prerelease', prereleaseTag);
+    if (!incremented) {
+      throw new Error(`Could not increment prerelease version ${JSON.stringify(currentLibraryVersion)}`);
+    }
+    return incremented;
+  }
+
+  return `${library.major}.${library.minor}.${library.patch + 1}`;
+}
+
+// Accept only the characters that appear in legitimate semver / AdCP
+// version strings. Guards against a hostile ADCP_VERSION or package.json
+// smuggling template-injection characters (quotes, backticks, newlines)
+// into the generated TS file at build time.
+const SAFE_VERSION = /^[0-9A-Za-z.\-+]+$/;
+
+function assertSafeVersion(value: string, source: string): void {
+  if (!SAFE_VERSION.test(value)) {
+    console.error(`❌ ${source} contains unsafe characters: ${JSON.stringify(value)}`);
+    process.exit(1);
+  }
+}
+
+// Legacy wire aliases. Historical protocol previews are intentionally absent:
+// only the exact current prerelease pin is advertised by buildCompatibleVersions.
+const COMPATIBLE_PREFIX = ['v3'] as const;
+
+const PRE_3_1_COMPATIBLE_PREFIX = COMPATIBLE_PREFIX.filter(version => !version.startsWith('3.1.')) as string[];
+
+/**
+ * Build the `COMPATIBLE_ADCP_VERSIONS` list dynamically from the current
+ * `ADCP_VERSION`. The bumper PR doesn't have to remember to append a new
+ * stable patch literal — the script enumerates the active stable range
+ * automatically.
+ *
+ * Fails loudly when the version is outside the known 3.x ranges so a future
+ * major/minor bump can't silently inherit stale compatibility semantics: the
+ * human bumper has to extend this script deliberately.
+ *
+ * Background: adcontextprotocol/adcp-client schema URL pinning drift. The
+ * 3.0.9 / 3.0.10 / 3.0.11 chore PRs all forgot to manually extend the
+ * `COMPATIBLE_ADCP_VERSIONS` array literal that previously lived inline in
+ * the template, so the compat surface capped at `3.0.8` across multiple
+ * patch bumps. Auto-deriving eliminates that drift class.
+ */
+// Sanity bound on the patch enumeration. The AdCP spec patch cadence is
+// roughly weekly; even at 10× speed we won't see 3.0.500 in the lifetime
+// of the 3.0.x series. A defensive cap turns a hostile or fat-fingered
+// `ADCP_VERSION = '3.0.999999999'` into a clean build failure instead of
+// a silent ~10⁹-string OOM during enumeration.
+const MAX_PATCH_ENUMERATION = 500;
+
+/**
+ * Last 3.0.x GA the SDK retains wire compat with when the primary pin
+ * moves into 3.1.0 prerelease builds. Wire compat is free per spec (`error.code`
+ * open enum, `recovery` fallback), so keeping the 3.0.x enumeration here
+ * means an 8.0-beta SDK can still talk to a 3.0.12-pinned seller without
+ * the version-negotiation layer flagging the peer as unsupported.
+ *
+ * Update this when 3.0 reaches EOL — at that point drop the 3.0.x
+ * enumeration entirely.
+ */
+const LAST_3_0_GA_PATCH = 25;
+const LAST_3_1_GA_PATCH = 29;
+/** Update alongside the stable 3.2 pin before building a 3.3 prerelease. */
+const LAST_3_2_GA_PATCH = 7;
+/** First published AdCP 3.2 GA patch; 3.2.0 was withdrawn before GA. */
+const FIRST_3_2_GA_PATCH = 1;
+
+function withVersionAliases(versions: readonly string[]): string[] {
+  const out: string[] = [];
+  const add = (value: string) => {
+    if (!out.includes(value)) out.push(value);
+  };
+  for (const version of versions) {
+    add(version);
+    const fullStable = /^(\d+)\.(\d+)\.\d+$/.exec(version);
+    if (fullStable) {
+      add(`${fullStable[1]}.${fullStable[2]}`);
+      continue;
+    }
+    const fullPrerelease = /^(\d+)\.(\d+)\.\d+-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)$/.exec(version);
+    if (!fullPrerelease) continue;
+    const releasePrecision = `${fullPrerelease[1]}.${fullPrerelease[2]}-${fullPrerelease[3]}`;
+    add(releasePrecision);
+    const family = /^(\d+\.\d+-[0-9A-Za-z-]+)\.\d+$/.exec(releasePrecision)?.[1];
+    if (family) add(family);
+  }
+  return out;
+}
+
+function buildCompatibleVersions(adcpVersion: string): string[] {
+  const semverMatch = /^(\d+)\.(\d+)\.(\d+)(?:-(.+))?$/.exec(adcpVersion);
+  if (!semverMatch) {
+    console.error(
+      `❌ ADCP_VERSION ${JSON.stringify(adcpVersion)} does not match major.minor.patch[-prerelease] shape.`
+    );
+    process.exit(1);
+  }
+  const major = Number(semverMatch[1]);
+  const minor = Number(semverMatch[2]);
+  const patch = Number(semverMatch[3]);
+  const prerelease = semverMatch[4];
+
+  // 3.2/3.3 prereleases are exact. Keep maintained older GA releases
+  // available for pinned peers, but never add a moving prerelease-family
+  // alias: beta.0, beta.1, and later candidates may carry different
+  // wire contracts and bundles.
+  if (major === 3 && (minor === 2 || minor === 3) && patch === 0 && /^(beta|rc)\.\d+$/.test(prerelease ?? '')) {
+    const range3_0_x: string[] = [];
+    for (let p = 0; p <= LAST_3_0_GA_PATCH; p++) range3_0_x.push(`3.0.${p}`);
+    const range3_1_x: string[] = [];
+    for (let p = 0; p <= LAST_3_1_GA_PATCH; p++) range3_1_x.push(`3.1.${p}`);
+    const range3_2_x: string[] = [];
+    if (minor === 3) {
+      for (let p = FIRST_3_2_GA_PATCH; p <= LAST_3_2_GA_PATCH; p++) range3_2_x.push(`3.2.${p}`);
+    }
+    const historical = withVersionAliases([...PRE_3_1_COMPATIBLE_PREFIX, ...range3_0_x, ...range3_1_x, ...range3_2_x]);
+    const exactPrereleaseAliases = withVersionAliases([adcpVersion]).filter(
+      version => version !== `${major}.${minor}-${prerelease!.split('.')[0]}`
+    );
+    return [...historical, ...exactPrereleaseAliases.filter(version => !historical.includes(version))];
+  }
+
+  // 3.1.0 prerelease primary pin (current 8.x line). Keep wire compat with
+  // 3.0.x GA sellers — the wire is open-enum and a 3.1-pinned SDK that meets
+  // a 3.0.12 seller MUST still parse the envelope. Enumerate 3.0.0..3.0.LAST_3_0_GA_PATCH
+  // plus the exact current prerelease.
+  if (major === 3 && minor === 1 && patch === 0 && /^(beta|rc)\./.test(prerelease ?? '')) {
+    const range3_0_x: string[] = [];
+    for (let p = 0; p <= LAST_3_0_GA_PATCH; p++) range3_0_x.push(`3.0.${p}`);
+    return withVersionAliases([...COMPATIBLE_PREFIX, ...range3_0_x, adcpVersion]);
+  }
+
+  if (prerelease) {
+    console.error(
+      `❌ ADCP_VERSION ${JSON.stringify(adcpVersion)} carries an unrecognized prerelease. ` +
+        `Extend buildCompatibleVersions in scripts/sync-version.ts to define compat semantics.`
+    );
+    process.exit(1);
+  }
+
+  // 3.2 GA line. AdCP 3.2.0 was withdrawn before GA (its June 2026 preview
+  // artifacts remain on the CDN but are not the 3.2 contract), so the stable
+  // enumeration starts at FIRST_3_2_GA_PATCH and never advertises `3.2.0`.
+  // Peers negotiate the release-precision `3.2` alias on the wire. Keep
+  // every supported 3.0/3.1 GA patch for pinned peers.
+  if (major === 3 && minor === 2) {
+    if (patch < FIRST_3_2_GA_PATCH) {
+      console.error(
+        `❌ ADCP_VERSION ${JSON.stringify(adcpVersion)} is the withdrawn AdCP 3.2.0 release. ` +
+          `Pin 3.2.${FIRST_3_2_GA_PATCH} or later.`
+      );
+      process.exit(1);
+    }
+    if (patch > MAX_PATCH_ENUMERATION) {
+      console.error(
+        `❌ ADCP_VERSION ${JSON.stringify(adcpVersion)} exceeds MAX_PATCH_ENUMERATION ` +
+          `(${MAX_PATCH_ENUMERATION}). If the spec has genuinely produced this many patches, ` +
+          `raise the constant in scripts/sync-version.ts deliberately.`
+      );
+      process.exit(1);
+    }
+    const range3_0_x: string[] = [];
+    for (let p = 0; p <= LAST_3_0_GA_PATCH; p++) range3_0_x.push(`3.0.${p}`);
+    const range3_1_x: string[] = [];
+    for (let p = 0; p <= LAST_3_1_GA_PATCH; p++) range3_1_x.push(`3.1.${p}`);
+    const range3_2_x: string[] = [];
+    for (let p = FIRST_3_2_GA_PATCH; p <= patch; p++) range3_2_x.push(`3.2.${p}`);
+    return withVersionAliases([...PRE_3_1_COMPATIBLE_PREFIX, ...range3_0_x, ...range3_1_x, ...range3_2_x]);
+  }
+
+  if (major === 3 && minor === 1) {
+    if (patch > MAX_PATCH_ENUMERATION) {
+      console.error(
+        `❌ ADCP_VERSION ${JSON.stringify(adcpVersion)} exceeds MAX_PATCH_ENUMERATION ` +
+          `(${MAX_PATCH_ENUMERATION}). If the spec has genuinely produced this many patches, ` +
+          `raise the constant in scripts/sync-version.ts deliberately.`
+      );
+      process.exit(1);
+    }
+    const range3_0_x: string[] = [];
+    for (let p = 0; p <= LAST_3_0_GA_PATCH; p++) range3_0_x.push(`3.0.${p}`);
+    const range3_1_x: string[] = [];
+    for (let p = 0; p <= patch; p++) range3_1_x.push(`3.1.${p}`);
+    return withVersionAliases([...PRE_3_1_COMPATIBLE_PREFIX, ...range3_0_x, ...range3_1_x]);
+  }
+
+  if (major !== 3 || minor !== 0) {
+    console.error(
+      `❌ ADCP_VERSION ${JSON.stringify(adcpVersion)} is outside the 3.0.x range this ` +
+        `script enumerates. Extend buildCompatibleVersions in scripts/sync-version.ts ` +
+        `to cover the new major/minor range, then re-run npm run sync-version.`
+    );
+    process.exit(1);
+  }
+  if (patch > MAX_PATCH_ENUMERATION) {
+    console.error(
+      `❌ ADCP_VERSION ${JSON.stringify(adcpVersion)} exceeds MAX_PATCH_ENUMERATION ` +
+        `(${MAX_PATCH_ENUMERATION}). If the spec has genuinely produced this many patches, ` +
+        `raise the constant in scripts/sync-version.ts deliberately.`
+    );
+    process.exit(1);
+  }
+  const range3_0_x: string[] = [];
+  for (let p = 0; p <= patch; p++) range3_0_x.push(`3.0.${p}`);
+  return withVersionAliases([...COMPATIBLE_PREFIX, ...range3_0_x]);
+}
+
+// Generate version.ts file with library and AdCP versions
+function generateVersionFile(libraryVersion: string, adcpVersion: string): void {
+  assertSafeVersion(libraryVersion, 'package.json version');
+  assertSafeVersion(adcpVersion, 'ADCP_VERSION');
+  const compatibleVersions = buildCompatibleVersions(adcpVersion);
+  const compatibleVersionsLiteral = compatibleVersions.map(v => `  '${v}',`).join('\n');
+  const versionFilePath = path.join(__dirname, '../src/lib/version.ts');
+  const versionContent = `// Generated version information
+// This file is auto-generated by sync-version.ts
+
+/**
+ * AdCP SDK library version
+ */
+export const LIBRARY_VERSION = '${libraryVersion}';
+
+/**
+ * AdCP specification version this library is built for
+ */
+export const ADCP_VERSION = '${adcpVersion}';
+
+/**
+ * AdCP major version sent with every request (adcp_major_version field).
+ * Sellers validate this against their supported versions and return
+ * VERSION_UNSUPPORTED if the version is not in range.
+ */
+export const ADCP_MAJOR_VERSION = 3;
+
+/**
+ * AdCP versions this library maintains backward compatibility with.
+ *
+ * Auto-derived from \`ADCP_VERSION\` by scripts/sync-version.ts. Do not edit
+ * this list by hand; bumping the AdCP pin via \`npm run sync-version\`
+ * extends it.
+ */
+export const COMPATIBLE_ADCP_VERSIONS = [
+${compatibleVersionsLiteral}
+] as const;
+
+/**
+ * String literal union of every AdCP version the SDK formally supports.
+ *
+ * Used by the per-instance \`adcpVersion\` constructor option to give callers
+ * autocomplete in editors. The intersection with \`(string & {})\` in the
+ * config type preserves the escape hatch — any string is still accepted at
+ * the type level — while the literal union surfaces canonical values first.
+ */
+export type AdcpVersion = (typeof COMPATIBLE_ADCP_VERSIONS)[number];
+
+/**
+ * Full version information
+ */
+export const VERSION_INFO = {
+  library: '${libraryVersion}',
+  adcp: '${adcpVersion}',
+  compatibleVersions: COMPATIBLE_ADCP_VERSIONS,
+  generatedAt: '${new Date().toISOString()}',
+} as const;
+
+/**
+ * Get the AdCP specification version this library is built for
+ */
+export function getAdcpVersion(): string {
+  return ADCP_VERSION;
+}
+
+/**
+ * Get the library version
+ */
+export function getLibraryVersion(): string {
+  return LIBRARY_VERSION;
+}
+
+/**
+ * Check if this library version is compatible with a given AdCP version
+ */
+export function isCompatibleWith(adcpVersion: string): boolean {
+  return (COMPATIBLE_ADCP_VERSIONS as readonly string[]).includes(adcpVersion);
+}
+
+/**
+ * Get all AdCP versions this library is compatible with
+ */
+export function getCompatibleVersions(): readonly string[] {
+  return COMPATIBLE_ADCP_VERSIONS;
+}
+
+/**
+ * Extract the major version number from an AdCP version string.
+ *
+ * Accepts:
+ *   - Semver: '3.0.0', '3.0.1', '3.1.0-beta.1' → 3
+ *   - Legacy aliases: 'v3' → 3, 'v2.5' / 'v2.6' → 2
+ *
+ * Returns NaN for unrecognized strings — callers should validate before passing.
+ */
+export function parseAdcpMajorVersion(version: string): number {
+  const trimmed = version.trim();
+  const semverLike = trimmed.startsWith('v') ? trimmed.slice(1) : trimmed;
+  const major = parseInt(semverLike.split('.')[0] ?? '', 10);
+  return Number.isFinite(major) ? major : NaN;
+}
+
+/**
+ * Normalize a full-semver AdCP version (\`MAJOR.MINOR.PATCH[-prerelease]\`) to
+ * the release-precision form that AdCP 3.1+ requires on the wire:
+ * \`MAJOR.MINOR[-prerelease]\` — the patch digit is dropped.
+ *
+ * Per the spec note on \`adcp_version\`: "SDKs that read full-semver values
+ * from bundle metadata (e.g. \`ComplianceIndex.published_version =
+ * "3.1.0-beta.1"\`) MUST normalize to release-precision (\`"3.1-beta.1"\`)
+ * before emitting on the wire — meta-field values are NOT valid wire
+ * values." The wire regex (\`^\\d+\\.\\d+(-[a-zA-Z0-9.-]+)?$\`) rejects strings
+ * with a patch digit.
+ *
+ * Behavior:
+ *   - \`"3.1.0-beta.7"\` → \`"3.1-beta.7"\`
+ *   - \`"3.1.0"\`        → \`"3.1"\`
+ *   - \`"3.0.12"\`       → \`"3.0"\`
+ *   - Already-release-precision input (\`"3.1"\`, \`"3.1-beta.7"\`) passes through
+ *   - Legacy aliases (\`"v2.5"\`, \`"v3"\`) pass through unchanged — the wire
+ *     regex doesn't accept them anyway; the v2.5 path uses
+ *     \`adcp_major_version\` instead of \`adcp_version\` for transport.
+ *   - Unrecognized strings pass through unchanged so callers can detect drift
+ *     via the wire validator rather than have it masked by this helper.
+ */
+export function toReleasePrecisionVersion(version: string): string {
+  const trimmed = version.trim();
+  // Pre-release form \`MAJOR.MINOR.PATCH-prerelease\` → \`MAJOR.MINOR-prerelease\`
+  const semverMatch = trimmed.match(/^(\\d+)\\.(\\d+)\\.\\d+(-[A-Za-z0-9.-]+)?$/);
+  if (semverMatch) {
+    const [, major, minor, pre = ''] = semverMatch;
+    return \`\${major}.\${minor}\${pre}\`;
+  }
+  // Already release-precision (no patch digit). Includes \`3.1\`, \`3.1-beta.7\`.
+  if (/^\\d+\\.\\d+(-[A-Za-z0-9.-]+)?$/.test(trimmed)) return trimmed;
+  // Legacy aliases (\`v3\`, \`v2.5\`, \`v2.6\`) and anything we don't recognize —
+  // pass through so the wire validator can flag genuine drift.
+  return version;
+}
+`;
+
+  const versionChanged = writeFileIfChanged(versionFilePath, versionContent);
+  if (versionChanged) {
+    console.log(`✅ Updated version file: ${versionFilePath}`);
+  } else {
+    console.log(`✅ Version file is up to date: ${versionFilePath}`);
+  }
+}
+
+// Update package.json with AdCP version
+function updatePackageJsonVersion(adcpVersion: string, autoUpdate: boolean = false): void {
+  const packagePath = path.join(__dirname, '../package.json');
+  const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
+
+  const currentLibraryVersion = packageJson.version;
+  const currentAdcpVersion = packageJson.adcp_version;
+
+  // Check if AdCP version has changed
+  if (currentAdcpVersion === adcpVersion) {
+    console.log(`✅ Package already aligned with AdCP v${adcpVersion}`);
+    generateVersionFile(currentLibraryVersion, adcpVersion);
+    return;
+  }
+
+  // Update adcp_version field
+  packageJson.adcp_version = adcpVersion;
+
+  if (autoUpdate) {
+    const newLibraryVersion = nextLibraryVersion(currentLibraryVersion, currentAdcpVersion, adcpVersion);
+
+    packageJson.version = newLibraryVersion;
+    console.log(`📈 Auto-updating library version: ${currentLibraryVersion} -> ${newLibraryVersion}`);
+  }
+
+  // Write updated package.json
+  writeFileSync(packagePath, JSON.stringify(packageJson, null, 2) + '\n');
+  console.log(`✅ Updated package.json:`);
+  console.log(`   📦 Library version: ${packageJson.version}`);
+  console.log(`   🏷️  AdCP version: ${adcpVersion}`);
+
+  // Generate version file
+  generateVersionFile(packageJson.version, adcpVersion);
+}
+
+// Main sync function
+async function syncVersion(): Promise<void> {
+  console.log('🔄 Syncing version with AdCP specification...');
+
+  // Get current state
+  const adcpVersion = getTargetAdCPVersion();
+  const { version: currentLibraryVersion, adcpVersion: currentAdcpVersion } = getCurrentPackageVersion();
+
+  console.log(`📋 Current state:`);
+  console.log(`   📦 Library version: ${currentLibraryVersion}`);
+  console.log(`   🏷️  Current AdCP version: ${currentAdcpVersion || 'not set'}`);
+  console.log(`   🎯 Target AdCP version: ${adcpVersion} (from ADCP_VERSION file)`);
+
+  // Check command line arguments
+  const args = process.argv.slice(2);
+  const autoUpdate = args.includes('--auto-update') || args.includes('-u');
+  const forceUpdate = args.includes('--force') || args.includes('-f');
+
+  if (currentAdcpVersion === adcpVersion && !forceUpdate) {
+    console.log(`✅ Already in sync with AdCP v${adcpVersion}`);
+    generateVersionFile(currentLibraryVersion, adcpVersion);
+    return;
+  }
+
+  if (currentAdcpVersion && currentAdcpVersion !== adcpVersion) {
+    console.log(`🔄 AdCP version change detected: ${currentAdcpVersion} -> ${adcpVersion}`);
+
+    if (!autoUpdate && !forceUpdate) {
+      console.log(`⚠️  Use --auto-update to automatically bump library version`);
+      console.log(`⚠️  Use --force to update AdCP version without changing library version`);
+      process.exit(1);
+    }
+  }
+
+  // Update versions
+  updatePackageJsonVersion(adcpVersion, autoUpdate);
+
+  console.log(`✅ Version sync completed`);
+}
+
+// CLI execution
+if (require.main === module) {
+  syncVersion().catch(error => {
+    console.error('❌ Version sync failed:', error);
+    process.exit(1);
+  });
+}
+
+export { syncVersion, getTargetAdCPVersion, nextLibraryVersion, buildCompatibleVersions };

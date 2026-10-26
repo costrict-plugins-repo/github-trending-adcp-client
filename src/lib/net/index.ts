@@ -1,0 +1,17 @@
+/**
+ * Shared networking primitives for the client library. Home of the SSRF-safe
+ * fetch used by compliance probes, the storyboard runner, and counterparty
+ * metadata resolvers (JWKS, revocation lists).
+ */
+export {
+  ssrfSafeFetch,
+  decodeBodyAsJsonOrText,
+  SSRF_TRANSIENT_CODES,
+  SsrfRefusedError,
+  type SsrfRefusedCode,
+  type SsrfDnsLookup,
+  type SsrfFetchOptions,
+  type SsrfFetchResult,
+} from './ssrf-fetch';
+export { isPrivateIp, isAlwaysBlocked, isLikelyPrivateUrl } from './address-guards';
+export { createAgentTransportFetch, type AgentTransportFetchOptions } from './agent-transport-fetch';

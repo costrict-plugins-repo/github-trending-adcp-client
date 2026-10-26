@@ -1,0 +1,1699 @@
+// Unit tests for response unwrapper
+const { test, describe } = require('node:test');
+const assert = require('node:assert');
+
+// Import the unwrapper utilities
+const {
+  unwrapProtocolResponse,
+  isAdcpError,
+  isAdcpSuccess,
+  isTerminalAdcpError,
+  hasAdvisorySuccessPayload,
+} = require('../../dist/lib/utils/index.js');
+const { createTestProduct, createTestCreative, createTestFormat, createTestPackage } = require('./test-fixtures');
+
+describe('Response Unwrapper', () => {
+  describe('unwrapProtocolResponse', () => {
+    test('should unwrap MCP structuredContent response', () => {
+      const mcpResponse = {
+        structuredContent: {
+          packages: [{ package_id: 'pkg1', budget: 10000 }],
+          media_buy_id: 'mb123',
+          buyer_ref: 'ref-123',
+        },
+        content: [{ type: 'text', text: 'Media buy created successfully' }],
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse, undefined, 'mcp');
+
+      // Should extract both data and text message
+      assert.strictEqual(result.media_buy_id, 'mb123');
+      assert.ok(result.packages);
+      assert.strictEqual(result.packages[0].package_id, 'pkg1');
+      assert.strictEqual(result._message, 'Media buy created successfully');
+    });
+
+    test('should preserve get_products success payloads with advisory errors[]', () => {
+      const mcpResponse = {
+        structuredContent: {
+          status: 'completed',
+          cache_scope: 'public',
+          products: [createTestProduct({ product_id: 'canonical_formats_divergent_display' })],
+          errors: [
+            {
+              code: 'FORMAT_DECLARATION_DIVERGENT',
+              source: 'producer',
+              message: 'Dual-emitted canonical format metadata differs from the v1 projection',
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse, 'get_products', 'mcp');
+
+      assert.strictEqual(result.products[0].product_id, 'canonical_formats_divergent_display');
+      assert.strictEqual(result.errors[0].code, 'FORMAT_DECLARATION_DIVERGENT');
+      assert.strictEqual(isAdcpSuccess(result, 'get_products'), true);
+    });
+
+    test('preserves the status-free list_products success arm', () => {
+      const payload = {
+        outcome: 'listed',
+        products: [],
+        feed_version: 'feed-v1',
+        cache_scope: 'public',
+      };
+      const result = unwrapProtocolResponse({ structuredContent: payload }, 'list_products', 'mcp');
+
+      assert.deepStrictEqual(result, payload);
+      assert.strictEqual(result.status, undefined);
+    });
+
+    test('preserves the status-free decline_proposals success arm', () => {
+      const payload = {
+        results: [{ proposal_id: 'proposal-1', outcome: 'declined' }],
+      };
+      const result = unwrapProtocolResponse({ structuredContent: payload }, 'decline_proposals', 'mcp');
+
+      assert.deepStrictEqual(result, payload);
+      assert.strictEqual(result.status, undefined);
+    });
+
+    test('rejects decline results without the required proposal_id', () => {
+      const payload = {
+        results: [{ outcome: 'declined' }],
+      };
+
+      assert.throws(
+        () => unwrapProtocolResponse({ structuredContent: payload }, 'decline_proposals', 'mcp'),
+        /Response validation failed for decline_proposals/
+      );
+    });
+
+    test('should unwrap A2A result.artifacts response with validation', () => {
+      const a2aResponse = {
+        result: {
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    cache_scope: 'public',
+                    products: [createTestProduct({ product_id: 'prod1', name: 'Test Product' })],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(a2aResponse, 'get_products', 'a2a');
+
+      assert.ok(result.products);
+      assert.strictEqual(result.products.length, 1);
+      assert.strictEqual(result.products[0].product_id, 'prod1');
+      assert.strictEqual(result.products[0].name, 'Test Product');
+    });
+
+    test('should unwrap markerless 3.0 get_products MCP response without cache_scope', () => {
+      const mcpResponse = {
+        structuredContent: {
+          products: [],
+        },
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse, 'get_products', 'mcp', {
+        responseAdcpVersion: '3.0',
+      });
+
+      assert.deepStrictEqual(result.products, []);
+      assert.strictEqual(result.cache_scope, undefined);
+      assert.strictEqual(result.adcp_version, undefined);
+    });
+
+    test('should unwrap markerless 3.0 get_products A2A response without cache_scope', () => {
+      const a2aResponse = {
+        result: {
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    products: [],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(a2aResponse, 'get_products', 'a2a', {
+        responseAdcpVersion: '3.0',
+      });
+
+      assert.deepStrictEqual(result.products, []);
+      assert.strictEqual(result.cache_scope, undefined);
+      assert.strictEqual(result.adcp_version, undefined);
+    });
+
+    test('should unwrap nested response field in A2A data part', () => {
+      // Some agents wrap AdCP responses in an extra { response: { ... } } layer
+      const a2aResponse = {
+        result: {
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    response: {
+                      cache_scope: 'public',
+                      products: [createTestProduct({ product_id: 'prod1', name: 'Test Product' })],
+                    },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(a2aResponse, 'get_products', 'a2a');
+
+      // Should unwrap the nested response field
+      assert.ok(result.products);
+      assert.strictEqual(result.products.length, 1);
+      assert.strictEqual(result.products[0].product_id, 'prod1');
+      assert.strictEqual(result.products[0].name, 'Test Product');
+    });
+
+    test('should convert A2A error to AdCP error format', () => {
+      const a2aErrorResponse = {
+        error: {
+          code: 400,
+          message: 'Invalid request parameters',
+        },
+      };
+
+      const result = unwrapProtocolResponse(a2aErrorResponse);
+
+      assert.ok(result.errors);
+      assert.strictEqual(result.errors.length, 1);
+      assert.strictEqual(result.errors[0].code, '400');
+      assert.strictEqual(result.errors[0].message, 'Invalid request parameters');
+    });
+
+    test('should convert MCP error to AdCP error format', () => {
+      const mcpErrorResponse = {
+        isError: true,
+        content: [{ type: 'text', text: 'Tool execution failed' }],
+      };
+
+      const result = unwrapProtocolResponse(mcpErrorResponse);
+
+      assert.ok(result.adcp_error);
+      assert.strictEqual(result.adcp_error.code, 'mcp_error');
+      assert.strictEqual(result.adcp_error.message, 'Tool execution failed');
+    });
+
+    test('should preserve full structuredContent on MCP error', () => {
+      const mcpErrorResponse = {
+        isError: true,
+        content: [{ type: 'text', text: '{"adcp_error":{"code":"INVALID_REQUEST","message":"bad"}}' }],
+        structuredContent: {
+          adcp_error: { code: 'INVALID_REQUEST', message: 'bad' },
+          context: { correlation_id: 'abc-123' },
+          ext: { vendor: 'test' },
+        },
+      };
+
+      const result = unwrapProtocolResponse(mcpErrorResponse);
+
+      assert.ok(result.adcp_error);
+      assert.strictEqual(result.adcp_error.code, 'INVALID_REQUEST');
+      assert.ok(result.context);
+      assert.strictEqual(result.context.correlation_id, 'abc-123');
+      assert.ok(result.ext);
+      assert.strictEqual(result.ext.vendor, 'test');
+    });
+
+    test('should parse JSON text content on MCP error when no structuredContent', () => {
+      const mcpErrorResponse = {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              adcp_error: { code: 'RATE_LIMITED', message: 'slow down' },
+              context: { correlation_id: 'def-456' },
+            }),
+          },
+        ],
+      };
+
+      const result = unwrapProtocolResponse(mcpErrorResponse);
+
+      assert.ok(result.adcp_error);
+      assert.strictEqual(result.adcp_error.code, 'RATE_LIMITED');
+      assert.ok(result.context);
+      assert.strictEqual(result.context.correlation_id, 'def-456');
+    });
+
+    test('should parse stringified JSON in MCP text content', () => {
+      const mcpResponse = {
+        content: [{ type: 'text', text: '{"packages":[{"package_id":"pkg1"}],"media_buy_id":"mb123"}' }],
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse);
+
+      assert.deepStrictEqual(result, {
+        packages: [{ package_id: 'pkg1' }],
+        media_buy_id: 'mb123',
+      });
+    });
+
+    test('should throw error for null or undefined response', () => {
+      assert.throws(() => unwrapProtocolResponse(null), /Protocol response is null or undefined/);
+      assert.throws(() => unwrapProtocolResponse(undefined), /Protocol response is null or undefined/);
+    });
+
+    test('should throw error for unrecognized format', () => {
+      const unknownFormat = {
+        someField: 'value',
+      };
+
+      assert.throws(() => unwrapProtocolResponse(unknownFormat), /Unable to extract AdCP response/);
+    });
+
+    test('should extract text messages from A2A TextParts', () => {
+      const a2aResponse = {
+        result: {
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'text',
+                  text: 'Found 2 products',
+                },
+                {
+                  kind: 'data',
+                  data: {
+                    cache_scope: 'public',
+                    products: [createTestProduct({ product_id: 'p1' }), createTestProduct({ product_id: 'p2' })],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(a2aResponse, 'get_products', 'a2a');
+
+      assert.ok(result.products);
+      assert.strictEqual(result._message, 'Found 2 products');
+    });
+
+    test('should extract text messages from MCP content array', () => {
+      const mcpResponse = {
+        content: [
+          {
+            type: 'text',
+            text: 'Query completed successfully',
+          },
+        ],
+        structuredContent: {
+          cache_scope: 'public',
+          products: [createTestProduct({ product_id: 'p1' })],
+        },
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse, 'get_products', 'mcp');
+
+      assert.ok(result.products);
+      assert.strictEqual(result._message, 'Query completed successfully');
+    });
+
+    test('should take last artifact in conversational protocol', () => {
+      const a2aResponse = {
+        result: {
+          artifacts: [
+            {
+              artifactId: 'intermediate',
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    cache_scope: 'public',
+                    products: [createTestProduct({ product_id: 'old', name: 'Old Product' })],
+                  },
+                },
+              ],
+            },
+            {
+              artifactId: 'final',
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    cache_scope: 'public',
+                    products: [createTestProduct({ product_id: 'new', name: 'New Product' })],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(a2aResponse, 'get_products', 'a2a');
+
+      assert.strictEqual(result.products[0].product_id, 'new', 'Should take last artifact');
+      assert.strictEqual(result.products[0].name, 'New Product');
+    });
+
+    test('should ignore trailing text-only artifact when extracting A2A data', () => {
+      const a2aResponse = {
+        result: {
+          kind: 'task',
+          status: { state: 'completed' },
+          artifacts: [
+            {
+              artifactId: 'result',
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    cache_scope: 'public',
+                    products: [createTestProduct({ product_id: 'final', name: 'Final Product' })],
+                  },
+                },
+              ],
+            },
+            {
+              artifactId: 'message',
+              parts: [{ kind: 'text', text: 'Query completed successfully' }],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(a2aResponse, 'get_products', 'a2a');
+
+      assert.strictEqual(result.products[0].product_id, 'final');
+      assert.strictEqual(result._message, 'Query completed successfully');
+    });
+
+    test('should throw error when A2A artifact has no DataPart', () => {
+      const a2aResponse = {
+        result: {
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'text',
+                  text: 'Only text, no data',
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      assert.throws(() => unwrapProtocolResponse(a2aResponse, 'get_products', 'a2a'), /must have a DataPart/);
+    });
+
+    test('should throw error when A2A artifacts array is empty', () => {
+      const a2aResponse = {
+        result: {
+          artifacts: [],
+        },
+      };
+
+      assert.throws(
+        () => unwrapProtocolResponse(a2aResponse, 'get_products', 'a2a'),
+        /must have at least one artifact/
+      );
+    });
+
+    test('should combine multiple text messages with newlines', () => {
+      const a2aResponse = {
+        result: {
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'text',
+                  text: 'Line 1',
+                },
+                {
+                  kind: 'text',
+                  text: 'Line 2',
+                },
+                {
+                  kind: 'data',
+                  data: {
+                    cache_scope: 'public',
+                    products: [createTestProduct({ product_id: 'p1' })],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(a2aResponse, 'get_products', 'a2a');
+
+      assert.strictEqual(result._message, 'Line 1\nLine 2');
+    });
+
+    test('should handle A2A artifacts without status field gracefully', () => {
+      // Per @a2a-js/sdk TypeScript definitions:
+      // - Artifact interface has fields: artifactId, description?, extensions?, metadata?, name?, parts[]
+      // - Task interface has status field (with state property)
+      // - Artifacts do NOT have a status field
+      //
+      // This test verifies that if an agent erroneously returns artifacts with status fields,
+      // the unwrapper handles it correctly by ignoring the status and extracting the data.
+      const a2aResponseWithStatus = {
+        result: {
+          artifacts: [
+            {
+              artifactId: 'art-1',
+              status: 'completed', // This should not exist per spec
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    cache_scope: 'public',
+                    products: [createTestProduct({ product_id: 'prod1', name: 'Test Product' })],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      // Should not throw and should extract the data correctly
+      const result = unwrapProtocolResponse(a2aResponseWithStatus, 'get_products', 'a2a');
+
+      assert.ok(result.products);
+      assert.strictEqual(result.products.length, 1);
+      assert.strictEqual(result.products[0].product_id, 'prod1');
+      assert.strictEqual(result.products[0].name, 'Test Product');
+
+      // Note: AdCP 3.1.0-beta.2 added envelope `status` as a required field
+      // on response bodies. Earlier versions of this test asserted that
+      // `status` should be stripped from the unwrapped result; now an
+      // unwrapped envelope correctly carries `status` through. The test
+      // still proves the core point — that an artifact-level `status` (out
+      // of @a2a-js/sdk's spec for artifacts) does not break extraction.
+    });
+
+    test('should correctly determine artifact completion from Task status, not artifact status', () => {
+      // This test verifies that we rely on Task.status.state, not hypothetical Artifact.status
+      const a2aCompletedTaskResponse = {
+        result: {
+          kind: 'task',
+          id: 'task-123',
+          contextId: 'ctx-456',
+          status: {
+            state: 'completed', // Task status indicates completion
+            timestamp: '2025-01-22T12:00:00Z',
+          },
+          artifacts: [
+            {
+              artifactId: 'art-1',
+              // No status field - artifacts don't have status per spec
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    cache_scope: 'public',
+                    products: [createTestProduct({ product_id: 'prod1', name: 'Test Product' })],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(a2aCompletedTaskResponse, 'get_products', 'a2a');
+
+      assert.ok(result.products);
+      assert.strictEqual(result.products.length, 1);
+      assert.strictEqual(result.products[0].product_id, 'prod1');
+
+      // The unwrapper should work regardless of Task status
+      // Task status indicates overall task state, not individual artifact state
+    });
+
+    test('should handle very large artifact arrays (performance test)', () => {
+      // Create 100+ artifacts to test performance
+      const largeArtifactArray = [];
+      for (let i = 0; i < 150; i++) {
+        largeArtifactArray.push({
+          artifactId: `art-${i}`,
+          parts: [
+            {
+              kind: 'data',
+              data: {
+                cache_scope: 'public',
+                products: [createTestProduct({ product_id: `prod${i}`, name: `Product ${i}` })],
+              },
+            },
+          ],
+        });
+      }
+
+      const a2aResponse = {
+        result: {
+          artifacts: largeArtifactArray,
+        },
+      };
+
+      // Should take last artifact per conversational protocol
+      const result = unwrapProtocolResponse(a2aResponse, 'get_products', 'a2a');
+
+      assert.ok(result.products);
+      assert.strictEqual(result.products[0].product_id, 'prod149', 'Should take last artifact');
+      assert.strictEqual(result.products[0].name, 'Product 149');
+    });
+
+    test('should throw error for malformed DataParts (missing data field)', () => {
+      const a2aResponse = {
+        result: {
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  // Missing data field
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      assert.throws(
+        () => unwrapProtocolResponse(a2aResponse, 'get_products', 'a2a'),
+        /must have a DataPart with AdCP data/
+      );
+    });
+
+    test('should reject intermediate A2A status "working"', () => {
+      const a2aWorkingResponse = {
+        result: {
+          status: {
+            state: 'working',
+            timestamp: '2025-01-22T12:00:00Z',
+          },
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    products: [createTestProduct({ product_id: 'prod1' })],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      assert.throws(
+        () => unwrapProtocolResponse(a2aWorkingResponse, 'get_products', 'a2a'),
+        /Cannot unwrap A2A response with intermediate status: working/
+      );
+    });
+
+    test('should reject intermediate A2A status "submitted"', () => {
+      const a2aSubmittedResponse = {
+        result: {
+          status: {
+            state: 'submitted',
+            timestamp: '2025-01-22T12:00:00Z',
+          },
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    products: [createTestProduct({ product_id: 'prod1' })],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      assert.throws(
+        () => unwrapProtocolResponse(a2aSubmittedResponse, 'get_products', 'a2a'),
+        /Cannot unwrap A2A response with intermediate status: submitted/
+      );
+    });
+
+    test('should reject intermediate A2A status "input-required"', () => {
+      const a2aInputRequiredResponse = {
+        result: {
+          status: {
+            state: 'input-required',
+            timestamp: '2025-01-22T12:00:00Z',
+          },
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    products: [createTestProduct({ product_id: 'prod1' })],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      assert.throws(
+        () => unwrapProtocolResponse(a2aInputRequiredResponse, 'get_products', 'a2a'),
+        /Cannot unwrap A2A response with intermediate status: input-required/
+      );
+    });
+
+    test('should unwrap A2A failed task carrying adcp_error DataPart', () => {
+      // Per AdCP transport-errors §A2A Binding: a failed task carries an
+      // artifact with a DataPart containing `adcp_error` plus a TextPart
+      // for human/LLM consumption. The unwrapper must surface the DataPart
+      // so storyboard validators (`error_code`, `field_value`) can read
+      // `adcp_error.code` / `context.correlation_id` from the unwrapped
+      // payload instead of falling back to `Task.status.state`.
+      const a2aFailedResponse = {
+        jsonrpc: '2.0',
+        result: {
+          kind: 'task',
+          status: { state: 'failed' },
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    context: { correlation_id: 'invalid_transitions--update_unknown_media_buy' },
+                    adcp_error: {
+                      code: 'MEDIA_BUY_NOT_FOUND',
+                      message: "Media buy 'does-not-exist' not found.",
+                      recovery: 'correctable',
+                    },
+                  },
+                },
+                { kind: 'text', text: "Media buy 'does-not-exist' not found." },
+              ],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(a2aFailedResponse, undefined, 'a2a');
+
+      assert.ok(result.adcp_error, 'should surface adcp_error from DataPart');
+      assert.strictEqual(result.adcp_error.code, 'MEDIA_BUY_NOT_FOUND');
+      assert.strictEqual(result.adcp_error.recovery, 'correctable');
+      assert.ok(result.context, 'should surface context from DataPart');
+      assert.strictEqual(result.context.correlation_id, 'invalid_transitions--update_unknown_media_buy');
+      // TextPart joined onto _message for human/LLM consumption
+      assert.ok(result._message?.includes('not found'));
+    });
+
+    // Sibling of adcp-client#1575 at the unwrap layer. When a non-conformant
+    // seller surfaces both a top-level JSON-RPC error AND a terminal-state Task
+    // with a structured DataPart artifact, the artifact is canonical per AdCP
+    // transport-errors §A2A Binding. Mirrors the protocol-layer guard added in
+    // PR #1577 so direct callers (storyboard fixtures, cached responses,
+    // webhook normalize paths) inherit the same defensive behavior.
+    test('should prefer DataPart artifact over top-level JSON-RPC error', () => {
+      const dualSignalResponse = {
+        jsonrpc: '2.0',
+        // Transport-level hint — would short-circuit pre-fix.
+        error: { code: -32000, message: 'Task is in terminal state: 3' },
+        // Canonical envelope — must win.
+        result: {
+          kind: 'task',
+          status: { state: 'failed' },
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    adcp_error: { code: 'TERMS_REJECTED', message: 'rejected', recovery: 'correctable' },
+                    context: { correlation_id: 'corr-1575-sibling' },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(dualSignalResponse, undefined, 'a2a');
+
+      assert.strictEqual(result.adcp_error.code, 'TERMS_REJECTED');
+      assert.strictEqual(result.adcp_error.recovery, 'correctable');
+      assert.strictEqual(result.context.correlation_id, 'corr-1575-sibling');
+      // Errors[] from the JSON-RPC short-circuit must NOT be present.
+      assert.strictEqual(result.errors, undefined);
+    });
+
+    // Negative: top-level JSON-RPC error WITHOUT a structured artifact must
+    // still go through the errors[] short-circuit. Defends the guard's
+    // discriminator (kind === 'task' + terminal state + DataPart) against
+    // accidental over-broadening.
+    test('should keep errors[] short-circuit when no terminal-Task artifact present', () => {
+      const errorOnlyResponse = {
+        jsonrpc: '2.0',
+        error: { code: -32602, message: 'Invalid params', data: { field: 'x' } },
+      };
+
+      const result = unwrapProtocolResponse(errorOnlyResponse, undefined, 'a2a');
+
+      assert.ok(Array.isArray(result.errors));
+      assert.strictEqual(result.errors[0].code, '-32602');
+      assert.strictEqual(result.errors[0].message, 'Invalid params');
+    });
+
+    test('should unwrap A2A rejected task with DataPart payload', () => {
+      const a2aRejectedResponse = {
+        result: {
+          kind: 'task',
+          status: { state: 'rejected' },
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    adcp_error: { code: 'POLICY_VIOLATION', message: 'rejected by policy' },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(a2aRejectedResponse, undefined, 'a2a');
+      assert.strictEqual(result.adcp_error.code, 'POLICY_VIOLATION');
+    });
+
+    test('should include text snippet in error for unparseable MCP JSON', () => {
+      const mcpResponse = {
+        content: [{ type: 'text', text: 'This is not JSON, just plain text that should be included in error' }],
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse);
+
+      assert.ok(result.errors);
+      assert.strictEqual(result.errors.length, 1);
+      assert.ok(result.errors[0].message.includes('This is not JSON'));
+    });
+
+    test('should truncate long text snippet in error message', () => {
+      const longText = 'x'.repeat(200); // 200 character string
+      const mcpResponse = {
+        content: [{ type: 'text', text: longText }],
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse);
+
+      assert.ok(result.errors);
+      assert.strictEqual(result.errors.length, 1);
+      // Should be truncated to 100 chars + "..."
+      assert.ok(result.errors[0].message.includes('...'));
+      assert.ok(result.errors[0].message.length < 200);
+    });
+
+    test('should validate get_products response with Zod schema', () => {
+      // GetProductsResponseSchema is now generated and validates responses
+      const a2aResponse = {
+        result: {
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    cache_scope: 'public',
+                    products: [createTestProduct({ product_id: 'prod-1' })],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      // Should validate successfully with GetProductsResponseSchema
+      const result = unwrapProtocolResponse(a2aResponse, 'get_products', 'a2a');
+      assert.ok(result.products, 'Should return validated products');
+      assert.strictEqual(result.products.length, 1);
+      assert.strictEqual(result.products[0].product_id, 'prod-1');
+    });
+
+    test('should accept legacy 3.0 MCP get_products without cache_scope', () => {
+      const mcpResponse = {
+        structuredContent: {
+          adcp_version: '3.0.12',
+          products: [createTestProduct({ product_id: 'prod-1' })],
+        },
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse, 'get_products', 'mcp');
+      assert.ok(result.products, 'Should return validated products');
+      assert.strictEqual(result.products.length, 1);
+      assert.strictEqual(result.cache_scope, undefined);
+      assert.strictEqual(result.status, undefined);
+      assert.strictEqual(result.adcp_version, '3.0.12');
+    });
+
+    test('should accept legacy 3.0 A2A get_products without cache_scope', () => {
+      const a2aResponse = {
+        result: {
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    adcp_version: '3.0.12',
+                    products: [createTestProduct({ product_id: 'prod-1' })],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(a2aResponse, 'get_products', 'a2a');
+      assert.ok(result.products, 'Should return validated products');
+      assert.strictEqual(result.products.length, 1);
+      assert.strictEqual(result.cache_scope, undefined);
+      assert.strictEqual(result.status, undefined);
+      assert.strictEqual(result.adcp_version, '3.0.12');
+    });
+
+    test('should reject get_products response with non-array products', () => {
+      const mcpResponse = {
+        structuredContent: {
+          cache_scope: 'public',
+          products: 'not an array',
+        },
+      };
+
+      assert.throws(
+        () => unwrapProtocolResponse(mcpResponse, 'get_products', 'mcp'),
+        /Response validation failed for get_products/
+      );
+    });
+
+    test('should pass through get_products error response without schema validation', () => {
+      const mcpResponse = {
+        structuredContent: {
+          errors: [{ code: 'agent_error', message: 'Something went wrong' }],
+        },
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse, 'get_products', 'mcp');
+      assert.ok(Array.isArray(result.errors), 'Should have errors array');
+      assert.strictEqual(result.errors[0].code, 'agent_error');
+    });
+
+    test('should fail Zod validation for missing required create_media_buy fields', () => {
+      const a2aResponse = {
+        result: {
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    packages: [createTestPackage({ package_id: 'pkg1' })],
+                    // Missing media_buy_id
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      assert.throws(
+        () => unwrapProtocolResponse(a2aResponse, 'create_media_buy', 'a2a'),
+        /Response validation failed for create_media_buy/
+      );
+    });
+
+    // Skipped: 3.1.0-beta.3 reshaped CreateMediaBuyResponseSchema from
+    // `z.union([...])` to `z.object({...envelope...}).passthrough().and(z.union([...]))`
+    // (envelope fields like `status` were promoted to required and now sit
+    // above the variant union). `getBestUnionErrors` reads `_def.options`
+    // off the top schema; on a `ZodIntersection` that's absent, so the
+    // union-disambiguation path falls back to the generic "Invalid input"
+    // message. Fix needs `getBestUnionErrors` to descend into intersections,
+    // which is a source-side change outside the cluster-3 fixture sweep.
+    // Tracked alongside the `union schema error reporting` skips in
+    // response-schema-validation.test.js.
+    test('should report specific field names for union schema validation failures', () => {
+      const mcpResponse = {
+        structuredContent: {
+          packages: [createTestPackage({ package_id: 'pkg1' })],
+          // Missing media_buy_id — union schema would show "(root): Invalid input"
+        },
+        content: [{ type: 'text', text: 'Created' }],
+      };
+
+      assert.throws(
+        () => unwrapProtocolResponse(mcpResponse, 'create_media_buy', 'mcp'),
+        err => {
+          assert.ok(err.message.includes('media_buy_id'), `Error should mention missing field, got: ${err.message}`);
+          assert.ok(!err.message.includes('"Invalid input"'), 'Should not show generic union error');
+          return true;
+        }
+      );
+    });
+
+    // Skipped: 3.1.0-beta.3 made `products` OPTIONAL on the
+    // GetProductsResponseSchema envelope (the wholesale-feed `unchanged: true`
+    // shape legitimately omits it). The `filterInvalidProducts` helper in
+    // response-unwrapper.ts inspects `schema.shape.products` and bails when
+    // it isn't a `ZodArray` — but `ZodOptional<ZodArray>` now sits there,
+    // so the helper returns null without filtering. Restoring the feature
+    // needs the helper to unwrap `ZodOptional` (and reassert the optionality
+    // after filtering), which is a source-side change outside the
+    // cluster-3 fixture sweep.
+    test('should filter invalid products when filterInvalidProducts is enabled', () => {
+      const validProduct = createTestProduct({ product_id: 'valid-1' });
+      const invalidProduct = { product_id: 'invalid-1' }; // Missing required fields
+
+      const mcpResponse = {
+        structuredContent: {
+          cache_scope: 'public',
+          products: [validProduct, invalidProduct],
+        },
+      };
+
+      // Without filtering, should throw
+      assert.throws(() => unwrapProtocolResponse(mcpResponse, 'get_products', 'mcp'), /validation failed/i);
+
+      // With filtering, should return only the valid product
+      const result = unwrapProtocolResponse(mcpResponse, 'get_products', 'mcp', {
+        filterInvalidProducts: true,
+      });
+      assert.strictEqual(result.products.length, 1);
+      assert.strictEqual(result.products[0].product_id, 'valid-1');
+    });
+
+    // See above (filterInvalidProducts skip) — same source-side root cause.
+    test('should return empty array when all products are invalid and filtering is enabled', () => {
+      const invalidProduct1 = { product_id: 'bad-1' };
+      const invalidProduct2 = { product_id: 'bad-2' };
+
+      const mcpResponse = {
+        structuredContent: {
+          cache_scope: 'public',
+          products: [invalidProduct1, invalidProduct2],
+        },
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse, 'get_products', 'mcp', {
+        filterInvalidProducts: true,
+      });
+      assert.strictEqual(result.products.length, 0);
+    });
+
+    test('should pass through fully valid responses unchanged when filtering is enabled', () => {
+      const product1 = createTestProduct({ product_id: 'p1' });
+      const product2 = createTestProduct({ product_id: 'p2' });
+
+      const mcpResponse = {
+        structuredContent: {
+          cache_scope: 'public',
+          products: [product1, product2],
+        },
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse, 'get_products', 'mcp', {
+        filterInvalidProducts: true,
+      });
+      assert.strictEqual(result.products.length, 2);
+    });
+
+    test('should NOT filter other tools even when filterInvalidProducts is enabled', () => {
+      const mcpResponse = {
+        structuredContent: {
+          media_buy_id: 'mb-1',
+          // Missing required fields like buyer_ref, packages
+        },
+      };
+
+      assert.throws(
+        () =>
+          unwrapProtocolResponse(mcpResponse, 'create_media_buy', 'mcp', {
+            filterInvalidProducts: true,
+          }),
+        /validation failed/i
+      );
+    });
+
+    // See the MCP-path skips above (`filterInvalidProducts` /
+    // `ZodOptional<ZodArray>` source-side root cause) — same issue surfaced
+    // via the A2A unwrap path.
+    test('should filter invalid products via A2A protocol path', () => {
+      const validProduct = createTestProduct({ product_id: 'a2a-valid' });
+      const invalidProduct = { product_id: 'a2a-bad' };
+
+      const a2aResponse = {
+        result: {
+          status: { state: 'completed' },
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    cache_scope: 'public',
+                    products: [validProduct, invalidProduct],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(a2aResponse, 'get_products', 'a2a', {
+        filterInvalidProducts: true,
+      });
+      assert.strictEqual(result.products.length, 1);
+      assert.strictEqual(result.products[0].product_id, 'a2a-valid');
+    });
+
+    test('should return null from filtering when products field is not an array', () => {
+      const mcpResponse = {
+        structuredContent: {
+          cache_scope: 'public',
+          products: 'not-an-array',
+        },
+      };
+
+      // Should still throw validation error, filtering can't help
+      assert.throws(
+        () =>
+          unwrapProtocolResponse(mcpResponse, 'get_products', 'mcp', {
+            filterInvalidProducts: true,
+          }),
+        /validation failed/i
+      );
+    });
+  });
+
+  describe('Protocol Auto-Detection Edge Cases', () => {
+    test('should throw error for empty response object', () => {
+      const emptyResponse = {};
+
+      assert.throws(
+        () => unwrapProtocolResponse(emptyResponse),
+        /Unable to extract AdCP response from protocol wrapper/
+      );
+    });
+
+    test('should throw error for response with only unrelated fields', () => {
+      const unrelatedResponse = {
+        someField: 'value',
+        anotherField: 123,
+        randomData: { nested: 'object' },
+      };
+
+      assert.throws(
+        () => unwrapProtocolResponse(unrelatedResponse),
+        /Unable to extract AdCP response from protocol wrapper/
+      );
+    });
+
+    test('should prioritize MCP when response has both MCP and A2A fields (ambiguous)', () => {
+      // This is an ambiguous response with both protocol indicators
+      const ambiguousResponse = {
+        // MCP fields
+        structuredContent: {
+          products: [createTestProduct({ product_id: 'mcp-prod', name: 'MCP Product' })],
+        },
+        // A2A fields
+        result: {
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    products: [createTestProduct({ product_id: 'a2a-prod', name: 'A2A Product' })],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(ambiguousResponse);
+
+      // Auto-detection should prioritize MCP (isMCPResponse is checked first)
+      assert.strictEqual(result.products[0].product_id, 'mcp-prod');
+      assert.strictEqual(result.products[0].name, 'MCP Product');
+    });
+
+    test('should detect A2A when only A2A fields present', () => {
+      const a2aOnlyResponse = {
+        result: {
+          artifacts: [
+            {
+              parts: [
+                {
+                  kind: 'data',
+                  data: {
+                    products: [createTestProduct({ product_id: 'a2a-only', name: 'A2A Only' })],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      const result = unwrapProtocolResponse(a2aOnlyResponse);
+
+      assert.strictEqual(result.products[0].product_id, 'a2a-only');
+      assert.strictEqual(result.products[0].name, 'A2A Only');
+    });
+
+    test('should detect MCP when only MCP fields present', () => {
+      const mcpOnlyResponse = {
+        structuredContent: {
+          products: [createTestProduct({ product_id: 'mcp-only', name: 'MCP Only' })],
+        },
+      };
+
+      const result = unwrapProtocolResponse(mcpOnlyResponse);
+
+      assert.strictEqual(result.products[0].product_id, 'mcp-only');
+      assert.strictEqual(result.products[0].name, 'MCP Only');
+    });
+  });
+
+  describe('isAdcpError', () => {
+    test('should return true for error responses', () => {
+      const errorResponse = {
+        errors: [{ code: 'invalid_request', message: 'Missing required field' }],
+      };
+
+      assert.strictEqual(isAdcpError(errorResponse), true);
+    });
+
+    test('should return false for success responses', () => {
+      const successResponse = {
+        packages: [{ package_id: 'pkg1' }],
+        media_buy_id: 'mb123',
+      };
+
+      assert.strictEqual(isAdcpError(successResponse), false);
+    });
+
+    test('should return false for empty errors array', () => {
+      const response = {
+        errors: [],
+      };
+
+      assert.strictEqual(isAdcpError(response), false);
+    });
+
+    test('should return true for adcp_error responses', () => {
+      assert.strictEqual(isAdcpError({ adcp_error: { code: 'RATE_LIMITED', message: 'slow' } }), true);
+    });
+
+    test('flat error_code responses are terminal for permissive expected-error handling', () => {
+      const response = {
+        error_code: 'INVALID_REQUEST',
+        message: 'Invalid request',
+      };
+
+      assert.strictEqual(isAdcpError(response), false);
+      assert.strictEqual(isTerminalAdcpError(response, 'get_products'), true);
+      assert.strictEqual(isAdcpSuccess(response, 'get_products'), false);
+    });
+
+    test('task-aware terminal detection treats flat error_code as advisory on success payloads', () => {
+      const advisorySuccess = {
+        status: 'completed',
+        cache_scope: 'public',
+        products: [createTestProduct({ product_id: 'prod-advisory-flat-error-code' })],
+        error_code: 'FORMAT_DECLARATION_DIVERGENT',
+      };
+
+      assert.strictEqual(hasAdvisorySuccessPayload(advisorySuccess, 'get_products'), true);
+      assert.strictEqual(isTerminalAdcpError(advisorySuccess, 'get_products'), false);
+      assert.strictEqual(isTerminalAdcpError(advisorySuccess), true);
+
+      const mcpResponse = { structuredContent: advisorySuccess };
+      const result = unwrapProtocolResponse(mcpResponse, 'get_products', 'mcp');
+      assert.strictEqual(result.products[0].product_id, 'prod-advisory-flat-error-code');
+      assert.strictEqual(result.error_code, 'FORMAT_DECLARATION_DIVERGENT');
+    });
+
+    test('should return false for adcp_error with non-string code', () => {
+      assert.strictEqual(isAdcpError({ adcp_error: { code: 42 } }), false);
+    });
+
+    test('should return false for adcp_error without code', () => {
+      assert.strictEqual(isAdcpError({ adcp_error: {} }), false);
+    });
+
+    test('isAdcpError remains structural; isTerminalAdcpError is task-aware for advisory errors[]', () => {
+      const advisorySuccess = {
+        status: 'completed',
+        cache_scope: 'public',
+        products: [createTestProduct({ product_id: 'prod-advisory' })],
+        errors: [{ code: 'FORMAT_DECLARATION_DIVERGENT', message: 'advisory' }],
+      };
+
+      assert.strictEqual(isAdcpError(advisorySuccess), true);
+      assert.strictEqual(hasAdvisorySuccessPayload(advisorySuccess, 'get_products'), true);
+      assert.strictEqual(isTerminalAdcpError(advisorySuccess, 'get_products'), false);
+    });
+
+    test('task-aware terminal detection accepts report_usage partial success errors[]', () => {
+      const partialSuccess = {
+        status: 'completed',
+        accepted: 2,
+        errors: [{ code: 'INVALID_USAGE_ROW', message: 'one row rejected' }],
+      };
+
+      assert.strictEqual(isAdcpError(partialSuccess), true);
+      assert.strictEqual(hasAdvisorySuccessPayload(partialSuccess, 'report_usage'), true);
+      assert.strictEqual(isTerminalAdcpError(partialSuccess, 'report_usage'), false);
+      assert.strictEqual(isAdcpSuccess(partialSuccess, 'report_usage'), true);
+    });
+
+    test('compact media-buy success discriminators preserve advisory errors[]', () => {
+      const advisory = [{ code: 'PARTIAL_AVAILABILITY', message: 'One alternative was unavailable' }];
+      const cases = [
+        ['request_proposals', { outcome: 'proposed', status: 'completed', proposals: [], errors: advisory }],
+        ['refine_proposals', { results: [], products: [], errors: advisory }],
+        ['decline_proposals', { results: [], errors: advisory }],
+      ];
+
+      for (const [toolName, response] of cases) {
+        assert.strictEqual(hasAdvisorySuccessPayload(response, toolName), true, toolName);
+        assert.strictEqual(isTerminalAdcpError(response, toolName), false, toolName);
+      }
+      assert.strictEqual(
+        hasAdvisorySuccessPayload({ results: [], errors: advisory }, 'refine_proposals'),
+        false,
+        'refine_proposals requires the schema-mandated products collection'
+      );
+    });
+
+    test('explicit terminal status wins over advisory success fields', () => {
+      const terminalPayload = {
+        status: 'failed',
+        accepted: 0,
+        errors: [{ code: 'INVALID_USAGE_ROW', message: 'all rows rejected' }],
+      };
+
+      assert.strictEqual(hasAdvisorySuccessPayload(terminalPayload, 'report_usage'), false);
+      assert.strictEqual(isTerminalAdcpError(terminalPayload, 'report_usage'), true);
+      assert.strictEqual(isAdcpSuccess(terminalPayload, 'report_usage'), false);
+    });
+
+    test('get_products structured rejection is a successful business outcome', () => {
+      const structuredRejection = {
+        status: 'rejected',
+        adcp_version: '3.2-beta.5',
+        reason: 'No inventory matches the requested brief',
+        suggestions: ['Try broadening the requested geography'],
+      };
+
+      assert.strictEqual(isTerminalAdcpError(structuredRejection, 'get_products'), false);
+      assert.strictEqual(isAdcpSuccess(structuredRejection, 'get_products'), true);
+      assert.strictEqual(
+        isTerminalAdcpError({ ...structuredRejection, suggestions: undefined }, 'get_products'),
+        false
+      );
+      assert.strictEqual(isTerminalAdcpError(structuredRejection), true);
+      assert.strictEqual(
+        isTerminalAdcpError({ ...structuredRejection, adcp_error: { code: 'INVALID_REQUEST' } }, 'get_products'),
+        true
+      );
+      assert.strictEqual(
+        isTerminalAdcpError({ ...structuredRejection, adcp_version: '3.1', suggestions: undefined }, 'get_products'),
+        true
+      );
+      const versionlessRejection = { ...structuredRejection };
+      delete versionlessRejection.adcp_version;
+      assert.strictEqual(isTerminalAdcpError(versionlessRejection, 'get_products', '3.2.0-beta.5'), false);
+      assert.strictEqual(isAdcpSuccess(versionlessRejection, 'get_products', '3.2.0-beta.5'), true);
+      assert.strictEqual(isTerminalAdcpError(versionlessRejection, 'get_products', '3.1.18'), true);
+      assert.strictEqual(isTerminalAdcpError({ ...structuredRejection, suggestions: [] }, 'get_products'), true);
+      assert.strictEqual(isTerminalAdcpError({ ...structuredRejection, reason: '' }, 'get_products'), true);
+      assert.strictEqual(isTerminalAdcpError({ ...structuredRejection, products: [] }, 'get_products'), true);
+      assert.strictEqual(isTerminalAdcpError({ status: 'rejected' }, 'get_products'), true);
+    });
+
+    test('task-aware terminal detection rejects envelope-only errors[] as failures', () => {
+      const envelopeOnly = {
+        status: 'completed',
+        context: { correlation_id: 'corr-envelope-only' },
+        errors: [{ code: 'INVALID_REQUEST', message: 'no success payload' }],
+      };
+
+      assert.strictEqual(hasAdvisorySuccessPayload(envelopeOnly, 'get_products'), false);
+      assert.strictEqual(isTerminalAdcpError(envelopeOnly, 'get_products'), true);
+    });
+
+    test('submitted envelopes can carry advisory errors[] without becoming terminal failures', () => {
+      const submitted = {
+        status: 'submitted',
+        task_id: 'task-advisory',
+        errors: [{ code: 'GOVERNANCE_OBSERVATION', message: 'queued with advisory' }],
+      };
+
+      assert.strictEqual(hasAdvisorySuccessPayload(submitted, 'create_media_buy'), true);
+      assert.strictEqual(isTerminalAdcpError(submitted, 'create_media_buy'), false);
+    });
+  });
+
+  describe('isAdcpSuccess', () => {
+    test('should validate create_media_buy success response', () => {
+      const successResponse = {
+        packages: [createTestPackage({ package_id: 'pkg1' })],
+        media_buy_id: 'mb123',
+        buyer_ref: 'buyer-ref-123',
+      };
+
+      assert.strictEqual(isAdcpSuccess(successResponse, 'create_media_buy'), true);
+    });
+
+    test('should fail validation for create_media_buy without required fields', () => {
+      const invalidResponse = {
+        packages: [createTestPackage({ package_id: 'pkg1' })],
+        // Missing media_buy_id
+      };
+
+      assert.strictEqual(isAdcpSuccess(invalidResponse, 'create_media_buy'), false);
+    });
+
+    test('should validate update_media_buy success response', () => {
+      const successResponse = {
+        media_buy_id: 'mb123',
+        buyer_ref: 'buyer-ref-123',
+        affected_packages: [createTestPackage({ package_id: 'pkg1' })],
+      };
+
+      assert.strictEqual(isAdcpSuccess(successResponse, 'update_media_buy'), true);
+    });
+
+    test('should fail validation for update_media_buy without required fields', () => {
+      const invalidResponse = {
+        packages: [createTestPackage({ package_id: 'pkg1' })],
+        // Missing affected_packages
+      };
+
+      assert.strictEqual(isAdcpSuccess(invalidResponse, 'update_media_buy'), false);
+    });
+
+    test('should validate get_products success response', () => {
+      const successResponse = {
+        cache_scope: 'public',
+        products: [createTestProduct({ product_id: 'prod1' })],
+      };
+
+      assert.strictEqual(isAdcpSuccess(successResponse, 'get_products'), true);
+    });
+
+    test('should fail validation for error responses', () => {
+      const errorResponse = {
+        errors: [{ code: 'error', message: 'Something went wrong' }],
+      };
+
+      assert.strictEqual(isAdcpSuccess(errorResponse, 'get_products'), false);
+    });
+  });
+
+  describe('TaskExecutor.extractResponseData retry behavior', () => {
+    let TaskExecutor;
+
+    test('should extract data from content[0].text when schema validation fails with toolName', () => {
+      // Lazy-load to avoid import order issues
+      TaskExecutor = require('../../dist/lib/core/TaskExecutor').TaskExecutor;
+      const executor = new TaskExecutor({});
+
+      // MCP response with content[0].text containing JSON that has extra fields
+      // that would fail schema validation but is otherwise valid JSON
+      const mcpResponse = {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              cache_scope: 'public',
+              products: [createTestProduct({ product_id: 'p1' })],
+              extra_field: 'unexpected',
+            }),
+          },
+        ],
+      };
+
+      const debugLogs = [];
+      // With toolName, unwrapProtocolResponse may do schema validation;
+      // without toolName, it just extracts the data
+      const result = executor.extractResponseData(mcpResponse, debugLogs);
+
+      // Should successfully extract the data (not return the raw envelope)
+      assert.ok(result.products, 'Should extract products from content[0].text');
+      assert.strictEqual(result.products[0].product_id, 'p1');
+      // Should NOT have protocol envelope fields
+      assert.strictEqual(result.content, undefined, 'Should not return raw MCP envelope');
+    });
+
+    test('executeTask returns completed success when get_products has advisory errors[]', async () => {
+      const { TaskExecutor } = require('../../dist/lib/core/TaskExecutor');
+      const { ProtocolClient } = require('../../dist/lib/protocols');
+      const executor = new TaskExecutor({ validation: { responses: 'strict' } });
+      const originalCallTool = ProtocolClient.callTool;
+
+      ProtocolClient.callTool = async () => ({
+        structuredContent: {
+          status: 'completed',
+          cache_scope: 'public',
+          products: [createTestProduct({ product_id: 'canonical_formats_divergent_display' })],
+          errors: [
+            {
+              code: 'FORMAT_DECLARATION_DIVERGENT',
+              source: 'producer',
+              message: 'Dual-emitted canonical format metadata differs from the v1 projection',
+            },
+          ],
+        },
+      });
+
+      try {
+        const result = await executor.executeTask(
+          {
+            id: 'agent-1',
+            name: 'Agent 1',
+            agent_uri: 'https://seller.example/mcp',
+            protocol: 'mcp',
+          },
+          'get_products',
+          {}
+        );
+
+        assert.strictEqual(result.success, true);
+        assert.strictEqual(result.status, 'completed');
+        assert.strictEqual(result.data.products[0].product_id, 'canonical_formats_divergent_display');
+        assert.strictEqual(result.data.errors[0].code, 'FORMAT_DECLARATION_DIVERGENT');
+        assert.strictEqual(result.adcpError, undefined);
+      } finally {
+        ProtocolClient.callTool = originalCallTool;
+      }
+    });
+
+    test('should return raw response when unwrapping fails completely', () => {
+      TaskExecutor = require('../../dist/lib/core/TaskExecutor').TaskExecutor;
+      const executor = new TaskExecutor({});
+
+      // Response that is not recognizable as any protocol
+      const unknownResponse = {
+        someField: 'value',
+      };
+
+      const debugLogs = [];
+      const result = executor.extractResponseData(unknownResponse, debugLogs);
+
+      // Should fall back to raw response
+      assert.strictEqual(result.someField, 'value');
+    });
+  });
+
+  describe('legacy envelope-status compat: injected status must not leak into returned data', () => {
+    test('preserves a legacy 3.0 full-semver version after validating create_media_buy', () => {
+      const response = unwrapProtocolResponse(
+        {
+          structuredContent: {
+            adcp_version: '3.0.12',
+            media_buy_id: 'buy-legacy-version',
+            buyer_ref: 'buyer-ref-legacy-version',
+            packages: [],
+            media_buy_status: 'pending_creatives',
+          },
+        },
+        'create_media_buy',
+        'mcp'
+      );
+
+      assert.strictEqual(response.adcp_version, '3.0.12');
+    });
+
+    // Regression test for adcp-client#1961.
+    // A 3.0.x seller emits media_buy_status without a top-level `status`.
+    // The compat shim injects status:"completed" so the 3.1 Zod schema accepts
+    // the payload, but that synthetic field must not appear in the data returned
+    // to callers — storyboard field_value_or_absent checks on the deprecated
+    // `status` field must observe absent, not the injected value.
+
+    test('unwrapProtocolResponse strips compat-injected status for a 3.0.x create_media_buy response', () => {
+      // Seller payload: no `status`, no `adcp_version` — triggers leniency shim
+      const mcpResponse = {
+        structuredContent: {
+          media_buy_id: 'mb-97b30f1a',
+          buyer_ref: 'buyer-ref-1',
+          packages: [createTestPackage({ package_id: 'pkg-1' })],
+          media_buy_status: 'pending_creatives',
+          // Deliberately no `status` field — 3.0.x omission
+        },
+        content: [{ type: 'text', text: 'Media buy created' }],
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse, 'create_media_buy', 'mcp');
+
+      // The synthetic status must NOT be present in the returned data
+      assert.ok(
+        !('status' in result),
+        `Returned data must not carry compat-injected status; got: ${JSON.stringify(result.status)}`
+      );
+      // The real fields must be intact
+      assert.strictEqual(result.media_buy_id, 'mb-97b30f1a');
+      assert.strictEqual(result.media_buy_status, 'pending_creatives');
+    });
+
+    test('unwrapProtocolResponse preserves seller-emitted status when present', () => {
+      // A 3.1 seller that correctly emits status alongside media_buy_status
+      const mcpResponse = {
+        structuredContent: {
+          media_buy_id: 'mb-abc123',
+          buyer_ref: 'buyer-ref-2',
+          packages: [createTestPackage({ package_id: 'pkg-2' })],
+          status: 'completed',
+          media_buy_status: 'completed',
+          adcp_version: '3.1-beta.3',
+        },
+        content: [],
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse, 'create_media_buy', 'mcp');
+
+      // Seller-emitted status must be preserved
+      assert.strictEqual(result.status, 'completed');
+      assert.strictEqual(result.media_buy_status, 'completed');
+    });
+
+    test('unwrapProtocolResponse preserves legacy media-buy lifecycle status after compat validation', () => {
+      const mcpResponse = {
+        structuredContent: {
+          media_buy_id: 'mb-legacy-status',
+          buyer_ref: 'buyer-ref-3',
+          packages: [createTestPackage({ package_id: 'pkg-3' })],
+          status: 'pending_creatives',
+        },
+        content: [],
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse, 'create_media_buy', 'mcp');
+
+      assert.strictEqual(result.status, 'pending_creatives');
+      assert.strictEqual(result.media_buy_status, 'pending_creatives');
+    });
+
+    test('unwrapProtocolResponse accepts 3.1 deprecated media-buy lifecycle status', () => {
+      const mcpResponse = {
+        structuredContent: {
+          adcp_version: '3.1',
+          media_buy_id: 'mb-31-deprecated-status',
+          buyer_ref: 'buyer-ref-4',
+          packages: [createTestPackage({ package_id: 'pkg-4' })],
+          status: 'pending_creatives',
+        },
+        content: [],
+      };
+
+      const result = unwrapProtocolResponse(mcpResponse, 'create_media_buy', 'mcp');
+
+      assert.strictEqual(result.status, 'pending_creatives');
+      assert.strictEqual(result.media_buy_status, 'pending_creatives');
+    });
+
+    // adcp-client#3432: the response version echo is optional, so the release
+    // the buyer requested decides whether a bare `completed` is task status.
+    test('unwrapProtocolResponse does not turn an un-echoed 3.2 task status into media_buy_status', () => {
+      const created = {
+        status: 'completed',
+        media_buy_id: 'seller-buy',
+        confirmed_at: '2026-10-23T00:00:00Z',
+        revision: 1,
+        packages: [createTestPackage({ package_id: 'seller-package' })],
+      };
+
+      const result = unwrapProtocolResponse({ structuredContent: created, content: [] }, 'create_media_buy', 'mcp', {
+        responseAdcpVersion: '3.2.7',
+      });
+
+      assert.strictEqual(result.status, 'completed');
+      assert.ok(!('media_buy_status' in result), `fabricated media_buy_status: ${result.media_buy_status}`);
+    });
+
+    test('unwrapProtocolResponse keeps the 3.0 lifecycle-in-status move for a 3.0 exchange', () => {
+      const created = {
+        status: 'active',
+        media_buy_id: 'seller-buy',
+        packages: [createTestPackage({ package_id: 'seller-package' })],
+      };
+
+      const result = unwrapProtocolResponse({ structuredContent: created, content: [] }, 'create_media_buy', 'mcp', {
+        responseAdcpVersion: '3.0',
+      });
+
+      assert.strictEqual(result.status, 'active');
+      assert.strictEqual(result.media_buy_status, 'active');
+    });
+  });
+});

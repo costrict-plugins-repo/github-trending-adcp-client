@@ -1,0 +1,865 @@
+const { describe, it } = require('node:test');
+const assert = require('node:assert');
+const {
+  extractAdcpErrorFromMcp,
+  extractAdcpErrorFromTransport,
+  extractAdcpErrorInfo,
+  extractCorrelationId,
+  resolveRecovery,
+  getExpectedAction,
+} = require('../dist/lib/utils/error-extraction');
+const { isRetryable, getRetryDelay } = require('../dist/lib/utils/retry');
+
+describe('extractAdcpErrorFromMcp', () => {
+  it('extracts from structuredContent.adcp_error (L3)', () => {
+    const response = {
+      isError: true,
+      content: [{ type: 'text', text: 'error text' }],
+      structuredContent: {
+        adcp_error: {
+          code: 'RATE_LIMITED',
+          message: 'Too many requests',
+          recovery: 'transient',
+          retry_after: 5,
+        },
+      },
+    };
+
+    const result = extractAdcpErrorFromMcp(response);
+    assert.ok(result);
+    assert.strictEqual(result.code, 'RATE_LIMITED');
+    assert.strictEqual(result.message, 'Too many requests');
+    assert.strictEqual(result.recovery, 'transient');
+    assert.strictEqual(result.retry_after, 5);
+    assert.strictEqual(result.source, 'structuredContent');
+    assert.strictEqual(result.compliance_level, 3);
+  });
+
+  it('extracts from JSON text content (L2)', () => {
+    const response = {
+      isError: true,
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            adcp_error: {
+              code: 'PRODUCT_NOT_FOUND',
+              message: 'Not found',
+              recovery: 'correctable',
+              field: 'product_id',
+            },
+          }),
+        },
+      ],
+    };
+
+    const result = extractAdcpErrorFromMcp(response);
+    assert.ok(result);
+    assert.strictEqual(result.code, 'PRODUCT_NOT_FOUND');
+    assert.strictEqual(result.field, 'product_id');
+    assert.strictEqual(result.source, 'text_json');
+    assert.strictEqual(result.compliance_level, 2);
+  });
+
+  it('extracts standard code from plain text (L1)', () => {
+    const response = {
+      isError: true,
+      content: [{ type: 'text', text: 'RATE_LIMITED: Too many requests' }],
+    };
+
+    const result = extractAdcpErrorFromMcp(response);
+    assert.ok(result);
+    assert.strictEqual(result.code, 'RATE_LIMITED');
+    assert.strictEqual(result.source, 'text_pattern');
+    assert.strictEqual(result.compliance_level, 1);
+  });
+
+  it('detects rate limit from lowercase pattern', () => {
+    const response = {
+      isError: true,
+      content: [{ type: 'text', text: 'Rate limit exceeded. Please try again later.' }],
+    };
+
+    const result = extractAdcpErrorFromMcp(response);
+    assert.ok(result);
+    assert.strictEqual(result.code, 'RATE_LIMITED');
+    assert.strictEqual(result.compliance_level, 1);
+  });
+
+  it('returns null for non-error responses', () => {
+    const response = {
+      isError: false,
+      content: [{ type: 'text', text: 'Success' }],
+      structuredContent: { products: [] },
+    };
+
+    assert.strictEqual(extractAdcpErrorFromMcp(response), null);
+  });
+
+  it('returns null for null/undefined', () => {
+    assert.strictEqual(extractAdcpErrorFromMcp(null), null);
+    assert.strictEqual(extractAdcpErrorFromMcp(undefined), null);
+  });
+
+  it('returns null for error with no recognizable AdCP error', () => {
+    const response = {
+      isError: true,
+      content: [{ type: 'text', text: 'Something went wrong' }],
+    };
+
+    assert.strictEqual(extractAdcpErrorFromMcp(response), null);
+  });
+
+  it('does not match CONFLICT in plain text (too ambiguous)', () => {
+    const response = {
+      isError: true,
+      content: [{ type: 'text', text: 'There was a conflict with the existing resource' }],
+    };
+
+    assert.strictEqual(extractAdcpErrorFromMcp(response), null);
+  });
+
+  it('skips non-JSON content items and finds JSON in later items', () => {
+    const response = {
+      isError: true,
+      content: [
+        { type: 'text', text: 'plain error message' },
+        { type: 'text', text: JSON.stringify({ adcp_error: { code: 'RATE_LIMITED', message: 'slow down' } }) },
+      ],
+    };
+
+    const result = extractAdcpErrorFromMcp(response);
+    assert.ok(result);
+    assert.strictEqual(result.code, 'RATE_LIMITED');
+    assert.strictEqual(result.source, 'text_json');
+  });
+
+  it('falls through when JSON has no adcp_error key', () => {
+    const response = {
+      isError: true,
+      content: [{ type: 'text', text: JSON.stringify({ error: 'something' }) }],
+    };
+
+    assert.strictEqual(extractAdcpErrorFromMcp(response), null);
+  });
+
+  it('falls through when adcp_error.code is not a string', () => {
+    const response = {
+      isError: true,
+      content: [{ type: 'text', text: JSON.stringify({ adcp_error: { code: 42 } }) }],
+    };
+
+    assert.strictEqual(extractAdcpErrorFromMcp(response), null);
+  });
+
+  it('preserves retry_after: 0 from structuredContent', () => {
+    const response = {
+      isError: true,
+      structuredContent: {
+        adcp_error: {
+          code: 'RATE_LIMITED',
+          message: 'Rate limited',
+          recovery: 'transient',
+          retry_after: 0,
+        },
+      },
+      content: [{ type: 'text', text: 'error' }],
+    };
+
+    const result = extractAdcpErrorFromMcp(response);
+    assert.ok(result);
+    assert.strictEqual(result.retry_after, 0);
+  });
+
+  it('prefers structuredContent over text fallback', () => {
+    const response = {
+      isError: true,
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ adcp_error: { code: 'INVALID_REQUEST', message: 'text version' } }),
+        },
+      ],
+      structuredContent: {
+        adcp_error: { code: 'PRODUCT_NOT_FOUND', message: 'structured version' },
+      },
+    };
+
+    const result = extractAdcpErrorFromMcp(response);
+    assert.ok(result);
+    assert.strictEqual(result.code, 'PRODUCT_NOT_FOUND');
+    assert.strictEqual(result.source, 'structuredContent');
+  });
+
+  // adcp-client#1694: structured issues[] forwarded on the L3 extraction path
+  it('forwards well-formed issues[] from structuredContent (L3)', () => {
+    const response = {
+      isError: true,
+      content: [{ type: 'text', text: 'error' }],
+      structuredContent: {
+        adcp_error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Validation failed',
+          issues: [{ pointer: '/packages/0/budget', message: 'must be number', keyword: 'type' }],
+        },
+      },
+    };
+    const result = extractAdcpErrorFromMcp(response);
+    assert.ok(result);
+    assert.ok(Array.isArray(result.issues));
+    assert.strictEqual(result.issues.length, 1);
+    assert.strictEqual(result.issues[0].pointer, '/packages/0/budget');
+    assert.strictEqual(result.issues[0].keyword, 'type');
+  });
+
+  it('drops malformed issues[] items on the L3 path', () => {
+    const response = {
+      isError: true,
+      content: [{ type: 'text', text: 'error' }],
+      structuredContent: {
+        adcp_error: {
+          code: 'VALIDATION_ERROR',
+          message: 'mixed',
+          issues: [
+            { pointer: '/ok', message: 'kept', keyword: 'required' },
+            { pointer: 1, message: 'numeric-pointer-dropped', keyword: 'type' },
+          ],
+        },
+      },
+    };
+    const result = extractAdcpErrorFromMcp(response);
+    assert.ok(result);
+    assert.strictEqual(result.issues.length, 1);
+  });
+});
+
+describe('extractAdcpErrorFromTransport', () => {
+  it('extracts from error.data.adcp_error', () => {
+    const error = {
+      code: -32029,
+      message: 'Rate limit exceeded',
+      data: {
+        adcp_error: {
+          code: 'RATE_LIMITED',
+          message: 'Too many requests',
+          recovery: 'transient',
+          retry_after: 10,
+        },
+      },
+    };
+
+    const result = extractAdcpErrorFromTransport(error);
+    assert.ok(result);
+    assert.strictEqual(result.code, 'RATE_LIMITED');
+    assert.strictEqual(result.retry_after, 10);
+    assert.strictEqual(result.compliance_level, 3);
+  });
+
+  it('falls back to message pattern matching', () => {
+    const error = new Error('Rate limit exceeded');
+
+    const result = extractAdcpErrorFromTransport(error);
+    assert.ok(result);
+    assert.strictEqual(result.code, 'RATE_LIMITED');
+    assert.strictEqual(result.compliance_level, 1);
+  });
+
+  it('extracts from plain JSON-RPC error object (not Error instance)', () => {
+    const error = {
+      code: -32029,
+      message: 'Rate limit exceeded',
+    };
+
+    const result = extractAdcpErrorFromTransport(error);
+    assert.ok(result);
+    assert.strictEqual(result.code, 'RATE_LIMITED');
+    assert.strictEqual(result.compliance_level, 1);
+  });
+
+  it('handles String(error) fallback for non-Error, non-object input', () => {
+    const result = extractAdcpErrorFromTransport('RATE_LIMITED: slow down');
+    assert.ok(result);
+    assert.strictEqual(result.code, 'RATE_LIMITED');
+  });
+
+  it('returns null for unrecognized errors', () => {
+    const error = new Error('Connection refused');
+    assert.strictEqual(extractAdcpErrorFromTransport(error), null);
+  });
+});
+
+describe('resolveRecovery', () => {
+  it('uses explicit recovery field', () => {
+    assert.strictEqual(resolveRecovery({ code: 'RATE_LIMITED', recovery: 'terminal' }), 'terminal');
+  });
+
+  it('falls back to standard code table', () => {
+    assert.strictEqual(resolveRecovery({ code: 'RATE_LIMITED' }), 'transient');
+    assert.strictEqual(resolveRecovery({ code: 'PRODUCT_NOT_FOUND' }), 'correctable');
+    assert.strictEqual(resolveRecovery({ code: 'ACCOUNT_SUSPENDED' }), 'terminal');
+  });
+
+  it('returns terminal for unknown codes', () => {
+    assert.strictEqual(resolveRecovery({ code: 'X_CUSTOM_ERROR' }), 'terminal');
+  });
+
+  it('ignores invalid recovery strings and falls back to code table', () => {
+    assert.strictEqual(resolveRecovery({ code: 'RATE_LIMITED', recovery: 'bogus' }), 'transient');
+  });
+});
+
+describe('getExpectedAction', () => {
+  it('maps correctly', () => {
+    assert.strictEqual(getExpectedAction('transient'), 'retry');
+    assert.strictEqual(getExpectedAction('correctable'), 'fix_request');
+    assert.strictEqual(getExpectedAction('terminal'), 'escalate');
+  });
+});
+
+describe('extractAdcpErrorInfo', () => {
+  it('extracts from adcp_error shape', () => {
+    const data = {
+      adcp_error: { code: 'RATE_LIMITED', message: 'Too fast', recovery: 'transient', retry_after: 5 },
+      context: { correlation_id: 'abc' },
+    };
+    const info = extractAdcpErrorInfo(data);
+    assert.ok(info);
+    assert.strictEqual(info.code, 'RATE_LIMITED');
+    assert.strictEqual(info.message, 'Too fast');
+    assert.strictEqual(info.recovery, 'transient');
+    assert.strictEqual(info.retry_after, 5);
+    assert.strictEqual(info.retryAfterMs, 5000);
+    assert.strictEqual(info.synthetic, undefined);
+  });
+
+  it('extracts from errors array shape', () => {
+    const data = { errors: [{ code: 'INVALID_REQUEST', message: 'Bad field' }] };
+    const info = extractAdcpErrorInfo(data);
+    assert.ok(info);
+    assert.strictEqual(info.code, 'INVALID_REQUEST');
+    assert.strictEqual(info.message, 'Bad field');
+  });
+
+  it('marks synthetic errors', () => {
+    const data = { adcp_error: { code: 'mcp_error', message: 'raw text', synthetic: true } };
+    const info = extractAdcpErrorInfo(data);
+    assert.ok(info);
+    assert.strictEqual(info.synthetic, true);
+  });
+
+  it('resolves recovery from standard code table', () => {
+    const data = { adcp_error: { code: 'RATE_LIMITED', message: 'slow' } };
+    const info = extractAdcpErrorInfo(data);
+    assert.ok(info);
+    assert.strictEqual(info.recovery, 'transient');
+  });
+
+  it('returns undefined for null/undefined', () => {
+    assert.strictEqual(extractAdcpErrorInfo(null), undefined);
+    assert.strictEqual(extractAdcpErrorInfo(undefined), undefined);
+  });
+
+  it('returns undefined for non-error data', () => {
+    assert.strictEqual(extractAdcpErrorInfo({ products: [] }), undefined);
+  });
+
+  // adcp-client#1694: structured issues[] forwarded as first-class field
+  it('forwards well-formed issues[] from adcp_error', () => {
+    const data = {
+      adcp_error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Validation failed',
+        recovery: 'correctable',
+        issues: [
+          {
+            pointer: '/packages/0/targeting',
+            message: 'must NOT have additional properties',
+            keyword: 'additionalProperties',
+          },
+          {
+            pointer: '/start_time',
+            message: "must match format 'date-time'",
+            keyword: 'format',
+            schemaPath: '#/properties/start_time/format',
+          },
+        ],
+      },
+    };
+    const info = extractAdcpErrorInfo(data);
+    assert.ok(info);
+    assert.ok(Array.isArray(info.issues));
+    assert.strictEqual(info.issues.length, 2);
+    assert.deepStrictEqual(info.issues[0], {
+      pointer: '/packages/0/targeting',
+      message: 'must NOT have additional properties',
+      keyword: 'additionalProperties',
+    });
+    // schemaPath preserved when present
+    assert.strictEqual(info.issues[1].schemaPath, '#/properties/start_time/format');
+  });
+
+  it('drops malformed issues[] items (missing required fields)', () => {
+    const data = {
+      adcp_error: {
+        code: 'VALIDATION_ERROR',
+        message: 'mixed',
+        issues: [
+          { pointer: '/ok', message: 'kept', keyword: 'type' },
+          { pointer: '/missing_keyword', message: 'dropped' }, // missing keyword
+          { message: 'no pointer', keyword: 'required' }, // missing pointer
+          { pointer: '/wrong_types', message: 1, keyword: 'enum' }, // non-string message
+        ],
+      },
+    };
+    const info = extractAdcpErrorInfo(data);
+    assert.ok(info);
+    assert.strictEqual(info.issues.length, 1, 'only the well-formed item survives');
+    assert.strictEqual(info.issues[0].pointer, '/ok');
+  });
+
+  it('omits issues when all items are malformed (no empty array on the field)', () => {
+    const data = {
+      adcp_error: {
+        code: 'VALIDATION_ERROR',
+        message: 'all bad',
+        issues: [{ pointer: 1 }, { message: 'x' }],
+      },
+    };
+    const info = extractAdcpErrorInfo(data);
+    assert.ok(info);
+    assert.strictEqual(info.issues, undefined, 'empty after filtering → field absent, not []');
+  });
+
+  it('omits issues when the wire field is absent', () => {
+    const data = { adcp_error: { code: 'INVALID_REQUEST', message: 'plain' } };
+    const info = extractAdcpErrorInfo(data);
+    assert.ok(info);
+    assert.strictEqual(info.issues, undefined);
+  });
+
+  it('omits issues when the wire field is not an array', () => {
+    const data = { adcp_error: { code: 'INVALID_REQUEST', message: 'plain', issues: 'not-an-array' } };
+    const info = extractAdcpErrorInfo(data);
+    assert.ok(info);
+    assert.strictEqual(info.issues, undefined);
+  });
+
+  it('keeps details when issues is also present (orthogonal fields)', () => {
+    const data = {
+      adcp_error: {
+        code: 'VALIDATION_ERROR',
+        message: 'both',
+        details: { retry_hint: 'fix and resubmit' },
+        issues: [{ pointer: '/x', message: 'y', keyword: 'type' }],
+      },
+    };
+    const info = extractAdcpErrorInfo(data);
+    assert.ok(info);
+    assert.deepStrictEqual(info.details, { retry_hint: 'fix and resubmit' });
+    assert.strictEqual(info.issues.length, 1);
+  });
+});
+
+describe('extractCorrelationId', () => {
+  it('extracts from context.correlation_id', () => {
+    assert.strictEqual(extractCorrelationId({ context: { correlation_id: 'abc-123' } }), 'abc-123');
+  });
+
+  it('returns undefined when no context', () => {
+    assert.strictEqual(extractCorrelationId({}), undefined);
+    assert.strictEqual(extractCorrelationId(null), undefined);
+  });
+});
+
+describe('isRetryable', () => {
+  it('returns true for transient errors', () => {
+    const result = {
+      success: false,
+      status: 'failed',
+      error: 'Rate limited',
+      adcpError: { code: 'RATE_LIMITED', recovery: 'transient', retryAfterMs: 5000 },
+      metadata: {
+        taskId: 'x',
+        taskName: 'y',
+        agent: { id: 'a', name: 'b', protocol: 'mcp' },
+        responseTimeMs: 0,
+        timestamp: '',
+        clarificationRounds: 0,
+        status: 'failed',
+      },
+    };
+    assert.strictEqual(isRetryable(result), true);
+  });
+
+  it('returns false for correctable errors', () => {
+    const result = {
+      success: false,
+      status: 'failed',
+      error: 'Bad field',
+      adcpError: { code: 'INVALID_REQUEST', recovery: 'correctable' },
+      metadata: {
+        taskId: 'x',
+        taskName: 'y',
+        agent: { id: 'a', name: 'b', protocol: 'mcp' },
+        responseTimeMs: 0,
+        timestamp: '',
+        clarificationRounds: 0,
+        status: 'failed',
+      },
+    };
+    assert.strictEqual(isRetryable(result), false);
+  });
+
+  it('returns false for terminal errors', () => {
+    const result = {
+      success: false,
+      status: 'failed',
+      error: 'Suspended',
+      adcpError: { code: 'ACCOUNT_SUSPENDED', recovery: 'terminal' },
+      metadata: {
+        taskId: 'x',
+        taskName: 'y',
+        agent: { id: 'a', name: 'b', protocol: 'mcp' },
+        responseTimeMs: 0,
+        timestamp: '',
+        clarificationRounds: 0,
+        status: 'failed',
+      },
+    };
+    assert.strictEqual(isRetryable(result), false);
+  });
+
+  it('returns false for success results', () => {
+    const result = {
+      success: true,
+      status: 'completed',
+      data: {},
+      metadata: {
+        taskId: 'x',
+        taskName: 'y',
+        agent: { id: 'a', name: 'b', protocol: 'mcp' },
+        responseTimeMs: 0,
+        timestamp: '',
+        clarificationRounds: 0,
+        status: 'completed',
+      },
+    };
+    assert.strictEqual(isRetryable(result), false);
+  });
+
+  it('returns false when no adcpError', () => {
+    const result = {
+      success: false,
+      status: 'failed',
+      error: 'Network error',
+      metadata: {
+        taskId: 'x',
+        taskName: 'y',
+        agent: { id: 'a', name: 'b', protocol: 'mcp' },
+        responseTimeMs: 0,
+        timestamp: '',
+        clarificationRounds: 0,
+        status: 'failed',
+      },
+    };
+    assert.strictEqual(isRetryable(result), false);
+  });
+});
+
+describe('getRetryDelay', () => {
+  it('returns retryAfterMs when present', () => {
+    const result = {
+      success: false,
+      status: 'failed',
+      error: 'Rate limited',
+      adcpError: { code: 'RATE_LIMITED', recovery: 'transient', retryAfterMs: 10000 },
+      metadata: {
+        taskId: 'x',
+        taskName: 'y',
+        agent: { id: 'a', name: 'b', protocol: 'mcp' },
+        responseTimeMs: 0,
+        timestamp: '',
+        clarificationRounds: 0,
+        status: 'failed',
+      },
+    };
+    assert.strictEqual(getRetryDelay(result), 10000);
+  });
+
+  it('returns default when no retryAfterMs', () => {
+    const result = {
+      success: false,
+      status: 'failed',
+      error: 'Rate limited',
+      adcpError: { code: 'RATE_LIMITED', recovery: 'transient' },
+      metadata: {
+        taskId: 'x',
+        taskName: 'y',
+        agent: { id: 'a', name: 'b', protocol: 'mcp' },
+        responseTimeMs: 0,
+        timestamp: '',
+        clarificationRounds: 0,
+        status: 'failed',
+      },
+    };
+    assert.strictEqual(getRetryDelay(result), 5000);
+    assert.strictEqual(getRetryDelay(result, 3000), 3000);
+  });
+
+  it('returns 0 for non-retryable results', () => {
+    const result = {
+      success: false,
+      status: 'failed',
+      error: 'Terminal',
+      adcpError: { code: 'ACCOUNT_SUSPENDED', recovery: 'terminal' },
+      metadata: {
+        taskId: 'x',
+        taskName: 'y',
+        agent: { id: 'a', name: 'b', protocol: 'mcp' },
+        responseTimeMs: 0,
+        timestamp: '',
+        clarificationRounds: 0,
+        status: 'failed',
+      },
+    };
+    assert.strictEqual(getRetryDelay(result), 0);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// buyer_reason extraction (AdCP 3.2 core/error.json)
+// -----------------------------------------------------------------------------
+describe('buyer_reason extraction', () => {
+  const BUYER_REASON = {
+    code: 'BUDGET_TOO_LOW',
+    message: 'Your budget is below the publisher’s minimum.',
+  };
+
+  it('preserves buyer_reason from structuredContent.adcp_error (L3)', () => {
+    const response = {
+      isError: true,
+      structuredContent: {
+        adcp_error: {
+          code: 'INVALID_REQUEST',
+          message: 'Bad request',
+          recovery: 'correctable',
+          buyer_reason: BUYER_REASON,
+        },
+      },
+    };
+    const result = extractAdcpErrorFromMcp(response);
+    assert.ok(result);
+    assert.deepStrictEqual(result.buyer_reason, BUYER_REASON);
+  });
+
+  it('preserves buyer_reason from JSON text (L2)', () => {
+    const response = {
+      isError: true,
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            adcp_error: {
+              code: 'INVALID_REQUEST',
+              message: 'Bad request',
+              recovery: 'correctable',
+              buyer_reason: BUYER_REASON,
+            },
+          }),
+        },
+      ],
+    };
+    const result = extractAdcpErrorFromMcp(response);
+    assert.ok(result);
+    assert.deepStrictEqual(result.buyer_reason, BUYER_REASON);
+  });
+
+  it('preserves buyer_reason from JSON-RPC transport error data', () => {
+    const err = {
+      data: {
+        adcp_error: {
+          code: 'CREATIVE_REJECTED',
+          message: 'creative failed review',
+          recovery: 'correctable',
+          buyer_reason: {
+            code: 'CREATIVE_REJECTED',
+            message: 'Please supply a creative that meets the publisher policy.',
+          },
+        },
+      },
+    };
+    const result = extractAdcpErrorFromTransport(err);
+    assert.ok(result);
+    assert.strictEqual(result.buyer_reason.code, 'CREATIVE_REJECTED');
+  });
+
+  it('preserves buyer_reason through extractAdcpErrorInfo (structured envelope)', () => {
+    const info = extractAdcpErrorInfo({
+      adcp_error: {
+        code: 'INVALID_REQUEST',
+        message: 'Bad request',
+        recovery: 'correctable',
+        buyer_reason: BUYER_REASON,
+      },
+    });
+    assert.ok(info);
+    assert.deepStrictEqual(info.buyer_reason, BUYER_REASON);
+  });
+
+  it('preserves buyer_reason on the first entry of legacy `{ errors: [...] }` envelope', () => {
+    const info = extractAdcpErrorInfo({
+      errors: [{ code: 'INVALID_REQUEST', message: 'Bad', buyer_reason: BUYER_REASON }],
+    });
+    assert.ok(info);
+    assert.deepStrictEqual(info.buyer_reason, BUYER_REASON);
+  });
+
+  it('drops buyer_reason with missing message (partial payloads are unsafe to surface)', () => {
+    // Producer sent `code` but no `message` — the buyer-safe render contract
+    // requires both. Extractor drops the whole object rather than surface a
+    // half-typed value.
+    const result = extractAdcpErrorFromMcp({
+      isError: true,
+      structuredContent: {
+        adcp_error: {
+          code: 'INVALID_REQUEST',
+          message: 'Bad',
+          recovery: 'correctable',
+          buyer_reason: { code: 'BUDGET_TOO_LOW' },
+        },
+      },
+    });
+    assert.ok(result);
+    assert.strictEqual(result.buyer_reason, undefined);
+  });
+
+  it('drops buyer_reason with empty-string code/message', () => {
+    const result = extractAdcpErrorFromMcp({
+      isError: true,
+      structuredContent: {
+        adcp_error: {
+          code: 'INVALID_REQUEST',
+          message: 'Bad',
+          recovery: 'correctable',
+          buyer_reason: { code: '', message: '' },
+        },
+      },
+    });
+    assert.ok(result);
+    assert.strictEqual(result.buyer_reason, undefined);
+  });
+
+  it('drops non-object buyer_reason', () => {
+    const result = extractAdcpErrorFromMcp({
+      isError: true,
+      structuredContent: {
+        adcp_error: {
+          code: 'INVALID_REQUEST',
+          message: 'Bad',
+          recovery: 'correctable',
+          buyer_reason: 'not an object',
+        },
+      },
+    });
+    assert.ok(result);
+    assert.strictEqual(result.buyer_reason, undefined);
+  });
+
+  it('leaves buyer_reason absent when the producer did not populate it', () => {
+    const result = extractAdcpErrorFromMcp({
+      isError: true,
+      structuredContent: {
+        adcp_error: { code: 'RATE_LIMITED', message: 'x', recovery: 'transient' },
+      },
+    });
+    assert.ok(result);
+    assert.strictEqual(result.buyer_reason, undefined);
+  });
+
+  it('round-trips through adcpError() builder: buyer_reason survives the envelope build', () => {
+    // Producer builder path: seller-side handler calls adcpError() with
+    // buyer_reason. Extractor must recover the identical shape on the buyer
+    // side. Without buyer_reason in AdcpErrorOptions / AdcpErrorPayload the
+    // field would silently drop between the seller build and the buyer read.
+    const { adcpError } = require('../dist/lib/server/errors');
+    const envelope = adcpError('INVALID_REQUEST', {
+      message: 'Bad request',
+      recovery: 'correctable',
+      buyer_reason: BUYER_REASON,
+    });
+    const extracted = extractAdcpErrorFromMcp(envelope);
+    assert.ok(extracted);
+    assert.deepStrictEqual(extracted.buyer_reason, BUYER_REASON);
+  });
+
+  it('round-trips through the sync throw path: new AdcpError → toStructuredError() preserves buyer_reason', () => {
+    // Async task-completion path (from-platform) serializes via
+    // toStructuredError(). Without buyer_reason on that method, an adopter
+    // that throws AdcpError with a buyer-actionable classification would
+    // silently lose it on the wire.
+    const { AdcpError } = require('../dist/lib/server/decisioning/async-outcome');
+    const err = new AdcpError('INVALID_REQUEST', {
+      recovery: 'correctable',
+      message: 'Bad request',
+      buyer_reason: BUYER_REASON,
+    });
+    const structured = err.toStructuredError();
+    assert.deepStrictEqual(structured.buyer_reason, BUYER_REASON);
+  });
+
+  it('round-trips through the sync-throw framework path: AdcpError → projectThrownAdcpError → extract', () => {
+    // Locks in the buyer_reason spread inside projectThrownAdcpError. A
+    // refactor that drops `err.buyer_reason` from that function would fail
+    // this test — even though the underlying adcpError() builder still
+    // supports the field, the glue between the class and the builder is what
+    // this line guards.
+    const { AdcpError } = require('../dist/lib/server/decisioning/async-outcome');
+    const { __unstable__projectThrownAdcpError } = require('../dist/lib/server/create-adcp-server');
+    const err = new AdcpError('INVALID_REQUEST', {
+      recovery: 'correctable',
+      message: 'Bad request',
+      buyer_reason: BUYER_REASON,
+    });
+    const envelope = __unstable__projectThrownAdcpError(err);
+    const extracted = extractAdcpErrorFromMcp(envelope);
+    assert.ok(extracted);
+    assert.deepStrictEqual(extracted.buyer_reason, BUYER_REASON);
+  });
+
+  it('two-layer projection preserves buyer_reason: envelope ↔ payload mirror', () => {
+    // The dispatcher mirrors between the envelope layer (structuredContent
+    // .adcp_error) and the payload layer (structuredContent.errors[]). Both
+    // directions must carry buyer_reason so the two layers stay in lockstep
+    // per the AdCP two-layer error emission contract.
+    //
+    // We can't import the private projection helpers directly; assert the
+    // observable equivalent by re-extracting from an envelope that carried
+    // buyer_reason and building a payload-shaped entry from the extraction.
+    const { adcpError } = require('../dist/lib/server/errors');
+    const envelope = adcpError('CREATIVE_REJECTED', {
+      message: 'Creative failed review',
+      buyer_reason: {
+        code: 'CREATIVE_REJECTED',
+        message: 'Please supply a creative that meets the publisher policy.',
+      },
+    });
+    const extracted = extractAdcpErrorFromMcp(envelope);
+    assert.ok(extracted);
+    assert.ok(extracted.buyer_reason);
+    assert.strictEqual(extracted.buyer_reason.code, 'CREATIVE_REJECTED');
+  });
+
+  it('IDEMPOTENCY_CONFLICT allowlist strips buyer_reason from the wire (defense-in-depth)', () => {
+    // The envelope allowlist for IDEMPOTENCY_CONFLICT is wire-shape-restricted:
+    // any adopter that mistakenly attaches buyer_reason to a conflict response
+    // has it dropped at the framework boundary, not surfaced to the buyer.
+    const { adcpError } = require('../dist/lib/server/errors');
+    const envelope = adcpError('IDEMPOTENCY_CONFLICT', {
+      message: 'idempotency conflict',
+      buyer_reason: BUYER_REASON,
+    });
+    const extracted = extractAdcpErrorFromMcp(envelope);
+    assert.ok(extracted);
+    assert.strictEqual(extracted.buyer_reason, undefined);
+  });
+});

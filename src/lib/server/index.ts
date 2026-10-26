@@ -1,0 +1,879 @@
+export { adcpError } from './errors';
+export type { AdcpErrorOptions, AdcpErrorPayload, AdcpErrorResponse } from './errors';
+
+export { normalizeError, normalizeErrors } from './normalize-errors';
+export type { NormalizedError } from './normalize-errors';
+
+export { pickSafeDetails } from './pick-safe-details';
+export type { PickSafeDetailsOptions } from './pick-safe-details';
+
+export { wrapEnvelope } from './wrap-envelope';
+export type { WrapEnvelopeOptions } from './wrap-envelope';
+
+export {
+  ERROR_ENVELOPE_FIELD_ALLOWLIST,
+  DEFAULT_ERROR_ENVELOPE_FIELDS,
+  ADCP_ERROR_FIELD_ALLOWLIST,
+  CONFLICT_ADCP_ERROR_ALLOWLIST,
+} from './envelope-allowlist';
+
+export { scanArgsForCredentials, DEFAULT_CREDENTIAL_PATTERNS } from './credential-policy';
+export type {
+  CredentialPolicy,
+  CredentialPolicyMode,
+  CredentialPolicyConfig,
+  CredentialPatternsConfig,
+} from './credential-policy';
+
+export { createDynamicRegistry } from './dynamic-registry';
+export type {
+  DynamicRegistry,
+  DynamicRegistryConfig,
+  DynamicRegistryRegisterOptions,
+  PendingRegistries,
+  RegistryShape,
+} from './dynamic-registry';
+
+export { defineOperationalPlatform } from './operational-platform';
+export type { OperationalPlatform, OperationalContext } from './operational-platform';
+
+export { pickWireSpecFields, scrubExtensions, WIRE_SPEC_FIELDS } from './wire-safe';
+export type { WireSafe, WireSpecRequestName, ScrubExtensionsOptions } from './wire-safe';
+export type { RequireCacheScopeWhenProducts, ServerPayload } from '../types/server-payload';
+export type {
+  ActivateSignalPayload,
+  AcquireRightsAcquiredPayload as LegacyAcquireRightsAcquiredPayload,
+  AcquireRightsPayload as LegacyAcquireRightsPayload,
+  AcquireRightsPendingApprovalPayload as LegacyAcquireRightsPendingApprovalPayload,
+  AcquireRightsRejectedPayload as LegacyAcquireRightsRejectedPayload,
+  BuildCreativeMultiPayload as LegacyBuildCreativeMultiPayload,
+  BuildCreativePayload as LegacyBuildCreativePayload,
+  BuildCreativeVariantPayload as LegacyBuildCreativeVariantPayload,
+  CalibrateContentPayload as LegacyCalibrateContentPayload,
+  CheckGovernancePayload,
+  CreateCollectionListPayload,
+  CreateContentStandardsPayload as LegacyCreateContentStandardsPayload,
+  CreateMediaBuyPayload as LegacyCreateMediaBuyPayload,
+  CreatePropertyListPayload,
+  CreativeApprovalPayload,
+  CreativeApprovedPayload,
+  CreativePendingReviewPayload,
+  CreativeRejectedPayload,
+  DeleteCollectionListPayload,
+  DeletePropertyListPayload,
+  GetAccountFinancialsPayload,
+  GetAccountFinancialsSuccessPayload,
+  GetAdCPCapabilitiesPayload,
+  GetBrandIdentityPayload,
+  GetCollectionListPayload,
+  GetContentStandardsPayload as LegacyGetContentStandardsPayload,
+  GetCreativeDeliveryPayload as LegacyGetCreativeDeliveryPayload,
+  GetCreativeFeaturesPayload as LegacyGetCreativeFeaturesPayload,
+  GetMediaBuyArtifactsPayload as LegacyGetMediaBuyArtifactsPayload,
+  GetMediaBuyDeliveryPayload as LegacyGetMediaBuyDeliveryPayload,
+  GetMediaBuysPayload as LegacyGetMediaBuysPayload,
+  GetPlanAuditLogsPayload,
+  GetProductsPayload as LegacyGetProductsPayload,
+  GetPropertyListPayload,
+  GetRightsPayload as LegacyGetRightsPayload,
+  GetRightsResponsePayload as LegacyGetRightsResponsePayload,
+  GetSignalsPayload,
+  ListAccountsPayload,
+  ListCollectionListsPayload,
+  ListContentStandardsPayload as LegacyListContentStandardsPayload,
+  ListCreativeFormatsPayload as LegacyListCreativeFormatsPayload,
+  ListCreativeFormatsResponsePayload as LegacyListCreativeFormatsResponsePayload,
+  ListCreativeFormatsServerPayload as LegacyListCreativeFormatsServerPayload,
+  ListCreativesPayload as LegacyListCreativesPayload,
+  ListPropertyListsPayload,
+  LogEventPayload,
+  CanonicalPreviewCreativePayload,
+  PreviewCreativePayload as LegacyPreviewCreativePayload,
+  ProvidePerformanceFeedbackPayload,
+  ReportPlanOutcomePayload,
+  ReportUsagePayload,
+  SIGetOfferingPayload,
+  SIInitiateSessionPayload,
+  SISendMessagePayload,
+  SITerminateSessionPayload,
+  SyncAccountsPayload,
+  SyncAccountsSuccessPayload,
+  SyncAudiencesPayload,
+  SyncCatalogsPayload,
+  SyncCreativesErrorPayload,
+  SyncCreativesPayload,
+  SyncCreativesSuccessPayload,
+  SyncEventSourcesPayload,
+  SyncGovernancePayload,
+  SyncGovernanceSuccessPayload,
+  SyncPlansPayload,
+  UpdateCollectionListPayload,
+  UpdateContentStandardsPayload as LegacyUpdateContentStandardsPayload,
+  UpdateMediaBuyPayload as LegacyUpdateMediaBuyPayload,
+  UpdatePropertyListPayload,
+  UpdateRightsPayload as LegacyUpdateRightsPayload,
+  ValidateContentDeliveryPayload as LegacyValidateContentDeliveryPayload,
+} from '../types/server-payload-aliases';
+
+export { assertNoExampleTlds } from './example-tld-guard';
+export type { AssertNoExampleTldsOptions } from './example-tld-guard';
+
+// Raw wire response builders remain available only through explicit
+// `legacy*` aliases on this primary barrel. The legacy/v5 subpath preserves
+// their historical names for handler-bag adopters.
+export {
+  capabilitiesResponse as legacyCapabilitiesResponse,
+  productsResponse as legacyProductsResponse,
+  mediaBuyResponse as legacyMediaBuyResponse,
+  deliveryResponse as legacyDeliveryResponse,
+  listAccountsResponse as legacyListAccountsResponse,
+  listCreativeFormatsResponse as legacyListCreativeFormatsResponse,
+  updateMediaBuyResponse as legacyUpdateMediaBuyResponse,
+  getMediaBuysResponse as legacyGetMediaBuysResponse,
+  performanceFeedbackResponse as legacyPerformanceFeedbackResponse,
+  buildCreativeResponse as legacyBuildCreativeResponse,
+  buildCreativeMultiResponse as legacyBuildCreativeMultiResponse,
+  previewCreativeResponse as legacyPreviewCreativeResponse,
+  creativeDeliveryResponse as legacyCreativeDeliveryResponse,
+  listCreativesResponse as legacyListCreativesResponse,
+  listPropertyListsResponse as legacyListPropertyListsResponse,
+  listCollectionListsResponse as legacyListCollectionListsResponse,
+  listContentStandardsResponse as legacyListContentStandardsResponse,
+  getPlanAuditLogsResponse as legacyGetPlanAuditLogsResponse,
+  syncCreativesResponse as legacySyncCreativesResponse,
+  getSignalsResponse as legacyGetSignalsResponse,
+  activateSignalResponse as legacyActivateSignalResponse,
+  cancelMediaBuyResponse as legacyCancelMediaBuyResponse,
+  acquireRightsResponse as legacyAcquireRightsResponse,
+  acquireRightsAcquired as legacyAcquireRightsAcquired,
+  acquireRightsPendingApproval as legacyAcquireRightsPendingApproval,
+  acquireRightsRejected as legacyAcquireRightsRejected,
+  updateRightsResponse as legacyUpdateRightsResponse,
+  updateRightsSuccess as legacyUpdateRightsSuccess,
+  creativeApprovalResponse as legacyCreativeApprovalResponse,
+  creativeApprovalApproved as legacyCreativeApprovalApproved,
+  creativeApprovalRejected as legacyCreativeApprovalRejected,
+  creativeApprovalPendingReview as legacyCreativeApprovalPendingReview,
+  creativeApprovalError as legacyCreativeApprovalError,
+  syncAccountsResponse as legacySyncAccountsResponse,
+  syncGovernanceResponse as legacySyncGovernanceResponse,
+  reportUsageResponse as legacyReportUsageResponse,
+  toStructuredContent,
+} from './responses';
+export type { McpToolResponse } from './responses';
+
+export { ADCP_MIRRORED_STRUCTURED_CONTENT_META_KEY } from './structured-content-fallback';
+export type {
+  StructuredContentFallbackTransport,
+  StructuredContentTextFallback,
+  StructuredContentTextFallbackContext,
+} from './structured-content-fallback';
+
+export { validActionsForStatus } from './media-buy-helpers';
+export type { ValidAction, CancelMediaBuyInput } from './media-buy-helpers';
+export { assertUpdateMediaBuyAllowed } from './media-buy-actions';
+export type { AssertUpdateMediaBuyAllowedOptions } from './media-buy-actions';
+
+export { createMediaBuyStore, DEFAULT_MEDIA_BUY_STORE_COLLECTION } from './media-buy-store';
+// Request-only Targeting Input projection (AdCP 3.2, DR-0020). Re-exported on
+// the server subpath because sellers are the side that has to resolve a clear
+// command into strict effective targeting before persisting or echoing it.
+export { applyTargetingInput, hasTargetingClears, resolveTargetingInput } from '../media-buy/targeting-input';
+export type { ResolvedTargetingInput, TargetingInputFor } from '../media-buy/targeting-input';
+export type { CreateTargetingInput, UpdateTargetingInput } from '../types';
+export type {
+  MediaBuyStore,
+  CreateMediaBuyStoreOptions,
+  CreateMediaBuyInputForStore,
+  CreateMediaBuyResultForStore,
+  UpdateMediaBuyInputForStore,
+  GetMediaBuysResultForStore,
+} from './media-buy-store';
+
+export {
+  MEDIA_BUY_TRANSITIONS,
+  getMediaBuyTransitions,
+  CREATIVE_ASSET_TRANSITIONS,
+  isLegalMediaBuyTransition,
+  isLegalCreativeTransition,
+  assertMediaBuyTransition,
+  assertCreativeTransition,
+} from './state-machine';
+
+export { getAccountMode, isSandboxOrMockAccount, assertSandboxAccount } from './account-mode';
+export type { AccountMode } from './account-mode';
+
+export {
+  taskToolResponse,
+  registerAdcpTaskTool,
+  createTaskCapableServer,
+  InMemoryTaskStore,
+  isTerminal,
+} from './tasks';
+export type {
+  AdcpTaskToolConfig,
+  TaskStore,
+  TaskMessageQueue,
+  CreateTaskOptions,
+  ToolTaskHandler,
+  CreateTaskRequestHandlerExtra,
+  TaskRequestHandlerExtra,
+  CreateTaskResult,
+  GetTaskResult,
+  Task,
+} from './tasks';
+
+export {
+  PostgresTaskStore,
+  cleanupExpiredTasks,
+  getMcpTasksMigration,
+  MCP_TASKS_MIGRATION,
+} from './postgres-task-store';
+export type { PgQueryable, PostgresTaskStoreOptions } from './postgres-task-store';
+
+export {
+  registerTestController,
+  handleTestControllerRequest,
+  TestControllerError,
+  toMcpResponse,
+  TOOL_INPUT_SHAPE,
+  CONTROLLER_SCENARIOS,
+  DISCOVERY_ARM_SCENARIOS,
+  SEED_SCENARIOS,
+  SEED_MESSAGES,
+  SESSION_ENTRY_CAP,
+  enforceMapCap,
+  createSeedFixtureCache,
+} from './test-controller';
+export type {
+  TestControllerStore,
+  TestControllerStoreFactory,
+  TestControllerStoreOrFactory,
+  ControllerScenario,
+  SeedScenario,
+  SeedFixtureCache,
+} from './test-controller';
+
+export { serve, taskScopeFromPrincipal, UnknownHostError, hostname, resolveHost } from './serve';
+export type { ServeContext, ServeOptions, ProtectedResourceMetadata } from './serve';
+
+export { createExpressAdapter } from './express-adapter';
+export type { ExpressAdapter, ExpressAdapterOptions } from './express-adapter';
+
+export {
+  verifyApiKey,
+  verifyBearer,
+  anyOf,
+  extractBearerToken,
+  respondUnauthorized,
+  signatureErrorCodeFromCause,
+  AuthError,
+  AUTH_NEEDS_RAW_BODY,
+  tagAuthenticatorNeedsRawBody,
+  authenticatorNeedsRawBody,
+  AUTH_PRESENCE_GATED,
+  tagAuthenticatorPresenceGated,
+  isAuthenticatorPresenceGated,
+  ADCP_SERVE_REQUEST_CONTEXT,
+  getServeRequestContext,
+  DEFAULT_JWT_ALGORITHMS,
+  DEFAULT_JWT_CLOCK_TOLERANCE_SECONDS,
+} from './auth';
+export type {
+  Authenticator,
+  AuthPrincipal,
+  AuthResult,
+  VerifyApiKeyOptions,
+  VerifyBearerOptions,
+  RespondUnauthorizedOptions,
+  ServeRequestContext,
+} from './auth';
+
+export { verifyIntrospection } from './auth-introspection';
+export type {
+  VerifyIntrospectionOptions,
+  IntrospectionCacheOptions,
+  IntrospectionResponse,
+} from './auth-introspection';
+
+export {
+  verifySignatureAsAuthenticator,
+  requireSignatureWhenPresent,
+  requireAuthenticatedOrSigned,
+  mcpToolNameResolver,
+  adcpOperationResolver,
+} from './auth-signature';
+export type {
+  VerifySignatureAsAuthenticatorOptions,
+  RequireSignatureWhenPresentOptions,
+  RequireAuthenticatedOrSignedOptions,
+} from './auth-signature';
+
+export {
+  InMemoryStateStore,
+  StateError,
+  PatchConflictError,
+  DEFAULT_MAX_DOCUMENT_BYTES,
+  SESSION_KEY_FIELD,
+  createSessionedStore,
+  scopedStore,
+  patchWithRetry,
+  isPutIfMatchConflict,
+  validateCollection,
+  validateId,
+  validatePayloadSize,
+  validateWrite,
+} from './state-store';
+export type {
+  AdcpStateStore,
+  InMemoryStateStoreOptions,
+  ListOptions,
+  ListResult,
+  PatchWithRetryOptions,
+  PutIfMatchResult,
+  StateErrorCode,
+  VersionedDocument,
+} from './state-store';
+
+export { PostgresStateStore, getAdcpStateMigration, ADCP_STATE_MIGRATION } from './postgres-state-store';
+export type { PostgresStateStoreOptions } from './postgres-state-store';
+
+export { structuredSerialize, structuredDeserialize } from './structured-serialize';
+
+export { MCP_APP_RESOURCE_MIME_TYPE } from './mcp-app';
+export type {
+  AdcpMcpResourceDefinition,
+  McpAppResourceCsp,
+  McpAppResourcePermissions,
+  McpAppResourceUiMeta,
+  McpAppResourceMeta,
+  McpAppResourceReadContext,
+} from './mcp-app';
+
+// `createAdcpServer` is NOT re-exported from `@adcp/sdk/server` anymore —
+// LLMs scaffolding from skills consistently latched onto it as the canonical
+// entry point despite the @deprecated JSDoc. Removing the top-level export
+// forces new code to either reach for `createAdcpServerFromPlatform` (the v6
+// canonical) or import from `@adcp/sdk/server/legacy/v5` (mid-migration /
+// escape-hatch only). Breaking change: v5 adopters see a hard import error
+// and update their import path. The migration is one line; the LLM-output
+// quality win is significant. See `docs/migration-5.x-to-6.x.md`.
+export {
+  requireSessionKey,
+  ADCP_PRE_TRANSPORT,
+  ADCP_SIGNED_REQUESTS_STATE,
+  ADCP_INSTRUCTIONS_FN,
+} from './create-adcp-server';
+export type { SessionContext, OnInstructionsError, MaybePromise, BridgeMarker } from './create-adcp-server';
+export type {
+  AdcpServer,
+  AdcpServerComplianceApi,
+  AdcpServerTransport,
+  AdcpTestRequest,
+  AdcpTestToolsCallRequest,
+  AdcpTestResponse,
+  AdcpInvokeOptions,
+} from './adcp-server';
+// Handler-bag types describe the raw v5 server surface. Primary-barrel names
+// are explicit Legacy aliases; the legacy/v5 subpath retains the originals.
+export type {
+  AdcpServerConfig as LegacyAdcpServerConfig,
+  WebhooksConfig,
+  AdcpToolMap as LegacyAdcpToolMap,
+  AdcpServerToolName,
+  AdcpCapabilitiesConfig,
+  AdcpCapabilitiesOverrides,
+  AdcpToolVersionRange,
+  AdcpVersionTranslationEvent,
+  AdcpCustomToolConfig as LegacyAdcpCustomToolConfig,
+  AdcpCustomToolHandler as LegacyAdcpCustomToolHandler,
+  AdcpCustomToolHandlerExtra as LegacyAdcpCustomToolHandlerExtra,
+  McpAppUiMeta,
+  McpAppMeta,
+  AdcpLogger,
+  SignedRequestsConfig,
+  AdcpPreTransport,
+  AdcpSignedRequestsState,
+  HandlerContext as LegacyHandlerContext,
+  SessionKeyContext,
+  MediaBuyHandlers as LegacyMediaBuyHandlers,
+  ProposalNegotiationHandlers as LegacyProposalNegotiationHandlers,
+  SignalsHandlers as LegacySignalsHandlers,
+  CreativeHandlers as LegacyCreativeHandlers,
+  GovernanceHandlers as LegacyGovernanceHandlers,
+  AccountHandlers as LegacyAccountHandlers,
+  EventTrackingHandlers as LegacyEventTrackingHandlers,
+  SponsoredIntelligenceHandlers as LegacySponsoredIntelligenceHandlers,
+  ResolveAccountContext as LegacyResolveAccountContext,
+} from './create-adcp-server';
+
+export { DEFAULT_REPORTING_CAPABILITIES } from './product-defaults';
+
+export {
+  isSandboxRequest,
+  mergeSeededProductsIntoResponse,
+  filterValidSeededProducts,
+  filterValidSeededCreatives,
+  filterValidSeededMediaBuys,
+  filterValidSeededAccounts,
+  filterValidSeededAccountFinancials,
+  filterValidSeededCreativeFormats,
+  mergeSeededCreativesIntoResponse,
+  mergeSeededMediaBuysIntoResponse,
+  mergeSeededAccountsIntoResponse,
+  mergeSeededCreativeFormatsIntoResponse,
+  pickSeededAccountFinancialsForRequest,
+  replaceAccountFinancialsIfSeeded,
+  bridgeFromTestControllerStore,
+  bridgeFromSessionStore,
+} from './test-controller-bridge';
+export type {
+  TestControllerBridge,
+  TestControllerBridgeContext,
+  BridgeFromSessionStoreOptions,
+  SeededCreative,
+  SeededMediaBuy,
+  SeededAccountFinancials,
+} from './test-controller-bridge';
+
+export {
+  createIdempotencyStore,
+  probeIdempotencyStore,
+  memoryBackend,
+  pgBackend,
+  getIdempotencyMigration,
+  IDEMPOTENCY_MIGRATION,
+  cleanupExpiredIdempotency,
+  redisBackend,
+  createLazyBackend,
+  hashPayload,
+  IdempotencyClaimOwnershipError,
+} from './idempotency';
+export type {
+  IdempotencyStore,
+  IdempotencyStoreConfig,
+  IdempotencyBackend,
+  IdempotencyCacheEntry,
+  IdempotencyCheckResult,
+  MemoryBackendOptions,
+  PgBackendOptions,
+  RedisBackendOptions,
+  RedisBackendClient,
+  RedisLikeClient,
+  LazyBackendFactory,
+  LazyBackendOptions,
+} from './idempotency';
+
+export { createA2AAdapter, A2AInvocationError } from './a2a-adapter';
+export type {
+  A2AAdapter,
+  A2AAdapterOptions,
+  A2AAgentCardOverrides,
+  A2AAgentCapabilitiesOverride,
+  A2AAgentSkillOverride,
+  A2AMountOptions,
+  ExpressAppLike,
+  LegacyHttpSecurityScheme,
+  LegacySecurityScheme,
+} from './a2a-adapter';
+export type { A2ALegacyCompatOptions } from '../protocols/a2a';
+
+export { createWebhookEmitter, memoryWebhookDeliveryStore, memoryWebhookKeyStore } from './webhook-emitter';
+export {
+  pgWebhookDeliveryStore,
+  pgWebhookDeliveryRecoveryBackend,
+  redisWebhookDeliveryStore,
+  redisWebhookDeliveryRecoveryBackend,
+  getWebhookDeliveryMigration,
+  getWebhookDeliveryRecoveryMigration,
+  WEBHOOK_DELIVERY_MIGRATION,
+  WEBHOOK_DELIVERY_RECOVERY_MIGRATION,
+  createWebhookDeliveryRecovery,
+  createPostgresWebhookRuntime,
+  toWebhookRecoveryDisposition,
+  pollWebhookDeliveryRecovery,
+  memoryWebhookDeliveryRecoveryBackend,
+  WebhookAuthenticationProtectionError,
+  WebhookAuthenticationResolutionError,
+  WebhookDeliveryTerminalError,
+  isWebhookDeliveryTerminalError,
+} from './webhook-delivery';
+export type {
+  PgWebhookDeliveryStoreOptions,
+  PgWebhookDeliveryRecoveryOptions,
+  RedisWebhookDeliveryStoreOptions,
+  RedisWebhookDeliveryRecoveryOptions,
+  ProtectedWebhookAuthentication,
+  WebhookAuthenticationAdapter,
+  WebhookAuthenticationContext,
+  StoredWebhookDeliverySnapshot,
+  PreparedWebhookDeliverySnapshot,
+  PrepareWebhookDeliveryOptions,
+  WebhookRecoveryRecord,
+  WebhookRecoveryLease,
+  WebhookRecoveryCheckpointResult,
+  WebhookRecoveryCheckpointOutcome,
+  WebhookDeliveryRecoveryBackend,
+  DurableWebhookDeliveryRecovery,
+  CreateWebhookDeliveryRecoveryOptions,
+  PollWebhookDeliveryRecoveryOptions,
+  CreatePostgresWebhookRuntimeOptions,
+  PostgresWebhookRecoveryPollOptions,
+  PostgresWebhookRuntime,
+  WebhookRecoveryDisposition,
+} from './webhook-delivery';
+export type {
+  WebhookEmitter,
+  RecoverableWebhookEmitter,
+  WebhookEmitterOptions,
+  WebhookEmitParams,
+  WebhookEmitResult,
+  WebhookRecoveredDelivery,
+  WebhookEmitAttempt,
+  WebhookEmitAttemptResult,
+  WebhookDeliveryBinding,
+  WebhookDeliveryRetired,
+  WebhookDeliveryRecord,
+  WebhookDeliveryKey,
+  WebhookDeliveryProposal,
+  WebhookDeliverySnapshot,
+  WebhookDeliveryRecovery,
+  WebhookDeliveryRecoveryClaim,
+  WebhookDeliveryStore,
+  WebhookIdempotencyKeyStore,
+  WebhookRetryOptions,
+  WebhookAuthentication,
+  WebhookAttemptAuthorizer,
+  WebhookAttemptAuthorizationDecision,
+  WebhookAttemptSuppressionReason,
+} from './webhook-emitter';
+export type { SigningProvider } from '../signing/provider';
+
+export {
+  ACCOUNT_NOTIFICATION_TYPES,
+  CALLER_NOTIFICATION_TYPES,
+  NOTIFICATION_SUBSCRIPTION_MIGRATION,
+  NotificationSubscriptionValidationError,
+  createPersistentNotificationRuntime,
+  createPersistentNotificationProtocolHandlers,
+  createPostgresPersistentNotificationRuntime,
+  getNotificationSubscriptionMigration,
+  memoryNotificationSubscriptionStore,
+  notificationSuppressionDisposition,
+  pgNotificationSubscriptionStore,
+  projectNotificationSubscriptionReadback,
+  validatePersistentNotificationDestination,
+} from './notification-subscriptions';
+export type {
+  CreatePostgresPersistentNotificationRuntimeOptions,
+  NotificationAuthenticationMode,
+  NotificationCredentialBindingAdapter,
+  NotificationDeliveryAuthorizationInput,
+  NotificationDeliveryAttemptCheckpoint,
+  NotificationDeliveryAttemptCheckpointInput,
+  NotificationDeliveryAuthorizer,
+  NotificationDestinationValidator,
+  NotificationEvent,
+  NotificationEventAnchor,
+  NotificationFanoutDelivery,
+  NotificationFanoutResult,
+  NotificationProofAdapter,
+  NotificationPreparationResult,
+  PreparedNotificationReplacement,
+  NotificationRecipientRef,
+  NotificationReplacementResult,
+  NotificationSubscriptionConfigInput,
+  NotificationSubscriptionMatch,
+  NotificationSubscriptionScope,
+  NotificationSubscriptionSet,
+  NotificationSubscriptionStore,
+  NotificationSubscriptionStoreReplaceResult,
+  NotificationSuppressionDisposition,
+  NotificationSubscriptionView,
+  PersistentNotificationRuntime,
+  PersistentNotificationRuntimeOptions,
+  PostgresNotificationSubscriptionStoreOptions,
+  PostgresPersistentNotificationRuntime,
+  StoredNotificationAuthentication,
+  StoredNotificationSubscription,
+} from './notification-subscriptions';
+
+export {
+  createPrincipalLifecycle,
+  createPrincipalStateStore,
+  principalNotificationSubscriptionStore,
+  DEFAULT_PRINCIPAL_STORE_COLLECTION,
+} from './principal';
+export type {
+  CreatePrincipalLifecycleOptions,
+  CreatePrincipalStateStoreOptions,
+  PendingPrincipalNotification,
+  PrepareReportingDestination,
+  PrincipalAppliedResult,
+  PrincipalConfiguration,
+  PrincipalConfigurationInput,
+  PrincipalDeclarationSupport,
+  PrincipalDeclarations,
+  PrincipalDeclarationsState,
+  PrincipalDestinationTransition,
+  PrincipalKind,
+  PrincipalLifecycleRuntime,
+  PrincipalNotificationRecoveryResult,
+  PrincipalPendingNotificationPage,
+  PrincipalReportingDestination,
+  PrincipalReportingDestinationInput,
+  PrincipalStateStore,
+  PrincipalStoreReplaceResult,
+  PrincipalStoreScope,
+  ReportingDestinationPreparation,
+  ResolvedReportingDestination,
+  ResolvedPrincipalScope,
+  StoredPrincipalRecord,
+  StoredReportingDestinationGeneration,
+  VersionedPrincipalRecord,
+} from './principal';
+
+export { createPinAndBindFetch, WEBHOOK_SSRF_POLICY, LOOPBACK_OK_WEBHOOK_SSRF_POLICY } from './pin-and-bind-fetch';
+export type { PinAndBindFetchOptions, DnsLookupAll } from './pin-and-bind-fetch';
+
+export {
+  checkGovernance,
+  createAdcpGovernanceEnforcementMiddleware,
+  governanceDeniedError,
+  governanceUnavailableError,
+} from './governance';
+export type {
+  AdcpGovernanceEnforcementMiddleware,
+  CheckGovernanceOptions,
+  GovernanceCallResult,
+  GovernanceApproved,
+  GovernanceDenied,
+  GovernanceConditions,
+} from './governance';
+
+export {
+  GovernanceAuthorizationError,
+  GovernanceReplayStoreAdapter,
+  InMemoryGovernanceReplayStore,
+  buildGovernanceExecutionCommitment,
+  buildGovernanceExecutionRequest,
+  computeGovernedPayloadHash,
+  createGovernanceEnforcementMiddleware,
+  verifyGovernanceAuthorization,
+  verifyHistoricalGovernanceContext,
+  createGovernanceAgentJwksResolver,
+} from '../governance';
+export type {
+  BuildGovernanceExecutionRequestInput,
+  GovernanceAuthorizationClaims,
+  GovernanceAuthorizationErrorCode,
+  GovernanceAuthorizationResult,
+  GovernanceAuthorizationSuccess,
+  GovernanceCommitment,
+  GovernanceEnforcementMiddleware,
+  GovernanceEnforcementMiddlewareConfig,
+  GovernanceEnforcementMiddlewareInput,
+  GovernanceReplayStore,
+  GovernanceReplayBinding,
+  GovernanceRevocationResolver,
+  GovernanceRevocationStatus,
+  VerifyGovernanceAuthorizationOptions,
+  VerifyHistoricalGovernanceContextOptions,
+  HistoricalGovernanceContextResult,
+  GovernanceBuyerIdentity,
+} from '../governance';
+
+export {
+  clearDefaultResolvedListCache,
+  createResolvedListCache,
+  DEFAULT_RESOLVE_LIST_PAGE_SIZE,
+  defaultResolvedListCache,
+  resolvePropertyList,
+  resolveCollectionList,
+  resolvedListCacheKey,
+  matchesPropertyList,
+  matchesCollectionList,
+} from './targeting-helpers';
+export type {
+  ResolvedListCache,
+  ResolvedListCacheEntry,
+  ResolvedListCacheValue,
+  ResolvedListKind,
+  ResolvedPropertyList,
+  ResolvedCollectionList,
+  ResolvedCollection,
+  ResolveListCallTool,
+  ResolveListOptions,
+} from './targeting-helpers';
+
+// ---------------------------------------------------------------------------
+// Platform-shaped server entry point (recommended for new agents)
+// ---------------------------------------------------------------------------
+//
+// `createAdcpServerFromPlatform` wraps `createAdcpServer` (the lower-level
+// handler-bag entry above) with compile-time specialism enforcement
+// (`RequiredPlatformsFor<S>`), capability projection, idempotency wiring,
+// async tasks, status normalization, multi-tenant routing, and async task
+// completion webhooks. Synchronous terminal responses remain inline by
+// default. Adopters declare a typed `DecisioningPlatform` per-specialism
+// and the framework wires the rest. See `docs/migration-5.x-to-6.x.md` and
+// `skills/build-decisioning-platform/` for the full walkthrough.
+//
+// Both `createAdcpServer` and `createAdcpServerFromPlatform` live on the
+// same import path so adopters discover them as siblings; pick the
+// function shape that matches your agent. The platform path internally
+// builds an `AdcpServerConfig` and calls `createAdcpServer` — they're
+// not adjacent surfaces, they're parent-child layers of the same SDK.
+//
+// **Pin to v5 long-term?** Import from `@adcp/sdk/server/legacy/v5`
+// instead. The subpath is the stable home for the v5 handler-bag
+// constructor; the top-level re-export here may be removed in a
+// future major. New code should not pin against `legacy/v5` either —
+// reach for `createAdcpServerFromPlatform` first.
+export * from './decisioning';
+export {
+  createProposalRefinementHandler,
+  createProposalSuccessor,
+  proposalRefinementScopeFromContext,
+  classifyProposalRefinementFailure,
+  defineProposalRefinementCapabilities,
+  ProposalSellerPreflightError,
+} from '../negotiation/seller';
+export { proposalTermsDigest, verifyProposalTermsDigest } from '../negotiation/verification';
+export type {
+  ProposalCommercialEvaluator,
+  ProposalFailureClassification,
+  ProposalEvaluationContext,
+  ProposalRefinementHandler,
+  ProposalRefinementHandlerOptions,
+  ProposalRefinementStore,
+  ProposalRefinementTransaction,
+  ProposalRefinementScope,
+  ProposalSourceExpectation,
+  ProposalSourceSnapshot,
+  ProposalSuccessorInput,
+} from '../negotiation/seller';
+export type {
+  CanonicalProposal,
+  ProposalCommercialTerms,
+  ProposalRefinementCapabilities,
+  ProposalRefinementResult,
+  RefineProposalsRequest,
+  RefineProposalsResponse,
+} from '../negotiation/types';
+
+// ---------------------------------------------------------------------------
+// Ctx-metadata store — opaque-blob round-trip for adapter-internal state
+// ---------------------------------------------------------------------------
+//
+// Publishers attach platform-specific opaque blobs to any returned resource
+// (product, media_buy, package, creative, audience, signal, rights_grant);
+// the framework persists by `(account_id, kind, id)`, strips from buyer-
+// facing wire payloads, threads back into the publisher's request context
+// on subsequent calls referencing the same resource ID. See
+// `docs/proposals/decisioning-platform-v6-1-ctx-metadata.md`.
+export {
+  createCtxMetadataStore,
+  memoryCtxMetadataStore,
+  pgCtxMetadataStore,
+  redisCtxMetadataStore,
+  getCtxMetadataMigration,
+  cleanupExpiredCtxMetadata,
+  CTX_METADATA_MIGRATION,
+  CtxMetadataValidationError,
+  ADCP_INTERNAL_TAG,
+  DEFAULT_MAX_VALUE_BYTES,
+  MAX_TTL_SECONDS,
+  stripCtxMetadata,
+  hasCtxMetadata,
+  stripImplementationConfig,
+  hasImplementationConfig,
+  ctxMetadataResultKey,
+  scopeCtxMetadataKey,
+} from './ctx-metadata';
+export type {
+  CtxMetadataStore,
+  CtxMetadataStoreConfig,
+  CtxMetadataBackend,
+  CtxMetadataEntry,
+  CtxMetadataRef,
+  ResourceKind as CtxMetadataResourceKind,
+  MemoryCtxMetadataStoreOptions,
+  PgCtxMetadataBackendOptions,
+  RedisCtxMetadataBackendOptions,
+  CtxMetadataRedisBackendClient,
+  CtxMetadataRedisLikeClient,
+  WireShape,
+} from './ctx-metadata';
+
+export { createTranslationMap, createUpstreamHttpClient } from './upstream-helpers';
+export type {
+  TranslationMap,
+  UpstreamAuth,
+  AuthContext,
+  UpstreamCallOptions,
+  UpstreamHttpClientOptions,
+  UpstreamHttpClient,
+  UpstreamHttpResult,
+} from './upstream-helpers';
+
+// ---------------------------------------------------------------------------
+// Server-side adapters
+// ---------------------------------------------------------------------------
+export {
+  InMemoryImplicitAccountStore,
+  defaultImplicitKeyFn,
+  type ImplicitAccountStoreOptions,
+} from '../adapters/implicit-account-store';
+
+export {
+  createOAuthPassthroughResolver,
+  type OAuthPassthroughResolverOptions,
+} from '../adapters/oauth-passthrough-resolver';
+
+export { createRosterAccountStore, type RosterAccountStoreOptions } from '../adapters/roster-account-store';
+export { createKeyedAccountStore, type KeyedAccountStoreOptions } from '../adapters/keyed-account-store';
+export {
+  memoryKeyedAccountBackend,
+  pgKeyedAccountBackend,
+  redisKeyedAccountBackend,
+  getKeyedAccountMigration,
+  type KeyedAccountBackend,
+  type KeyedAccountRecord,
+  type KeyedAccountSnapshot,
+  type PgKeyedAccountBackendOptions,
+  type KeyedAccountRedisClient,
+} from '../adapters/keyed-account-backend';
+
+export {
+  createDerivedAccountStore,
+  type DerivedAccountStoreOptions,
+  type DerivedAccountStoreBaseOptions,
+  type DerivedSingletonAccountStoreOptions,
+  type DerivedRosterAccountStoreOptions,
+} from '../adapters/derived-account-store';
+
+// ---------------------------------------------------------------------------
+// Socket Mode — outbound WebSocket bridge for adopter dev environments
+// ---------------------------------------------------------------------------
+export {
+  ConformanceClient,
+  WebSocketTransport,
+  type ConformanceClientOptions,
+  type ConformanceStatus,
+} from './socket-mode';
+
+export { mediaBuyActionResolver } from './media-buy-action-resolver';
+export type {
+  SellerActionDecision,
+  SellerActionResolutionOptions,
+  SellerActionResolution,
+} from './media-buy-action-resolver';
+export * from '../identifiers';
+export { registerPropertyListTool, sendPropertyListChanged } from './property-lists';
+export type {
+  PropertyListPage,
+  PropertyListToolOptions,
+  PropertyListChangedNotification,
+  SendPropertyListChangedOptions,
+} from './property-lists';

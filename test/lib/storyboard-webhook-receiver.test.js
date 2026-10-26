@@ -1,0 +1,1785 @@
+/**
+ * Storyboard outbound-webhook conformance runner — adcontextprotocol/adcp#2431.
+ *
+ * Covers three layers:
+ *   1. Receiver module — per-step URL routing, delivery_index tracking,
+ *      retry-replay policy (5xx→2xx), filter matching.
+ *   2. Runner variables — `{{runner.*}}` and `{{prior_step.*.operation_id}}`
+ *      substitution against a `RunnerVariables` bag.
+ *   3. runStoryboard integration — `expect_webhook`, `expect_no_webhook`,
+ *      `expect_webhook_retry_keys_stable`, and `expect_webhook_signature_valid`
+ *      pseudo-tasks against a fake publisher.
+ */
+
+const { describe, test, afterEach } = require('node:test');
+const assert = require('node:assert');
+const http = require('http');
+const https = require('node:https');
+const net = require('node:net');
+const { mkdtempSync, readFileSync, rmSync } = require('node:fs');
+const { tmpdir } = require('node:os');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const { setTimeout: delay } = require('node:timers/promises');
+
+const { createWebhookReceiver } = require('../../dist/lib/testing/storyboard/webhook-receiver.js');
+const webhookAssertions = require('../../dist/lib/testing/storyboard/webhook-assertions.js');
+const { executeWebhookAssertionStep } = webhookAssertions;
+const { injectContext, createRunnerVariables } = require('../../dist/lib/testing/storyboard/context.js');
+const { runStoryboard } = require('../../dist/lib/testing/storyboard/runner.js');
+const { ADCP_VERSION } = require('../../dist/lib/version.js');
+
+// ────────────────────────────────────────────────────────────
+// Receiver module: direct tests
+// ────────────────────────────────────────────────────────────
+
+async function post(url, body, headers) {
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(headers ?? {}) },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  });
+}
+
+function postWithTestTls(url, body) {
+  const payload = JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      url,
+      {
+        method: 'POST',
+        rejectUnauthorized: false,
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) },
+      },
+      res => {
+        res.resume();
+        res.once('end', () => resolve(res));
+      }
+    );
+    req.once('error', reject);
+    req.end(payload);
+  });
+}
+
+async function getFreePort() {
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const port = server.address().port;
+  await new Promise(resolve => server.close(resolve));
+  return port;
+}
+
+describe('createWebhookReceiver', () => {
+  test('echoes proof-of-control challenges on the registered callback URL (#2701)', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      const challenge = 'proof-control-token-0000000000000001';
+      const callbackUrl = `${receiver.base_url}/step/register/op-1`;
+      const challengeBody = {
+        type: 'webhook.challenge',
+        challenge,
+        account_id: 'acct_123',
+        subscriber_id: 'buyer-primary',
+        seller_agent_url: 'https://seller.example/adcp',
+        delivery_auth: { mode: 'rfc9421' },
+        event_types: ['creative.status_changed'],
+      };
+      const response = await post(callbackUrl, challengeBody, {
+        signature: 'sig1=:c2lnbmF0dXJl:',
+        'signature-input': 'sig1=("@method" "@target-uri");keyid="seller-key"',
+      });
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(await response.json(), { challenge });
+      assert.strictEqual(receiver.all().length, 0, 'challenge probes are not webhook deliveries');
+      assert.strictEqual(receiver.challenges().length, 1, 'challenge metadata is retained for grading');
+      assert.deepStrictEqual(receiver.challenges()[0].body, challengeBody);
+      assert.ok(receiver.challenges()[0].headers['signature-input']);
+
+      const malformed = await post(callbackUrl, { ...challengeBody, challenge: 'too-short' });
+      assert.strictEqual(malformed.status, 400);
+      const missingRequired = await post(callbackUrl, { type: 'webhook.challenge', challenge });
+      assert.strictEqual(missingRequired.status, 400);
+      const obsoleteRoute = await post(`${receiver.base_url}/challenge`, challengeBody);
+      assert.strictEqual(obsoleteRoute.status, 404);
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('accepts the agent-level proof-of-control challenge arm', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      const challenge = 'agent-proof-control-token-000000000001';
+      const body = {
+        type: 'webhook.challenge',
+        scope: 'agent',
+        challenge,
+        subscriber_id: 'registry-cache',
+        seller_agent_url: 'https://seller.example/adcp',
+        delivery_auth: { mode: 'rfc9421' },
+        event_types: ['capabilities.changed'],
+      };
+      const response = await post(`${receiver.base_url}/step/register_agent/op-2`, body);
+
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(await response.json(), { challenge });
+      assert.deepStrictEqual(receiver.challenges()[0].body, body);
+      assert.strictEqual(receiver.all().length, 0);
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('rejects oversized challenge envelopes before retaining them', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      const response = await post(`${receiver.base_url}/step/register/op-large`, {
+        type: 'webhook.challenge',
+        challenge: 'proof-control-token-0000000000000001',
+        account_id: 'x'.repeat(17_000),
+        subscriber_id: 'buyer-primary',
+        seller_agent_url: 'https://seller.example/adcp',
+        delivery_auth: { mode: 'rfc9421' },
+        event_types: ['creative.status_changed'],
+      });
+
+      assert.strictEqual(response.status, 413);
+      assert.strictEqual(receiver.challenges().length, 0);
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('per-step URL routing captures step_id + operation_id from path', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      const url = `${receiver.base_url}/step/trigger_media_buy/op-123`;
+      const res = await post(url, { idempotency_key: 'evt_abcdef0123456789', task_id: 'mb-1' });
+      assert.strictEqual(res.status, 204);
+      const captured = receiver.all();
+      assert.strictEqual(captured.length, 1);
+      assert.strictEqual(captured[0].step_id, 'trigger_media_buy');
+      assert.strictEqual(captured[0].operation_id, 'op-123');
+      assert.strictEqual(captured[0].delivery_index, 1);
+      assert.strictEqual(captured[0].response_status, 204);
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('retry-replay policy returns 5xx for first N deliveries then 2xx', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      receiver.set_retry_replay({ step_id: 'trigger', operation_id: 'op-A' }, { count: 2, http_status: 503 });
+      const url = `${receiver.base_url}/step/trigger/op-A`;
+      const statuses = [];
+      for (let i = 0; i < 3; i++) {
+        const res = await post(url, { idempotency_key: 'evt_stable0123456789' });
+        statuses.push(res.status);
+      }
+      assert.deepStrictEqual(statuses, [503, 503, 204]);
+      const captured = receiver.all();
+      assert.strictEqual(captured.length, 3);
+      assert.strictEqual(captured[0].delivery_index, 1);
+      assert.strictEqual(captured[2].delivery_index, 3);
+      assert.strictEqual(captured[0].response_status, 503);
+      assert.strictEqual(captured[2].response_status, 204);
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('capture cap does not mask retry-replay acceptance (#2653)', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      receiver.set_retry_replay({ step_id: 'trigger', operation_id: 'op-cap' }, { count: 100, http_status: 503 });
+      const url = `${receiver.base_url}/step/trigger/op-cap`;
+      for (let i = 0; i < 100; i++) {
+        const res = await post(url, { idempotency_key: 'evt_stable0123456789' });
+        assert.strictEqual(res.status, 503);
+      }
+
+      const accepted = await post(url, { idempotency_key: 'evt_stable0123456789' });
+      assert.strictEqual(accepted.status, 204);
+      assert.strictEqual(receiver.all().length, 100, 'the accepted overflow delivery is not retained');
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('global capture cap does not mask retry-replay acceptance after prior steps (#2653)', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      for (let step = 0; step < 10; step++) {
+        for (let batch = 0; batch < 4; batch++) {
+          const responses = await Promise.all(
+            Array.from({ length: 25 }, () =>
+              post(`${receiver.base_url}/step/prior_${step}/op-${step}`, {
+                idempotency_key: `evt_prior${step}abcdef012345`,
+              })
+            )
+          );
+          assert.ok(responses.every(res => res.status === 204));
+        }
+      }
+      assert.strictEqual(receiver.all().length, 1000);
+
+      receiver.set_retry_replay({ step_id: 'trigger', operation_id: 'op-global-cap' }, { count: 1, http_status: 503 });
+      const url = `${receiver.base_url}/step/trigger/op-global-cap`;
+      assert.strictEqual((await post(url, { idempotency_key: 'evt_stable0123456789' })).status, 503);
+      assert.strictEqual((await post(url, { idempotency_key: 'evt_stable0123456789' })).status, 204);
+      assert.strictEqual(receiver.all().length, 1000, 'overflow deliveries are not retained');
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('wait resolves on first match; wait_all returns every match after delay', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      const url = `${receiver.base_url}/step/s1/op-x`;
+      const waiter = receiver.wait({ step_id: 's1' }, 1500);
+      setTimeout(() => void post(url, { idempotency_key: 'evt_x1234567890abcdef' }), 20);
+      const first = await waiter;
+      assert.ok(first.webhook);
+      assert.strictEqual(first.webhook.step_id, 's1');
+
+      await post(url, { idempotency_key: 'evt_x1234567890abcdef' });
+      await post(url, { idempotency_key: 'evt_x1234567890abcdef' });
+      const all = await receiver.wait_all({ step_id: 's1' }, 50);
+      assert.strictEqual(all.length, 3);
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('wait times out cleanly when no match arrives', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      const result = await receiver.wait({ step_id: 'nobody' }, 80);
+      assert.strictEqual(result.timed_out, true);
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('close drains pending wait_all timers immediately (#2653)', async () => {
+    const receiver = await createWebhookReceiver();
+    const pending = receiver.wait_all({ step_id: 'nobody' }, 60_000);
+
+    await receiver.close();
+    const result = await Promise.race([pending, delay(250).then(() => 'still-pending')]);
+    assert.deepStrictEqual(result, []);
+  });
+
+  test('close resolves a pending first-match waiter immediately (#2701)', async () => {
+    const receiver = await createWebhookReceiver();
+    const pending = receiver.wait({ step_id: 'nobody' }, 60_000);
+
+    await receiver.close();
+    const result = await Promise.race([pending, delay(250).then(() => 'still-pending')]);
+    assert.deepStrictEqual(result, { timed_out: true });
+  });
+
+  test('close preserves matches already captured by a pending wait_all', async () => {
+    const receiver = await createWebhookReceiver();
+    const pending = receiver.wait_all({ step_id: 'captured_before_close' }, 60_000);
+    await post(`${receiver.base_url}/step/captured_before_close/op-close`, {
+      idempotency_key: 'evt_close0123456789ab',
+    });
+
+    await receiver.close();
+    const result = await pending;
+    assert.strictEqual(result.length, 1);
+    assert.strictEqual(result[0].step_id, 'captured_before_close');
+  });
+
+  test('waits registered after close resolve immediately and preserve retained matches', async () => {
+    const receiver = await createWebhookReceiver();
+    await post(`${receiver.base_url}/step/retained/op-late`, {
+      idempotency_key: 'evt_retained12345678',
+    });
+    await receiver.close();
+
+    const retained = await receiver.wait({ step_id: 'retained' }, 60_000);
+    assert.strictEqual(retained.webhook.step_id, 'retained');
+    assert.strictEqual((await receiver.wait_all({ step_id: 'retained' }, 60_000)).length, 1);
+    assert.deepStrictEqual(await receiver.wait({ step_id: 'late' }, 60_000), { timed_out: true });
+    assert.deepStrictEqual(await receiver.wait_all({ step_id: 'late' }, 60_000), []);
+  });
+
+  test('filter scopes by step_id, operation_id, and body path', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      await post(`${receiver.base_url}/step/foo/op-1`, {
+        idempotency_key: 'evt_x1234567890abcdef',
+        task: { id: 'noise' },
+      });
+      await post(`${receiver.base_url}/step/foo/op-2`, {
+        idempotency_key: 'evt_x1234567890abcdef',
+        task: { id: 'target' },
+      });
+      const filtered = receiver.matching({ operation_id: 'op-2', body: { 'task.id': 'target' } });
+      assert.strictEqual(filtered.length, 1);
+      assert.strictEqual(filtered[0].operation_id, 'op-2');
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('rejects POSTs on unknown paths with 404', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      const res = await post(`${receiver.base_url}/webhook`, { idempotency_key: 'evt_x1234567890abcdef' });
+      assert.strictEqual(res.status, 404);
+      assert.strictEqual(receiver.all().length, 0);
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('proxy_url mode requires public_url; loopback mode does not', async () => {
+    await assert.rejects(() => createWebhookReceiver({ mode: 'proxy_url' }), /public_url/);
+    const rec = await createWebhookReceiver({ mode: 'proxy_url', public_url: 'https://tunnel.example' });
+    try {
+      assert.strictEqual(rec.mode, 'proxy_url');
+      assert.match(rec.base_url, /^https:\/\/tunnel\.example\/_adcp_receiver\/[0-9a-f-]+$/);
+    } finally {
+      await rec.close();
+    }
+  });
+
+  test('rejects proxy_url with bad scheme, userinfo, or CRLF', async () => {
+    await assert.rejects(() => createWebhookReceiver({ mode: 'proxy_url', public_url: 'file:///etc/passwd' }), /http/);
+    await assert.rejects(
+      () => createWebhookReceiver({ mode: 'proxy_url', public_url: 'https://user:pw@example.com' }),
+      /userinfo/
+    );
+    await assert.rejects(
+      () => createWebhookReceiver({ mode: 'proxy_url', public_url: 'https://example.com\r\nX-Evil: 1' }),
+      /CR\/LF/
+    );
+    await assert.rejects(
+      () => createWebhookReceiver({ mode: 'proxy_url', public_url: 'https://example.com?redirect=1' }),
+      /query string or fragment/
+    );
+  });
+
+  test('requires an explicit local-development opt-in for an HTTP proxy URL', async () => {
+    await assert.rejects(
+      () => createWebhookReceiver({ mode: 'proxy_url', public_url: 'http://tests:9999' }),
+      /must use https/
+    );
+    const receiver = await createWebhookReceiver({
+      mode: 'proxy_url',
+      public_url: 'http://tests:9999',
+      allowHttp: true,
+    });
+    await receiver.close();
+  });
+
+  test('rejects 0.0.0.0 in loopback_mock mode', async () => {
+    await assert.rejects(() => createWebhookReceiver({ host: '0.0.0.0' }), /not permitted/);
+    await assert.rejects(() => createWebhookReceiver({ host: '0:0:0:0:0:0:0:0' }), /not permitted/);
+  });
+
+  test('binds on all interfaces in proxy mode and protects the route with an unguessable prefix', async () => {
+    const port = await getFreePort();
+    const receiver = await createWebhookReceiver({
+      mode: 'proxy_url',
+      host: '0.0.0.0',
+      port,
+      public_url: `http://tests:${port}/hooks`,
+      allowHttp: true,
+    });
+    try {
+      const routePrefix = new URL(receiver.base_url).pathname;
+      const accepted = await post(`http://127.0.0.1:${port}${routePrefix}/step/container/op-1`, {
+        idempotency_key: 'evt_x1234567890abcdef',
+      });
+      assert.strictEqual(accepted.status, 204);
+      assert.strictEqual(receiver.all().length, 1);
+      assert.strictEqual(receiver.all()[0].path, '/step/container/op-1');
+
+      const unscoped = await post(`http://127.0.0.1:${port}/step/container/op-2`, {
+        idempotency_key: 'evt_x1234567890abcdef',
+      });
+      assert.strictEqual(unscoped.status, 404);
+      assert.strictEqual(receiver.all().length, 1);
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('requires an HTTPS public URL when direct TLS is configured', async () => {
+    await assert.rejects(
+      () =>
+        createWebhookReceiver({
+          mode: 'proxy_url',
+          public_url: 'http://tests:9999',
+          allowHttp: true,
+          tls: { cert: 'invalid', key: 'invalid' },
+        }),
+      /must use https when local TLS is configured/
+    );
+  });
+
+  test(
+    'serves and captures webhooks over direct TLS',
+    { skip: spawnSync('openssl', ['version'], { stdio: 'ignore' }).status !== 0 },
+    async () => {
+      const certDir = mkdtempSync(path.join(tmpdir(), 'adcp-webhook-tls-'));
+      const certPath = path.join(certDir, 'cert.pem');
+      const keyPath = path.join(certDir, 'key.pem');
+      let receiver;
+      try {
+        const generated = spawnSync(
+          'openssl',
+          [
+            'req',
+            '-x509',
+            '-newkey',
+            'rsa:2048',
+            '-nodes',
+            '-keyout',
+            keyPath,
+            '-out',
+            certPath,
+            '-days',
+            '1',
+            '-subj',
+            '/CN=127.0.0.1',
+            '-addext',
+            'subjectAltName=IP:127.0.0.1',
+          ],
+          { stdio: 'ignore' }
+        );
+        assert.strictEqual(generated.status, 0, 'failed to generate test TLS certificate');
+        receiver = await createWebhookReceiver({
+          tls: { cert: readFileSync(certPath), key: readFileSync(keyPath) },
+        });
+        assert.match(receiver.base_url, /^https:\/\//);
+        const response = await postWithTestTls(`${receiver.base_url}/step/tls/op-1`, {
+          idempotency_key: 'evt_x1234567890abcdef',
+        });
+        assert.strictEqual(response.statusCode, 204);
+        assert.strictEqual(receiver.all().length, 1);
+      } finally {
+        if (receiver) await receiver.close();
+        rmSync(certDir, { recursive: true, force: true });
+      }
+    }
+  );
+
+  test('redacts sensitive headers in captured webhooks', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      await post(
+        `${receiver.base_url}/step/s/op`,
+        { idempotency_key: 'evt_x1234567890abcdef' },
+        {
+          authorization: 'Bearer super-secret',
+          'x-api-key': 'also-secret',
+        }
+      );
+      const [w] = receiver.all();
+      assert.strictEqual(w.headers.authorization, '[redacted]');
+      assert.strictEqual(w.headers['x-api-key'], '[redacted]');
+      assert.strictEqual(w.headers['content-type'], 'application/json'); // unaffected
+    } finally {
+      await receiver.close();
+    }
+  });
+});
+
+// ────────────────────────────────────────────────────────────
+// Runner-variable substitution
+// ────────────────────────────────────────────────────────────
+
+describe('injectContext with RunnerVariables', () => {
+  test('{{runner.webhook_base}} is substituted inside a larger string', () => {
+    const rv = createRunnerVariables({ webhookBase: 'https://receiver.example' });
+    const out = injectContext({ url: '{{runner.webhook_base}}/hook' }, {}, rv);
+    assert.strictEqual(out.url, 'https://receiver.example/hook');
+  });
+
+  test('{{runner.webhook_url:<id>}} mints operation_id once per step_id', () => {
+    const rv = createRunnerVariables({ webhookBase: 'https://receiver.example' });
+    const first = injectContext({ url: '{{runner.webhook_url:trigger}}' }, {}, rv);
+    const second = injectContext({ url: '{{runner.webhook_url:trigger}}' }, {}, rv);
+    assert.strictEqual(first.url, second.url);
+    const opId = rv.stepOperationIds.get('trigger');
+    assert.ok(opId, 'operation_id cached on stepOperationIds');
+    assert.strictEqual(first.url, `https://receiver.example/step/trigger/${opId}`);
+  });
+
+  test('{{prior_step.<id>.operation_id}} resolves to the same id as the URL', () => {
+    const rv = createRunnerVariables({ webhookBase: 'https://receiver.example' });
+    const triggerUrl = injectContext({ u: '{{runner.webhook_url:trigger}}' }, {}, rv).u;
+    const opId = rv.stepOperationIds.get('trigger');
+    const filterResolved = injectContext({ op: '{{prior_step.trigger.operation_id}}' }, {}, rv);
+    assert.strictEqual(filterResolved.op, opId);
+    assert.ok(triggerUrl.endsWith(opId));
+  });
+
+  test('unresolved tokens pass through unchanged', () => {
+    const rv = createRunnerVariables({}); // no webhook base
+    const out = injectContext({ a: '{{runner.webhook_base}}', b: '{{prior_step.ghost.operation_id}}' }, {}, rv);
+    assert.strictEqual(out.a, '{{runner.webhook_base}}');
+    assert.strictEqual(out.b, '{{prior_step.ghost.operation_id}}');
+  });
+
+  test('returns quickly on nested/partial mustache inputs (ReDoS regression for CodeQL #49)', () => {
+    const rv = createRunnerVariables({ webhookBase: 'https://r.example' });
+    // Pathological input that the prior `[^}]+` alternation would backtrack
+    // over at O(n²) — many repetitions of a `{{runner.` prefix without a
+    // matching close. The new `[^{}]+` character class forbids a token from
+    // straddling a nested `{{`, so no match fires and the input passes
+    // through unchanged in linear time.
+    const pathological = '{{runner.'.repeat(5000);
+    const start = process.hrtime.bigint();
+    const out = injectContext({ x: pathological }, {}, rv);
+    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+    assert.strictEqual(out.x, pathological);
+    // Bound generously — was observed ~300 ns per input char pre-fix at this
+    // scale. If a future regex change re-introduces polynomial backtracking,
+    // this will time out well under the assertion.
+    assert.ok(elapsedMs < 100, `expected sub-100ms, got ${elapsedMs.toFixed(1)}ms`);
+  });
+});
+
+// ────────────────────────────────────────────────────────────
+// End-to-end: runStoryboard + webhook_receiver
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Fake publisher. The `__test_fire_webhook` tool POSTs a payload to the
+ * push_notification_config.url — simulating a seller's webhook emission
+ * path. Configurable failure modes let us exercise every expect_webhook
+ * error code without standing up a real seller.
+ */
+async function startFakePublisher(config = {}) {
+  const server = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    let rpc;
+    try {
+      rpc = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    } catch {
+      res.writeHead(400).end();
+      return;
+    }
+    if (rpc.method === 'initialize') {
+      res.writeHead(200, { 'content-type': 'application/json', 'mcp-session-id': 'test-session' });
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          result: { protocolVersion: '2025-11-25', capabilities: {}, serverInfo: { name: 'test', version: '1.0.0' } },
+        })
+      );
+      return;
+    }
+    if (rpc.method === 'notifications/initialized') {
+      res.writeHead(202);
+      res.end();
+      return;
+    }
+    if (rpc.method === 'tools/list') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          result: { tools: [{ name: '__test_fire_webhook', inputSchema: { type: 'object' } }] },
+        })
+      );
+      return;
+    }
+    const toolName = rpc.params?.name;
+    const args = rpc.params?.arguments ?? {};
+
+    if (toolName === '__test_fire_webhook') {
+      const url = args.push_notification_config?.url;
+      const taskId = args.task_id ?? 'mb-1';
+      const mode = config.mode ?? 'ok';
+      const fire = async (idempotencyKey, attempt) => {
+        try {
+          await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              idempotency_key: idempotencyKey,
+              task: { task_id: taskId, status: 'completed', attempt },
+            }),
+          });
+        } catch {
+          // swallow — test surfaces failures via timeouts or count mismatch
+        }
+      };
+
+      if (mode === 'ok') {
+        await fire('evt_stable_' + '0123456789abcdef'.slice(0, 16), 1);
+      } else if (mode === 'mcp_envelope') {
+        try {
+          await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              idempotency_key: 'evt_mcp_envelope_0123456789',
+              operation_id: args.push_notification_config?.operation_id ?? 'op_mcp_envelope',
+              task_id: taskId,
+              task_type: 'create_media_buy',
+              status: 'completed',
+              timestamp: '2026-05-26T09:00:44.582Z',
+              result: {
+                status: 'completed',
+                media_buy_id: 'mb_1',
+                packages: [],
+              },
+            }),
+          });
+        } catch {}
+      } else if (mode === 'missing_envelope_fields') {
+        try {
+          await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              idempotency_key: 'evt_missing_fields_012345',
+              task_id: taskId,
+              task_type: 'create_media_buy',
+              status: 'completed',
+              result: { status: 'completed', media_buy_id: 'mb_1', packages: [] },
+            }),
+          });
+        } catch {}
+      } else if (mode === 'bare_delivery_result') {
+        try {
+          await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              notification_type: 'scheduled',
+              sequence_number: 31,
+              reporting_period: {
+                start: '2026-05-25T00:00:00Z',
+                end: '2026-05-25T23:59:00Z',
+              },
+              currency: 'USD',
+              media_buy_deliveries: [],
+            }),
+          });
+        } catch {}
+      } else if (mode === 'missing_key') {
+        try {
+          await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ task: { task_id: taskId, status: 'completed' } }),
+          });
+        } catch {}
+      } else if (mode === 'invalid_key_format') {
+        await fire('tooShort', 1);
+      } else if (mode === 'retry_stable') {
+        // Retry up to N+1 times with the SAME idempotency_key. The receiver's
+        // retry-replay policy decides when deliveries are accepted; this
+        // publisher just keeps retrying as long as the receiver says 5xx.
+        const key = 'evt_stable_' + '0123456789abcdef'.slice(0, 16);
+        let attempt = 1;
+        while (attempt <= 10) {
+          try {
+            const deliveryRes = await fetch(url, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                idempotency_key: key,
+                task: { task_id: taskId, status: attempt === 1 ? 'pending' : 'completed', attempt },
+              }),
+            });
+            if (deliveryRes.status < 500) break;
+          } catch {
+            break;
+          }
+          attempt++;
+          await delay(5);
+        }
+      } else if (mode === 'retry_rotated') {
+        let attempt = 1;
+        while (attempt <= 10) {
+          const key = 'evt_rot_' + attempt.toString().padStart(12, '0');
+          try {
+            const deliveryRes = await fetch(url, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                idempotency_key: key,
+                task: { task_id: taskId, status: attempt === 1 ? 'pending' : 'completed', attempt },
+              }),
+            });
+            if (deliveryRes.status < 500) break;
+          } catch {
+            break;
+          }
+          attempt++;
+          await delay(5);
+        }
+      } else if (mode === 'duplicate_logical_event') {
+        // Two webhooks with DIFFERENT idempotency_keys — simulates publisher
+        // re-executing on replay and emitting a duplicate event.
+        await fire('evt_first_' + '0123456789abcdef'.slice(0, 16), 1);
+        await fire('evt_secon_' + '0123456789abcdef'.slice(0, 16), 2);
+      }
+
+      res.writeHead(200, { 'content-type': 'application/json' }).end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          result: { structuredContent: { fired: true, task_id: taskId } },
+        })
+      );
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' }).end(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: rpc.id,
+        result: { isError: true, structuredContent: { error: `unknown tool ${toolName}`, code: 'NOT_FOUND' } },
+      })
+    );
+  });
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  return {
+    server,
+    url: `http://127.0.0.1:${server.address().port}/mcp`,
+  };
+}
+
+function stopPublisher(p) {
+  return new Promise(r => p.server.close(r));
+}
+
+async function startReplayReceiver(handler) {
+  const requests = [];
+  const server = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const rawBody = Buffer.concat(chunks).toString('utf8');
+    let body;
+    try {
+      body = rawBody ? JSON.parse(rawBody) : null;
+    } catch {
+      body = rawBody;
+    }
+    requests.push({ method: req.method, url: req.url, headers: req.headers, rawBody, body });
+    const response = await handler({ req, body, rawBody, requests });
+    res
+      .writeHead(response.status, { 'content-type': 'application/json' })
+      .end(JSON.stringify(response.body ?? { ok: response.status >= 200 && response.status < 300 }));
+  });
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  return {
+    server,
+    requests,
+    url: `http://127.0.0.1:${server.address().port}/webhook`,
+  };
+}
+
+function stopReplayReceiver(receiver) {
+  return new Promise(r => receiver.server.close(r));
+}
+
+function storyboardWith(steps) {
+  return {
+    id: 'webhook_emission_sb',
+    version: '1.0.0',
+    title: 'Webhook emission test',
+    category: 'testing',
+    summary: '',
+    narrative: '',
+    agent: { interaction_model: '*', capabilities: [] },
+    caller: { role: 'compliance_runner' },
+    phases: [{ id: 'p', title: 'emit', steps }],
+  };
+}
+
+const AGENT_TOOLS = ['__test_fire_webhook'];
+const RUN_OPTIONS_BASE = {
+  protocol: 'mcp',
+  allow_http: true,
+  agentTools: AGENT_TOOLS,
+  _profile: { name: 'fake', tools: AGENT_TOOLS.map(name => ({ name })) },
+};
+
+describe('runStoryboard: expect_webhook step task', () => {
+  let publisher;
+  afterEach(async () => {
+    if (publisher) await stopPublisher(publisher);
+    publisher = undefined;
+  });
+
+  test('passes when publisher emits a webhook with a valid idempotency_key', async () => {
+    publisher = await startFakePublisher({ mode: 'ok' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Trigger webhook',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: {
+          task_id: 'mb-1',
+          push_notification_config: { url: '{{runner.webhook_url:trigger}}' },
+        },
+      },
+      {
+        id: 'assert',
+        title: 'Assert webhook arrived with idempotency_key',
+        task: 'expect_webhook',
+        triggered_by: 'trigger',
+        timeout_seconds: 2,
+      },
+    ]);
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const [triggerStep, assertStep] = result.phases[0].steps;
+    assert.strictEqual(triggerStep.passed, true, triggerStep.error);
+    assert.strictEqual(assertStep.passed, true, `validations: ${JSON.stringify(assertStep.validations)}`);
+    assert.strictEqual(assertStep.validations[0].check, 'expect_webhook');
+  });
+
+  test('validates webhook_payload_schema_ref for full MCP webhook envelopes', async () => {
+    publisher = await startFakePublisher({ mode: 'mcp_envelope' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Trigger webhook',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: {
+          task_id: 'mb-1',
+          push_notification_config: { url: '{{runner.webhook_url:trigger}}' },
+        },
+      },
+      {
+        id: 'assert',
+        title: 'Assert webhook schema',
+        task: 'expect_webhook',
+        triggered_by: 'trigger',
+        timeout_seconds: 2,
+        webhook_payload_schema_ref: 'core/mcp-webhook-payload.json',
+      },
+    ]);
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.passed, true, JSON.stringify(assertStep.validations));
+    assert.ok(
+      assertStep.validations.some(v => v.schema_id === `/schemas/${ADCP_VERSION}/core/mcp-webhook-payload.json`)
+    );
+  });
+
+  test('fails schema_violation when webhook envelope fields are missing', async () => {
+    publisher = await startFakePublisher({ mode: 'missing_envelope_fields' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Trigger webhook',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: {
+          task_id: 'mb-1',
+          push_notification_config: { url: '{{runner.webhook_url:trigger}}' },
+        },
+      },
+      {
+        id: 'assert',
+        title: 'Assert webhook schema',
+        task: 'expect_webhook',
+        triggered_by: 'trigger',
+        timeout_seconds: 2,
+        webhook_payload_schema_ref: 'core/mcp-webhook-payload.json',
+      },
+    ]);
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.passed, false);
+    assert.strictEqual(assertStep.validations[0].actual.code, 'schema_violation');
+    assert.ok(assertStep.validations[0].actual.issues.some(issue => issue.keyword === 'required'));
+  });
+
+  test('fails schema_violation for bare delivery result payloads', async () => {
+    publisher = await startFakePublisher({ mode: 'bare_delivery_result' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Trigger webhook',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: {
+          task_id: 'mb-1',
+          push_notification_config: { url: '{{runner.webhook_url:trigger}}' },
+        },
+      },
+      {
+        id: 'assert',
+        title: 'Assert webhook schema',
+        task: 'expect_webhook',
+        triggered_by: 'trigger',
+        timeout_seconds: 2,
+        webhook_payload_schema_ref: 'core/mcp-webhook-payload.json',
+      },
+    ]);
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.passed, false);
+    assert.strictEqual(assertStep.validations[0].actual.code, 'schema_violation');
+  });
+
+  test('fails with no_webhook_received when publisher does not emit', async () => {
+    publisher = await startFakePublisher({ mode: 'quiet' }); // unknown mode → no webhook
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Trigger',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: { push_notification_config: { url: '{{runner.webhook_url:trigger}}' } },
+      },
+      {
+        id: 'assert',
+        title: 'Assert',
+        task: 'expect_webhook',
+        triggered_by: 'trigger',
+        timeout_seconds: 0.2,
+      },
+    ]);
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.passed, false);
+    assert.strictEqual(assertStep.validations[0].actual.code, 'no_webhook_received');
+  });
+
+  test('fails with missing_idempotency_key when the key is absent', async () => {
+    publisher = await startFakePublisher({ mode: 'missing_key' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Trigger',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: { push_notification_config: { url: '{{runner.webhook_url:trigger}}' } },
+      },
+      {
+        id: 'assert',
+        title: 'Assert',
+        task: 'expect_webhook',
+        triggered_by: 'trigger',
+        timeout_seconds: 2,
+      },
+    ]);
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.passed, false);
+    assert.strictEqual(assertStep.validations[0].actual.code, 'missing_idempotency_key');
+  });
+
+  test('fails with invalid_idempotency_key_format on pattern mismatch', async () => {
+    publisher = await startFakePublisher({ mode: 'invalid_key_format' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Trigger',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: { push_notification_config: { url: '{{runner.webhook_url:trigger}}' } },
+      },
+      {
+        id: 'assert',
+        title: 'Assert',
+        task: 'expect_webhook',
+        triggered_by: 'trigger',
+        timeout_seconds: 2,
+      },
+    ]);
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.passed, false);
+    assert.strictEqual(assertStep.validations[0].actual.code, 'invalid_idempotency_key_format');
+  });
+
+  test('fails with duplicate_webhook_on_replay when two distinct logical events arrive under a cap of 1', async () => {
+    publisher = await startFakePublisher({ mode: 'duplicate_logical_event' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Trigger',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: { push_notification_config: { url: '{{runner.webhook_url:trigger}}' } },
+      },
+      {
+        id: 'assert',
+        title: 'Assert',
+        task: 'expect_webhook',
+        triggered_by: 'trigger',
+        timeout_seconds: 0.3,
+        expect_max_deliveries_per_logical_event: 1,
+      },
+    ]);
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.passed, false);
+    assert.strictEqual(assertStep.validations[0].actual.code, 'duplicate_webhook_on_replay');
+  });
+
+  test('grades not_applicable when requires_contract is not in options.contracts', async () => {
+    publisher = await startFakePublisher({ mode: 'ok' });
+    const storyboard = storyboardWith([
+      {
+        id: 'assert',
+        title: 'Gated assertion',
+        task: 'expect_webhook',
+        timeout_seconds: 0.2,
+        requires_contract: 'webhook_receiver_runner',
+      },
+    ]);
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+      contracts: [], // contract NOT in scope
+    });
+    const assertStep = result.phases[0].steps[0];
+    assert.strictEqual(assertStep.skipped, true);
+    assert.strictEqual(assertStep.skip.reason, 'unsatisfied_contract');
+  });
+
+  test('grades not_applicable when webhook_receiver is not enabled', async () => {
+    publisher = await startFakePublisher({ mode: 'ok' });
+    const storyboard = storyboardWith([
+      {
+        id: 'assert',
+        title: 'No receiver',
+        task: 'expect_webhook',
+        timeout_seconds: 0.2,
+      },
+    ]);
+    const result = await runStoryboard(publisher.url, storyboard, RUN_OPTIONS_BASE);
+    const assertStep = result.phases[0].steps[0];
+    assert.strictEqual(assertStep.skipped, true);
+    assert.strictEqual(assertStep.skip.reason, 'unsatisfied_contract');
+  });
+});
+
+describe('runStoryboard: expect_no_webhook step task', () => {
+  let publisher;
+  afterEach(async () => {
+    if (publisher) await stopPublisher(publisher);
+    publisher = undefined;
+  });
+
+  test('passes after the observation window when no matching webhook arrives', async () => {
+    publisher = await startFakePublisher({ mode: 'quiet' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Complete synchronously without a webhook',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: { push_notification_config: { url: '{{runner.webhook_url:trigger}}' } },
+      },
+      {
+        id: 'assert_silence',
+        title: 'Assert no completion webhook',
+        task: 'expect_no_webhook',
+        triggered_by: 'trigger',
+        timeout_seconds: 0.05,
+      },
+    ]);
+
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.passed, true, JSON.stringify(assertStep.validations));
+    assert.strictEqual(assertStep.validations[0].check, 'expect_no_webhook');
+    assert.strictEqual(assertStep.validations[0].json_pointer, null);
+  });
+
+  test('fails immediately with safe correlation metadata when a matching webhook arrives', async () => {
+    publisher = await startFakePublisher({ mode: 'ok' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Emit an unexpected webhook',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: { push_notification_config: { url: '{{runner.webhook_url:trigger}}' } },
+      },
+      {
+        id: 'assert_silence',
+        title: 'Assert no completion webhook',
+        task: 'expect_no_webhook',
+        triggered_by: 'trigger',
+        timeout_seconds: 2,
+      },
+    ]);
+
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    const validation = assertStep.validations[0];
+    assert.strictEqual(assertStep.passed, false);
+    assert.strictEqual(validation.actual.code, 'unexpected_webhook_received');
+    assert.strictEqual(validation.json_pointer, null);
+    assert.strictEqual(validation.actual.actual.count, 1);
+    assert.strictEqual(validation.actual.actual.first_delivery.step_id, 'trigger');
+    assert.ok(validation.actual.actual.first_delivery.operation_id);
+    assert.ok(assertStep.duration_ms < 1000, `expected immediate failure, got ${assertStep.duration_ms}ms`);
+  });
+
+  test('fails when a matching webhook arrives while the observation waiter is active', async () => {
+    let signalWaitStarted;
+    const waitStarted = new Promise(resolve => {
+      signalWaitStarted = resolve;
+    });
+    let resolveWait;
+    const captured = [];
+    const receiver = {
+      base_url: 'http://127.0.0.1:1',
+      mode: 'loopback_mock',
+      all: () => [...captured],
+      matching: () => [...captured],
+      set_retry_replay: () => {},
+      wait: () => {
+        signalWaitStarted();
+        return new Promise(resolve => {
+          resolveWait = resolve;
+        });
+      },
+      wait_all: async () => [],
+      close: async () => {},
+    };
+    const runState = {
+      contributions: new Set(),
+      priorStepResults: new Map([['trigger', { passed: true }]]),
+      priorProbes: new Map(),
+      agentUrl: '',
+      webhookReceiver: receiver,
+      runnerVars: createRunnerVariables({ webhookBase: receiver.base_url }),
+    };
+    const step = {
+      id: 'assert_silence',
+      title: 'Assert no completion webhook',
+      task: 'expect_no_webhook',
+      triggered_by: 'trigger',
+      timeout_seconds: 1,
+    };
+
+    const resultPromise = executeWebhookAssertionStep(step, 'p', {}, [], {}, runState);
+    await waitStarted;
+    const webhook = {
+      id: 'delivery-1',
+      step_id: 'trigger',
+      operation_id: 'operation-1',
+      delivery_index: 1,
+      received_at: new Date().toISOString(),
+      body: { idempotency_key: 'evt_delayed_0123456789abcdef' },
+    };
+    captured.push(webhook);
+    resolveWait({ timed_out: false, webhook });
+
+    const assertStep = await resultPromise;
+    assert.strictEqual(assertStep.passed, false);
+    assert.strictEqual(assertStep.validations[0].actual.code, 'unexpected_webhook_received');
+    assert.strictEqual(assertStep.validations[0].actual.actual.first_delivery.id, 'delivery-1');
+  });
+
+  test('ignores deliveries that do not match the authored body filter', async () => {
+    publisher = await startFakePublisher({ mode: 'ok' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Emit an unrelated webhook',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: {
+          task_id: 'mb-1',
+          push_notification_config: { url: '{{runner.webhook_url:trigger}}' },
+        },
+      },
+      {
+        id: 'assert_silence',
+        title: 'Assert no matching webhook',
+        task: 'expect_no_webhook',
+        triggered_by: 'trigger',
+        filter: { body: { 'task.task_id': 'different-task' } },
+        timeout_seconds: 0.05,
+      },
+    ]);
+
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.passed, true, JSON.stringify(assertStep.validations));
+  });
+
+  test('skips when the triggering step was skipped', async () => {
+    publisher = await startFakePublisher({ mode: 'quiet' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Unavailable trigger',
+        task: '__test_fire_webhook',
+        requires_tool: '__missing_webhook_tool',
+        sample_request: {},
+      },
+      {
+        id: 'assert_silence',
+        title: 'Assert no completion webhook',
+        task: 'expect_no_webhook',
+        triggered_by: 'trigger',
+        timeout_seconds: 0.05,
+      },
+    ]);
+
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const [triggerStep, assertStep] = result.phases[0].steps;
+    assert.strictEqual(triggerStep.skipped, true);
+    assert.strictEqual(assertStep.skipped, true);
+    assert.strictEqual(assertStep.skip.reason, 'prerequisite_failed');
+  });
+
+  test('does not false-pass when triggered_by has no prior result', async () => {
+    publisher = await startFakePublisher({ mode: 'quiet' });
+    const storyboard = storyboardWith([
+      {
+        id: 'assert_silence',
+        title: 'Assert no completion webhook',
+        task: 'expect_no_webhook',
+        triggered_by: 'missing_trigger',
+        timeout_seconds: 0.05,
+      },
+    ]);
+
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[0];
+    assert.strictEqual(assertStep.skipped, true);
+    assert.strictEqual(assertStep.skip.reason, 'prerequisite_failed');
+    assert.match(assertStep.skip.detail, /no prior result/);
+  });
+
+  test('grades not_applicable when webhook_receiver is not enabled', async () => {
+    publisher = await startFakePublisher({ mode: 'quiet' });
+    const storyboard = storyboardWith([
+      {
+        id: 'assert_silence',
+        title: 'No receiver',
+        task: 'expect_no_webhook',
+        timeout_seconds: 0.05,
+      },
+    ]);
+
+    const result = await runStoryboard(publisher.url, storyboard, RUN_OPTIONS_BASE);
+    const assertStep = result.phases[0].steps[0];
+    assert.strictEqual(assertStep.skipped, true);
+    assert.strictEqual(assertStep.skip.reason, 'unsatisfied_contract');
+  });
+
+  test('uses a five-second default and clamps authored timeouts to five minutes', async () => {
+    const observedTimeouts = [];
+    const receiver = {
+      base_url: 'http://127.0.0.1:1',
+      mode: 'loopback_mock',
+      all: () => [],
+      matching: () => [],
+      set_retry_replay: () => {},
+      wait: async (_filter, timeoutMs) => {
+        observedTimeouts.push(timeoutMs);
+        return { timed_out: true };
+      },
+      wait_all: async () => [],
+      close: async () => {},
+    };
+    const runState = {
+      contributions: new Set(),
+      priorStepResults: new Map([['trigger', { passed: true }]]),
+      priorProbes: new Map(),
+      agentUrl: publisher?.url ?? '',
+      webhookReceiver: receiver,
+      runnerVars: createRunnerVariables({ webhookBase: receiver.base_url }),
+    };
+    const baseStep = {
+      id: 'assert_silence',
+      title: 'Assert no completion webhook',
+      task: 'expect_no_webhook',
+      triggered_by: 'trigger',
+    };
+
+    await executeWebhookAssertionStep(baseStep, 'p', {}, [], {}, runState);
+    await executeWebhookAssertionStep({ ...baseStep, timeout_seconds: 999 }, 'p', {}, [], {}, runState);
+
+    assert.deepStrictEqual(observedTimeouts, [5000, 300000]);
+  });
+
+  test('is exported by both CJS and ESM builds', async () => {
+    const esmAssertions = await import('../../dist/lib/testing/storyboard/webhook-assertions.mjs');
+    assert.strictEqual(webhookAssertions.WEBHOOK_ASSERTION_TASKS.has('expect_no_webhook'), true);
+    assert.strictEqual(esmAssertions.WEBHOOK_ASSERTION_TASKS.has('expect_no_webhook'), true);
+  });
+});
+
+describe('executeWebhookAssertionStep prerequisites', () => {
+  test('fails immediately when an earlier account notification setup failed (#2701)', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      const setup = {
+        id: 'register_notifications',
+        title: 'Register notifications',
+        task: 'sync_accounts',
+        sample_request: {
+          accounts: [
+            {
+              notification_configs: [
+                {
+                  subscriber_id: 'buyer-primary',
+                  url: 'https://receiver.example/',
+                  event_types: ['creative.status_changed'],
+                },
+              ],
+            },
+          ],
+        },
+      };
+      const assertion = {
+        id: 'assert_notification',
+        title: 'Assert notification',
+        task: 'expect_webhook',
+        filter: { subscriber_id: 'buyer-primary' },
+        timeout_seconds: 60,
+      };
+      const runState = {
+        contributions: new Set(),
+        priorStepResults: new Map([
+          ['register_notifications', { step_id: 'register_notifications', passed: false, skipped: false }],
+        ]),
+        priorProbes: new Map(),
+        agentUrl: '',
+        webhookReceiver: { ...receiver, wait: async () => ({ timed_out: true }) },
+        runnerVars: createRunnerVariables({ webhookBase: receiver.base_url }),
+      };
+      const started = Date.now();
+      const result = await executeWebhookAssertionStep(
+        assertion,
+        'assertions',
+        {},
+        [
+          { step: setup, phaseId: 'setup', globalIndex: 0 },
+          { step: assertion, phaseId: 'assertions', globalIndex: 1 },
+        ],
+        {},
+        runState
+      );
+
+      assert.strictEqual(result.skipped, true);
+      assert.strictEqual(result.skip.reason, 'prerequisite_failed');
+      assert.match(result.skip.detail, /register_notifications/);
+      assert.ok(Date.now() - started < 250, 'must not enter the webhook timeout');
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('requires every supplied discriminator to match a failed notification setup (#2701)', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      const setup = {
+        id: 'register_other_notifications',
+        title: 'Register other notifications',
+        task: 'sync_accounts',
+        sample_request: {
+          accounts: [
+            {
+              notification_configs: [{ subscriber_id: 'other', event_types: ['creative.status_changed'] }],
+            },
+          ],
+        },
+      };
+      const assertion = {
+        id: 'assert_notification',
+        title: 'Assert notification',
+        task: 'expect_no_webhook',
+        triggered_by: 'trigger',
+        filter: { body: { subscriber_id: 'buyer-primary', notification_type: 'creative.status_changed' } },
+        timeout_seconds: 0,
+      };
+      const runState = {
+        contributions: new Set(),
+        priorStepResults: new Map([
+          ['register_other_notifications', { step_id: 'register_other_notifications', passed: false, skipped: false }],
+          ['trigger', { step_id: 'trigger', passed: true, skipped: false }],
+        ]),
+        priorProbes: new Map(),
+        agentUrl: '',
+        webhookReceiver: { ...receiver, wait: async () => ({ timed_out: true }) },
+        runnerVars: createRunnerVariables({ webhookBase: receiver.base_url }),
+      };
+      const result = await executeWebhookAssertionStep(
+        assertion,
+        'assertions',
+        {},
+        [
+          { step: setup, phaseId: 'setup', globalIndex: 0 },
+          { step: assertion, phaseId: 'assertions', globalIndex: 1 },
+        ],
+        {},
+        runState
+      );
+
+      assert.notStrictEqual(result.skip?.reason, 'prerequisite_failed');
+    } finally {
+      await receiver.close();
+    }
+  });
+});
+
+describe('runStoryboard: expect_webhook_retry_keys_stable', () => {
+  let publisher;
+  afterEach(async () => {
+    if (publisher) await stopPublisher(publisher);
+    publisher = undefined;
+  });
+
+  test('passes when publisher retries with the same idempotency_key', async () => {
+    publisher = await startFakePublisher({ mode: 'retry_stable' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Trigger',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: { push_notification_config: { url: '{{runner.webhook_url:trigger}}' } },
+      },
+      {
+        id: 'assert_stable',
+        title: 'Retry stable',
+        task: 'expect_webhook_retry_keys_stable',
+        triggered_by: 'trigger',
+        retry_trigger: { count: 2, http_status: 503 },
+        timeout_seconds: 1,
+        expect_min_deliveries: 2,
+      },
+    ]);
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.passed, true, JSON.stringify(assertStep.validations));
+    assert.strictEqual(assertStep.validations[0].check, 'expect_webhook_retry_keys_stable');
+  });
+
+  test('fails with idempotency_key_rotated when publisher changes the key across retries', async () => {
+    publisher = await startFakePublisher({ mode: 'retry_rotated' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Trigger',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: { push_notification_config: { url: '{{runner.webhook_url:trigger}}' } },
+      },
+      {
+        id: 'assert_stable',
+        title: 'Retry stable',
+        task: 'expect_webhook_retry_keys_stable',
+        triggered_by: 'trigger',
+        retry_trigger: { count: 2, http_status: 503 },
+        timeout_seconds: 1,
+      },
+    ]);
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.passed, false);
+    assert.strictEqual(assertStep.validations[0].actual.code, 'idempotency_key_rotated');
+  });
+
+  test('fails with insufficient_retries when publisher does not retry', async () => {
+    publisher = await startFakePublisher({ mode: 'ok' }); // single delivery, no retries
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Trigger',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: { push_notification_config: { url: '{{runner.webhook_url:trigger}}' } },
+      },
+      {
+        id: 'assert_stable',
+        title: 'Retry stable',
+        task: 'expect_webhook_retry_keys_stable',
+        triggered_by: 'trigger',
+        retry_trigger: { count: 2, http_status: 503 },
+        timeout_seconds: 0.3,
+        expect_min_deliveries: 2,
+      },
+    ]);
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.passed, false);
+    assert.strictEqual(assertStep.validations[0].actual.code, 'insufficient_retries');
+  });
+});
+
+describe('runStoryboard: expect_webhook_signature_valid (gating)', () => {
+  let publisher;
+  afterEach(async () => {
+    if (publisher) await stopPublisher(publisher);
+    publisher = undefined;
+  });
+
+  test('grades not_applicable when webhook_signing is not configured', async () => {
+    publisher = await startFakePublisher({ mode: 'ok' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Trigger',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: { push_notification_config: { url: '{{runner.webhook_url:trigger}}' } },
+      },
+      {
+        id: 'assert_sig',
+        title: 'Assert signature',
+        task: 'expect_webhook_signature_valid',
+        triggered_by: 'trigger',
+        timeout_seconds: 0.3,
+      },
+    ]);
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.skipped, true);
+    assert.strictEqual(assertStep.skip.reason, 'unsatisfied_contract');
+    assert.match(assertStep.skip.detail, /webhook_signing/);
+  });
+});
+
+describe('runStoryboard: replay_webhook_vector', () => {
+  let receiver;
+  afterEach(async () => {
+    if (receiver) await stopReplayReceiver(receiver);
+    receiver = undefined;
+  });
+
+  test('posts positive envelope vectors and validates retry idempotency stability', async () => {
+    receiver = await startReplayReceiver(({ body }) => ({
+      status:
+        body &&
+        typeof body === 'object' &&
+        body.idempotency_key &&
+        body.task_type === 'media_buy_delivery' &&
+        body.status === 'completed'
+          ? 204
+          : 400,
+    }));
+    const storyboard = storyboardWith([
+      {
+        id: 'post_delivery_report_envelope',
+        title: 'POST delivery report inside MCP webhook envelope',
+        task: 'replay_webhook_vector',
+        vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#positive/mcp-delivery-report-envelope',
+        webhook_payload_schema_ref: 'core/mcp-webhook-payload.json',
+      },
+      {
+        id: 'post_same_event_retry',
+        title: 'POST retry with same idempotency_key',
+        task: 'replay_webhook_vector',
+        vector_ref:
+          'static/test-vectors/webhook-receiver-envelope.json#positive/mcp-delivery-report-retry-same-idempotency-key',
+        webhook_payload_schema_ref: 'core/mcp-webhook-payload.json',
+      },
+    ]);
+
+    const result = await runStoryboard('http://127.0.0.1:9/mcp', storyboard, {
+      ...RUN_OPTIONS_BASE,
+      agentTools: [],
+      webhook_replay_receiver: { url: receiver.url },
+    });
+
+    assert.strictEqual(result.phases[0].steps[0].passed, true, JSON.stringify(result.phases[0].steps[0].validations));
+    assert.strictEqual(result.phases[0].steps[1].passed, true, JSON.stringify(result.phases[0].steps[1].validations));
+    assert.strictEqual(receiver.requests.length, 2);
+    assert.strictEqual(receiver.requests[0].body.idempotency_key, receiver.requests[1].body.idempotency_key);
+    assert.ok(
+      result.phases[0].steps[1].validations.some(
+        v => v.check === 'webhook_replay_same_event_idempotency_key' && v.passed === true
+      )
+    );
+  });
+
+  test('passes negative vectors when receiver rejects them before dispatch', async () => {
+    receiver = await startReplayReceiver(({ body }) => ({
+      status:
+        body &&
+        typeof body === 'object' &&
+        body.idempotency_key &&
+        body.operation_id &&
+        body.task_id &&
+        body.task_type &&
+        body.status === 'completed'
+          ? 204
+          : 400,
+      body: { error: 'missing_envelope_fields' },
+    }));
+    const storyboard = storyboardWith([
+      {
+        id: 'reject_bare_delivery_result',
+        title: 'Reject top-level notification_type result',
+        task: 'replay_webhook_vector',
+        vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#negative/bare-delivery-result',
+        expect_error: true,
+        webhook_payload_schema_ref: 'core/mcp-webhook-payload.json',
+      },
+    ]);
+
+    const result = await runStoryboard('http://127.0.0.1:9/mcp', storyboard, {
+      ...RUN_OPTIONS_BASE,
+      agentTools: [],
+      webhook_replay_receiver: { url: receiver.url },
+    });
+
+    const step = result.phases[0].steps[0];
+    assert.strictEqual(step.passed, true, JSON.stringify(step.validations));
+    assert.strictEqual(step.response.status, 400);
+    assert.ok(step.validations.some(v => v.check === 'webhook_replay_payload_schema' && v.passed === true));
+  });
+
+  test('grades the storyboard not applicable when no replay receiver URL is configured', async () => {
+    const steps = [
+      {
+        id: 'post_delivery_report_envelope',
+        title: 'POST delivery report inside MCP webhook envelope',
+        task: 'replay_webhook_vector',
+        vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#positive/mcp-delivery-report-envelope',
+      },
+      {
+        id: 'post_same_event_retry',
+        title: 'POST retry with same idempotency_key',
+        task: 'replay_webhook_vector',
+        vector_ref:
+          'static/test-vectors/webhook-receiver-envelope.json#positive/mcp-delivery-report-retry-same-idempotency-key',
+      },
+      {
+        id: 'reject_bare_delivery_result',
+        title: 'Reject top-level notification_type result',
+        task: 'replay_webhook_vector',
+        vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#negative/bare-delivery-result',
+      },
+      {
+        id: 'reject_missing_idempotency_key',
+        title: 'Reject envelope without idempotency_key',
+        task: 'replay_webhook_vector',
+        vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#negative/missing-idempotency-key',
+      },
+      {
+        id: 'reject_unsupported_status',
+        title: 'Reject media buy status used as webhook status',
+        task: 'replay_webhook_vector',
+        vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#negative/unsupported-top-level-status',
+      },
+    ];
+    const storyboard = storyboardWith(steps);
+    storyboard.phases = [
+      { id: 'positive_envelope_replay', title: 'Accept canonical webhook envelopes', steps: steps.slice(0, 2) },
+      { id: 'negative_envelope_rejections', title: 'Reject invalid webhook envelopes', steps: steps.slice(2) },
+    ];
+
+    const result = await runStoryboard('http://127.0.0.1:9/mcp', storyboard, {
+      ...RUN_OPTIONS_BASE,
+      agentTools: [],
+    });
+
+    assert.strictEqual(result.overall_passed, true);
+    assert.strictEqual(result.failed_count, 0);
+    assert.strictEqual(result.skipped_count, 1);
+    assert.strictEqual(result.phases.length, 1);
+    assert.strictEqual(result.phases[0].phase_id, 'requirement_unmet');
+    const step = result.phases[0].steps[0];
+    assert.strictEqual(step.skipped, true);
+    assert.strictEqual(step.skip.reason, 'not_applicable');
+    assert.strictEqual(step.skip.requirement, 'webhook_replay_receiver');
+    assert.match(step.skip.detail, /webhook_replay_receiver\.url/);
+  });
+
+  test('applies the receiver requirement before evaluating unrelated step-level skips', async () => {
+    const storyboard = storyboardWith([
+      {
+        id: 'post_delivery_report_envelope',
+        title: 'POST delivery report inside MCP webhook envelope',
+        task: 'replay_webhook_vector',
+        vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#positive/mcp-delivery-report-envelope',
+      },
+      {
+        id: 'missing_agent_tool',
+        title: 'Missing agent tool',
+        task: 'missing_agent_tool',
+      },
+    ]);
+
+    const result = await runStoryboard('http://127.0.0.1:9/mcp', storyboard, {
+      ...RUN_OPTIONS_BASE,
+      agentTools: [],
+    });
+
+    assert.strictEqual(result.overall_passed, true);
+    assert.strictEqual(result.failed_count, 0);
+    assert.strictEqual(result.skipped_count, 1);
+    assert.strictEqual(result.phases[0].phase_id, 'requirement_unmet');
+    assert.strictEqual(result.phases[0].steps[0].skip.reason, 'not_applicable');
+    assert.strictEqual(result.phases[0].steps[0].skip.requirement, 'webhook_replay_receiver');
+  });
+});

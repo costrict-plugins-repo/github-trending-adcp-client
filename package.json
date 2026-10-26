@@ -1,0 +1,826 @@
+{
+  "name": "@adcp/sdk",
+  "version": "17.0.0-beta.0",
+  "description": "AdCP SDK — client, server, and compliance harnesses for the AdContext Protocol (MCP + A2A)",
+  "workspaces": [
+    ".",
+    "packages/*"
+  ],
+  "main": "dist/lib/index.js",
+  "module": "./dist/lib/index.mjs",
+  "types": "dist/lib/index.d.ts",
+  "type": "commonjs",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/lib/index.d.mts",
+        "default": "./dist/lib/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/index.d.ts",
+        "default": "./dist/lib/index.js"
+      }
+    },
+    "./client": {
+      "import": {
+        "types": "./dist/lib/client/index.d.mts",
+        "default": "./dist/lib/client/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/client/index.d.ts",
+        "default": "./dist/lib/client/index.js"
+      }
+    },
+    "./client/core": {
+      "import": {
+        "types": "./dist/lib/client/core.d.mts",
+        "default": "./dist/lib/client/core.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/client/core.d.ts",
+        "default": "./dist/lib/client/core.js"
+      }
+    },
+    "./compliance": {
+      "import": {
+        "types": "./dist/lib/compliance/index.d.mts",
+        "default": "./dist/lib/compliance/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/compliance/index.d.ts",
+        "default": "./dist/lib/compliance/index.js"
+      }
+    },
+    "./advanced": {
+      "import": {
+        "types": "./dist/lib/advanced.d.mts",
+        "default": "./dist/lib/advanced.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/advanced.d.ts",
+        "default": "./dist/lib/advanced.js"
+      }
+    },
+    "./types": {
+      "import": {
+        "types": "./dist/lib/types/index.d.mts",
+        "default": "./dist/lib/types/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/types/index.d.ts",
+        "default": "./dist/lib/types/index.js"
+      }
+    },
+    "./enums": {
+      "import": {
+        "types": "./dist/lib/enums.d.mts",
+        "default": "./dist/lib/enums.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/enums.d.ts",
+        "default": "./dist/lib/enums.js"
+      }
+    },
+    "./types/*": {
+      "types": "./dist/lib/types/*.d.ts"
+    },
+    "./wholesale-feed-sync": {
+      "import": {
+        "types": "./dist/lib/wholesale-feed-sync/index.d.mts",
+        "default": "./dist/lib/wholesale-feed-sync/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/wholesale-feed-sync/index.d.ts",
+        "default": "./dist/lib/wholesale-feed-sync/index.js"
+      }
+    },
+    "./v2/projection": {
+      "import": {
+        "types": "./dist/lib/v2/projection/index.d.mts",
+        "default": "./dist/lib/v2/projection/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/v2/projection/index.d.ts",
+        "default": "./dist/lib/v2/projection/index.js"
+      }
+    },
+    "./v2/format-schema": {
+      "import": {
+        "types": "./dist/lib/v2/format-schema/index.d.mts",
+        "default": "./dist/lib/v2/format-schema/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/v2/format-schema/index.d.ts",
+        "default": "./dist/lib/v2/format-schema/index.js"
+      }
+    },
+    "./v2/publisher-catalog": {
+      "import": {
+        "types": "./dist/lib/v2/publisher-catalog/index.d.mts",
+        "default": "./dist/lib/v2/publisher-catalog/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/v2/publisher-catalog/index.d.ts",
+        "default": "./dist/lib/v2/publisher-catalog/index.js"
+      }
+    },
+    "./testing": {
+      "import": {
+        "types": "./dist/lib/testing/index.d.mts",
+        "default": "./dist/lib/testing/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/testing/index.d.ts",
+        "default": "./dist/lib/testing/index.js"
+      }
+    },
+    "./testing/personas": {
+      "import": {
+        "types": "./dist/lib/testing/personas/index.d.mts",
+        "default": "./dist/lib/testing/personas/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/testing/personas/index.d.ts",
+        "default": "./dist/lib/testing/personas/index.js"
+      }
+    },
+    "./testing/storyboard/request-signing": {
+      "import": {
+        "types": "./dist/lib/testing/storyboard/request-signing/index.d.mts",
+        "default": "./dist/lib/testing/storyboard/request-signing/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/testing/storyboard/request-signing/index.d.ts",
+        "default": "./dist/lib/testing/storyboard/request-signing/index.js"
+      }
+    },
+    "./auth": {
+      "import": {
+        "types": "./dist/lib/auth/index.d.mts",
+        "default": "./dist/lib/auth/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/auth/index.d.ts",
+        "default": "./dist/lib/auth/index.js"
+      }
+    },
+    "./webhooks": {
+      "import": {
+        "types": "./dist/lib/webhooks/index.d.mts",
+        "default": "./dist/lib/webhooks/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/webhooks/index.d.ts",
+        "default": "./dist/lib/webhooks/index.js"
+      }
+    },
+    "./brand": {
+      "import": {
+        "types": "./dist/lib/brand/index.d.mts",
+        "default": "./dist/lib/brand/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/brand/index.d.ts",
+        "default": "./dist/lib/brand/index.js"
+      }
+    },
+    "./net": {
+      "import": {
+        "types": "./dist/lib/net/index.d.mts",
+        "default": "./dist/lib/net/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/net/index.d.ts",
+        "default": "./dist/lib/net/index.js"
+      }
+    },
+    "./canonical-references": {
+      "import": {
+        "types": "./dist/lib/canonical-references/index.d.mts",
+        "default": "./dist/lib/canonical-references/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/canonical-references/index.d.ts",
+        "default": "./dist/lib/canonical-references/index.js"
+      }
+    },
+    "./server": {
+      "import": {
+        "types": "./dist/lib/server/index.d.mts",
+        "default": "./dist/lib/server/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/server/index.d.ts",
+        "default": "./dist/lib/server/index.js"
+      }
+    },
+    "./server/legacy/v5": {
+      "import": {
+        "types": "./dist/lib/server/legacy/v5/index.d.mts",
+        "default": "./dist/lib/server/legacy/v5/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/server/legacy/v5/index.d.ts",
+        "default": "./dist/lib/server/legacy/v5/index.js"
+      }
+    },
+    "./signing": {
+      "import": {
+        "types": "./dist/lib/signing/index.d.mts",
+        "default": "./dist/lib/signing/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/signing/index.d.ts",
+        "default": "./dist/lib/signing/index.js"
+      }
+    },
+    "./signing/client": {
+      "import": {
+        "types": "./dist/lib/signing/client.d.mts",
+        "default": "./dist/lib/signing/client.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/signing/client.d.ts",
+        "default": "./dist/lib/signing/client.js"
+      }
+    },
+    "./signing/server": {
+      "import": {
+        "types": "./dist/lib/signing/server.d.mts",
+        "default": "./dist/lib/signing/server.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/signing/server.d.ts",
+        "default": "./dist/lib/signing/server.js"
+      }
+    },
+    "./signing/testing": {
+      "import": {
+        "types": "./dist/lib/signing/testing.d.mts",
+        "default": "./dist/lib/signing/testing.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/signing/testing.d.ts",
+        "default": "./dist/lib/signing/testing.js"
+      }
+    },
+    "./schemas": {
+      "import": {
+        "types": "./dist/lib/schemas/index.d.mts",
+        "default": "./dist/lib/schemas/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/schemas/index.d.ts",
+        "default": "./dist/lib/schemas/index.js"
+      }
+    },
+    "./schemas/browser": {
+      "import": {
+        "types": "./dist/lib/schemas/browser.d.mts",
+        "default": "./dist/lib/schemas/browser.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/schemas/browser.d.ts",
+        "default": "./dist/lib/schemas/browser.js"
+      }
+    },
+    "./compliance-fixtures": {
+      "import": {
+        "types": "./dist/lib/compliance-fixtures/index.d.mts",
+        "default": "./dist/lib/compliance-fixtures/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/compliance-fixtures/index.d.ts",
+        "default": "./dist/lib/compliance-fixtures/index.js"
+      }
+    },
+    "./compliance-fixtures/reporting-consumer-status-v1.json": "./dist/lib/compliance-fixtures/reporting-consumer-status-v1.json",
+    "./compliance-fixtures/principal.yaml": "./dist/lib/compliance-fixtures/principal.yaml",
+    "./compliance-fixtures/reporting-core.yaml": "./dist/lib/compliance-fixtures/reporting-core.yaml",
+    "./compliance-fixtures/canonical-storyboards-provenance.json": "./dist/lib/compliance-fixtures/canonical-storyboards-provenance.json",
+    "./conformance": {
+      "import": {
+        "types": "./dist/lib/conformance/index.d.mts",
+        "default": "./dist/lib/conformance/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/conformance/index.d.ts",
+        "default": "./dist/lib/conformance/index.js"
+      }
+    },
+    "./substitution": {
+      "import": {
+        "types": "./dist/lib/substitution/index.d.mts",
+        "default": "./dist/lib/substitution/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/substitution/index.d.ts",
+        "default": "./dist/lib/substitution/index.js"
+      }
+    },
+    "./express-mcp": {
+      "import": {
+        "types": "./dist/lib/express-mcp/index.d.mts",
+        "default": "./dist/lib/express-mcp/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/express-mcp/index.d.ts",
+        "default": "./dist/lib/express-mcp/index.js"
+      }
+    },
+    "./mock-server": {
+      "import": {
+        "types": "./dist/lib/mock-server/index.d.mts",
+        "default": "./dist/lib/mock-server/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/mock-server/index.d.ts",
+        "default": "./dist/lib/mock-server/index.js"
+      }
+    },
+    "./upstream-recorder": {
+      "import": {
+        "types": "./dist/lib/upstream-recorder/index.d.mts",
+        "default": "./dist/lib/upstream-recorder/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/upstream-recorder/index.d.ts",
+        "default": "./dist/lib/upstream-recorder/index.js"
+      }
+    },
+    "./reporting/consumer": {
+      "import": {
+        "types": "./dist/lib/reporting/consumer/index.d.mts",
+        "default": "./dist/lib/reporting/consumer/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/reporting/consumer/index.d.ts",
+        "default": "./dist/lib/reporting/consumer/index.js"
+      }
+    },
+    "./reporting/source": {
+      "import": {
+        "types": "./dist/lib/reporting/source/index.d.mts",
+        "default": "./dist/lib/reporting/source/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/reporting/source/index.d.ts",
+        "default": "./dist/lib/reporting/source/index.js"
+      }
+    },
+    "./reporting/source/schemas/*": "./dist/lib/reporting/source/schemas/*",
+    "./reporting/ledger": {
+      "import": {
+        "types": "./dist/lib/reporting/ledger/index.d.mts",
+        "default": "./dist/lib/reporting/ledger/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/reporting/ledger/index.d.ts",
+        "default": "./dist/lib/reporting/ledger/index.js"
+      }
+    },
+    "./reporting/service": {
+      "import": {
+        "types": "./dist/lib/reporting/service/index.d.mts",
+        "default": "./dist/lib/reporting/service/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/reporting/service/index.d.ts",
+        "default": "./dist/lib/reporting/service/index.js"
+      }
+    },
+    "./negotiation/verification": {
+      "import": {
+        "types": "./dist/lib/negotiation/verification.d.mts",
+        "default": "./dist/lib/negotiation/verification.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/negotiation/verification.d.ts",
+        "default": "./dist/lib/negotiation/verification.js"
+      }
+    },
+    "./package.json": "./package.json",
+    "./media-buy/actions": {
+      "import": {
+        "types": "./dist/lib/media-buy/actions.d.mts",
+        "default": "./dist/lib/media-buy/actions.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/media-buy/actions.d.ts",
+        "default": "./dist/lib/media-buy/actions.js"
+      }
+    },
+    "./identity-3.3": {
+      "import": {
+        "types": "./dist/lib/identity-3.3/index.d.mts",
+        "default": "./dist/lib/identity-3.3/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/identity-3.3/index.d.ts",
+        "default": "./dist/lib/identity-3.3/index.js"
+      }
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "client": [
+        "dist/lib/client/index.d.ts"
+      ],
+      "client/core": [
+        "dist/lib/client/core.d.ts"
+      ],
+      "compliance": [
+        "dist/lib/compliance/index.d.ts"
+      ],
+      "advanced": [
+        "dist/lib/advanced.d.ts"
+      ],
+      "types": [
+        "dist/lib/types/index.d.ts"
+      ],
+      "wholesale-feed-sync": [
+        "dist/lib/wholesale-feed-sync/index.d.ts"
+      ],
+      "v2/projection": [
+        "dist/lib/v2/projection/index.d.ts"
+      ],
+      "v2/format-schema": [
+        "dist/lib/v2/format-schema/index.d.ts"
+      ],
+      "v2/publisher-catalog": [
+        "dist/lib/v2/publisher-catalog/index.d.ts"
+      ],
+      "testing": [
+        "dist/lib/testing/index.d.ts"
+      ],
+      "auth": [
+        "dist/lib/auth/index.d.ts"
+      ],
+      "webhooks": [
+        "dist/lib/webhooks/index.d.ts"
+      ],
+      "brand": [
+        "dist/lib/brand/index.d.ts"
+      ],
+      "net": [
+        "dist/lib/net/index.d.ts"
+      ],
+      "canonical-references": [
+        "dist/lib/canonical-references/index.d.ts"
+      ],
+      "server": [
+        "dist/lib/server/index.d.ts"
+      ],
+      "signing": [
+        "dist/lib/signing/index.d.ts"
+      ],
+      "signing/client": [
+        "dist/lib/signing/client.d.ts"
+      ],
+      "signing/server": [
+        "dist/lib/signing/server.d.ts"
+      ],
+      "signing/testing": [
+        "dist/lib/signing/testing.d.ts"
+      ],
+      "schemas": [
+        "dist/lib/schemas/index.d.ts"
+      ],
+      "schemas/browser": [
+        "dist/lib/schemas/browser.d.ts"
+      ],
+      "compliance-fixtures": [
+        "dist/lib/compliance-fixtures/index.d.ts"
+      ],
+      "conformance": [
+        "dist/lib/conformance/index.d.ts"
+      ],
+      "substitution": [
+        "dist/lib/substitution/index.d.ts"
+      ],
+      "express-mcp": [
+        "dist/lib/express-mcp/index.d.ts"
+      ],
+      "mock-server": [
+        "dist/lib/mock-server/index.d.ts"
+      ],
+      "upstream-recorder": [
+        "dist/lib/upstream-recorder/index.d.ts"
+      ],
+      "reporting/consumer": [
+        "dist/lib/reporting/consumer/index.d.ts"
+      ],
+      "reporting/source": [
+        "dist/lib/reporting/source/index.d.ts"
+      ],
+      "reporting/ledger": [
+        "dist/lib/reporting/ledger/index.d.ts"
+      ],
+      "reporting/service": [
+        "dist/lib/reporting/service/index.d.ts"
+      ],
+      "enums": [
+        "dist/lib/enums.d.ts"
+      ],
+      "testing/personas": [
+        "dist/lib/testing/personas/index.d.ts"
+      ],
+      "testing/storyboard/request-signing": [
+        "dist/lib/testing/storyboard/request-signing/index.d.ts"
+      ],
+      "server/legacy/v5": [
+        "dist/lib/server/legacy/v5/index.d.ts"
+      ],
+      "types/*": [
+        "dist/lib/types/*.d.ts"
+      ],
+      "negotiation/verification": [
+        "dist/lib/negotiation/verification.d.ts"
+      ],
+      "media-buy/actions": [
+        "dist/lib/media-buy/actions.d.ts"
+      ],
+      "identity-3.3": [
+        "dist/lib/identity-3.3/index.d.ts"
+      ]
+    }
+  },
+  "bin": {
+    "adcp": "./bin/adcp.js"
+  },
+  "files": [
+    "dist/lib/**/*",
+    "!dist/**/*.map",
+    "!dist/lib/schemas-data/*/bundled/**/*",
+    "bin/**/*.js",
+    "skills/**/*",
+    "!skills/*.previous/**/*",
+    ".claude-plugin/**/*",
+    "compliance/cache/3.0.25/**/*",
+    "compliance/cache/3.1.29/**/*",
+    "compliance/cache/3.2.7/**/*",
+    "compliance/cache/3.3.0-beta.0/**/*",
+    "ADCP_VERSION",
+    "docs/README.md",
+    "docs/TYPE-SUMMARY.md",
+    "docs/ZOD-SCHEMAS.md",
+    "docs/CLI.md",
+    "docs/llms.txt",
+    "docs/getting-started.md",
+    "docs/development/PROTOCOL_DIFFERENCES.md",
+    "docs/releases/**/*.md",
+    "docs/migration-*.md",
+    "MIGRATION-v8.md",
+    "docs/guides/**/*.md",
+    "docs/recipes/**/*.md",
+    "docs/examples/**/*",
+    "examples/README.md",
+    "examples/CONTRIBUTING.md",
+    "examples/storyboards/account-sync-contract.yaml",
+    "examples/adcp.config.json",
+    "examples/reliable-reporting-buyer/**/*",
+    "examples/seller-3.2-starter.ts",
+    "examples/supply-path-verification.ts",
+    "examples/wholesale-feed-sync.ts",
+    "examples/comply-controller-seller.ts",
+    "examples/seller-test-controller.ts",
+    "examples/gcp-kms-signing-provider.ts",
+    "examples/error-compliant-server.ts",
+    "examples/existing-platform-thin.ts",
+    "examples/durable-buyer-writes/**/*",
+    "examples/targeting-input-existing-platform.ts",
+    "examples/signals-agent.ts",
+    "examples/decisioning-platform-mock-seller.ts",
+    "examples/decisioning-platform-broadcast-tv.ts",
+    "examples/decisioning-platform-identity-graph.ts",
+    "examples/decisioning-platform-multi-tenant.ts",
+    "examples/decisioning-platform-multi-tenant-db.ts",
+    "examples/decisioning-platform-path-routed.ts",
+    "examples/decisioning-platform-programmatic.ts",
+    "examples/hello-cluster.ts",
+    "examples/hello_*.ts",
+    "examples/proxy-seller-snap/**/*",
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepare": "node scripts/install-hooks.js 2>/dev/null || true",
+    "sync:agents": "node scripts/import-claude-agents.mjs",
+    "prepublishOnly": "npm run clean && npm run sync-schemas:all && (test -f src/lib/types/tools.generated.ts || npm run generate-types) && npm run build:lib && npm run check:publish-protocol-artifacts && node --test-timeout=60000 --test-force-exit --test test/lib/adcp-client.test.js test/lib/validation.test.js test/lib/zod-schemas.test.js",
+    "build": "npm run build:lib",
+    "build:lib": "npm run sync-version && npm run schemas:ensure && tsx scripts/generate-wire-spec-fields.ts && tsup && node --max-old-space-size=8192 ./node_modules/typescript/bin/tsc --project tsconfig.lib.json --emitDeclarationOnly && tsx scripts/copy-schemas-to-dist.ts && tsx scripts/copy-reporting-source-schemas.ts && tsx scripts/copy-reporting-consumer-status-fixtures.ts && tsx scripts/sync-canonical-storyboard-fixtures.ts --copy-dist && tsx scripts/copy-v2-projection-catalog.ts && tsx scripts/generate-per-tool-types.ts && tsx scripts/generate-dmts-declarations.ts && npm run build --workspace=@adcp/reporting-storage",
+    "build:test-agents": "npm run build:lib && tsc -p test-agents/tsconfig.json --rootDir test-agents",
+    "pretest": "npm run build:lib",
+    "test": "npm run test:node && npm test --workspace=packages/eslint-plugin --if-present && npm test --workspace=@adcp/reference-renderers && npm run test:reporting-storage",
+    "test:node": "npm run test:node:fast && npm run test:node:slow",
+    "test:node:fast": "node scripts/run-node-tests.mjs --group fast",
+    "test:node:fast:shard": "node scripts/run-node-tests.mjs --group fast --shard-env",
+    "test:node:slow": "node scripts/run-node-tests.mjs --group slow",
+    "test:file": "node scripts/run-node-tests.mjs",
+    "pretest:lib": "npm run build:lib",
+    "test:lib": "npm run test:lib:fast && npm run test:lib:slow",
+    "test:lib:fast": "node scripts/run-node-tests.mjs --scope lib --group fast",
+    "test:lib:slow": "node scripts/run-node-tests.mjs --scope lib --group slow",
+    "pretest:examples": "npm run build",
+    "test:examples": "NODE_ENV=test node --test-timeout=180000 --test-force-exit --test-concurrency=1 --test test/examples/*.test.js",
+    "test:e2e": "node --test test/e2e/registry-live.test.js",
+    "test:e2e:local-app": "node test/e2e/adcp-e2e.test.js",
+    "test:e2e:wholesale-feed-training": "node --test test/e2e/wholesale-feed-training.test.js",
+    "test:protocols": "node test/run-protocol-tests.js",
+    "changeset": "changeset",
+    "version": "changeset version && npm install --package-lock-only --ignore-scripts && npm run sync-version && npm run generate-agent-docs && npm run generate-release-worksheet",
+    "release": "tsx scripts/publish-adcp-release.ts",
+    "test:protocol-compliance": "node test/run-protocol-tests.js --only compliance",
+    "test:protocol-schema": "node test/run-protocol-tests.js --only schema",
+    "test:protocol-integration": "node test/run-protocol-tests.js --only integration",
+    "test:all": "npm run test:lib && npm run test:protocols",
+    "test:protocol-comparison": "node test/utils/comprehensive-protocol-comparison.js",
+    "test:status-report": "node test/utils/final-status-report.js",
+    "sync-schemas": "tsx scripts/sync-schemas.ts",
+    "sync-schemas:all": "npm run sync-schemas && npm run sync-schemas -- 3.2.7 && npm run sync-schemas -- 3.1.29 && npm run sync-schemas -- 3.0.25",
+    "sync:canonical-storyboard-fixtures": "tsx scripts/sync-canonical-storyboard-fixtures.ts --update",
+    "check:canonical-storyboard-fixtures": "tsx scripts/sync-canonical-storyboard-fixtures.ts --check",
+    "sync-registry-schemas": "tsx scripts/generate-registry-types.ts --sync",
+    "schemas:ensure": "tsx scripts/schemas-ensure.ts",
+    "schema-diff": "tsx scripts/schema-diff.ts",
+    "generate-types": "tsx scripts/generate-types.ts && tsx scripts/generate-enum-arrays.ts && tsx scripts/generate-inline-enum-arrays.ts && tsx scripts/generate-manifest-derived.ts && tsx scripts/generate-entity-hydration.ts && tsx scripts/generate-media-buy-update-fields.ts && tsx scripts/generate-media-buy-action-metadata.ts",
+    "generate-manifest-derived": "tsx scripts/generate-manifest-derived.ts",
+    "generate-entity-hydration": "tsx scripts/generate-entity-hydration.ts",
+    "generate-types:all": "npm run generate-types",
+    "generate-registry-types": "tsx scripts/generate-registry-types.ts",
+    "generate-enum-arrays": "tsx scripts/generate-enum-arrays.ts",
+    "generate-inline-enum-arrays": "tsx scripts/generate-inline-enum-arrays.ts",
+    "generate-zod-schemas": "tsx scripts/generate-zod-from-ts.ts && tsx scripts/generate-inline-enum-arrays.ts",
+    "generate-wellknown-schemas": "tsx scripts/generate-wellknown-schemas.ts",
+    "generate-agent-docs": "tsx scripts/generate-agent-docs.ts",
+    "generate-release-worksheet": "tsx scripts/gen-release-worksheet.ts",
+    "compliance:fork-matrix": "node --test --test-timeout=300000 'test/examples/hello-*.test.js' test/examples/proxy-seller-snap.test.js",
+    "typecheck:skill-examples": "tsx scripts/typecheck-skill-examples.ts",
+    "check:skill-sync": "tsx scripts/check-skill-sync.ts",
+    "check:package": "npm run check:runtime-compat && npm run check:packed-artifact && npm run check:publish-protocol-artifacts && npm run typecheck:examples && publint --strict && node --max-old-space-size=8192 ./node_modules/@arethetypeswrong/cli/dist/index.js --pack . --exclude-entrypoints compliance-fixtures/reporting-consumer-status-v1.json compliance-fixtures/principal.yaml compliance-fixtures/reporting-core.yaml compliance-fixtures/canonical-storyboards-provenance.json && npm run check --workspace=@adcp/reporting-storage && node --max-old-space-size=8192 ./node_modules/@arethetypeswrong/cli/dist/index.js --pack packages/reporting-storage",
+    "check:packed-artifact": "node scripts/check-packed-artifact.mjs && node scripts/check-reporting-consumer-package.mjs && node scripts/check-reporting-storage-package.mjs",
+    "check:runtime-compat": "node scripts/check-runtime-compat.mjs",
+    "check:package-size": "node scripts/check-package-size.mjs && node packages/reporting-storage/scripts/check-package.mjs --size",
+    "check:publish-protocol-artifacts": "node scripts/check-publish-protocol-artifacts.mjs",
+    "verify:package": "node scripts/verify-package.mjs",
+    "validate:reporting-gcp": "node packages/reporting-storage/scripts/validate-reporting-gcp.mjs",
+    "check:adopter-types": "tsx scripts/check-adopter-types.ts",
+    "check:adopter-types-narrow": "tsx scripts/check-adopter-types-narrow.ts",
+    "sync-version": "tsx scripts/sync-version.ts",
+    "validate-schemas": "tsx scripts/validate-schemas.ts",
+    "lint": "eslint 'src/lib/testing/**/*.ts'",
+    "lint:fix": "eslint 'src/lib/testing/**/*.ts' --fix",
+    "lint:boundaries": "eslint --config eslint.boundaries.config.mjs 'src/**/*.{ts,tsx,js,mjs,cjs}' 'bin/**/*.js' 'examples/**/*.{ts,js,mjs}'",
+    "lint:workflows": "node scripts/lint-workflows.js",
+    "typecheck": "node --max-old-space-size=8192 ./node_modules/typescript/bin/tsc --noEmit",
+    "typecheck:reporting-storage": "npm run typecheck --workspace=@adcp/reporting-storage",
+    "typecheck:examples": "tsc --noEmit --project tsconfig.examples.json",
+    "clean": "rm -rf dist/",
+    "docs": "typedoc",
+    "docs:watch": "typedoc --watch",
+    "docs:serve": "npx http-server docs -p 4000 -o",
+    "docs:open": "open docs/api/index.html || xdg-open docs/api/index.html || start docs/api/index.html",
+    "ci:validate": "node scripts/ci-validate.js",
+    "ci:quick": "npm run format:check && npm run typecheck && npm run build:lib && npm run typecheck:reporting-storage && npm test",
+    "test:zod-openapi-portability": "node --test test/lib/zod-openapi-portability.test.js",
+    "test:schemas-browser": "node --test-timeout=60000 --test test/lib/schemas-browser.test.js",
+    "ci:schema-check": "npm run sync-schemas && npm run generate-types && npm run generate-registry-types -- --sync && git diff --exit-code -I '// Generated at:' src/lib/types/ src/lib/agents/ src/lib/media-buy/action-metadata.generated.ts src/lib/media-buy/update-fields.generated.ts src/lib/registry/types.generated.ts schemas/registry/registry.yaml || (echo '⚠️  Generated files are out of sync. Run: npm run sync-schemas && npm run generate-types && npm run generate-registry-types -- --sync' && exit 1)",
+    "ci:codegen-strict": "tsx scripts/check-no-loose-oneof.ts",
+    "ci:docs-check": "npm run generate-agent-docs && npm run generate-release-worksheet && git diff --exit-code -I '> Generated at:' docs/llms.txt docs/TYPE-SUMMARY.md docs/migration-14.x-rc-worksheet.md || (echo '⚠️  Generated docs are out of sync. Run: npm run generate-agent-docs && npm run generate-release-worksheet' && exit 1)",
+    "ci:doc-links": "tsx scripts/check-doc-links.ts",
+    "ci:pre-push": "npm run ci:schema-check && npm run ci:codegen-strict && npm run ci:quick",
+    "hooks:install": "node scripts/install-hooks.js",
+    "hooks:uninstall": "rm -f .git/hooks/pre-push",
+    "hello-cluster": "tsx examples/hello-cluster.ts",
+    "registry:cron": "tsx src/registry/cron.ts",
+    "registry:validate-all": "tsx src/registry/cron.ts --all",
+    "registry:validate-pending": "tsx src/registry/cron.ts --pending",
+    "registry:mcp": "tsx src/registry/mcp-server.ts",
+    "format": "prettier --write \"./**/*.{css,html,js,ts,tsx,json}\"",
+    "format:check": "prettier --check \"./**/*.{css,html,js,ts,tsx,json}\"",
+    "review:codex": "bash scripts/codex-review.sh",
+    "test:reporting-storage": "npm test --workspace=@adcp/reporting-storage"
+  },
+  "keywords": [
+    "adcp",
+    "mcp",
+    "a2a",
+    "protocol",
+    "client",
+    "library",
+    "advertising",
+    "testing"
+  ],
+  "author": {
+    "name": "AdCP Community",
+    "email": "maintainers@adcontextprotocol.org",
+    "url": "https://adcontextprotocol.org"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adcontextprotocol/adcp-client.git"
+  },
+  "homepage": "https://github.com/adcontextprotocol/adcp-client#readme",
+  "bugs": {
+    "url": "https://github.com/adcontextprotocol/adcp-client/issues",
+    "email": "bugs@adcontextprotocol.org"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.3.1",
+    "@modelcontextprotocol/ext-apps": "2.0.0",
+    "@modelcontextprotocol/node": "2.0.0",
+    "@modelcontextprotocol/server": "2.3.1",
+    "@types/ws": "^8.18.1",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "fast-check": "^4.9.0",
+    "http-message-sig": "0.3.0",
+    "jose": "^6.2.10",
+    "pg": "^8.23.0",
+    "secure-json-parse": "^4.1.0",
+    "semver": "^7.8.5",
+    "structured-headers": "2.0.3",
+    "tldts": "^7.0.0",
+    "undici": "^6.28.0",
+    "ws": "^8.21.3",
+    "yaml": "^2.9.0"
+  },
+  "peerDependencies": {
+    "@a2a-js/sdk": "^1.0.1",
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "@opentelemetry/api": "^1.0.0",
+    "redis": "^4.6.0 || ^5.0.0 || ^6.0.0",
+    "zod": "^4.1.5"
+  },
+  "peerDependenciesMeta": {
+    "@opentelemetry/api": {
+      "optional": true
+    },
+    "redis": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@a2a-js/sdk": "^1.0.1",
+    "@apidevtools/json-schema-ref-parser": "^15.5.2",
+    "@arethetypeswrong/cli": "^0.18.5",
+    "@changesets/cli": "^3.0.3",
+    "@commitlint/cli": "^20.5.3",
+    "@commitlint/config-conventional": "^20.5.3",
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "@opentelemetry/api": "^1.9.1",
+    "@types/express": "4.17.25",
+    "@types/node": "^20.19.43",
+    "@types/pg": "^8.23.1",
+    "@types/semver": "^7.8.0",
+    "actionlint": "^2.0.6",
+    "esbuild": "^0.28.2",
+    "esbuild-fix-imports-plugin": "^1.0.23",
+    "eslint": "^10.9.1",
+    "json-schema-to-typescript": "^15.0.4",
+    "json-schema-to-zod": "^2.8.1",
+    "openapi-typescript": "^7.13.0",
+    "prettier": "3.8.3",
+    "publint": "^0.3.24",
+    "redis": "^6.2.1",
+    "tar": "^7.5.22",
+    "ts-to-zod": "^5.1.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.12",
+    "typedoc": "^0.28.20",
+    "typedoc-plugin-markdown": "^4.13.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.68.0",
+    "web-bot-auth": "0.2.0",
+    "workerd": "1.20260730.1",
+    "zod": "^4.6.6",
+    "zod-openapi": "^5.4.3"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "overrides": {
+    "esbuild": "$esbuild",
+    "rollup": ">=4.59.0",
+    "@types/glob": "^8.1.0",
+    "js-yaml": "^4.1.1",
+    "@apidevtools/json-schema-ref-parser@^15.0.0": {
+      ".": "$@apidevtools/json-schema-ref-parser",
+      "js-yaml": "^5.4.3"
+    },
+    "@changesets/parse": {
+      "js-yaml": "^3.15.2"
+    },
+    "minimatch": "^10.2.1",
+    "launch-editor": "^2.14.2",
+    "markdown-it": "^14.3.3"
+  },
+  "adcp_version": "3.3.0-beta.0",
+  "sideEffects": [
+    "**/default-invariants.*"
+  ]
+}

@@ -1,0 +1,190 @@
+/**
+ * Runtime validation that a `DecisioningPlatform` impl matches its
+ * `capabilities.specialisms[]` declaration.
+ *
+ * Compile-time, `RequiredPlatformsFor<S>` enforces this in TypeScript adopter
+ * code. Untyped JS callers, downstream packages with relaxed `tsconfig`, and
+ * Python-port adopters running this through bindings need a runtime gate.
+ *
+ * Mirrors the v1.0 specialism × interface mapping in
+ * `src/lib/server/decisioning/platform.ts`.
+ *
+ * @public
+ */
+
+import type { DecisioningPlatform } from '../platform';
+import { isAccountResolutionMode } from '../account';
+import type { AdCPSpecialism } from '../../../types/tools.generated';
+
+// Sales specialisms require channels + pricingModels on capabilities because
+// buyers read those fields from get_adcp_capabilities to know what the seller
+// trades in. Signals/governance/creative-only platforms legitimately omit them
+// (hence the fields are optional on DecisioningCapabilities), but a media-buy
+// platform serving an empty or absent channels list is a mis-configured agent.
+// Derived from the `sales-` prefix on `AdCPSpecialism` rather than a hand-
+// maintained allowlist, so future sales specialisms automatically inherit the
+// channels + pricingModels gate.
+function isSalesSpecialism(s: AdCPSpecialism): boolean {
+  return s.startsWith('sales-');
+}
+
+const COMPACT_CORE_METHODS = [
+  'listProducts',
+  'buyProducts',
+  'controlMediaBuy',
+  'getMediaBuys',
+  'getMediaBuyDelivery',
+] as const;
+const COMPACT_PROPOSAL_METHODS = [
+  'proposalRefinement',
+  'listProducts',
+  'requestProposals',
+  'refineProposals',
+  'declineProposals',
+  'acceptProposal',
+  'getMediaBuys',
+  'getMediaBuyDelivery',
+] as const;
+
+const SPECIALISM_REQUIREMENTS: Partial<Record<AdCPSpecialism, ReadonlyArray<keyof DecisioningPlatform>>> = {
+  // All sales-* specialisms share the SalesPlatform interface. Adopters
+  // implement `sales` once; the specialism enum picks which buyer-side
+  // storyboard the agent is validated against. Wired here per the AdCP 3.0
+  // GA enum.
+  'sales-non-guaranteed': [],
+  'sales-guaranteed': [],
+  'sales-broadcast-tv': [],
+  'sales-dooh': [],
+  'sales-streaming-tv': [],
+  'sales-exchange': [],
+  'sales-social': ['sales'],
+  'sales-catalog-driven': ['sales'],
+  'sales-retail-media': ['sales'],
+  'sales-proposal-mode': [],
+  // Creative specialisms share the CreativeXxxPlatform field name; adopters
+  // pick the right archetype (template / generative / ad-server) at
+  // construction time.
+  'creative-template': ['creative'],
+  'creative-generative': ['creative'],
+  'creative-ad-server': ['creative'],
+  'creative-transformers': ['creative'],
+  // Audience sync is a single specialism with a single platform interface.
+  'audience-sync': ['audiences'],
+  // Signal specialisms — both share the SignalsPlatform interface.
+  // Marketplace = third-party data brokers; owned = first-party providers.
+  'signal-marketplace': ['signals'],
+  'signal-owned': ['signals'],
+  // Sponsored Intelligence — brand-side conversational sponsored
+  // experiences.
+  'sponsored-intelligence': ['sponsoredIntelligence'],
+  // Campaign governance — today's two specialisms share one platform
+  // interface; consolidates to `campaign-governance` when adcp#3329 lands.
+  'governance-spend-authority': ['campaignGovernance'],
+  'governance-delivery-monitor': ['campaignGovernance'],
+  // Property + collection list publishing.
+  'property-lists': ['propertyLists'],
+  'collection-lists': ['collectionLists'],
+  // Content standards — brand-safety / policy compliance enforcement.
+  'content-standards': ['contentStandards'],
+  // Brand-rights — identity discovery + licensing for branded inventory.
+  // 4 wire tools wire through `brandRights` (`get_brand_identity`,
+  // `get_rights`, `acquire_rights`, `update_rights`). `creative_approval`
+  // is webhook-only (`reviewCreativeApproval` on the platform interface)
+  // and not in `AdcpToolMap`.
+  'brand-rights': ['brandRights'],
+};
+
+export class PlatformConfigError extends Error {
+  readonly name = 'PlatformConfigError' as const;
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+// Note on HITL tools: the v6 unified shape collapses sync/HITL into a
+// single method per tool whose return type is `Success | TaskHandoff<Success>`.
+// Adopters branch in the body and call `ctx.handoffToTask(fn)` to defer
+// to a background task. The framework detects the handoff marker at the
+// dispatch seam — there's no exactly-one validation needed because the
+// shape is the same regardless of which path the adopter takes.
+//
+// This applies to `create_media_buy` and `sync_creatives` today (the 2
+// spec-listed tools whose per-tool response oneOf includes the Submitted
+// arm). When adcontextprotocol/adcp#3392 lands, the same shape extends
+// to `update_media_buy`, `build_creative`, `sync_catalogs`, `get_products`.
+
+export function validatePlatform(
+  platform: DecisioningPlatform,
+  effectiveFields: Partial<Record<keyof DecisioningPlatform, unknown>> = {}
+): void {
+  const claimed = platform.capabilities?.specialisms ?? [];
+  const errors: string[] = [];
+
+  for (const specialism of claimed) {
+    const acceptsCompactLifecycle =
+      specialism === 'sales-non-guaranteed' ||
+      specialism === 'sales-guaranteed' ||
+      specialism === 'sales-broadcast-tv' ||
+      specialism === 'sales-dooh' ||
+      specialism === 'sales-streaming-tv' ||
+      specialism === 'sales-exchange' ||
+      specialism === 'sales-proposal-mode';
+    if (acceptsCompactLifecycle && platform.sales == null && platform.mediaBuyLifecycle == null) {
+      errors.push(`${specialism} requires platform.sales or platform.mediaBuyLifecycle`);
+    }
+    if (acceptsCompactLifecycle && platform.sales == null && platform.mediaBuyLifecycle != null) {
+      const required = specialism === 'sales-proposal-mode' ? COMPACT_PROPOSAL_METHODS : COMPACT_CORE_METHODS;
+      for (const method of required) {
+        if (platform.mediaBuyLifecycle[method] == null) {
+          errors.push(`${specialism} requires platform.mediaBuyLifecycle.${method}`);
+        }
+      }
+    }
+  }
+
+  // 1. Specialism declarations match required interfaces.
+  for (const specialism of claimed) {
+    const required = SPECIALISM_REQUIREMENTS[specialism];
+    if (!required) continue; // forward-compat for unknown specialisms
+    for (const field of required) {
+      if (platform[field] == null && effectiveFields[field] == null) {
+        errors.push(`capabilities.specialisms claims '${specialism}'; platform.${String(field)} is missing`);
+      }
+    }
+  }
+
+  // 2. Media-buy platforms require channels + pricingModels on capabilities.
+  // These fields are optional on DecisioningCapabilities so non-media-buy
+  // platforms (signals, governance, creative-only) can omit them, but a
+  // sales platform that omits them will emit a broken get_adcp_capabilities
+  // response that buyers cannot interpret.
+  const claimedSales = claimed.filter(isSalesSpecialism);
+  if (claimedSales.length > 0) {
+    if (platform.capabilities?.channels == null) {
+      errors.push(`capabilities.channels is required for media-buy platforms (claimed: ${claimedSales.join(', ')})`);
+    }
+    if (platform.capabilities?.pricingModels == null) {
+      errors.push(
+        `capabilities.pricingModels is required for media-buy platforms (claimed: ${claimedSales.join(', ')})`
+      );
+    }
+  }
+
+  // 3. `resolution` must be a recognized mode.
+  //
+  // Untyped adopters can put anything here, and a typo must not silently
+  // inherit a different mode's wire enforcement — `'Derived'` or `'implict'`
+  // would otherwise normalize to `'explicit'` and quietly drop the
+  // reference-shape contract the adopter meant to declare.
+  const declaredResolution = platform.accounts?.resolution;
+  if (declaredResolution !== undefined && !isAccountResolutionMode(declaredResolution)) {
+    errors.push(
+      `accounts.resolution: '${String(declaredResolution)}' is not a recognized resolution mode ` +
+        `('explicit' | 'implicit' | 'derived')`
+    );
+  }
+
+  if (errors.length > 0) {
+    throw new PlatformConfigError(`DecisioningPlatform configuration is incomplete:\n  - ${errors.join('\n  - ')}`);
+  }
+}

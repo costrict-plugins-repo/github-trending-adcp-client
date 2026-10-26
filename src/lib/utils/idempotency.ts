@@ -1,0 +1,211 @@
+/**
+ * Idempotency key ergonomics for AdCP mutating requests.
+ *
+ * AdCP v3 requires an `idempotency_key` on every mutating request. This
+ * module handles two things the SDK owns:
+ *
+ * 1. Knowing which tools are mutating (so we auto-generate for them and not
+ *    for read-only tools).
+ * 2. Generating UUID v4 keys that satisfy the spec's
+ *    `^[A-Za-z0-9_.:-]{16,255}$` pattern.
+ */
+
+import { randomUUID } from 'crypto';
+
+/**
+ * Tools that can mutate provider state or record economically consequential
+ * work and therefore need retry/signing safeguards.
+ *
+ * Kept as a static runtime set so importing the client does not construct the
+ * SDK's entire generated Zod schema graph. Most entries require
+ * `idempotency_key`; `get_creative_features` keeps it optional in 3.x for wire
+ * compatibility while clients SHOULD still send one.
+ *
+ * `si_terminate_session` is intentionally excluded even though it's a
+ * mutating operation: the spec documents it as naturally idempotent via
+ * `session_id` (terminate twice = no-op).
+ */
+export const MUTATING_TASKS: ReadonlySet<string> = new Set([
+  'accept_proposal',
+  'acquire_rights',
+  'activate_signal',
+  'build_creative',
+  'buy_products',
+  'calibrate_content',
+  'control_media_buy',
+  'create_collection_list',
+  'create_content_standards',
+  'create_media_buy',
+  'create_property_list',
+  'decline_proposals',
+  'delete_collection_list',
+  'delete_property_list',
+  'get_creative_features',
+  'log_event',
+  'provide_performance_feedback',
+  'refine_proposals',
+  'report_plan_adjustment',
+  'report_plan_outcome',
+  'report_usage',
+  'request_proposals',
+  'si_initiate_session',
+  'si_send_message',
+  'sync_accounts',
+  'sync_agent_notification_configs',
+  'sync_audiences',
+  'sync_catalogs',
+  'sync_creatives',
+  'sync_event_sources',
+  'sync_governance',
+  'sync_plans',
+  'sync_principal',
+  'sync_reporting_receipts',
+  'sync_reporting_status',
+  'update_collection_list',
+  'update_content_standards',
+  'update_media_buy',
+  'update_property_list',
+  'update_rights',
+]);
+
+/**
+ * Whether a tool can mutate provider state or record economically
+ * consequential work.
+ *
+ * Callers use this to decide whether to auto-generate a key when one isn't
+ * provided. Unknown tool names return `false` — we don't guess.
+ */
+export function isMutatingTask(toolName: string): boolean {
+  return MUTATING_TASKS.has(toolName);
+}
+
+/**
+ * Whether this concrete request can change seller state and should therefore
+ * carry an idempotency key. Most mutations are classified by their tool's
+ * required request field. AdCP 3.2's legacy-compatible proposal finalization
+ * is the exception: it is a state-changing variant of otherwise read-only
+ * `get_products`, whose compatibility schema keeps the key optional. Creative
+ * feature evaluation is also economically consequential in AdCP 3.2 even
+ * though its 3.x compatibility schema keeps the key optional; classifying it
+ * here makes SDK callers mint a key while servers can still admit legacy
+ * keyless requests.
+ */
+export function requestUsesIdempotency(toolName: string, params: unknown): boolean {
+  if (isMutatingTask(toolName)) return true;
+  if (toolName !== 'get_products' || !isRecord(params)) return false;
+  // Classify finalize intent before schema validation. A malformed finalize
+  // request must not fall through as a read merely because proposal_id or
+  // scope is invalid; validation/handler logic reports those details later.
+  if (isRecord(params.refine)) return params.refine.action === 'finalize';
+  return Array.isArray(params.refine)
+    ? params.refine.some(entry => isRecord(entry) && entry.action === 'finalize')
+    : false;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Generate a fresh idempotency key for a mutating request.
+ *
+ * Returns a UUID v4, which satisfies the spec's
+ * `^[A-Za-z0-9_.:-]{16,255}$` pattern and provides ≥122 bits of entropy
+ * (the spec minimum to prevent cache enumeration).
+ */
+export function generateIdempotencyKey(): string {
+  return randomUUID();
+}
+
+/**
+ * Pattern the spec requires `idempotency_key` to match. Exported so callers
+ * doing BYOK can validate their keys before sending.
+ */
+export const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_.:-]{16,255}$/;
+
+/**
+ * Validate that a key matches the spec pattern. Useful for callers that
+ * persist keys (e.g., bring-your-own-key from a database) and want to
+ * catch drift early.
+ */
+export function isValidIdempotencyKey(key: string): boolean {
+  return IDEMPOTENCY_KEY_PATTERN.test(key);
+}
+
+/**
+ * Utility type: take a generated request interface that requires
+ * `idempotency_key` and make that field optional for callers.
+ *
+ * The SDK auto-generates a UUID v4 when callers don't provide one, so
+ * public client signatures use this loosened input type. Callers who
+ * want byte-identical retries across process restarts still pass their
+ * own key — it's just no longer required at compile time.
+ */
+export type MutatingRequestInput<T extends { idempotency_key: string }> = Omit<T, 'idempotency_key'> & {
+  idempotency_key?: string;
+};
+
+/**
+ * Validate a bring-your-own-key `idempotency_key` up front and return a
+ * `{ idempotency_key }` fragment to spread into a mutating request.
+ *
+ * Useful when the caller persists keys across process restarts (e.g., key
+ * stored in a DB alongside a campaign row) and wants to catch drift before
+ * the round-trip — the server would reject a malformed key with
+ * `INVALID_REQUEST`, but failing locally produces a faster, cleaner error.
+ *
+ * Throws when the key doesn't match `IDEMPOTENCY_KEY_PATTERN`
+ * (`^[A-Za-z0-9_.:-]{16,255}$`).
+ *
+ * @example
+ * ```ts
+ * const key = await db.getOrCreateIdempotencyKey(campaign.id);
+ * const result = await client.createMediaBuy({ ...params, ...useIdempotencyKey(key) });
+ * ```
+ */
+export function useIdempotencyKey(key: string): { idempotency_key: string } {
+  if (typeof key !== 'string' || !isValidIdempotencyKey(key)) {
+    // Preview only 8 chars so near-valid keys (16+ chars, minor drift) don't
+    // flow verbatim into exception messages and stack traces. Matches the
+    // redactIdempotencyKey() policy for debug logs.
+    const preview =
+      typeof key === 'string' ? `${JSON.stringify(key.slice(0, 8))}${key.length > 8 ? '…' : ''}` : typeof key;
+    throw new Error(`Invalid idempotency_key: must match ${IDEMPOTENCY_KEY_PATTERN}. Received: ${preview}`);
+  }
+  return { idempotency_key: key };
+}
+
+/**
+ * True when the caller has opted into logging full idempotency keys via the
+ * `ADCP_LOG_IDEMPOTENCY_KEYS` environment variable. Keys are a retry-pattern
+ * oracle within their TTL, so the default is to truncate.
+ */
+function fullIdempotencyKeyLoggingEnabled(): boolean {
+  const value = process.env.ADCP_LOG_IDEMPOTENCY_KEYS;
+  if (!value) return false;
+  const v = value.toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+/**
+ * Truncate an idempotency key for logging — first 8 chars followed by `…`.
+ * Callers who need the full key for debugging can opt in via
+ * `ADCP_LOG_IDEMPOTENCY_KEYS=1`.
+ */
+export function redactIdempotencyKey(key: string): string {
+  if (fullIdempotencyKeyLoggingEnabled()) return key;
+  if (typeof key !== 'string' || key.length === 0) return key;
+  return `${key.slice(0, 8)}…`;
+}
+
+/**
+ * Return a shallow copy of `args` with any `idempotency_key` field replaced by
+ * its truncated form for safe debug logging. Leaves non-key fields untouched.
+ * No-op when `ADCP_LOG_IDEMPOTENCY_KEYS` is set.
+ */
+export function redactIdempotencyKeyInArgs<T extends Record<string, unknown>>(args: T): T {
+  if (!args || typeof args !== 'object') return args;
+  if (!('idempotency_key' in args) || typeof args.idempotency_key !== 'string') return args;
+  if (fullIdempotencyKeyLoggingEnabled()) return args;
+  return { ...args, idempotency_key: redactIdempotencyKey(args.idempotency_key) } as T;
+}

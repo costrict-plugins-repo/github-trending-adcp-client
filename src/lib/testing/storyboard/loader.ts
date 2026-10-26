@@ -1,0 +1,691 @@
+/**
+ * Storyboard YAML parser.
+ *
+ * Storyboards are pulled from the compliance cache populated by
+ * `npm run sync-schemas`. See `./compliance.ts` for capability-driven
+ * resolution and bundle loading.
+ */
+
+import { readFileSync } from 'fs';
+import { parse } from 'yaml';
+import type { Storyboard } from './types';
+import { MUTATING_TASKS } from '../../utils/idempotency';
+import { validateFixtureResolutionDeclarations } from './fixture-resolution';
+import { validateCreativeBuildProbeSpec } from './creative-build-probe';
+import { valid as validSemver } from 'semver';
+import { parsePhaseCondition } from './phase-condition';
+
+/**
+ * Supported `branch_set.semantics` values. Extend when AdCP adds `all_of`,
+ * `at_least_n`, etc. Exported so the runner can enforce the same whitelist
+ * on programmatically-constructed storyboards that bypass the YAML parser.
+ */
+export const BRANCH_SET_SEMANTICS = ['any_of'] as const;
+
+/** Internal runner task used for protocol-authored steps that grade an agent's own synthesized output. */
+export const VALIDATION_ONLY_TASK = '__validation_only__';
+
+const IDENTIFIER_PATH_SEGMENT = String.raw`[A-Za-z_][A-Za-z0-9_-]*(?:\[\*\])*`;
+const IDENTIFIER_PATH_PATTERN = new RegExp(`^${IDENTIFIER_PATH_SEGMENT}(?:\\.${IDENTIFIER_PATH_SEGMENT})*$`);
+const CAPABILITY_PATH_PATTERN = /^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$/;
+
+/** Parse a YAML string into a Storyboard. Throws if required fields are missing. */
+export function parseStoryboard(yamlContent: string): Storyboard {
+  const parsed = parse(yamlContent) as Storyboard;
+  if (!parsed?.id || !parsed?.phases) {
+    throw new Error('Invalid storyboard YAML: missing required fields (id, phases)');
+  }
+  if (Object.prototype.hasOwnProperty.call(parsed, 'compliance_dir')) {
+    throw new Error(
+      'Invalid storyboard YAML: compliance_dir is loader-owned runtime provenance; select an external cache with runner options instead.'
+    );
+  }
+  for (const phase of parsed.phases) {
+    // Specialism YAMLs may declare a phase with no `steps:` — the steps are
+    // synthesized at runtime from fixtures (see request-signing/synthesize.ts).
+    // Treat missing steps as an empty list so the parser stays phase-agnostic.
+    if (!phase.steps) phase.steps = [];
+    // YAML uses `name:` for context outputs but our runtime expects `key:`.
+    for (const step of phase.steps) {
+      if (!step.context_outputs) continue;
+      for (const output of step.context_outputs) {
+        const raw = output as unknown as Record<string, unknown>;
+        if (raw.name && !raw.key) {
+          output.key = raw.name as string;
+        }
+      }
+    }
+  }
+  const normalized = normalizeValidationOnlyTasks(parsed);
+  validateStoryboardShape(normalized);
+  return normalized;
+}
+
+/** Load and parse a single storyboard file. Useful for ad-hoc testing of in-development YAMLs. */
+export function loadStoryboardFile(filePath: string): Storyboard {
+  return parseStoryboard(readFileSync(filePath, 'utf-8'));
+}
+
+/**
+ * Return a runner-ready storyboard without mutating validation-only source
+ * steps. This keeps programmatic and frozen inputs safe while retaining the
+ * internal pseudo-task expected by execution and result projection.
+ */
+export function normalizeValidationOnlyTasks(storyboard: Storyboard): Storyboard {
+  let changed = false;
+  const phases = storyboard.phases.map(phase => {
+    if (!phase.steps) return phase;
+    let stepsChanged = false;
+    const steps = phase.steps.map(step => {
+      const rawStep = step as unknown as { task?: unknown; validations?: unknown };
+      if (rawStep.task !== undefined) return step;
+      if (!Array.isArray(rawStep.validations) || rawStep.validations.length === 0) return step;
+      changed = true;
+      stepsChanged = true;
+      return { ...step, task: VALIDATION_ONLY_TASK };
+    });
+    return stepsChanged ? { ...phase, steps } : phase;
+  });
+  return changed ? { ...storyboard, phases } : storyboard;
+}
+
+/**
+ * Enforce authoring-time invariants on a Storyboard. Called by
+ * `parseStoryboard`, and should also be called by any runner entry point
+ * that accepts a programmatically-built `Storyboard` object so the same
+ * loud-fail-on-drift guarantee holds regardless of how the storyboard was
+ * constructed. Mutates only legacy shorthand fields (resolves
+ * `contributes: true` to `contributes_to`) and is idempotent on
+ * already-validated inputs.
+ */
+export function validateStoryboardShape(storyboard: Storyboard): void {
+  if (storyboard.creative_build_probe !== undefined) validateCreativeBuildProbeSpec(storyboard.creative_build_probe);
+  validateRequires(storyboard);
+  validateRequiresAllCapabilities(storyboard);
+  validateFixtureResolutionDeclarations(storyboard);
+  validateRequiredAnyOfTools(storyboard);
+  validatePhaseDependsOn(storyboard);
+  for (const phase of storyboard.phases) {
+    validatePhaseSkipIf(storyboard.id, phase);
+    validateBranchSet(storyboard.id, phase);
+    if (!phase.steps) continue;
+    for (const step of phase.steps) {
+      const rawStep = step as unknown as { task?: unknown; validations?: unknown };
+      if (rawStep.task === undefined) {
+        if (!Array.isArray(rawStep.validations) || rawStep.validations.length === 0) {
+          throw new Error(`[${storyboard.id}] phase '${phase.id}' step '${step.id}': missing task and validations`);
+        }
+      }
+      if (step.validations?.some(validation => validation.check === 'property_list_reference')) {
+        if (storyboard.requires?.[0] !== 'property_list_reference_runner')
+          throw new Error(
+            `[${storyboard.id}] ${step.id}: property_list_reference requires property_list_reference_runner as the first storyboard requirement.`
+          );
+        if (step.parallel_dispatch)
+          throw new Error(
+            `[${storyboard.id}] ${step.id}: property_list_reference requires one issued reference, without parallel_dispatch.`
+          );
+      }
+      resolveContributesShorthand(storyboard.id, phase, step);
+      validateFixtureForMutatingStep(storyboard.id, phase, step);
+      validateOmitFlagCoherence(storyboard.id, phase, step);
+      validateContextOutputs(storyboard.id, phase, step);
+      validateUpstreamAttestationMode(storyboard.id, phase, step);
+      validateUpstreamIdentifierPaths(storyboard.id, phase, step);
+      validateAdvisoryDeclarations(storyboard.id, phase, step);
+      validatePeerSubstitutesFor(storyboard.id, phase, step);
+    }
+  }
+}
+
+function validatePhaseSkipIf(storyboardId: string, phase: Storyboard['phases'][number]): void {
+  if (phase.skip_if === undefined) return;
+  if (typeof phase.skip_if !== 'string') {
+    throw new Error(`[${storyboardId}] phase '${phase.id}': skip_if must be a string`);
+  }
+  try {
+    parsePhaseCondition(phase.skip_if);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`[${storyboardId}] phase '${phase.id}': ${detail}`);
+  }
+}
+
+function validateRequiresAllCapabilities(storyboard: Storyboard): void {
+  const predicates = storyboard.requires_all_capabilities;
+  if (predicates === undefined) return;
+  if (!Array.isArray(predicates) || predicates.length < 2) {
+    throw new Error(
+      `[${storyboard.id}] requires_all_capabilities: must list at least two predicates; use requires_capability for one`
+    );
+  }
+  for (let index = 0; index < predicates.length; index++) {
+    const raw = predicates[index] as unknown;
+    const prefix = `[${storyboard.id}] requires_all_capabilities[${index}]`;
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error(`${prefix}: must be a capability predicate object`);
+    }
+    const predicate = raw as Record<string, unknown>;
+    if (typeof predicate.path !== 'string' || predicate.path.trim().length === 0) {
+      throw new Error(`${prefix}.path: must be a non-empty string`);
+    }
+    if (!CAPABILITY_PATH_PATTERN.test(predicate.path)) {
+      throw new Error(`${prefix}.path: must be a canonical dotted capability path`);
+    }
+    const matcherKeys = ['equals', 'present', 'contains', 'not_contains'].filter(key =>
+      Object.prototype.hasOwnProperty.call(predicate, key)
+    );
+    if (matcherKeys.length !== 1) {
+      throw new Error(`${prefix}: must declare exactly one of equals, present, contains, or not_contains`);
+    }
+    const unknownKeys = Object.keys(predicate).filter(key => key !== 'path' && !matcherKeys.includes(key));
+    if (unknownKeys.length > 0) {
+      throw new Error(`${prefix}: unknown field${unknownKeys.length === 1 ? '' : 's'} ${unknownKeys.join(', ')}`);
+    }
+    if (matcherKeys[0] === 'present' && typeof predicate.present !== 'boolean') {
+      throw new Error(`${prefix}.present: must be a boolean`);
+    }
+    if (
+      matcherKeys[0] === 'equals' &&
+      predicate.equals !== null &&
+      !['boolean', 'string', 'number'].includes(typeof predicate.equals)
+    ) {
+      throw new Error(`${prefix}.equals: must be a boolean, string, number, or null`);
+    }
+    if (
+      (matcherKeys[0] === 'contains' || matcherKeys[0] === 'not_contains') &&
+      !isJsonCapabilityValue(predicate[matcherKeys[0]!])
+    ) {
+      throw new Error(`${prefix}.${matcherKeys[0]}: must be a JSON-compatible capability value`);
+    }
+  }
+}
+
+function isJsonCapabilityValue(value: unknown, seen = new Set<object>()): boolean {
+  if (value === null || ['boolean', 'string'].includes(typeof value)) return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (typeof value !== 'object') return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  const valid = Array.isArray(value)
+    ? value.every(entry => isJsonCapabilityValue(entry, seen))
+    : Object.getPrototypeOf(value) === Object.prototype &&
+      Object.values(value as Record<string, unknown>).every(entry => isJsonCapabilityValue(entry, seen));
+  seen.delete(value);
+  return valid;
+}
+
+function validateAdvisoryDeclarations(
+  storyboardId: string,
+  phase: { id?: string },
+  step: { id?: string; validations?: any[] }
+): void {
+  for (let index = 0; index < (step.validations ?? []).length; index++) {
+    const validation = step.validations![index];
+    if (
+      validation?.severity !== undefined &&
+      validation.severity !== 'required' &&
+      validation.severity !== 'advisory'
+    ) {
+      const prefix = `[${storyboardId}] ${phase.id ?? '?'}.${step.id ?? '?'}.validations[${index}]`;
+      throw new Error(`${prefix}.severity: must be either "required" or "advisory"`);
+    }
+    if (validation?.severity !== 'advisory') continue;
+    const prefix = `[${storyboardId}] ${phase.id ?? '?'}.${step.id ?? '?'}.validations[${index}]`;
+    const hasExpiry = validation.expires_after_version !== undefined;
+    const hasPermanent = validation.permanent_advisory !== undefined;
+    if (hasExpiry === hasPermanent) {
+      throw new Error(
+        `${prefix}: severity "advisory" must declare exactly one of expires_after_version or permanent_advisory`
+      );
+    }
+    if (
+      hasExpiry &&
+      (typeof validation.expires_after_version !== 'string' || !validSemver(validation.expires_after_version))
+    ) {
+      throw new Error(`${prefix}.expires_after_version: must be a valid semver string`);
+    }
+    if (
+      hasPermanent &&
+      (typeof validation.permanent_advisory !== 'object' ||
+        validation.permanent_advisory === null ||
+        typeof validation.permanent_advisory.reason !== 'string' ||
+        validation.permanent_advisory.reason.trim().length === 0)
+    ) {
+      throw new Error(`${prefix}.permanent_advisory.reason: must be a non-empty string`);
+    }
+  }
+}
+
+function validateUpstreamAttestationMode(
+  storyboardId: string,
+  phase: { id?: string },
+  step: { id?: string; validations?: any[] }
+): void {
+  const validations = step.validations ?? [];
+  for (let validationIndex = 0; validationIndex < validations.length; validationIndex++) {
+    const validation = validations[validationIndex];
+    if (validation?.check !== 'upstream_traffic') continue;
+    const mode = validation.preferred_attestation_mode;
+    if (mode !== undefined && mode !== 'raw' && mode !== 'digest') {
+      throw new Error(
+        `[${storyboardId}] ${phase.id ?? '?'}.${step.id ?? '?'}.validations[${validationIndex}].preferred_attestation_mode: must be "raw" or "digest"`
+      );
+    }
+  }
+}
+
+function validateUpstreamIdentifierPaths(
+  storyboardId: string,
+  phase: { id?: string },
+  step: { id?: string; validations?: any[] }
+): void {
+  const validations = step.validations ?? [];
+  for (let validationIndex = 0; validationIndex < validations.length; validationIndex++) {
+    const validation = validations[validationIndex];
+    if (validation?.check !== 'upstream_traffic' || validation.identifier_paths === undefined) continue;
+    if (!Array.isArray(validation.identifier_paths)) {
+      throw new Error(
+        `[${storyboardId}] ${phase.id ?? '?'}.${
+          step.id ?? '?'
+        }.validations[${validationIndex}].identifier_paths: must be an array of request-payload paths`
+      );
+    }
+    for (let pathIndex = 0; pathIndex < validation.identifier_paths.length; pathIndex++) {
+      const path = validation.identifier_paths[pathIndex];
+      if (typeof path !== 'string' || path.length === 0) {
+        throw new Error(
+          `[${storyboardId}] ${phase.id ?? '?'}.${step.id ?? '?'}.validations[${validationIndex}].identifier_paths[${pathIndex}]: must be a non-empty string`
+        );
+      }
+      const pathErrorPrefix = `[${storyboardId}] ${phase.id ?? '?'}.${step.id ?? '?'}.validations[${validationIndex}].identifier_paths[${pathIndex}]`;
+      let firstSegment: string;
+      try {
+        const validated = validateIdentifierPathSyntax(path);
+        firstSegment = validated.firstSegment;
+      } catch {
+        throw new Error(
+          `${pathErrorPrefix}: "${path}" is unsupported; identifier_paths resolve only against the request payload or sample_request using dotted paths with [*] array selectors`
+        );
+      }
+      const root = firstSegment.toLowerCase();
+      if (root === 'request' || root === 'response' || root === 'context') {
+        throw new Error(
+          `${pathErrorPrefix}: "${path}" is unsupported; identifier_paths resolve only against the request payload or sample_request`
+        );
+      }
+    }
+  }
+}
+
+function validateIdentifierPathSyntax(path: string): { normalized: string; firstSegment: string } {
+  const trimmed = path.trim();
+  const normalized = trimmed.startsWith('$.') ? trimmed.slice(2) : trimmed;
+  if (!IDENTIFIER_PATH_PATTERN.test(normalized)) {
+    throw new Error('unsupported identifier path syntax');
+  }
+  return { normalized, firstSegment: normalized.split(/[.[\]]/, 1)[0] ?? '' };
+}
+
+function validateRequiredAnyOfTools(storyboard: Storyboard): void {
+  if (storyboard.required_any_of_tools === undefined) return;
+  if (!Array.isArray(storyboard.required_any_of_tools)) {
+    throw new Error(`[${storyboard.id}] required_any_of_tools: must be an array of tool-family objects`);
+  }
+  if (storyboard.required_any_of_tools.length === 0) {
+    throw new Error(`[${storyboard.id}] required_any_of_tools: [] is not allowed — omit the field to use no gate`);
+  }
+  for (let i = 0; i < storyboard.required_any_of_tools.length; i++) {
+    const family = storyboard.required_any_of_tools[i] as unknown;
+    if (family === null || typeof family !== 'object' || Array.isArray(family)) {
+      throw new Error(`[${storyboard.id}] required_any_of_tools[${i}]: must be an object`);
+    }
+    const { tools, rationale } = family as { tools?: unknown; rationale?: unknown };
+    if (!Array.isArray(tools) || tools.length < 2) {
+      throw new Error(`[${storyboard.id}] required_any_of_tools[${i}].tools: must list at least two tool names`);
+    }
+    for (const tool of tools) {
+      if (typeof tool !== 'string' || tool.length === 0) {
+        throw new Error(`[${storyboard.id}] required_any_of_tools[${i}].tools: entries must be non-empty strings`);
+      }
+    }
+    if (rationale !== undefined && typeof rationale !== 'string') {
+      throw new Error(`[${storyboard.id}] required_any_of_tools[${i}].rationale: must be a string`);
+    }
+  }
+}
+
+/**
+ * Authoring-time validation for `phase.depends_on` (#1161). Each entry
+ * must reference a phase declared earlier in the storyboard. Forward
+ * references and self-references fail loud at parse time so authoring
+ * mistakes (typos, reorderings) don't degrade silently into "phase
+ * always runs" / "phase always cascades."
+ *
+ * Rules:
+ *   - Empty list (`depends_on: []`) is legal — it declares an
+ *     independent phase. No further validation needed.
+ *   - Each non-empty entry must be a non-empty string.
+ *   - Each entry must reference a phase that appears EARLIER in the
+ *     `storyboard.phases[]` array (forward references are rejected).
+ *   - A phase cannot depend on itself.
+ */
+function validatePhaseDependsOn(storyboard: Storyboard): void {
+  const phaseIdsSeen = new Set<string>();
+  for (const phase of storyboard.phases) {
+    if (phase.depends_on !== undefined) {
+      if (!Array.isArray(phase.depends_on)) {
+        throw new Error(`[${storyboard.id}] phase '${phase.id}': depends_on must be an array of phase ids`);
+      }
+      for (const dep of phase.depends_on) {
+        if (typeof dep !== 'string' || dep.length === 0) {
+          throw new Error(`[${storyboard.id}] phase '${phase.id}': depends_on entries must be non-empty strings`);
+        }
+        if (dep === phase.id) {
+          throw new Error(`[${storyboard.id}] phase '${phase.id}': depends_on cannot reference itself`);
+        }
+        if (!phaseIdsSeen.has(dep)) {
+          throw new Error(
+            `[${storyboard.id}] phase '${phase.id}': depends_on '${dep}' is not a phase declared earlier in this storyboard (forward and unknown references are rejected)`
+          );
+        }
+      }
+    }
+    phaseIdsSeen.add(phase.id);
+  }
+}
+
+/**
+ * Authoring-time validation for `Storyboard.requires` (#1626). The field is
+ * an array of non-empty requirement names:
+ *
+ *   - `requires: []` is rejected — an empty array reads as "no
+ *     requirements," which is the same as omitting the field; failing
+ *     load forces the author to omit it explicitly.
+ *   - Each entry must be a non-empty string.
+ *
+ * Unknown string values are allowed for forward compatibility. Runners that
+ * don't know how to satisfy a future requirement skip at runtime with
+ * `skip_reason: 'requirement_unmet'` and the authored value in
+ * `skip.requirement`.
+ */
+function validateRequires(storyboard: Storyboard): void {
+  if (storyboard.requires === undefined) return;
+  if (!Array.isArray(storyboard.requires)) {
+    throw new Error(
+      `[${storyboard.id}] requires: must be an array of requirement names (got ${typeof storyboard.requires})`
+    );
+  }
+  if (storyboard.requires.length === 0) {
+    throw new Error(`[${storyboard.id}] requires: [] is not allowed — omit the field to use the default ([real_wire])`);
+  }
+  for (let i = 0; i < storyboard.requires.length; i++) {
+    const name = storyboard.requires[i];
+    if (typeof name !== 'string' || name.length === 0) {
+      throw new Error(`[${storyboard.id}] requires[${i}]: entries must be non-empty strings`);
+    }
+  }
+}
+
+/**
+ * Issue #820: mutating tasks (per {@link MUTATING_TASKS}) must have a
+ * `sample_request` authored. The fixture is authoritative at run time —
+ * there's no sane default payload for a write, and silently fabricating
+ * one was the bug factory that produced #780 / #792 / #793 / #802 / #805.
+ *
+ * Error messages point at the task name, the step id, the storyboard, and
+ * suggest the concrete author action.
+ *
+ * Opt-out: steps with `expect_error: true` that deliberately exercise
+ * missing-fixture / malformed-payload seller behavior skip this check —
+ * the author is signaling the payload is the test condition.
+ *
+ * Synthesized phases (`request-signing/synthesize.ts`, controller seeding)
+ * start with `phase.steps = []` in YAML and the loader doesn't see the
+ * runtime-generated steps, so those paths are not affected.
+ */
+function validateFixtureForMutatingStep(
+  storyboardId: string,
+  phase: Storyboard['phases'][number],
+  step: Storyboard['phases'][number]['steps'][number]
+): void {
+  if (!MUTATING_TASKS.has(step.task)) return;
+  if (step.sample_request !== undefined) return;
+  if (step.expect_error === true) return;
+  throw new Error(
+    `[${storyboardId}] phase '${phase.id}' step '${step.id}' (task=${step.task}): ` +
+      `mutating tasks require a sample_request fixture — the runner no longer fabricates ` +
+      `write payloads. Author sample_request in the step or, for intentionally malformed ` +
+      `payloads, set expect_error: true.`
+  );
+}
+
+/**
+ * `omit_account: true` must be paired with `expect_error: true`.
+ *
+ * An accountless `create_media_buy` will always be rejected by a spec-compliant
+ * seller; a step that sets `omit_account` without `expect_error` will be graded
+ * as a failure (not a controlled negative test), producing a misleading
+ * compliance result. Fail loud at parse time so the author sees the problem
+ * during storyboard load, not at run time.
+ */
+function validateOmitFlagCoherence(
+  storyboardId: string,
+  phase: Storyboard['phases'][number],
+  step: Storyboard['phases'][number]['steps'][number]
+): void {
+  if (step.omit_account && step.expect_error !== true) {
+    throw new Error(
+      `[${storyboardId}] phase '${phase.id}' step '${step.id}': ` +
+        `omit_account: true requires expect_error: true — an accountless ` +
+        `create_media_buy will always be rejected by a spec-compliant seller.`
+    );
+  }
+}
+
+/**
+ * Each `context_outputs` entry must declare exactly one source: either
+ * `path` (extract from response) or `generate` (mint at run time). An entry
+ * with neither is a silent no-op; one with both would silently pick `generate`
+ * and ignore `path`. Both are authoring foot-guns that should fail loud.
+ */
+function validateContextOutputs(
+  storyboardId: string,
+  phase: Storyboard['phases'][number],
+  step: Storyboard['phases'][number]['steps'][number]
+): void {
+  if (!step.context_outputs?.length) return;
+  for (const output of step.context_outputs) {
+    const hasPath = output.path !== undefined;
+    const hasGenerate = output.generate !== undefined;
+    if (!hasPath && !hasGenerate) {
+      throw new Error(
+        `[${storyboardId}] phase '${phase.id}' step '${step.id}': context_outputs entry ` +
+          `'${output.key}' must set exactly one of 'path' or 'generate'.`
+      );
+    }
+    if (hasPath && hasGenerate) {
+      throw new Error(
+        `[${storyboardId}] phase '${phase.id}' step '${step.id}': context_outputs entry ` +
+          `'${output.key}' sets both 'path' and 'generate' — they are mutually exclusive.`
+      );
+    }
+    // Validate generator name. The runtime resolver also checks but the loader
+    // catches typos at storyboard-load time so authors see the failure on
+    // build, not on the first run.
+    if (hasGenerate && output.generate !== 'uuid_v4' && output.generate !== 'opaque_id') {
+      throw new Error(
+        `[${storyboardId}] phase '${phase.id}' step '${step.id}': context_outputs entry ` +
+          `'${output.key}' has unknown generate value '${output.generate}'. ` +
+          `Supported: 'uuid_v4', 'opaque_id'.`
+      );
+    }
+  }
+}
+
+/**
+ * Authoring-time validation for `provides_state_for` (the AdCP 3.0.3 spec
+ * field — adcp#3734) and the legacy `peer_substitutes_for` synonym. The
+ * runner treats the field as same-phase-only and substitution-only-when-
+ * stateful; surface those constraints at parse time so storyboard authors
+ * see typos and cross-phase references on build, not as a silent no-rescue
+ * at run time.
+ *
+ * Both field names parse to the same canonical normalized form on the step
+ * object (the spec name `provides_state_for` is preferred when both are
+ * declared). The deprecation alias is documented in `types.ts`.
+ *
+ * Rules:
+ *   - Each target must reference a step that exists in the same phase.
+ *   - A step cannot substitute for itself.
+ *   - The substitute step itself must be `stateful: true` — non-stateful
+ *     passes don't establish state per the cascade contract.
+ *   - The target step must be `stateful: true` — non-stateful targets
+ *     don't participate in cascade gating, so a substitution declaration
+ *     would be a no-op.
+ *   - When both fields are declared on the same step, they must match
+ *     element-for-element (the deprecation contract is "synonym for", not
+ *     "additive with").
+ */
+function validatePeerSubstitutesFor(
+  storyboardId: string,
+  phase: Storyboard['phases'][number],
+  step: Storyboard['phases'][number]['steps'][number]
+): void {
+  const newField = step.provides_state_for;
+  const legacyField = step.peer_substitutes_for;
+  if (newField === undefined && legacyField === undefined) return;
+
+  if (newField !== undefined && legacyField !== undefined) {
+    // Order-sensitive equality: `[A, B]` vs `[B, A]` would throw despite being
+    // semantically equivalent. Authors mid-migration should write the same list
+    // in both fields; the deprecation alias is a literal synonym, not a
+    // same-set restatement.
+    const a = JSON.stringify(Array.isArray(newField) ? newField : [newField]);
+    const b = JSON.stringify(Array.isArray(legacyField) ? legacyField : [legacyField]);
+    if (a !== b) {
+      throw new Error(
+        `[${storyboardId}] phase '${phase.id}' step '${step.id}': both provides_state_for and ` +
+          `peer_substitutes_for declared with different values — pick one (provides_state_for is the ` +
+          `spec field; peer_substitutes_for is a deprecated synonym)`
+      );
+    }
+  }
+
+  // Normalize onto provides_state_for so the runner can read a single field.
+  // peer_substitutes_for stays for back-compat with any consumer code that
+  // already reads it.
+  if (newField === undefined && legacyField !== undefined) {
+    step.provides_state_for = legacyField;
+  } else if (newField !== undefined && legacyField === undefined) {
+    step.peer_substitutes_for = newField;
+  }
+
+  const sourceFieldName = newField !== undefined ? 'provides_state_for' : 'peer_substitutes_for';
+  const declared = step.provides_state_for!;
+  const targets = Array.isArray(declared) ? declared : [declared];
+  if (!step.stateful) {
+    throw new Error(
+      `[${storyboardId}] phase '${phase.id}' step '${step.id}': ${sourceFieldName} is only legal on stateful steps`
+    );
+  }
+  const phaseStepIds = new Map(phase.steps.map(s => [s.id, s]));
+  for (const target of targets) {
+    if (typeof target !== 'string' || target.length === 0) {
+      throw new Error(
+        `[${storyboardId}] phase '${phase.id}' step '${step.id}': ${sourceFieldName} entries must be non-empty strings`
+      );
+    }
+    if (target === step.id) {
+      throw new Error(
+        `[${storyboardId}] phase '${phase.id}' step '${step.id}': ${sourceFieldName} cannot reference itself`
+      );
+    }
+    const targetStep = phaseStepIds.get(target);
+    if (!targetStep) {
+      throw new Error(
+        `[${storyboardId}] phase '${phase.id}' step '${step.id}': ${sourceFieldName} target '${target}' is not a step in this phase (same-phase only)`
+      );
+    }
+    if (!targetStep.stateful) {
+      throw new Error(
+        `[${storyboardId}] phase '${phase.id}' step '${step.id}': ${sourceFieldName} target '${target}' must be stateful`
+      );
+    }
+  }
+}
+
+function validateBranchSet(storyboardId: string, phase: Storyboard['phases'][number]): void {
+  if (phase.branch_set === undefined) return;
+  const bs = phase.branch_set as unknown;
+  if (!bs || typeof bs !== 'object') {
+    throw new Error(`[${storyboardId}] phase '${phase.id}': branch_set must be an object with { id, semantics }`);
+  }
+  const { id, semantics } = bs as Record<string, unknown>;
+  if (typeof id !== 'string' || id.length === 0) {
+    throw new Error(`[${storyboardId}] phase '${phase.id}': branch_set.id must be a non-empty string`);
+  }
+  if (typeof semantics !== 'string' || semantics.length === 0) {
+    throw new Error(`[${storyboardId}] phase '${phase.id}': branch_set.semantics must be a non-empty string`);
+  }
+  // Only `any_of` is defined in AdCP today (adcp#2646 lint rule 2 —
+  // `at_least_n` and `all_of` are reserved but not defined). Reject unknown
+  // values at parse rather than silently skipping grading at runtime, so
+  // spec-drift typos fail loud instead of degrading to raw `failed` peers.
+  if (!(BRANCH_SET_SEMANTICS as readonly string[]).includes(semantics)) {
+    throw new Error(
+      `[${storyboardId}] phase '${phase.id}': branch_set.semantics='${semantics}' is not supported (valid: ${BRANCH_SET_SEMANTICS.join(', ')})`
+    );
+  }
+  // Schema constraint: every phase in a branch set MUST be optional. A
+  // non-optional branch-set phase would fail the storyboard on any step
+  // failure regardless of peer contribution, defeating the any_of gate.
+  if (phase.optional !== true) {
+    throw new Error(`[${storyboardId}] phase '${phase.id}': phases declaring branch_set must set 'optional: true'`);
+  }
+}
+
+/**
+ * Resolve the `contributes: true` boolean shorthand introduced alongside the
+ * first-class `branch_set:` phase field (adcp-client#693, adcp#2646).
+ *
+ * Rules:
+ *   - `contributes: true` is legal only inside a phase that declares `branch_set:`.
+ *   - A step MUST NOT set both `contributes` and `contributes_to` (ambiguous).
+ *   - A string `contributes_to` inside a branch_set phase MUST equal `branch_set.id`
+ *     (otherwise the aggregation target drifts — same invariant the spec lint enforces).
+ *
+ * After resolution, `step.contributes_to` carries the flag name and `step.contributes`
+ * is cleared, so the runner reads a single field regardless of authoring form.
+ */
+function resolveContributesShorthand(
+  storyboardId: string,
+  phase: Storyboard['phases'][number],
+  step: Storyboard['phases'][number]['steps'][number]
+): void {
+  const hasBoolean = step.contributes !== undefined;
+  const hasString = step.contributes_to !== undefined;
+
+  if (hasBoolean && hasString) {
+    throw new Error(`[${storyboardId}] step '${step.id}' declares both 'contributes' and 'contributes_to' — pick one`);
+  }
+
+  if (hasBoolean) {
+    if (step.contributes === true) {
+      if (!phase.branch_set) {
+        throw new Error(
+          `[${storyboardId}] step '${step.id}': 'contributes: true' is only legal inside a phase that declares branch_set`
+        );
+      }
+      step.contributes_to = phase.branch_set.id;
+    }
+    delete step.contributes;
+    return;
+  }
+
+  if (hasString && phase.branch_set && step.contributes_to !== phase.branch_set.id) {
+    throw new Error(
+      `[${storyboardId}] step '${step.id}': contributes_to='${step.contributes_to}' must equal enclosing phase's branch_set.id='${phase.branch_set.id}'`
+    );
+  }
+}

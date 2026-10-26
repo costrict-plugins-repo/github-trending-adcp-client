@@ -1,0 +1,13859 @@
+const { describe, test } = require('node:test');
+const assert = require('node:assert/strict');
+const { readFileSync } = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+
+const testDurableToken = label => crypto.createHash('sha256').update(label).digest('base64url');
+
+const {
+  AgentClient,
+  InMemoryWebhookRegistrationStore,
+  MemoryStorage,
+  MediaBuyLifecycleCompatibilityError,
+  createInMemoryEstablishedProposalStore,
+  ESTABLISHED_PROPOSAL_COMPLETION_TOMBSTONE_RETENTION_MS,
+  ProtocolClient,
+  createInMemoryLegacyPurchaseContinuationStore,
+  legacyPurchaseSettlementFingerprint,
+  memoryBackend,
+  proposalTermsDigest,
+} = require('../../dist/lib/index.js');
+const { ADCP_VERSION } = require('../../dist/lib/version.js');
+
+// The SDK's own default pin, plus a synthetic release one step beyond it.
+// Negotiation fail-closed tests are about the *relationship* between what a
+// seller advertises and what the buyer is pinned to, so deriving the "newer"
+// side keeps them meaningful across pin bumps instead of silently inverting
+// into "seller advertises the same version" the next time the pin moves.
+const SDK_PIN = ADCP_VERSION;
+const ONE_BEYOND_SDK_PIN = (() => {
+  const prerelease = /^(\d+\.\d+\.\d+-[0-9A-Za-z-]+\.)(\d+)$/.exec(SDK_PIN);
+  if (prerelease) return `${prerelease[1]}${Number(prerelease[2]) + 1}`;
+  const stable = /^(\d+)\.(\d+)\.(\d+)$/.exec(SDK_PIN);
+  if (stable) return `${stable[1]}.${Number(stable[2]) + 1}.0`;
+  throw new Error(`Cannot derive a newer release than the SDK pin ${SDK_PIN}`);
+})();
+const {
+  DEFERRED_SETTLEMENT_ACK,
+  DeferredSettlementOwnershipError,
+  hasCompletionHandlerAlreadyPublished,
+} = require('../../dist/lib/core/TaskExecutor.js');
+
+const PRODUCTS_ONLY_BRIEF_VECTORS = JSON.parse(
+  readFileSync(
+    path.resolve(
+      __dirname,
+      '../../compliance/cache/latest/test-vectors/products-only-brief-compatibility/vectors.json'
+    ),
+    'utf8'
+  )
+);
+
+const AGENT = {
+  id: 'compat-seller',
+  name: 'Compatibility seller',
+  agent_uri: 'https://seller.example/mcp',
+  protocol: 'mcp',
+};
+
+function capabilities({ version = SDK_PIN, tools, discoveredTools, replayTtlSeconds = 3600 } = {}) {
+  return {
+    version: 'v3',
+    majorVersions: [3],
+    supportedVersions: [version],
+    protocols: ['media_buy'],
+    features: {},
+    extensions: [],
+    idempotency: { replayTtlSeconds },
+    mediaBuyLifecycleTools: tools,
+    discoveredTools,
+    _synthetic: false,
+  };
+}
+
+function completed(taskName, data) {
+  return {
+    success: true,
+    status: 'completed',
+    data,
+    metadata: {
+      taskId: `${taskName}-task`,
+      taskName,
+      agent: { id: AGENT.id, name: AGENT.name, protocol: AGENT.protocol },
+      responseTimeMs: 1,
+      timestamp: new Date().toISOString(),
+      clarificationRounds: 0,
+      status: 'completed',
+    },
+  };
+}
+
+function legacyListedProduct(product_id, name, extra = {}) {
+  return {
+    product_id,
+    name,
+    pricing_options: [
+      {
+        pricing_option_id: 'fixed-cpm',
+        pricing_model: 'cpm',
+        currency: 'USD',
+        fixed_price: 10,
+      },
+    ],
+    ...extra,
+  };
+}
+
+function working(taskName) {
+  return {
+    success: true,
+    status: 'working',
+    data: { task_id: `${taskName}-task` },
+    metadata: {
+      taskId: `${taskName}-task`,
+      taskName,
+      agent: { id: AGENT.id, name: AGENT.name, protocol: AGENT.protocol },
+      responseTimeMs: 1,
+      timestamp: new Date().toISOString(),
+      clarificationRounds: 0,
+      status: 'working',
+    },
+  };
+}
+
+function failed(taskName) {
+  return {
+    success: false,
+    status: 'failed',
+    error: { code: 'seller_failed', message: 'Seller rejected the request' },
+    metadata: {
+      taskId: `${taskName}-task`,
+      taskName,
+      agent: { id: AGENT.id, name: AGENT.name, protocol: AGENT.protocol },
+      responseTimeMs: 1,
+      timestamp: new Date().toISOString(),
+      clarificationRounds: 0,
+      status: 'failed',
+    },
+  };
+}
+
+function submitted(taskName, terminal, { localTaskId = `${taskName}-task`, sellerTaskId = `${taskName}-task` } = {}) {
+  return {
+    success: true,
+    status: 'submitted',
+    metadata: {
+      taskId: localTaskId,
+      serverTaskId: sellerTaskId,
+      taskName,
+      agent: { id: AGENT.id, name: AGENT.name, protocol: AGENT.protocol },
+      responseTimeMs: 1,
+      timestamp: new Date().toISOString(),
+      clarificationRounds: 0,
+      status: 'submitted',
+    },
+    submitted: {
+      taskId: sellerTaskId,
+      track: async () => ({
+        taskId: sellerTaskId,
+        status: terminal.status,
+        taskType: taskName,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        result: terminal.data,
+      }),
+      waitForCompletion: async () => terminal,
+    },
+  };
+}
+
+function deferred(taskName, resume) {
+  return {
+    success: true,
+    status: 'deferred',
+    metadata: {
+      taskId: `${taskName}-task`,
+      taskName,
+      agent: { id: AGENT.id, name: AGENT.name, protocol: AGENT.protocol },
+      responseTimeMs: 1,
+      timestamp: new Date().toISOString(),
+      clarificationRounds: 0,
+      status: 'deferred',
+    },
+    deferred: { token: testDurableToken(`${taskName}-deferred-token`), resume },
+  };
+}
+
+let compatibilityOperationSequence = 0;
+
+function clientWithCaps(caps, adcpVersion, clientOptions = {}, agentConfig = AGENT) {
+  const agent = new AgentClient(agentConfig, {
+    validateFeatures: false,
+    ...(adcpVersion && { adcpVersion }),
+    ...clientOptions,
+  });
+  agent.getCapabilities = async () => caps;
+  const negotiate = agent.negotiateMediaBuyLifecycle.bind(agent);
+  agent.negotiateMediaBuyLifecycle = options =>
+    negotiate({ legacyPurchaseSellerSessionScope: 'test-authenticated-seller-session', ...options });
+  agent.getProductsLegacyWithPreDispatch = async (params, beforeDispatch, inputHandler, options) => {
+    const decision = await beforeDispatch(params, {
+      governanceAdjusted: false,
+      publishSettledTaskStatus: (status, data, error) => {
+        agent.lastSettledTaskStatus = { status, data, error };
+      },
+      registerExternalTaskSettlement: handler => {
+        agent.externalTaskSettlementHandler = handler;
+      },
+    });
+    if (decision.action === 'return') return decision.result;
+    let result;
+    try {
+      result = await agent.getProducts(params, inputHandler, options);
+    } catch (error) {
+      if (decision.onError) return decision.onError(error);
+      throw error;
+    }
+    return decision.onResult ? decision.onResult(result) : result;
+  };
+  agent.createMediaBuyLegacyWithPreDispatch = async (params, beforeDispatch, inputHandler, options) => {
+    const decision = await beforeDispatch(params, {
+      operationId: `compat-operation-${++compatibilityOperationSequence}`,
+      governanceAdjusted: false,
+      publishSettledTaskStatus: (status, data, error) => {
+        agent.lastSettledTaskStatus = { status, data, error };
+      },
+      registerExternalTaskSettlement: handler => {
+        agent.externalTaskSettlementHandler = handler;
+      },
+    });
+    if (decision.action === 'return') return decision.result;
+    let result;
+    try {
+      result = Object.hasOwn(agent, 'createMediaBuy')
+        ? await agent.createMediaBuy(params, inputHandler, options)
+        : await agent.createMediaBuyLegacy(params, inputHandler, options);
+    } catch (error) {
+      if (decision.onError) return decision.onError(error);
+      throw error;
+    }
+    return decision.onResult ? decision.onResult(result) : result;
+  };
+  return agent;
+}
+
+const COMPACT_TOOLS = [
+  'list_products',
+  'request_proposals',
+  'refine_proposals',
+  'decline_proposals',
+  'buy_products',
+  'accept_proposal',
+  'control_media_buy',
+];
+
+function proposalMutationRequest(operation, proposalId, idempotencyKey, suffix = '') {
+  return operation === 'refinement'
+    ? {
+        idempotency_key: idempotencyKey,
+        refinements: [{ proposal_id: proposalId, action: 'revise', ask: `Keep terms${suffix}` }],
+      }
+    : {
+        idempotency_key: idempotencyKey,
+        declines: [{ proposal_id: proposalId, reason: 'other', detail: `No longer needed${suffix}` }],
+      };
+}
+
+function completedProposalMutation(operation, proposalId) {
+  const tool = operation === 'refinement' ? 'refine_proposals' : 'decline_proposals';
+  return operation === 'refinement'
+    ? completed(tool, {
+        products: [],
+        results: [
+          {
+            source_proposal_id: proposalId,
+            outcome: 'unable',
+            reason_code: 'commercially_declined',
+            reason: 'The original proposal remains available.',
+          },
+        ],
+      })
+    : completed(tool, { results: [{ proposal_id: proposalId, outcome: 'declined' }] });
+}
+
+function seedProposalSnapshot(coordinator, proposal, account = { account_id: 'account-1' }) {
+  coordinator.rememberProposals({ proposals: [proposal] }, coordinator.accountScope(account));
+}
+
+describe('MediaBuyLifecycleCoordinator negotiation matrix', () => {
+  for (const lane of [
+    { name: '3.0 legacy', caps: capabilities({ version: '3.0' }), expected: 'established' },
+    { name: '3.1 legacy', caps: capabilities({ version: '3.1' }), expected: 'established' },
+    {
+      name: '3.2 legacy-only',
+      caps: capabilities({ discoveredTools: ['get_products'] }),
+      expected: 'established',
+    },
+    {
+      name: '3.2 dual-surface',
+      caps: capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products'] }),
+      expected: 'compact',
+    },
+    { name: '3.2 compact-only', caps: capabilities({ tools: COMPACT_TOOLS }), expected: 'compact' },
+  ]) {
+    test(`${lane.name} selects ${lane.expected} product discovery`, async () => {
+      const agent = clientWithCaps(lane.caps);
+      const calls = [];
+      agent.listProducts = async request => {
+        calls.push(['list_products', request]);
+        return completed('list_products', { products: [{ product_id: 'p1' }], feed_version: 'feed-compact' });
+      };
+      agent.getProducts = async request => {
+        calls.push(['get_products', request]);
+        return completed('get_products', {
+          products: [{ product_id: 'p1' }],
+          wholesale_feed_version: 'feed-established',
+          cache_scope: 'public',
+        });
+      };
+
+      const coordinator = await agent.negotiateMediaBuyLifecycle();
+      const result = await coordinator.listProducts({ max_results: 5 });
+
+      assert.equal(coordinator.lifecycle, lane.expected);
+      assert.equal(result.compatibility.lifecycle, lane.expected);
+      assert.deepEqual(result.compatibility.tools_used, [
+        lane.expected === 'compact' ? 'list_products' : 'get_products',
+      ]);
+      assert.equal(result.data.feed_version, lane.expected === 'compact' ? 'feed-compact' : 'feed-established');
+      assert.equal(calls.length, 1);
+      if (lane.expected === 'established') {
+        assert.equal(calls[0][1].buying_mode, 'wholesale');
+        assert.deepEqual(calls[0][1].pagination, { max_results: 5 });
+      }
+    });
+  }
+
+  test('out-of-range seller replay declarations fail negotiation with a defined error', async () => {
+    for (const replayTtlSeconds of [3599, 604801, 3600.5]) {
+      const agent = clientWithCaps(capabilities({ version: '3.1', replayTtlSeconds }));
+      await assert.rejects(
+        agent.negotiateMediaBuyLifecycle(),
+        error => error.code === 'CONFIGURATION_ERROR' && error.configField === 'adcp.idempotency.replay_ttl_seconds'
+      );
+    }
+  });
+
+  test('partial compact 3.2 surfaces never fall through to unadvertised established tools', async () => {
+    const noDiscovery = clientWithCaps(capabilities({ tools: ['buy_products'] }));
+    await assert.rejects(noDiscovery.negotiateMediaBuyLifecycle(), error => {
+      assert.ok(error instanceof MediaBuyLifecycleCompatibilityError);
+      assert.equal(error.feature, 'lifecycle_tool_not_advertised');
+      assert.equal(error.operation, 'list_products');
+      return true;
+    });
+
+    const agent = clientWithCaps(capabilities({ tools: ['list_products'] }));
+    let dispatches = 0;
+    for (const method of [
+      'getProducts',
+      'createMediaBuy',
+      'updateMediaBuy',
+      'requestProposals',
+      'refineProposals',
+      'declineProposals',
+      'buyProducts',
+      'acceptProposal',
+      'controlMediaBuy',
+      'getMediaBuys',
+      'getMediaBuyDelivery',
+    ]) {
+      agent[method] = async () => {
+        dispatches += 1;
+        return completed(method, {});
+      };
+    }
+    agent.listProducts = async () => completed('list_products', { outcome: 'listed', products: [] });
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+    const operations = [
+      ['request_proposals', () => coordinator.requestProposals({ brief: 'test' })],
+      [
+        'refine_proposals',
+        () => coordinator.refineProposals({ refinements: [{ proposal_id: 'proposal-1', action: 'finalize' }] }),
+      ],
+      [
+        'decline_proposals',
+        () => coordinator.declineProposals({ declines: [{ proposal_id: 'proposal-1', reason: 'other' }] }),
+      ],
+      ['buy_products', () => coordinator.buyProducts({})],
+      [
+        'accept_proposal',
+        () =>
+          coordinator.acceptProposal({
+            account: { account_id: 'account-1' },
+            proposal_id: 'proposal-1',
+            proposal_terms_digest: `sha256:${'A'.repeat(43)}`,
+          }),
+      ],
+      [
+        'control_media_buy',
+        () =>
+          coordinator.controlMediaBuy({
+            account: { account_id: 'account-1' },
+            media_buy_id: 'media-buy-1',
+            revision: 1,
+            paused: true,
+          }),
+      ],
+      ['get_media_buys', () => coordinator.getMediaBuys({ account: { account_id: 'account-1' } })],
+      [
+        'get_media_buy_delivery',
+        () =>
+          coordinator.getMediaBuyDelivery({
+            account: { account_id: 'account-1' },
+            media_buy_ids: ['media-buy-1'],
+            start_date: '2027-01-01',
+            end_date: '2027-01-02',
+          }),
+      ],
+    ];
+    for (const [operation, invoke] of operations) {
+      await assert.rejects(invoke(), error => {
+        assert.ok(error instanceof MediaBuyLifecycleCompatibilityError);
+        assert.equal(error.feature, 'lifecycle_tool_not_advertised');
+        assert.equal(error.operation, operation);
+        return true;
+      });
+    }
+    assert.equal(dispatches, 0);
+  });
+
+  test('established list projection preserves seller pagination defaults and explicit limits', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const requests = [];
+    agent.getProducts = async value => {
+      requests.push(value);
+      return completed('get_products', { products: [] });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    await coordinator.listProducts({});
+    await coordinator.listProducts({ max_results: 25 });
+
+    assert.equal(requests[0].pagination, undefined);
+    assert.deepEqual(requests[1].pagination, { max_results: 25 });
+  });
+
+  for (const version of ['3.0', '3.1']) {
+    test(`${version} list projection preserves exact offer filters and pagination`, async () => {
+      const agent = clientWithCaps(capabilities({ version }), version);
+      const requests = [];
+      const sellerResponse = {
+        products: [],
+        pagination: { cursor: `seller-next-${version}`, has_more: true },
+        cache_scope: 'account',
+      };
+      agent.getProducts = async request => {
+        requests.push(structuredClone(request));
+        return completed('get_products', sellerResponse);
+      };
+      const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+      const result = await coordinator.listProducts({
+        account: { account_id: `account-${version}` },
+        criteria: { offer_filters: { countries: ['US'], channels: ['display'] } },
+        cursor: `buyer-cursor-${version}`,
+        max_results: 17,
+      });
+
+      assert.deepEqual(requests, [
+        {
+          buying_mode: 'wholesale',
+          account: { account_id: `account-${version}` },
+          filters: { countries: ['US'], channels: ['display'] },
+          pagination: { cursor: `buyer-cursor-${version}`, max_results: 17 },
+        },
+      ]);
+      assert.equal(requests[0].targeting_overlay, undefined, 'country criteria must remain product filters');
+      assert.equal(result.data.next_cursor, `seller-next-${version}`);
+      assert.deepEqual(result.data.pagination, sellerResponse.pagination);
+      assert.strictEqual(result.data.raw, sellerResponse);
+    });
+  }
+
+  test('established list criteria report the exact unsupported field before dispatch', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    let dispatches = 0;
+    agent.getProducts = async () => {
+      dispatches += 1;
+      return completed('get_products', { products: [] });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    for (const [params, feature] of [
+      [{ criteria: { product_ids: ['product-1'] } }, 'criteria.product_ids'],
+      [
+        { criteria: { offer_filters: { required_metrics: ['viewable_rate'] } } },
+        'criteria.offer_filters.required_metrics',
+      ],
+      [
+        { criteria: { offer_filters: { required_metrics: ['impressions'] } } },
+        'criteria.offer_filters.required_metrics',
+      ],
+      [{ governance_context: 'governance-1' }, 'governance_context'],
+      [{ context_id: 'context-1' }, 'context_id'],
+      [{ adcp_version: '3.1' }, 'adcp_version'],
+      [{ adcp_major_version: 4 }, 'adcp_major_version'],
+    ]) {
+      await assert.rejects(
+        coordinator.listProducts(params),
+        error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === feature
+      );
+    }
+    assert.equal(dispatches, 0);
+  });
+
+  test('malformed native proposal completions fail instead of fabricating a legacy outcome', async () => {
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    agent.requestProposals = async () => completed('request_proposals', { proposals: [], products: [] });
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    await assert.rejects(
+      coordinator.requestProposals({ brief: 'Reach readers' }),
+      /request_proposals returned a malformed compact completion/
+    );
+  });
+
+  const proposalPricing = {
+    pricing_option_id: 'proposal-validation-price',
+    pricing_model: 'cpm',
+    currency: 'USD',
+    fixed_price: 10,
+  };
+  const proposalValidationTerms = {
+    brand: { domain: 'example.com' },
+    start_time: '2027-01-01T00:00:00Z',
+    end_time: '2027-02-01T00:00:00Z',
+    purchases: [
+      {
+        product_id: 'proposal-validation-product',
+        pricing_option_id: proposalPricing.pricing_option_id,
+        pricing: proposalPricing,
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      },
+    ],
+  };
+  const validDraftProposal = {
+    proposal_id: 'proposal-validation-draft',
+    proposal_kind: 'new_media_buy',
+    proposal_status: 'draft',
+    name: 'Proposal validation draft',
+    expires_at: '2099-12-31T23:59:59Z',
+    commercial_terms: proposalValidationTerms,
+    terms_digest: proposalTermsDigest(proposalValidationTerms),
+  };
+  const validProposalProduct = {
+    product_id: 'proposal-validation-product',
+    name: 'Proposal validation product',
+    pricing_options: [proposalPricing],
+  };
+
+  test('compact proposal validation strips only the SDK-synthesized message annotation', async () => {
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    let response = {
+      outcome: 'proposed',
+      proposals: [validDraftProposal],
+      products: [validProposalProduct],
+      _message: 'SDK text-part summary',
+    };
+    agent.requestProposals = async () => completed('request_proposals', response);
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    const accepted = await coordinator.requestProposals({ brief: 'Reach readers' });
+    assert.equal(accepted.data.outcome, 'proposed');
+    assert.equal(Object.hasOwn(accepted.data.raw, '_message'), false);
+
+    response = { ...response, _seller_annotation: 'must remain seller-controlled' };
+    await assert.rejects(
+      coordinator.requestProposals({ brief: 'Reach readers' }),
+      /undeclared fields _seller_annotation/
+    );
+  });
+
+  for (const [name, response] of [
+    ['proposed without proposals', { outcome: 'proposed', products: [validProposalProduct] }],
+    ['proposed without products', { outcome: 'proposed', proposals: [validDraftProposal] }],
+    [
+      'proposed with rejection fields',
+      {
+        outcome: 'proposed',
+        proposals: [validDraftProposal],
+        products: [validProposalProduct],
+        reason: 'wrong branch',
+      },
+    ],
+    [
+      'proposed with rejection suggestions',
+      {
+        outcome: 'proposed',
+        proposals: [validDraftProposal],
+        products: [validProposalProduct],
+        suggestions: ['wrong branch'],
+      },
+    ],
+    ['rejected without reason', { outcome: 'rejected' }],
+    ['rejected with proposals', { outcome: 'rejected', reason: 'No match', proposals: [validDraftProposal] }],
+    ['rejected with products', { outcome: 'rejected', reason: 'No match', products: [validProposalProduct] }],
+    ['rejected with a submitted task ID', { outcome: 'rejected', reason: 'No match', task_id: 'task-1' }],
+    ['a submitted arm inside a completed SDK result', { status: 'submitted', task_id: 'task-1' }],
+  ]) {
+    test(`compact proposal completion rejects ${name} even when client response validation is disabled`, async () => {
+      const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+      agent.requestProposals = async () => completed('request_proposals', response);
+      const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+      await assert.rejects(
+        coordinator.requestProposals({ brief: 'Reach readers' }),
+        /request_proposals returned a malformed compact completion/
+      );
+    });
+  }
+
+  for (const operation of ['refine', 'decline']) {
+    test(`compact ${operation} validates the response root before following proposal containers`, async () => {
+      const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+      const response =
+        operation === 'refine'
+          ? {
+              products: [],
+              results: [
+                {
+                  source_proposal_id: 'root-validation-proposal',
+                  outcome: 'unable',
+                  reason_code: 'commercially_declined',
+                  reason: 'No change was applied.',
+                },
+              ],
+            }
+          : { results: [{ proposal_id: 'root-validation-proposal', outcome: 'declined' }] };
+      response.proposals = {};
+      let cursor = response.proposals;
+      for (let index = 0; index < 4100; index += 1) {
+        cursor.proposals = {};
+        cursor = cursor.proposals;
+      }
+      if (operation === 'refine') agent.refineProposals = async () => completed('refine_proposals', response);
+      else agent.declineProposals = async () => completed('decline_proposals', response);
+      const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: `root-first-${operation}` });
+
+      const invocation =
+        operation === 'refine'
+          ? coordinator.refineProposals({
+              refinements: [{ proposal_id: 'root-validation-proposal', action: 'revise', ask: 'Change it' }],
+            })
+          : coordinator.declineProposals({
+              declines: [{ proposal_id: 'root-validation-proposal', reason: 'other' }],
+            });
+      await assert.rejects(invocation, error => {
+        assert.doesNotMatch(error.message, /bounded traversal limit/);
+        return true;
+      });
+      coordinator.dispose();
+    });
+  }
+
+  test('legacy proposal traversal is cycle-safe and bounded', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const cyclic = {};
+    cyclic.proposals = [cyclic];
+    let response = cyclic;
+    agent.getProducts = async () => completed('get_products', response);
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    const projected = await coordinator.requestProposals({ brief: 'Cycle-safe traversal' });
+    assert.equal(projected.data.outcome, 'legacy_unavailable');
+
+    response = {};
+    let cursor = response;
+    for (let index = 0; index < 4100; index += 1) {
+      cursor.proposals = {};
+      cursor = cursor.proposals;
+    }
+    await assert.rejects(
+      coordinator.requestProposals({ brief: 'Bounded traversal' }),
+      /proposal response exceeded the bounded traversal limit/
+    );
+    coordinator.dispose();
+  });
+
+  for (const delivery of ['immediate', 'task-update']) {
+    test(`${delivery} malformed same-ID compact proposal evidence revokes an older executable snapshot`, async () => {
+      const proposalId = `malformed-replacement-${delivery}`;
+      const committedProposal = {
+        ...validDraftProposal,
+        proposal_id: proposalId,
+        proposal_status: 'committed',
+      };
+      const listeners = new Set();
+      const agent = clientWithCaps(
+        capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+      );
+      agent.onTaskUpdate = listener => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      };
+      agent.getProducts = async () => completed('get_products', { proposals: [committedProposal] });
+      const malformed = {
+        outcome: 'proposed',
+        proposals: [{ proposal_id: proposalId }],
+        products: [validProposalProduct],
+      };
+      agent.requestProposals = async () =>
+        delivery === 'immediate' ? completed('request_proposals', malformed) : working('request_proposals');
+      let mutations = 0;
+      agent.createMediaBuy = async () => {
+        mutations += 1;
+        return completed('create_media_buy', { media_buy_id: 'must-not-be-created' });
+      };
+      const principalScope = `malformed-replacement-${delivery}`;
+      const established = await agent.negotiateMediaBuyLifecycle({
+        principalScope,
+        preferredLifecycle: 'established',
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      });
+      await established.requestProposals({ brief: 'Valid source', account: { account_id: 'account-1' } });
+      const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+
+      if (delivery === 'immediate') {
+        await assert.rejects(
+          compact.requestProposals({ brief: 'Malformed replacement', account: { account_id: 'account-1' } }),
+          /malformed compact completion/
+        );
+      } else {
+        await compact.requestProposals({ brief: 'Malformed replacement', account: { account_id: 'account-1' } });
+        for (const listener of [...listeners]) {
+          listener({
+            taskId: 'request_proposals-task',
+            taskType: 'request_proposals',
+            status: 'completed',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            result: malformed,
+          });
+        }
+      }
+
+      await assert.rejects(
+        established.acceptProposal({
+          account: { account_id: 'account-1' },
+          proposal_id: proposalId,
+          proposal_terms_digest: committedProposal.terms_digest,
+        }),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+      );
+      assert.equal(mutations, 0);
+      compact.dispose();
+      established.dispose();
+    });
+  }
+
+  test('current 3.2 prerelease preserves native compact BrandRef countries', async () => {
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    let request;
+    agent.listProducts = async value => {
+      request = value;
+      return completed('list_products', { products: [] });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    await coordinator.listProducts({ brand: { domain: 'example.com', countries: ['US'] } });
+
+    assert.deepEqual(request.brand, { domain: 'example.com', countries: ['US'] });
+  });
+
+  test('compact and established product pages expose the same cursor and unchanged view', async () => {
+    const compactAgent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    compactAgent.listProducts = async () =>
+      completed('list_products', { next_cursor: 'cursor-2', outcome: 'unchanged' });
+    const establishedAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    establishedAgent.getProducts = async () =>
+      completed('get_products', { pagination: { cursor: 'cursor-2', has_more: true }, unchanged: true });
+
+    const compact = await (await compactAgent.negotiateMediaBuyLifecycle()).listProducts({});
+    const established = await (await establishedAgent.negotiateMediaBuyLifecycle()).listProducts({});
+
+    for (const result of [compact, established]) {
+      assert.equal(result.data.next_cursor, 'cursor-2');
+      assert.equal(result.data.unchanged, true);
+    }
+  });
+
+  test('projection preserves absent product and proposal collections instead of inventing empty arrays', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async request =>
+      completed(
+        'get_products',
+        request.buying_mode === 'wholesale'
+          ? { unchanged: true, cache_scope: 'public' }
+          : { context: { correlation_id: 'no-proposals' } }
+      );
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-tenant-1' });
+
+    const products = await coordinator.listProducts({});
+    const proposals = await coordinator.requestProposals({
+      idempotency_key: 'proposal-request-key-no-results',
+      brief: 'No matching inventory',
+    });
+
+    assert.equal(Object.hasOwn(products.data, 'products'), false);
+    assert.equal(products.data.unchanged, true);
+    assert.equal(Object.hasOwn(proposals.data, 'proposals'), false);
+    assert.equal(proposals.data.operation, 'request');
+    assert.equal(proposals.data.outcome, 'legacy_unavailable');
+    assert.deepEqual(proposals.data.context, { correlation_id: 'no-proposals' });
+  });
+
+  test('proposal compatibility responses preserve native and projected outcome discriminants', async () => {
+    const canonicalChild = overrides => ({
+      proposal_id: 'proposal-child',
+      proposal_kind: 'new_media_buy',
+      parent_proposal_id: 'proposal-1',
+      proposal_status: 'draft',
+      name: 'Revised proposal',
+      commercial_terms: {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+        purchases: [
+          {
+            product_id: 'product-1',
+            pricing_option_id: 'pricing-1',
+            start_time: '2027-01-01T00:00:00Z',
+            end_time: '2027-02-01T00:00:00Z',
+            pricing: {
+              pricing_option_id: 'pricing-1',
+              pricing_model: 'cpm',
+              currency: 'USD',
+              fixed_price: 5,
+            },
+          },
+        ],
+      },
+      terms_digest: `sha256:${'A'.repeat(43)}`,
+      ...overrides,
+    });
+    const compactAgent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    compactAgent.refineProposals = async () =>
+      completed('refine_proposals', {
+        status: 'completed',
+        products: [],
+        results: [
+          {
+            source_proposal_id: 'proposal-1',
+            outcome: 'unable',
+            reason_code: 'commercially_declined',
+            reason: 'Inventory cannot satisfy the requested constraint.',
+          },
+        ],
+      });
+    compactAgent.declineProposals = async () =>
+      completed('decline_proposals', { results: [{ proposal_id: 'proposal-2', outcome: 'declined' }] });
+    const compact = await compactAgent.negotiateMediaBuyLifecycle();
+
+    const refined = await compact.refineProposals({
+      refinements: [{ proposal_id: 'proposal-1', action: 'revise', ask: 'lower price' }],
+    });
+    assert.equal(refined.data.operation, 'refine');
+    assert.equal(refined.data.outcome, 'native_results');
+    assert.equal(refined.data.results[0].outcome, 'unable');
+    assert.equal(refined.data.results[0].reason_code, 'commercially_declined');
+    assert.equal(refined.data.results[0].reason, 'Inventory cannot satisfy the requested constraint.');
+
+    compactAgent.refineProposals = async () =>
+      completed('refine_proposals', {
+        products: [],
+        results: [
+          {
+            source_proposal_id: 'proposal-20',
+            outcome: 'unable',
+            reason_code: 'commercially_declined',
+            reason: 'second',
+          },
+          {
+            source_proposal_id: 'proposal-10',
+            outcome: 'unable',
+            reason_code: 'commercially_declined',
+            reason: 'first',
+          },
+        ],
+      });
+    await assert.rejects(
+      compact.refineProposals({
+        refinements: [
+          { proposal_id: 'proposal-10', action: 'revise', ask: 'first' },
+          { proposal_id: 'proposal-20', action: 'revise', ask: 'second' },
+        ],
+      }),
+      error => /results must preserve source request order/.test(error.message)
+    );
+
+    compactAgent.refineProposals = async () =>
+      completed('refine_proposals', {
+        products: [],
+        results: [
+          {
+            source_proposal_id: 'proposal-3',
+            outcome: 'revised',
+            proposals: [canonicalChild({ parent_proposal_id: 'different-parent' })],
+          },
+        ],
+      });
+    await assert.rejects(
+      compact.refineProposals({ refinements: [{ proposal_id: 'proposal-3', action: 'revise', ask: 'first' }] }),
+      error => /parent_proposal_id/.test(error.message)
+    );
+
+    compactAgent.refineProposals = async () =>
+      completed('refine_proposals', {
+        products: [],
+        results: [
+          {
+            source_proposal_id: 'proposal-4',
+            outcome: 'revised',
+            proposals: [{ proposal_id: 'proposal-child', parent_proposal_id: 'proposal-4' }],
+          },
+        ],
+      });
+    await assert.rejects(
+      compact.refineProposals({ refinements: [{ proposal_id: 'proposal-4', action: 'revise', ask: 'first' }] }),
+      error => /refine_proposals response failed verification/.test(error.message)
+    );
+
+    compactAgent.refineProposals = async () =>
+      completed('refine_proposals', {
+        products: [],
+        results: [
+          {
+            source_proposal_id: 'proposal-5',
+            outcome: 'revised',
+            proposals: [
+              canonicalChild({
+                parent_proposal_id: 'proposal-5',
+                proposal_status: 'committed',
+                expires_at: '2099-12-31T23:59:59Z',
+              }),
+            ],
+          },
+        ],
+      });
+    await assert.rejects(
+      compact.refineProposals({ refinements: [{ proposal_id: 'proposal-5', action: 'revise', ask: 'first' }] }),
+      error => /proposal_status/.test(error.message)
+    );
+
+    const declined = await compact.declineProposals({
+      declines: [{ proposal_id: 'proposal-2', reason: 'other' }],
+    });
+    assert.equal(declined.data.operation, 'decline');
+    assert.equal(declined.data.outcome, 'native_results');
+    assert.deepEqual(declined.data.results, [{ proposal_id: 'proposal-2', outcome: 'declined' }]);
+
+    compactAgent.declineProposals = async () => completed('decline_proposals', { results: [{ outcome: 'declined' }] });
+    await assert.rejects(
+      compact.declineProposals({ declines: [{ proposal_id: 'proposal-2', reason: 'other' }] }),
+      /malformed compact completion/
+    );
+
+    compactAgent.declineProposals = async () =>
+      completed('decline_proposals', { results: [{ proposal_id: 0, outcome: 'unable', reason: 'Invalid ID' }] });
+    await assert.rejects(
+      compact.declineProposals({ declines: [{ proposal_id: 'proposal-40', reason: 'other' }] }),
+      error => error instanceof TypeError && /malformed compact completion/.test(error.message)
+    );
+
+    compactAgent.declineProposals = async () =>
+      completed('decline_proposals', {
+        results: [
+          { proposal_id: 'proposal-60', outcome: 'declined' },
+          { proposal_id: 'proposal-50', outcome: 'declined' },
+        ],
+      });
+    await assert.rejects(
+      compact.declineProposals({
+        declines: [
+          { proposal_id: 'proposal-50', reason: 'other' },
+          { proposal_id: 'proposal-60', reason: 'other' },
+        ],
+      }),
+      error => error instanceof TypeError && /different proposal/.test(error.message)
+    );
+
+    compactAgent.declineProposals = async () =>
+      completed('decline_proposals', {
+        results: [
+          { proposal_id: 'proposal-70', outcome: 'declined' },
+          { proposal_id: 'proposal-80', outcome: 'declined' },
+        ],
+      });
+    await assert.rejects(
+      compact.declineProposals({ declines: [{ proposal_id: 'proposal-70', reason: 'other' }] }),
+      error => error instanceof TypeError && /different result count/.test(error.message)
+    );
+
+    const legacyAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    legacyAgent.getProducts = async () => completed('get_products', { proposals: [] });
+    const legacy = await legacyAgent.negotiateMediaBuyLifecycle({
+      allowedLosses: ['proposal_decline_not_terminal', 'proposal_decline_reason_not_forwarded'],
+    });
+    const projectedDecline = await legacy.declineProposals({
+      declines: [{ proposal_id: 'legacy-proposal-1', reason: 'budget_changed' }],
+    });
+    assert.equal(projectedDecline.data.operation, 'decline');
+    assert.equal(projectedDecline.data.outcome, 'legacy_unconfirmed');
+    assert.deepEqual(projectedDecline.data.results, [{ proposal_id: 'legacy-proposal-1', outcome: 'unconfirmed' }]);
+  });
+
+  test('decline outcomes revoke only locally terminal proposal snapshots across lifecycle lanes', async () => {
+    for (const scenario of [
+      { name: 'compact confirmed decline', lifecycle: 'compact', outcome: 'declined', accepts: false },
+      { name: 'compact unable decline', lifecycle: 'compact', outcome: 'unable', accepts: true },
+      { name: 'established unconfirmed omit', lifecycle: 'established', outcome: 'unconfirmed', accepts: false },
+    ]) {
+      const proposalId = `cross-lane-${scenario.lifecycle}-${scenario.outcome}`;
+      const commercialTerms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+        total_budget: { amount: 1000, currency: 'USD' },
+      };
+      const proposal = {
+        proposal_id: proposalId,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        commercial_terms: commercialTerms,
+        terms_digest: proposalTermsDigest(commercialTerms),
+      };
+      const agent = clientWithCaps(
+        capabilities({
+          tools: COMPACT_TOOLS,
+          discoveredTools: ['get_products', 'create_media_buy', 'update_media_buy'],
+        })
+      );
+      agent.requestProposals = async () =>
+        completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+      agent.declineProposals = async () =>
+        completed('decline_proposals', {
+          results: [
+            {
+              proposal_id: proposalId,
+              outcome: scenario.outcome,
+              ...(scenario.outcome === 'unable' && { reason: 'Seller could not apply the decline.' }),
+            },
+          ],
+        });
+      let refinementDispatches = 0;
+      agent.refineProposals = async () => {
+        refinementDispatches += 1;
+        return completed('refine_proposals', { products: [], results: [] });
+      };
+      agent.getProducts = async request => {
+        if (request.buying_mode === 'refine') refinementDispatches += 1;
+        return completed('get_products', { products: [], proposals: [] });
+      };
+      let mutations = 0;
+      agent.createMediaBuy = async () => {
+        mutations += 1;
+        return completed('create_media_buy', { media_buy_id: 'cross-lane-media-buy', revision: 1 });
+      };
+      const principalScope = `buyer-${scenario.lifecycle}-${scenario.outcome}`;
+      const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      seedProposalSnapshot(compact, proposal);
+      const established = await agent.negotiateMediaBuyLifecycle({
+        principalScope,
+        preferredLifecycle: 'established',
+        allowedLosses: [
+          'proposal_terms_digest_not_enforced',
+          'proposal_decline_not_terminal',
+          'proposal_decline_reason_not_forwarded',
+        ],
+      });
+      if (scenario.lifecycle === 'compact') {
+        await compact.declineProposals({
+          idempotency_key: `decline-${scenario.lifecycle}-${scenario.outcome}-0001`,
+          declines: [{ proposal_id: proposalId, reason: 'other' }],
+        });
+      } else {
+        await established.declineProposals({
+          idempotency_key: `decline-${scenario.lifecycle}-${scenario.outcome}-0001`,
+          declines: [{ proposal_id: proposalId, reason: 'other' }],
+        });
+      }
+      const refinementDispatchesAfterDecline = refinementDispatches;
+      const accept = () =>
+        established.acceptProposal({
+          idempotency_key: `accept-${scenario.lifecycle}-${scenario.outcome}-0001`,
+          account: { account_id: 'account-1' },
+          proposal_id: proposalId,
+          proposal_terms_digest: proposal.terms_digest,
+        });
+      if (scenario.accepts) {
+        const accepted = await accept();
+        assert.equal(accepted.success, true, scenario.name);
+      } else {
+        await assert.rejects(
+          accept(),
+          error =>
+            error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+        );
+        for (const refine of [
+          () =>
+            compact.refineProposals({
+              idempotency_key: `compact-refine-terminal-${scenario.lifecycle}-${scenario.outcome}-0001`,
+              refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Already terminal' }],
+            }),
+          () =>
+            established.refineProposals({
+              idempotency_key: `established-refine-terminal-${scenario.lifecycle}-${scenario.outcome}-0001`,
+              refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Already terminal' }],
+            }),
+        ]) {
+          await assert.rejects(
+            refine(),
+            error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_terminal'
+          );
+        }
+      }
+      assert.equal(mutations, scenario.accepts ? 1 : 0, scenario.name);
+      assert.equal(refinementDispatches, refinementDispatchesAfterDecline, scenario.name);
+    }
+  });
+
+  test('unscoped native terminal fences and task updates remain fail-closed', async () => {
+    const immediateId = 'unscoped-terminal-immediate';
+    const asyncId = 'unscoped-terminal-task-update';
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    const listeners = new Set();
+    agent.onTaskUpdate = listener => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    };
+    let declineMode = 'immediate';
+    agent.declineProposals = async () =>
+      declineMode === 'immediate'
+        ? completed('decline_proposals', { results: [{ proposal_id: immediateId, outcome: 'declined' }] })
+        : working('decline_proposals');
+    let competingDispatches = 0;
+    agent.acceptProposal = agent.refineProposals = async () => {
+      competingDispatches += 1;
+      return completed('unexpected_competing_mutation', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    await coordinator.declineProposals({
+      idempotency_key: 'unscoped-terminal-decline-immediate-0001',
+      declines: [{ proposal_id: immediateId, reason: 'other' }],
+    });
+    declineMode = 'working';
+    assert.equal(
+      (
+        await coordinator.declineProposals({
+          idempotency_key: 'unscoped-terminal-decline-update-0001',
+          declines: [{ proposal_id: asyncId, reason: 'other' }],
+        })
+      ).status,
+      'working'
+    );
+    assert.equal(listeners.size > 0, true);
+    for (const listener of [...listeners]) {
+      listener({
+        taskId: 'decline_proposals-task',
+        taskType: 'decline_proposals',
+        status: 'completed',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        result: { results: [{ proposal_id: asyncId, outcome: 'declined' }] },
+      });
+    }
+    assert.equal(coordinator.proposalSnapshotStore.pendingDeclines.size, 0);
+
+    for (const proposalId of [immediateId, asyncId]) {
+      await assert.rejects(
+        coordinator.acceptProposal({
+          idempotency_key: `unscoped-terminal-accept-${proposalId}-0001`,
+          account: { account_id: 'account-1' },
+          proposal_id: proposalId,
+          proposal_terms_digest: proposalTermsDigest({}),
+        }),
+        error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_terminal'
+      );
+      await assert.rejects(
+        coordinator.refineProposals({
+          idempotency_key: `unscoped-terminal-refine-${proposalId}-0001`,
+          refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Already declined' }],
+        }),
+        error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_terminal'
+      );
+    }
+    assert.equal(competingDispatches, 0);
+    coordinator.dispose();
+  });
+
+  test('established acceptance waits for a shared pending decline and remains possible after unable', async () => {
+    const proposalId = 'pending-decline-acceptance-proposal';
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+      total_budget: { amount: 1000, currency: 'USD' },
+    };
+    const proposal = {
+      proposal_id: proposalId,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: commercialTerms,
+      terms_digest: proposalTermsDigest(commercialTerms),
+    };
+    const agent = clientWithCaps(
+      capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+    );
+    agent.requestProposals = async () => completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+    agent.declineProposals = async () =>
+      submitted(
+        'decline_proposals',
+        completed('decline_proposals', {
+          results: [{ proposal_id: proposalId, outcome: 'unable', reason: 'Proposal remains available.' }],
+        })
+      );
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', { media_buy_id: 'accepted-after-unable', revision: 1 });
+    };
+
+    const principalScope = 'buyer-pending-decline-acceptance';
+    const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+    seedProposalSnapshot(compact, proposal);
+    const established = await agent.negotiateMediaBuyLifecycle({
+      principalScope,
+      preferredLifecycle: 'established',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    const decline = await compact.declineProposals({
+      idempotency_key: 'pending-decline-decline-0001',
+      declines: [{ proposal_id: proposalId, reason: 'other' }],
+    });
+    const accept = () =>
+      established.acceptProposal({
+        idempotency_key: 'pending-decline-accept-0001',
+        account: { account_id: 'account-1' },
+        proposal_id: proposalId,
+        proposal_terms_digest: proposal.terms_digest,
+      });
+
+    await assert.rejects(
+      accept(),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_decline_pending'
+    );
+    assert.equal(mutations, 0, 'acceptance must fail before seller dispatch while decline is unresolved');
+
+    const completedDecline = await decline.submitted.waitForCompletion();
+    assert.deepEqual(completedDecline.data.results, [
+      { proposal_id: proposalId, outcome: 'unable', reason: 'Proposal remains available.' },
+    ]);
+    const accepted = await accept();
+    assert.equal(accepted.success, true);
+    assert.equal(mutations, 1, 'an unable decline must not permanently revoke the proposal');
+    compact.dispose();
+    established.dispose();
+  });
+
+  test('decline cannot race a shared in-flight established acceptance', async () => {
+    const proposalId = 'pending-acceptance-decline-proposal';
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+      total_budget: { amount: 1000, currency: 'USD' },
+    };
+    const proposal = {
+      proposal_id: proposalId,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: commercialTerms,
+      terms_digest: proposalTermsDigest(commercialTerms),
+    };
+    const agent = clientWithCaps(
+      capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+    );
+    agent.requestProposals = async () => completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+    let resolveAcceptance;
+    let markAcceptanceStarted;
+    const acceptanceGate = new Promise(resolve => {
+      resolveAcceptance = resolve;
+    });
+    const acceptanceStarted = new Promise(resolve => {
+      markAcceptanceStarted = resolve;
+    });
+    let acceptanceDispatches = 0;
+    agent.createMediaBuy = async () => {
+      acceptanceDispatches += 1;
+      markAcceptanceStarted();
+      await acceptanceGate;
+      return completed('create_media_buy', { media_buy_id: 'accepted-without-decline-race', revision: 1 });
+    };
+    let declineDispatches = 0;
+    agent.declineProposals = async () => {
+      declineDispatches += 1;
+      return completed('decline_proposals', { results: [{ proposal_id: proposalId, outcome: 'declined' }] });
+    };
+
+    const principalScope = 'buyer-pending-acceptance-decline';
+    const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+    const established = await agent.negotiateMediaBuyLifecycle({
+      principalScope,
+      preferredLifecycle: 'established',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    seedProposalSnapshot(compact, proposal);
+
+    const acceptance = established.acceptProposal({
+      idempotency_key: 'pending-acceptance-accept-0001',
+      account: { account_id: 'account-1' },
+      proposal_id: proposalId,
+      proposal_terms_digest: proposal.terms_digest,
+    });
+    await acceptanceStarted;
+    await assert.rejects(
+      compact.declineProposals({
+        idempotency_key: 'pending-acceptance-decline-0001',
+        declines: [{ proposal_id: proposalId, reason: 'other' }],
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_pending'
+    );
+    assert.equal(acceptanceDispatches, 1);
+    assert.equal(declineDispatches, 0, 'decline must fail before seller dispatch while acceptance is unresolved');
+
+    resolveAcceptance();
+    assert.equal((await acceptance).success, true);
+    compact.dispose();
+    established.dispose();
+  });
+
+  test('commit-uncertain acceptance blocks decline while preserving the exact idempotent retry', async () => {
+    const proposalId = 'commit-uncertain-decline-proposal';
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+      total_budget: { amount: 1000, currency: 'USD' },
+    };
+    const proposal = {
+      proposal_id: proposalId,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: commercialTerms,
+      terms_digest: proposalTermsDigest(commercialTerms),
+    };
+    const agent = clientWithCaps(
+      capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+    );
+    agent.requestProposals = async () => completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+    let acceptanceDispatches = 0;
+    agent.createMediaBuy = async () => {
+      acceptanceDispatches += 1;
+      if (acceptanceDispatches === 1) throw new Error('transport outcome unknown');
+      return completed('create_media_buy', { media_buy_id: 'idempotent-retry-buy', revision: 1 });
+    };
+    let declineDispatches = 0;
+    agent.declineProposals = async () => {
+      declineDispatches += 1;
+      return completed('decline_proposals', { results: [{ proposal_id: proposalId, outcome: 'declined' }] });
+    };
+
+    const principalScope = 'buyer-commit-uncertain-decline';
+    const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+    const established = await agent.negotiateMediaBuyLifecycle({
+      principalScope,
+      preferredLifecycle: 'established',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    seedProposalSnapshot(compact, proposal);
+    const acceptance = {
+      idempotency_key: 'commit-uncertain-accept-0001',
+      account: { account_id: 'account-1' },
+      proposal_id: proposalId,
+      proposal_terms_digest: proposal.terms_digest,
+    };
+
+    await assert.rejects(established.acceptProposal(acceptance), /transport outcome unknown/);
+    await assert.rejects(
+      compact.declineProposals({
+        idempotency_key: 'commit-uncertain-decline-0001',
+        declines: [{ proposal_id: proposalId, reason: 'other' }],
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_commit_uncertain'
+    );
+    assert.equal(declineDispatches, 0, 'a different mutation must not follow an unknown create outcome');
+
+    assert.equal((await established.acceptProposal(acceptance)).success, true);
+    assert.equal(acceptanceDispatches, 2, 'only the exact idempotent create retry may reconcile the ambiguity');
+    compact.dispose();
+    established.dispose();
+  });
+
+  test('expired commit uncertainty still blocks decline until external reconciliation', async () => {
+    const proposalId = 'expired-commit-uncertain-proposal';
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+      total_budget: { amount: 1000, currency: 'USD' },
+    };
+    const proposal = {
+      proposal_id: proposalId,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: commercialTerms,
+      terms_digest: proposalTermsDigest(commercialTerms),
+    };
+    const agent = clientWithCaps(
+      capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+    );
+    agent.requestProposals = async () => completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+    agent.createMediaBuy = async () => {
+      throw new Error('transport outcome remains unknown');
+    };
+    let declineDispatches = 0;
+    agent.declineProposals = async () => {
+      declineDispatches += 1;
+      return completed('decline_proposals', { results: [{ proposal_id: proposalId, outcome: 'declined' }] });
+    };
+
+    const principalScope = 'buyer-expired-commit-uncertain';
+    const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+    const established = await agent.negotiateMediaBuyLifecycle({
+      principalScope,
+      preferredLifecycle: 'established',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    established.idempotencyReplayTtlMs = 10;
+    seedProposalSnapshot(compact, proposal);
+    const acceptance = {
+      idempotency_key: 'expired-uncertain-accept-0001',
+      account: { account_id: 'account-1' },
+      proposal_id: proposalId,
+      proposal_terms_digest: proposal.terms_digest,
+    };
+
+    await assert.rejects(established.acceptProposal(acceptance), /transport outcome remains unknown/);
+    const reservation = established.proposalSnapshotStore.proposalAcceptances.get(proposalId).reservation;
+    const expiryTimer = established.acceptanceRetryExpiryTimers.get(reservation);
+    clearTimeout(expiryTimer);
+    established.acceptanceRetryExpiryTimers.delete(reservation);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await assert.rejects(
+      established.acceptProposal(acceptance),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_retry_window'
+    );
+    await assert.rejects(
+      compact.declineProposals({
+        idempotency_key: 'expired-uncertain-decline-0001',
+        declines: [{ proposal_id: proposalId, reason: 'other' }],
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_commit_uncertain'
+    );
+    assert.equal(declineDispatches, 0);
+    compact.dispose();
+    established.dispose();
+  });
+
+  test('transport ambiguity without replay support permanently fences competing proposal mutations', async () => {
+    const proposalId = 'no-replay-commit-uncertain-proposal';
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+      total_budget: { amount: 1000, currency: 'USD' },
+    };
+    const proposal = {
+      proposal_id: proposalId,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: commercialTerms,
+      terms_digest: proposalTermsDigest(commercialTerms),
+    };
+    const caps = capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] });
+    delete caps.idempotency;
+    const agent = clientWithCaps(caps);
+    agent.requestProposals = async () => completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+    agent.createMediaBuy = async () => {
+      throw new Error('unknown create outcome without replay support');
+    };
+    let competingDispatches = 0;
+    agent.declineProposals =
+      agent.refineProposals =
+      agent.acceptProposal =
+        async () => {
+          competingDispatches += 1;
+          return completed('unexpected_competing_mutation', {});
+        };
+
+    const principalScope = 'buyer-no-replay-commit-uncertain';
+    const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+    const established = await agent.negotiateMediaBuyLifecycle({
+      principalScope,
+      preferredLifecycle: 'established',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    seedProposalSnapshot(compact, proposal);
+    await assert.rejects(
+      established.acceptProposal({
+        idempotency_key: 'no-replay-uncertain-accept-0001',
+        account: { account_id: 'account-1' },
+        proposal_id: proposalId,
+        proposal_terms_digest: proposal.terms_digest,
+      }),
+      /unknown create outcome without replay support/
+    );
+
+    const assertCommitUncertain = promise =>
+      assert.rejects(
+        promise,
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError &&
+          error.feature === 'proposal_acceptance_commit_uncertain'
+      );
+    await assertCommitUncertain(
+      compact.declineProposals({
+        idempotency_key: 'no-replay-uncertain-decline-0001',
+        declines: [{ proposal_id: proposalId, reason: 'other' }],
+      })
+    );
+    await assertCommitUncertain(
+      compact.refineProposals({
+        idempotency_key: 'no-replay-uncertain-refine-0001',
+        refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Do not dispatch' }],
+      })
+    );
+    await assertCommitUncertain(
+      compact.acceptProposal({
+        idempotency_key: 'no-replay-uncertain-compact-accept-0001',
+        account: { account_id: 'account-1' },
+        proposal_id: proposalId,
+        proposal_terms_digest: proposal.terms_digest,
+      })
+    );
+    assert.equal(competingDispatches, 0);
+    compact.dispose();
+    established.dispose();
+  });
+
+  test('disposing an exactly retryable transport ambiguity preserves the fence for a fresh coordinator', async () => {
+    const proposalId = 'retryable-transport-dispose-proposal';
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+      total_budget: { amount: 1000, currency: 'USD' },
+    };
+    const proposal = {
+      proposal_id: proposalId,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: commercialTerms,
+      terms_digest: proposalTermsDigest(commercialTerms),
+    };
+    const agent = clientWithCaps(
+      capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+    );
+    agent.requestProposals = async () => completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+    let acceptanceDispatches = 0;
+    agent.createMediaBuy = async () => {
+      acceptanceDispatches += 1;
+      if (acceptanceDispatches === 1) throw new Error('retryable transport outcome unknown');
+      return completed('create_media_buy', { media_buy_id: 'retryable-dispose-reconciled', revision: 1 });
+    };
+    let competingDispatches = 0;
+    agent.declineProposals =
+      agent.refineProposals =
+      agent.acceptProposal =
+        async () => {
+          competingDispatches += 1;
+          return completed('unexpected_competing_mutation', {});
+        };
+
+    const principalScope = 'buyer-retryable-transport-dispose';
+    const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+    const established = await agent.negotiateMediaBuyLifecycle({
+      principalScope,
+      preferredLifecycle: 'established',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    seedProposalSnapshot(compact, proposal);
+    await assert.rejects(
+      established.acceptProposal({
+        idempotency_key: 'retryable-dispose-accept-0001',
+        account: { account_id: 'account-1' },
+        proposal_id: proposalId,
+        proposal_terms_digest: proposal.terms_digest,
+      }),
+      /retryable transport outcome unknown/
+    );
+    compact.dispose();
+    established.dispose();
+
+    const fresh = await agent.negotiateMediaBuyLifecycle({ principalScope });
+    const assertCommitUncertain = promise =>
+      assert.rejects(
+        promise,
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError &&
+          error.feature === 'proposal_acceptance_commit_uncertain'
+      );
+    await assertCommitUncertain(
+      fresh.declineProposals({
+        idempotency_key: 'retryable-dispose-decline-0001',
+        declines: [{ proposal_id: proposalId, reason: 'other' }],
+      })
+    );
+    await assertCommitUncertain(
+      fresh.refineProposals({
+        idempotency_key: 'retryable-dispose-refine-0001',
+        refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Do not dispatch' }],
+      })
+    );
+    await assertCommitUncertain(
+      fresh.acceptProposal({
+        idempotency_key: 'retryable-dispose-compact-accept-0001',
+        account: { account_id: 'account-1' },
+        proposal_id: proposalId,
+        proposal_terms_digest: proposal.terms_digest,
+      })
+    );
+    assert.equal(competingDispatches, 0);
+    const retry = await agent.negotiateMediaBuyLifecycle({
+      principalScope,
+      preferredLifecycle: 'established',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    assert.equal(
+      (
+        await retry.acceptProposal({
+          idempotency_key: 'retryable-dispose-accept-0001',
+          account: { account_id: 'account-1' },
+          proposal_id: proposalId,
+          proposal_terms_digest: proposal.terms_digest,
+        })
+      ).success,
+      true
+    );
+    assert.equal(acceptanceDispatches, 2);
+    fresh.dispose();
+    retry.dispose();
+  });
+
+  for (const retirement of ['no-replay', 'replay-expiry', 'dispose']) {
+    test(`paused acceptance ${retirement} permits terminal decline but fences compact accept and refine`, async () => {
+      const proposalId = `paused-terminal-${retirement}-proposal`;
+      const commercialTerms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+        total_budget: { amount: 1000, currency: 'USD' },
+      };
+      const proposal = {
+        proposal_id: proposalId,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        commercial_terms: commercialTerms,
+        terms_digest: proposalTermsDigest(commercialTerms),
+      };
+      const caps = capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] });
+      if (retirement === 'no-replay') delete caps.idempotency;
+      const agent = clientWithCaps(caps);
+      agent.requestProposals = async () =>
+        completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+      agent.createMediaBuy = async () => ({ ...working('create_media_buy'), status: 'input-required' });
+      let compactAcceptDispatches = 0;
+      let refineDispatches = 0;
+      let declineDispatches = 0;
+      agent.acceptProposal = async () => {
+        compactAcceptDispatches += 1;
+        return completed('accept_proposal', { proposal_id: proposalId, outcome: 'accepted' });
+      };
+      agent.refineProposals = async () => {
+        refineDispatches += 1;
+        return completed('refine_proposals', { outcome: 'refined', proposals: [] });
+      };
+      agent.declineProposals = async () => {
+        declineDispatches += 1;
+        return completed('decline_proposals', {
+          results: [{ proposal_id: proposalId, outcome: 'declined' }],
+        });
+      };
+
+      const principalScope = `buyer-paused-terminal-${retirement}`;
+      const discovery = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      const established = await agent.negotiateMediaBuyLifecycle({
+        principalScope,
+        preferredLifecycle: 'established',
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      });
+      if (retirement === 'replay-expiry') established.idempotencyReplayTtlMs = 10;
+      seedProposalSnapshot(discovery, proposal);
+      assert.equal(
+        (
+          await established.acceptProposal({
+            idempotency_key: `paused-terminal-${retirement}-accept-0001`,
+            account: { account_id: 'account-1' },
+            proposal_id: proposalId,
+            proposal_terms_digest: proposal.terms_digest,
+          })
+        ).status,
+        'input-required'
+      );
+
+      if (retirement === 'replay-expiry') {
+        await new Promise(resolve => setTimeout(resolve, 30));
+      } else if (retirement === 'dispose') {
+        established.dispose();
+      }
+      discovery.dispose();
+
+      const fresh = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      const assertTerminal = promise =>
+        assert.rejects(
+          promise,
+          error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_terminal'
+        );
+      await assertTerminal(
+        fresh.refineProposals({
+          idempotency_key: `paused-terminal-${retirement}-refine-0001`,
+          refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Do not dispatch' }],
+        })
+      );
+      await assertTerminal(
+        fresh.acceptProposal({
+          idempotency_key: `paused-terminal-${retirement}-compact-accept-0001`,
+          account: { account_id: 'account-1' },
+          proposal_id: proposalId,
+          proposal_terms_digest: proposal.terms_digest,
+        })
+      );
+      assert.equal(
+        (
+          await fresh.declineProposals({
+            idempotency_key: `paused-terminal-${retirement}-decline-0001`,
+            declines: [{ proposal_id: proposalId, reason: 'other' }],
+          })
+        ).success,
+        true
+      );
+      assert.equal(refineDispatches, 0);
+      assert.equal(compactAcceptDispatches, 0);
+      assert.equal(declineDispatches, 1);
+      fresh.dispose();
+      established.dispose();
+    });
+  }
+
+  for (const retirement of ['watcher-expiry', 'dispose']) {
+    test(`unresolved working acceptance ${retirement} preserves a cross-lifecycle commit-uncertain fence`, async () => {
+      const proposalId = `working-acceptance-${retirement}-proposal`;
+      const commercialTerms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+        total_budget: { amount: 1000, currency: 'USD' },
+      };
+      const proposal = {
+        proposal_id: proposalId,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        commercial_terms: commercialTerms,
+        terms_digest: proposalTermsDigest(commercialTerms),
+      };
+      const agent = clientWithCaps(
+        capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+      );
+      agent.requestProposals = async () =>
+        completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+      let acceptanceDispatches = 0;
+      agent.createMediaBuy = async () => {
+        acceptanceDispatches += 1;
+        return acceptanceDispatches === 1
+          ? working('create_media_buy')
+          : completed('create_media_buy', { media_buy_id: `mb-working-${retirement}-retry` });
+      };
+      let competingDispatches = 0;
+      agent.declineProposals =
+        agent.refineProposals =
+        agent.acceptProposal =
+          async () => {
+            competingDispatches += 1;
+            return completed('unexpected_competing_mutation', {});
+          };
+
+      const principalScope = `buyer-working-acceptance-${retirement}`;
+      const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      const established = await agent.negotiateMediaBuyLifecycle({
+        principalScope,
+        preferredLifecycle: 'established',
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      });
+      const coordinatorClass = established.constructor;
+      const originalTtl = coordinatorClass.PROPOSAL_TASK_WATCH_TTL_MS;
+      if (retirement === 'watcher-expiry') coordinatorClass.PROPOSAL_TASK_WATCH_TTL_MS = 10;
+
+      try {
+        seedProposalSnapshot(compact, proposal);
+        assert.equal(
+          (
+            await established.acceptProposal({
+              idempotency_key: `working-${retirement}-accept-0001`,
+              account: { account_id: 'account-1' },
+              proposal_id: proposalId,
+              proposal_terms_digest: proposal.terms_digest,
+            })
+          ).status,
+          'working'
+        );
+        const firstReservation = established.proposalSnapshotStore.proposalAcceptances.get(proposalId).reservation;
+        const replayDeadline = firstReservation.retryDeadlineMs;
+        assert.equal(Object.getOwnPropertyDescriptor(firstReservation, 'retryDeadlineMs').writable, false);
+        assert.equal(Reflect.set(firstReservation, 'retryDeadlineMs', replayDeadline + 60_000), false);
+        if (retirement === 'watcher-expiry') {
+          await new Promise(resolve => setTimeout(resolve, 30));
+        } else {
+          established.dispose();
+        }
+
+        const assertCommitUncertain = promise =>
+          assert.rejects(
+            promise,
+            error =>
+              error instanceof MediaBuyLifecycleCompatibilityError &&
+              error.feature === 'proposal_acceptance_commit_uncertain'
+          );
+        await assertCommitUncertain(
+          compact.declineProposals({
+            idempotency_key: `working-${retirement}-decline-0001`,
+            declines: [{ proposal_id: proposalId, reason: 'other' }],
+          })
+        );
+        await assertCommitUncertain(
+          compact.refineProposals({
+            idempotency_key: `working-${retirement}-refine-0001`,
+            refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Do not dispatch' }],
+          })
+        );
+        await assertCommitUncertain(
+          compact.acceptProposal({
+            idempotency_key: `working-${retirement}-compact-accept-0001`,
+            account: { account_id: 'account-1' },
+            proposal_id: proposalId,
+            proposal_terms_digest: proposal.terms_digest,
+          })
+        );
+        assert.equal(competingDispatches, 0);
+        const retry = await agent.negotiateMediaBuyLifecycle({
+          principalScope,
+          preferredLifecycle: 'established',
+          allowedLosses: ['proposal_terms_digest_not_enforced'],
+        });
+        assert.equal(
+          (
+            await retry.acceptProposal({
+              idempotency_key: `working-${retirement}-accept-0001`,
+              account: { account_id: 'account-1' },
+              proposal_id: proposalId,
+              proposal_terms_digest: proposal.terms_digest,
+            })
+          ).status,
+          'completed'
+        );
+        assert.equal(acceptanceDispatches, 2);
+        retry.dispose();
+      } finally {
+        coordinatorClass.PROPOSAL_TASK_WATCH_TTL_MS = originalTtl;
+        compact.dispose();
+        established.dispose();
+      }
+    });
+  }
+
+  test('submitted refine completions enforce request semantics before caching executable proposals', async () => {
+    const sourceProposalId = 'async-refine-source';
+    const childProposalId = 'async-refine-invalid-finalized-child';
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+      purchases: [
+        {
+          product_id: 'product-1',
+          pricing_option_id: 'pricing-1',
+          start_time: '2027-01-01T00:00:00Z',
+          end_time: '2027-02-01T00:00:00Z',
+          budget: 1000,
+          pricing: {
+            pricing_option_id: 'pricing-1',
+            pricing_model: 'cpm',
+            currency: 'USD',
+            fixed_price: 5,
+          },
+        },
+      ],
+    };
+    const sourceProposal = {
+      proposal_id: sourceProposalId,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'draft',
+      name: 'Source proposal',
+      commercial_terms: commercialTerms,
+      terms_digest: proposalTermsDigest(commercialTerms),
+    };
+    const invalidFinalizedChild = {
+      ...sourceProposal,
+      proposal_id: childProposalId,
+      parent_proposal_id: sourceProposalId,
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      name: 'Invalid finalize response to revise',
+    };
+    const agent = clientWithCaps(
+      capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+    );
+    agent.requestProposals = async () =>
+      completed('request_proposals', { outcome: 'proposed', proposals: [sourceProposal] });
+    agent.refineProposals = async () =>
+      submitted(
+        'refine_proposals',
+        completed('refine_proposals', {
+          products: [],
+          results: [
+            {
+              source_proposal_id: sourceProposalId,
+              outcome: 'finalized',
+              proposal: invalidFinalizedChild,
+            },
+          ],
+        })
+      );
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', { media_buy_id: 'must-not-be-created', revision: 1 });
+    };
+    const principalScope = 'buyer-async-refine-semantic-gate';
+    const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+    seedProposalSnapshot(compact, sourceProposal);
+    const pending = await compact.refineProposals({
+      idempotency_key: 'async-refine-semantic-refine-0001',
+      refinements: [{ proposal_id: sourceProposalId, action: 'revise', ask: 'Change the plan' }],
+    });
+    await assert.rejects(pending.submitted.waitForCompletion(), /revise must not return finalized/);
+
+    const established = await agent.negotiateMediaBuyLifecycle({
+      principalScope,
+      preferredLifecycle: 'established',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    await assert.rejects(
+      established.acceptProposal({
+        idempotency_key: 'async-refine-semantic-accept-0001',
+        account: { account_id: 'account-1' },
+        proposal_id: childProposalId,
+        proposal_terms_digest: invalidFinalizedChild.terms_digest,
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    await assert.rejects(
+      established.acceptProposal({
+        idempotency_key: 'async-refine-semantic-source-accept-0001',
+        account: { account_id: 'account-1' },
+        proposal_id: sourceProposalId,
+        proposal_terms_digest: sourceProposal.terms_digest,
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_refinement_pending'
+    );
+    assert.equal(mutations, 0);
+    compact.dispose();
+    established.dispose();
+  });
+
+  for (const completionMode of ['immediate', 'submitted']) {
+    test(`an unable compact refinement preserves the immutable source proposal after ${completionMode} completion`, async () => {
+      const proposalId = 'unable-refine-source-remains-executable';
+      const commercialTerms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+        total_budget: { amount: 1000, currency: 'USD' },
+      };
+      const proposal = {
+        proposal_id: proposalId,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        commercial_terms: commercialTerms,
+        terms_digest: proposalTermsDigest(commercialTerms),
+      };
+      const agent = clientWithCaps(
+        capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+      );
+      agent.requestProposals = async () =>
+        completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+      agent.refineProposals = async () => {
+        const terminal = completed('refine_proposals', {
+          products: [],
+          results: [
+            {
+              source_proposal_id: proposalId,
+              outcome: 'unable',
+              reason_code: 'commercially_declined',
+              reason: 'The requested change is unavailable.',
+            },
+          ],
+        });
+        return completionMode === 'submitted' ? submitted('refine_proposals', terminal) : terminal;
+      };
+      let mutations = 0;
+      agent.createMediaBuy = async () => {
+        mutations += 1;
+        return completed('create_media_buy', { media_buy_id: 'source-proposal-buy', revision: 1 });
+      };
+      const principalScope = `buyer-unable-refine-source-${completionMode}`;
+      const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      seedProposalSnapshot(compact, proposal);
+      const refinement = await compact.refineProposals({
+        idempotency_key: `unable-refine-source-refine-${completionMode}-0001`,
+        refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Unavailable change' }],
+      });
+      if (refinement.submitted) await refinement.submitted.waitForCompletion();
+
+      const established = await agent.negotiateMediaBuyLifecycle({
+        principalScope,
+        preferredLifecycle: 'established',
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      });
+      const accepted = await established.acceptProposal({
+        idempotency_key: `unable-refine-source-accept-${completionMode}-0001`,
+        account: { account_id: 'account-1' },
+        proposal_id: proposalId,
+        proposal_terms_digest: proposal.terms_digest,
+      });
+      assert.equal(accepted.success, true);
+      assert.equal(mutations, 1);
+      compact.dispose();
+      established.dispose();
+    });
+  }
+
+  for (const path of ['immediate', 'tracked', 'polled', 'task-update']) {
+    for (const terminalStatus of ['failed', 'governance-denied']) {
+      test(`${path} authoritative ${terminalStatus} refinement restores the still-valid source proposal`, async () => {
+        const proposalId = `authoritative-refine-${path}-${terminalStatus}`;
+        const commercialTerms = {
+          brand: { domain: 'example.com' },
+          start_time: '2027-01-01T00:00:00Z',
+          end_time: '2027-02-01T00:00:00Z',
+          total_budget: { amount: 1000, currency: 'USD' },
+        };
+        const proposal = {
+          proposal_id: proposalId,
+          proposal_kind: 'new_media_buy',
+          proposal_status: 'committed',
+          expires_at: '2099-12-31T23:59:59Z',
+          commercial_terms: commercialTerms,
+          terms_digest: proposalTermsDigest(commercialTerms),
+        };
+        const listeners = new Set();
+        const agent = clientWithCaps(
+          capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+        );
+        agent.onTaskUpdate = listener => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        };
+        const terminal = {
+          ...failed('refine_proposals'),
+          status: terminalStatus,
+          data: { proposal_id: proposalId },
+          metadata: { ...failed('refine_proposals').metadata, status: terminalStatus },
+        };
+        agent.refineProposals = async () => {
+          if (path === 'immediate') return terminal;
+          if (path === 'task-update') return working('refine_proposals');
+          return submitted('refine_proposals', terminal);
+        };
+        let mutations = 0;
+        agent.createMediaBuy = async () => {
+          mutations += 1;
+          return completed('create_media_buy', { media_buy_id: `accepted-after-${terminalStatus}` });
+        };
+        const principalScope = `authoritative-refine-${path}-${terminalStatus}`;
+        const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+        seedProposalSnapshot(compact, proposal);
+        const refinement = await compact.refineProposals({
+          idempotency_key: `authoritative-${path}-${terminalStatus}-refine-0001`,
+          refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Change the plan' }],
+        });
+        if (path === 'tracked') await refinement.submitted.track();
+        if (path === 'polled') await refinement.submitted.waitForCompletion();
+        if (path === 'task-update') {
+          for (const listener of [...listeners]) {
+            listener({
+              taskId: 'refine_proposals-task',
+              taskType: 'refine_proposals',
+              status: terminalStatus,
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+              result: { proposal_id: proposalId },
+            });
+          }
+        }
+
+        const established = await agent.negotiateMediaBuyLifecycle({
+          principalScope,
+          preferredLifecycle: 'established',
+          allowedLosses: ['proposal_terms_digest_not_enforced'],
+        });
+        const accepted = await established.acceptProposal({
+          idempotency_key: `authoritative-${path}-${terminalStatus}-accept-0001`,
+          account: { account_id: 'account-1' },
+          proposal_id: proposalId,
+          proposal_terms_digest: proposal.terms_digest,
+        });
+        assert.equal(accepted.success, true);
+        assert.equal(mutations, 1);
+        compact.dispose();
+        established.dispose();
+      });
+    }
+  }
+
+  test('an uncorrelated failed refinement continuation remains fail-closed', async () => {
+    const proposalId = 'unknown-failed-refinement-proposal';
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+      total_budget: { amount: 1000, currency: 'USD' },
+    };
+    const proposal = {
+      proposal_id: proposalId,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: commercialTerms,
+      terms_digest: proposalTermsDigest(commercialTerms),
+    };
+    const agent = clientWithCaps(
+      capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+    );
+    agent.refineProposals = async () => failed('unknown');
+    let acceptDispatches = 0;
+    agent.createMediaBuy = async () => {
+      acceptDispatches += 1;
+      return completed('create_media_buy', { media_buy_id: 'must-not-dispatch' });
+    };
+    const principalScope = 'unknown-failed-refinement';
+    const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+    seedProposalSnapshot(compact, proposal);
+    assert.equal(
+      (
+        await compact.refineProposals({
+          idempotency_key: 'unknown-failed-refinement-key-0001',
+          refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Ambiguous local failure' }],
+        })
+      ).status,
+      'failed'
+    );
+    const established = await agent.negotiateMediaBuyLifecycle({
+      principalScope,
+      preferredLifecycle: 'established',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    await assert.rejects(
+      established.acceptProposal({
+        idempotency_key: 'unknown-failed-refinement-accept-0001',
+        account: { account_id: 'account-1' },
+        proposal_id: proposalId,
+        proposal_terms_digest: proposal.terms_digest,
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_refinement_pending'
+    );
+    assert.equal(acceptDispatches, 0);
+    compact.dispose();
+    established.dispose();
+  });
+
+  for (const scenario of ['in-flight', 'initial-transport-throw', 'continuation-throw']) {
+    test(`shared refinement fencing prevents established acceptance during ${scenario}`, async () => {
+      const proposalId = `refinement-fence-${scenario}`;
+      const commercialTerms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+        total_budget: { amount: 1000, currency: 'USD' },
+      };
+      const proposal = {
+        proposal_id: proposalId,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        commercial_terms: commercialTerms,
+        terms_digest: proposalTermsDigest(commercialTerms),
+      };
+      const agent = clientWithCaps(
+        capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+      );
+      agent.requestProposals = async () =>
+        completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+      agent.refineProposals = async () => {
+        if (scenario === 'initial-transport-throw') throw new Error('ambiguous refine transport failure');
+        if (scenario === 'in-flight') return working('refine_proposals');
+        const pending = submitted(
+          'refine_proposals',
+          completed('refine_proposals', {
+            products: [],
+            results: [
+              {
+                source_proposal_id: proposalId,
+                outcome: 'unable',
+                reason_code: 'commercially_declined',
+                reason: 'Would have preserved the source if delivery were trustworthy.',
+              },
+            ],
+          })
+        );
+        pending.submitted.waitForCompletion = async () => {
+          throw new Error('ambiguous refine continuation failure');
+        };
+        return pending;
+      };
+      let mutations = 0;
+      agent.createMediaBuy = async () => {
+        mutations += 1;
+        return completed('create_media_buy', { media_buy_id: 'must-not-be-created', revision: 1 });
+      };
+      const principalScope = `buyer-refinement-fence-${scenario}`;
+      const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      const established = await agent.negotiateMediaBuyLifecycle({
+        principalScope,
+        preferredLifecycle: 'established',
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      });
+      seedProposalSnapshot(compact, proposal);
+      const refine = () =>
+        compact.refineProposals({
+          idempotency_key: `refinement-fence-refine-${scenario}-0001`,
+          refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Ambiguous change' }],
+        });
+      if (scenario === 'initial-transport-throw') {
+        await assert.rejects(refine(), /ambiguous refine transport failure/);
+      } else {
+        const result = await refine();
+        if (scenario === 'continuation-throw') {
+          await assert.rejects(result.submitted.waitForCompletion(), /ambiguous refine continuation failure/);
+        }
+      }
+
+      await assert.rejects(
+        established.acceptProposal({
+          idempotency_key: `refinement-fence-accept-${scenario}-0001`,
+          account: { account_id: 'account-1' },
+          proposal_id: proposalId,
+          proposal_terms_digest: proposal.terms_digest,
+        }),
+        error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_refinement_pending'
+      );
+      assert.equal(mutations, 0);
+      compact.dispose();
+      established.dispose();
+    });
+  }
+
+  test('native compact acceptance owns the shared fence and retires the proposal on success', async () => {
+    const proposalId = 'native-acceptance-shared-fence-proposal';
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products'] }));
+    let finishAcceptance;
+    let acceptanceDispatches = 0;
+    let competingDispatches = 0;
+    agent.acceptProposal = async () => {
+      acceptanceDispatches += 1;
+      return new Promise(resolve => {
+        finishAcceptance = () =>
+          resolve(completed('accept_proposal', { proposal_id: proposalId, outcome: 'accepted', media_buy_id: 'mb-1' }));
+      });
+    };
+    agent.declineProposals = agent.refineProposals = async () => {
+      competingDispatches += 1;
+      return completed('unexpected_competing_mutation', {});
+    };
+    agent.getProducts = async () => {
+      competingDispatches += 1;
+      return completed('get_products', { products: [] });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'native-acceptance-shared-fence' });
+    const acceptance = coordinator.acceptProposal({
+      idempotency_key: 'native-acceptance-shared-fence-key-0001',
+      account: { account_id: 'account-1' },
+      proposal_id: proposalId,
+      proposal_terms_digest: proposalTermsDigest({}),
+    });
+    await new Promise(resolve => setImmediate(resolve));
+
+    for (const mutation of [
+      () =>
+        coordinator.declineProposals({
+          idempotency_key: 'native-acceptance-fenced-decline-0001',
+          declines: [{ proposal_id: proposalId, reason: 'other' }],
+        }),
+      () =>
+        coordinator.refineProposals({
+          idempotency_key: 'native-acceptance-fenced-refine-0001',
+          refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Do not race acceptance' }],
+        }),
+    ]) {
+      await assert.rejects(
+        mutation(),
+        error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_pending'
+      );
+    }
+    finishAcceptance();
+    assert.equal((await acceptance).status, 'completed');
+
+    await assert.rejects(
+      coordinator.declineProposals({
+        idempotency_key: 'native-acceptance-terminal-decline-0001',
+        declines: [{ proposal_id: proposalId, reason: 'other' }],
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_terminal'
+    );
+    await assert.rejects(
+      coordinator.refineProposals({
+        idempotency_key: 'native-acceptance-terminal-refine-0001',
+        refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Already accepted' }],
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_terminal'
+    );
+    const established = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'native-acceptance-shared-fence',
+      preferredLifecycle: 'established',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    await assert.rejects(
+      established.refineProposals({
+        idempotency_key: 'native-acceptance-established-refine-0001',
+        refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Already accepted' }],
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_terminal'
+    );
+    assert.equal(acceptanceDispatches, 1);
+    assert.equal(competingDispatches, 0);
+    coordinator.dispose();
+    established.dispose();
+  });
+
+  test('a deferred native acceptance continuation cannot dispatch after an exact retry', async () => {
+    const proposalId = 'native-acceptance-deferred-epoch-proposal';
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    let dispatches = 0;
+    let continuationDispatches = 0;
+    agent.acceptProposal = async () => {
+      dispatches += 1;
+      if (dispatches > 1) {
+        return completed('accept_proposal', { proposal_id: proposalId, outcome: 'accepted', media_buy_id: 'mb-2' });
+      }
+      return deferred('accept_proposal', async () => {
+        continuationDispatches += 1;
+        return completed('accept_proposal', { proposal_id: proposalId, outcome: 'accepted', media_buy_id: 'mb-2' });
+      });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'native-acceptance-deferred-epoch' });
+    const request = {
+      idempotency_key: 'native-acceptance-deferred-key-0001',
+      account: { account_id: 'account-1' },
+      proposal_id: proposalId,
+      proposal_terms_digest: proposalTermsDigest({}),
+    };
+    const first = await coordinator.acceptProposal(request);
+    assert.equal(first.status, 'deferred');
+    const reservation = coordinator.proposalSnapshotStore.proposalAcceptances.get(proposalId).reservation;
+    const replayDeadline = reservation.retryDeadlineMs;
+    assert.equal(Object.getOwnPropertyDescriptor(reservation, 'retryDeadlineMs').writable, false);
+    assert.equal(Reflect.set(reservation, 'retryDeadlineMs', replayDeadline + 60_000), false);
+    assert.equal((await coordinator.acceptProposal(request)).status, 'completed');
+    await assert.rejects(
+      first.deferred.resume({ approved: true }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError &&
+        error.feature === 'proposal_acceptance_continuation_stale'
+    );
+    assert.equal(dispatches, 2);
+    assert.equal(continuationDispatches, 0);
+    coordinator.dispose();
+  });
+
+  test('a deferred acceptance continuation waits for an unresolved decline and resumes after unable', async () => {
+    const proposalId = 'native-acceptance-deferred-decline-proposal';
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    let continuationDispatches = 0;
+    agent.acceptProposal = async () =>
+      deferred('accept_proposal', async () => {
+        continuationDispatches += 1;
+        return completed('accept_proposal', {
+          proposal_id: proposalId,
+          outcome: 'accepted',
+          media_buy_id: 'mb-after-unable-decline',
+        });
+      });
+    agent.declineProposals = async () =>
+      submitted(
+        'decline_proposals',
+        completed('decline_proposals', {
+          results: [{ proposal_id: proposalId, outcome: 'unable', reason: 'Seller could not decline.' }],
+        })
+      );
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'native-acceptance-deferred-decline',
+    });
+    const acceptance = await coordinator.acceptProposal({
+      idempotency_key: 'native-acceptance-deferred-decline-accept-0001',
+      account: { account_id: 'account-1' },
+      proposal_id: proposalId,
+      proposal_terms_digest: proposalTermsDigest({}),
+    });
+    const decline = await coordinator.declineProposals({
+      idempotency_key: 'native-acceptance-deferred-decline-0001',
+      declines: [{ proposal_id: proposalId, reason: 'other' }],
+    });
+
+    await assert.rejects(
+      acceptance.deferred.resume({ approved: true }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_decline_pending'
+    );
+    assert.equal(continuationDispatches, 0);
+    assert.equal((await decline.submitted.waitForCompletion()).status, 'completed');
+    assert.equal((await acceptance.deferred.resume({ approved: true })).status, 'completed');
+    assert.equal(continuationDispatches, 1);
+    coordinator.dispose();
+  });
+
+  for (const eventTiming of ['raced', 'watched']) {
+    test(`${eventTiming} event-only unable decline releases its shared fence without retiring the source`, async () => {
+      const proposalId = `event-only-unable-decline-source-${eventTiming}`;
+      const commercialTerms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+        total_budget: { amount: 1000, currency: 'USD' },
+      };
+      const proposal = {
+        proposal_id: proposalId,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        commercial_terms: commercialTerms,
+        terms_digest: proposalTermsDigest(commercialTerms),
+      };
+      const agent = clientWithCaps(
+        capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+      );
+      const taskListeners = new Set();
+      agent.onTaskUpdate = listener => {
+        taskListeners.add(listener);
+        return () => taskListeners.delete(listener);
+      };
+      agent.requestProposals = async () =>
+        completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+      const unableUpdate = {
+        taskId: 'decline_proposals-task',
+        status: 'completed',
+        taskType: 'decline_proposals',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        result: {
+          results: [{ proposal_id: proposalId, outcome: 'unable', reason: 'The proposal remains available.' }],
+        },
+      };
+      agent.declineProposals = async () => {
+        if (eventTiming === 'raced') {
+          for (const listener of [...taskListeners]) listener(unableUpdate);
+        }
+        return working('decline_proposals');
+      };
+      let mutations = 0;
+      agent.createMediaBuy = async () => {
+        mutations += 1;
+        return completed('create_media_buy', { media_buy_id: 'accepted-after-event-unable', revision: 1 });
+      };
+      const principalScope = `buyer-event-only-unable-decline-${eventTiming}`;
+      const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      const established = await agent.negotiateMediaBuyLifecycle({
+        principalScope,
+        preferredLifecycle: 'established',
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      });
+      seedProposalSnapshot(compact, proposal);
+      await compact.declineProposals({
+        idempotency_key: `event-only-unable-decline-decline-${eventTiming}-0001`,
+        declines: [{ proposal_id: proposalId, reason: 'other' }],
+      });
+      assert.equal(taskListeners.size, eventTiming === 'watched' ? 1 : 0);
+      if (eventTiming === 'watched') {
+        for (const listener of [...taskListeners]) listener(unableUpdate);
+      }
+      assert.equal(taskListeners.size, 0);
+      const accepted = await established.acceptProposal({
+        idempotency_key: `event-only-unable-decline-accept-${eventTiming}-0001`,
+        account: { account_id: 'account-1' },
+        proposal_id: proposalId,
+        proposal_terms_digest: proposal.terms_digest,
+      });
+      assert.equal(accepted.success, true);
+      assert.equal(mutations, 1);
+      compact.dispose();
+      established.dispose();
+    });
+  }
+
+  for (const operation of ['refinement', 'decline']) {
+    test(`an unrelated terminal task cannot release an in-flight ${operation} fence`, async () => {
+      const proposalId = `uncorrelated-${operation}-source`;
+      const commercialTerms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+        total_budget: { amount: 1000, currency: 'USD' },
+      };
+      const proposal = {
+        proposal_id: proposalId,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        commercial_terms: commercialTerms,
+        terms_digest: proposalTermsDigest(commercialTerms),
+      };
+      const agent = clientWithCaps(
+        capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+      );
+      const taskListeners = new Set();
+      agent.onTaskUpdate = listener => {
+        taskListeners.add(listener);
+        return () => taskListeners.delete(listener);
+      };
+      agent.requestProposals = async () =>
+        completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+      let resolveDispatch;
+      const heldDispatch = () =>
+        new Promise(resolve => {
+          resolveDispatch = resolve;
+        });
+      if (operation === 'refinement') agent.refineProposals = heldDispatch;
+      else agent.declineProposals = heldDispatch;
+      let mutations = 0;
+      agent.createMediaBuy = async () => {
+        mutations += 1;
+        return completed('create_media_buy', { media_buy_id: 'must-not-be-created', revision: 1 });
+      };
+      const principalScope = `buyer-uncorrelated-${operation}`;
+      const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      const established = await agent.negotiateMediaBuyLifecycle({
+        principalScope,
+        preferredLifecycle: 'established',
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      });
+      seedProposalSnapshot(compact, proposal);
+      const pending =
+        operation === 'refinement'
+          ? compact.refineProposals({
+              idempotency_key: 'uncorrelated-refinement-0001',
+              refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Held change' }],
+            })
+          : compact.declineProposals({
+              idempotency_key: 'uncorrelated-decline-0001',
+              declines: [{ proposal_id: proposalId, reason: 'other' }],
+            });
+      assert.equal(taskListeners.size, 1);
+      const taskType = operation === 'refinement' ? 'refine_proposals' : 'decline_proposals';
+      for (const listener of [...taskListeners]) {
+        listener({
+          taskId: `unrelated-${taskType}-task`,
+          status: 'completed',
+          taskType,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result:
+            operation === 'refinement'
+              ? {
+                  products: [],
+                  results: [
+                    {
+                      source_proposal_id: proposalId,
+                      outcome: 'unable',
+                      reason_code: 'commercially_declined',
+                      reason: 'Unrelated task result',
+                    },
+                  ],
+                }
+              : { results: [{ outcome: 'unable', reason: 'Unrelated task result' }] },
+        });
+      }
+      await assert.rejects(
+        established.acceptProposal({
+          idempotency_key: `uncorrelated-${operation}-accept-0001`,
+          account: { account_id: 'account-1' },
+          proposal_id: proposalId,
+          proposal_terms_digest: proposal.terms_digest,
+        }),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError &&
+          error.feature === (operation === 'refinement' ? 'proposal_refinement_pending' : 'proposal_decline_pending')
+      );
+      resolveDispatch(working(taskType));
+      const result = await pending;
+      assert.equal(result.status, 'working');
+      assert.equal(mutations, 0);
+      compact.dispose();
+      established.dispose();
+    });
+  }
+
+  test('ambiguous and paused declines cannot fail open into established acceptance', async () => {
+    for (const scenario of [
+      { name: 'transport rejection', result: 'throw', feature: 'proposal_decline_pending' },
+      { name: 'input-required pause', result: 'pause', feature: 'proposal_decline_pending' },
+      { name: 'malformed async completion', result: 'malformed', feature: 'proposal_decline_pending' },
+    ]) {
+      const proposalId = `decline-fail-closed-${scenario.result}`;
+      const commercialTerms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+        total_budget: { amount: 1000, currency: 'USD' },
+      };
+      const proposal = {
+        proposal_id: proposalId,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        commercial_terms: commercialTerms,
+        terms_digest: proposalTermsDigest(commercialTerms),
+      };
+      const agent = clientWithCaps(
+        capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_products', 'create_media_buy'] })
+      );
+      agent.requestProposals = async () =>
+        completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+      agent.declineProposals = async () => {
+        if (scenario.result === 'throw') throw new Error('ambiguous transport failure');
+        if (scenario.result === 'malformed') {
+          return submitted('decline_proposals', completed('decline_proposals', { results: [{}] }));
+        }
+        return { ...working('decline_proposals'), status: 'input-required' };
+      };
+      let mutations = 0;
+      agent.createMediaBuy = async () => {
+        mutations += 1;
+        return completed('create_media_buy', { media_buy_id: 'must-not-be-created', revision: 1 });
+      };
+      const principalScope = `buyer-${scenario.result}-decline`;
+      const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      seedProposalSnapshot(compact, proposal);
+      const established = await agent.negotiateMediaBuyLifecycle({
+        principalScope,
+        preferredLifecycle: 'established',
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      });
+      const decline = compact.declineProposals({
+        idempotency_key: `decline-${scenario.result}-mutation-0001`,
+        declines: [{ proposal_id: proposalId, reason: 'other' }],
+      });
+      if (scenario.result === 'throw') await assert.rejects(decline, /ambiguous transport failure/);
+      else if (scenario.result === 'malformed') {
+        const pending = await decline;
+        await assert.rejects(pending.submitted.waitForCompletion(), /malformed compact completion/);
+      } else assert.equal((await decline).status, 'input-required');
+
+      await assert.rejects(
+        established.acceptProposal({
+          idempotency_key: `decline-${scenario.result}-accept-0001`,
+          account: { account_id: 'account-1' },
+          proposal_id: proposalId,
+          proposal_terms_digest: proposal.terms_digest,
+        }),
+        error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === scenario.feature,
+        scenario.name
+      );
+      assert.equal(mutations, 0, scenario.name);
+      compact.dispose();
+      established.dispose();
+    }
+  });
+
+  test('dispose preserves the fence for a decline that was already dispatched', async () => {
+    const proposalId = 'decline-dispose-race-proposal';
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+      total_budget: { amount: 1000, currency: 'USD' },
+    };
+    const proposal = {
+      proposal_id: proposalId,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: commercialTerms,
+      terms_digest: proposalTermsDigest(commercialTerms),
+    };
+    const agent = clientWithCaps(
+      capabilities({
+        tools: COMPACT_TOOLS,
+        discoveredTools: ['get_products', 'create_media_buy'],
+      })
+    );
+    agent.requestProposals = async () => completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+    let resolveDecline;
+    agent.declineProposals = () =>
+      new Promise(resolve => {
+        resolveDecline = resolve;
+      });
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', { media_buy_id: 'must-not-be-created', revision: 1 });
+    };
+    const principalScope = 'buyer-decline-dispose-race';
+    const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+    seedProposalSnapshot(compact, proposal);
+
+    const pendingDecline = compact.declineProposals({
+      idempotency_key: 'decline-dispose-decline-0001',
+      declines: [{ proposal_id: proposalId, reason: 'other' }],
+    });
+    compact.dispose();
+    resolveDecline(completed('decline_proposals', { results: [{ proposal_id: proposalId, outcome: 'declined' }] }));
+    await assert.rejects(
+      pendingDecline,
+      error => error.code === 'CONFIGURATION_ERROR' && error.configField === 'mediaBuy.lifecycleCoordinator'
+    );
+
+    const established = await agent.negotiateMediaBuyLifecycle({
+      principalScope,
+      preferredLifecycle: 'established',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    await assert.rejects(
+      established.acceptProposal({
+        idempotency_key: 'decline-dispose-accept-0001',
+        account: { account_id: 'account-1' },
+        proposal_id: proposalId,
+        proposal_terms_digest: proposal.terms_digest,
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_decline_pending'
+    );
+    assert.equal(mutations, 0);
+    established.dispose();
+  });
+
+  test('dispose preserves the fence for a decline continuation that was already polling', async () => {
+    const proposalId = 'decline-continuation-dispose-race';
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const proposal = {
+      proposal_id: proposalId,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: commercialTerms,
+      terms_digest: proposalTermsDigest(commercialTerms),
+    };
+    const agent = clientWithCaps(
+      capabilities({
+        tools: COMPACT_TOOLS,
+        discoveredTools: ['get_products', 'create_media_buy'],
+      })
+    );
+    agent.requestProposals = async () => completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+    let resolveCompletion;
+    agent.declineProposals = async () => {
+      const result = submitted(
+        'decline_proposals',
+        completed('decline_proposals', { results: [{ proposal_id: proposalId, outcome: 'declined' }] })
+      );
+      result.submitted.waitForCompletion = () =>
+        new Promise(resolve => {
+          resolveCompletion = resolve;
+        });
+      return result;
+    };
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', { media_buy_id: 'must-not-be-created', revision: 1 });
+    };
+    const principalScope = 'buyer-decline-continuation-dispose-race';
+    const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+    seedProposalSnapshot(compact, proposal);
+    const submittedDecline = await compact.declineProposals({
+      idempotency_key: 'decline-continuation-decline-0001',
+      declines: [{ proposal_id: proposalId, reason: 'other' }],
+    });
+    const completion = submittedDecline.submitted.waitForCompletion();
+    compact.dispose();
+    resolveCompletion(completed('decline_proposals', { results: [{ proposal_id: proposalId, outcome: 'declined' }] }));
+    await assert.rejects(
+      completion,
+      error => error.code === 'CONFIGURATION_ERROR' && error.configField === 'mediaBuy.lifecycleCoordinator'
+    );
+
+    const established = await agent.negotiateMediaBuyLifecycle({
+      principalScope,
+      preferredLifecycle: 'established',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    await assert.rejects(
+      established.acceptProposal({
+        idempotency_key: 'decline-continuation-accept-0001',
+        account: { account_id: 'account-1' },
+        proposal_id: proposalId,
+        proposal_terms_digest: proposal.terms_digest,
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_decline_pending'
+    );
+    assert.equal(mutations, 0);
+    established.dispose();
+  });
+
+  for (const operation of ['refinement', 'decline']) {
+    for (const pauseStatus of ['input-required', 'auth-required']) {
+      for (const pausePath of ['direct', 'tracked', 'polled']) {
+        test(`an exact ${operation} retry reuses its lease after a ${pausePath} ${pauseStatus} pause`, async () => {
+          const proposalId = `paused-${operation}-${pauseStatus}-${pausePath}-proposal`;
+          const tool = operation === 'refinement' ? 'refine_proposals' : 'decline_proposals';
+          const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+          const requests = [];
+          let dispatches = 0;
+          const completedMutation = () =>
+            operation === 'refinement'
+              ? completed(tool, {
+                  products: [],
+                  results: [
+                    {
+                      source_proposal_id: proposalId,
+                      outcome: 'unable',
+                      reason_code: 'commercially_declined',
+                      reason: 'The original proposal remains available.',
+                    },
+                  ],
+                })
+              : completed(tool, { results: [{ proposal_id: proposalId, outcome: 'declined' }] });
+          const dispatch = async request => {
+            requests.push(structuredClone(request));
+            dispatches += 1;
+            if (dispatches > 1) return completedMutation();
+            const pause = { ...working(tool), status: pauseStatus };
+            return pausePath === 'direct' ? pause : submitted(tool, pause);
+          };
+          if (operation === 'refinement') agent.refineProposals = dispatch;
+          else agent.declineProposals = dispatch;
+          const coordinator = await agent.negotiateMediaBuyLifecycle({
+            principalScope: `buyer-paused-${operation}-${pauseStatus}-${pausePath}`,
+          });
+          const request =
+            operation === 'refinement'
+              ? {
+                  ...(pausePath !== 'polled' && {
+                    idempotency_key: `paused-refinement-${pauseStatus}-${pausePath}-0001`,
+                  }),
+                  refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Keep the exact request' }],
+                }
+              : {
+                  ...(pausePath !== 'polled' && {
+                    idempotency_key: `paused-decline-${pauseStatus}-${pausePath}-0001`,
+                  }),
+                  declines: [{ proposal_id: proposalId, reason: 'other', detail: 'Keep the exact request' }],
+                };
+          const invoke = value =>
+            operation === 'refinement' ? coordinator.refineProposals(value) : coordinator.declineProposals(value);
+
+          const first = await invoke(request);
+          if (pausePath === 'direct') assert.equal(first.status, pauseStatus);
+          else if (pausePath === 'tracked') assert.equal((await first.submitted.track()).status, pauseStatus);
+          else assert.equal((await first.submitted.waitForCompletion()).status, pauseStatus);
+
+          const leases =
+            operation === 'refinement'
+              ? coordinator.proposalSnapshotStore.pendingRefinements
+              : coordinator.proposalSnapshotStore.pendingDeclines;
+          assert.equal(leases.size, 1);
+          assert.equal([...leases][0].state, 'paused');
+          const divergent = structuredClone(request);
+          if (operation === 'refinement') divergent.refinements[0].ask = 'A different request';
+          else divergent.declines[0].detail = 'A different request';
+          await assert.rejects(
+            invoke(divergent),
+            error =>
+              error instanceof MediaBuyLifecycleCompatibilityError &&
+              error.feature === (operation === 'refinement' ? 'proposal_refinement_retry' : 'proposal_decline_retry')
+          );
+          assert.equal(dispatches, 1, 'a divergent retry must fail before seller dispatch');
+          assert.equal(leases.size, 1, 'a divergent retry must not allocate another lease');
+
+          const retried = await invoke(request);
+          assert.equal(retried.status, 'completed');
+          assert.equal(dispatches, 2);
+          assert.deepEqual(requests[1], requests[0], 'the retry must preserve the exact outbound request');
+          assert.match(requests[0].idempotency_key, /^[A-Za-z0-9_-]{16,255}$/);
+          assert.equal(leases.size, 0);
+          coordinator.dispose();
+        });
+      }
+    }
+  }
+
+  for (const operation of ['refinement', 'decline']) {
+    const tool = operation === 'refinement' ? 'refine_proposals' : 'decline_proposals';
+    const invoke = (coordinator, request) =>
+      operation === 'refinement' ? coordinator.refineProposals(request) : coordinator.declineProposals(request);
+    const reservations = coordinator =>
+      operation === 'refinement'
+        ? coordinator.proposalSnapshotStore.pendingRefinements
+        : coordinator.proposalSnapshotStore.pendingDeclines;
+
+    test(`${operation} ambiguity without an advertised replay TTL leaves a cross-coordinator tombstone`, async () => {
+      const proposalId = `no-ttl-${operation}-proposal`;
+      const caps = capabilities({ tools: COMPACT_TOOLS });
+      delete caps.idempotency;
+      const agent = clientWithCaps(caps);
+      let dispatches = 0;
+      agent[operation === 'refinement' ? 'refineProposals' : 'declineProposals'] = async () => {
+        dispatches += 1;
+        throw new Error('transport outcome is unknown');
+      };
+      const principalScope = `buyer-no-ttl-${operation}`;
+      const first = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      const request = proposalMutationRequest(operation, proposalId, `no-ttl-${operation}-key-0001`);
+
+      await assert.rejects(invoke(first, request), /transport outcome is unknown/);
+      assert.equal(reservations(first).size, 0);
+      const fresh = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      await assert.rejects(
+        invoke(fresh, request),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_mutation_commit_uncertain'
+      );
+      assert.equal(dispatches, 1);
+      first.dispose();
+      fresh.dispose();
+    });
+
+    test(`${operation} transport ambiguity permits only the exact immutable-deadline replay`, async () => {
+      const proposalId = `transport-${operation}-proposal`;
+      const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+      let dispatches = 0;
+      agent[operation === 'refinement' ? 'refineProposals' : 'declineProposals'] = async () => {
+        dispatches += 1;
+        if (dispatches === 1) throw new Error('transport failed after dispatch');
+        return completedProposalMutation(operation, proposalId);
+      };
+      const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: `buyer-transport-${operation}` });
+      const request = proposalMutationRequest(operation, proposalId, `transport-${operation}-key-0001`);
+
+      await assert.rejects(invoke(coordinator, request), /transport failed after dispatch/);
+      const reservation = [...reservations(coordinator)][0];
+      assert.equal(reservation.state, 'commit-uncertain');
+      assert.equal(Object.getOwnPropertyDescriptor(reservation, 'retryDeadlineMs').writable, false);
+      await assert.rejects(
+        invoke(coordinator, { ...request, idempotency_key: `transport-${operation}-key-0002` }),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError &&
+          error.feature === (operation === 'refinement' ? 'proposal_refinement_retry' : 'proposal_decline_retry')
+      );
+      assert.equal(dispatches, 1);
+      assert.equal((await invoke(coordinator, request)).status, 'completed');
+      assert.equal(dispatches, 2);
+      coordinator.dispose();
+    });
+
+    test(`${operation} replay expiry retires the reservation and blocks a fresh coordinator`, async () => {
+      const proposalId = `expired-${operation}-proposal`;
+      const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+      let dispatches = 0;
+      agent[operation === 'refinement' ? 'refineProposals' : 'declineProposals'] = async () => {
+        dispatches += 1;
+        return { ...working(tool), status: 'input-required' };
+      };
+      const principalScope = `buyer-expired-${operation}`;
+      const first = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      first.idempotencyReplayTtlMs = 15;
+      const request = proposalMutationRequest(operation, proposalId, `expired-${operation}-key-0001`);
+      assert.equal((await invoke(first, request)).status, 'input-required');
+      const reservation = [...reservations(first)][0];
+      const deadline = reservation.retryDeadlineMs;
+      assert.equal(reservation.state, 'paused');
+      assert.equal(Object.getOwnPropertyDescriptor(reservation, 'retryDeadlineMs').writable, false);
+      assert.equal(Reflect.set(reservation, 'retryDeadlineMs', deadline + 60_000), false);
+      await new Promise(resolve => setTimeout(resolve, 30));
+
+      await assert.rejects(
+        invoke(first, request),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError &&
+          [
+            'proposal_mutation_commit_uncertain',
+            `proposal_${operation === 'refinement' ? 'refinement' : 'decline'}_retry_window`,
+          ].includes(error.feature)
+      );
+      const fresh = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      await assert.rejects(
+        invoke(fresh, request),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_mutation_commit_uncertain'
+      );
+      assert.equal(dispatches, 1);
+      first.dispose();
+      fresh.dispose();
+    });
+
+    test(`${operation} abort, stale continuation, and stale timer cannot mutate a newer retry epoch`, async () => {
+      const proposalId = `epoch-${operation}-proposal`;
+      const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+      let dispatches = 0;
+      let resolveTrack;
+      agent[operation === 'refinement' ? 'refineProposals' : 'declineProposals'] = async () => {
+        dispatches += 1;
+        if (dispatches > 1) return completedProposalMutation(operation, proposalId);
+        const result = submitted(tool, completedProposalMutation(operation, proposalId));
+        result.submitted.track = () =>
+          new Promise(resolve => {
+            resolveTrack = resolve;
+          });
+        result.submitted.waitForCompletion = async (_pollInterval, signal) => {
+          if (signal?.aborted) {
+            const error = new Error('local wait aborted');
+            error.name = 'AbortError';
+            throw error;
+          }
+          return completedProposalMutation(operation, proposalId);
+        };
+        return result;
+      };
+      const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: `buyer-epoch-${operation}` });
+      const request = proposalMutationRequest(operation, proposalId, `epoch-${operation}-key-0001`);
+      const first = await invoke(coordinator, request);
+      const staleTrack = first.submitted.track();
+      const abort = new AbortController();
+      abort.abort();
+      await assert.rejects(first.submitted.waitForCompletion(undefined, abort.signal), /local wait aborted/);
+      const reservation = [...reservations(coordinator)][0];
+      const staleTimer = reservation.timer;
+      assert.equal(reservation.state, 'commit-uncertain');
+      assert.equal((await invoke(coordinator, request)).status, 'completed');
+      assert.equal(reservations(coordinator).size, 0);
+
+      resolveTrack({
+        taskId: `${tool}-task`,
+        taskType: tool,
+        status: 'failed',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      assert.equal((await staleTrack).status, 'failed');
+      staleTimer?._onTimeout?.();
+      const newRequest = proposalMutationRequest(operation, proposalId, `epoch-${operation}-key-0002`, '-new');
+      assert.equal((await invoke(coordinator, newRequest)).status, 'completed');
+      assert.equal(dispatches, 3);
+      coordinator.dispose();
+    });
+
+    test(`${operation} deferred continuation cannot dispatch after an exact retry takes ownership`, async () => {
+      const proposalId = `deferred-epoch-${operation}-proposal`;
+      const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+      let dispatches = 0;
+      let continuationDispatches = 0;
+      agent[operation === 'refinement' ? 'refineProposals' : 'declineProposals'] = async () => {
+        dispatches += 1;
+        if (dispatches > 1) return completedProposalMutation(operation, proposalId);
+        return deferred(tool, async () => {
+          continuationDispatches += 1;
+          return completedProposalMutation(operation, proposalId);
+        });
+      };
+      const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: `buyer-deferred-${operation}` });
+      const request = proposalMutationRequest(operation, proposalId, `deferred-${operation}-key-0001`);
+      const first = await invoke(coordinator, request);
+      assert.equal([...reservations(coordinator)][0].state, 'paused');
+
+      assert.equal((await invoke(coordinator, request)).status, 'completed');
+      await assert.rejects(
+        first.deferred.resume({ approved: true }),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError &&
+          error.feature === 'proposal_mutation_continuation_stale'
+      );
+      assert.equal(dispatches, 2);
+      assert.equal(continuationDispatches, 0);
+      coordinator.dispose();
+    });
+
+    test(`${operation} dispose preserves an exact retry for a fresh coordinator`, async () => {
+      const proposalId = `dispose-${operation}-proposal`;
+      const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+      let dispatches = 0;
+      agent[operation === 'refinement' ? 'refineProposals' : 'declineProposals'] = async () => {
+        dispatches += 1;
+        return dispatches === 1 ? working(tool) : completedProposalMutation(operation, proposalId);
+      };
+      const principalScope = `buyer-dispose-${operation}`;
+      const first = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      const request = proposalMutationRequest(operation, proposalId, `dispose-${operation}-key-0001`);
+      assert.equal((await invoke(first, request)).status, 'working');
+      first.dispose();
+      assert.equal([...reservations(first)][0].state, 'commit-uncertain');
+
+      const fresh = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      await assert.rejects(
+        invoke(fresh, { ...request, idempotency_key: `dispose-${operation}-key-0002` }),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError &&
+          error.feature === (operation === 'refinement' ? 'proposal_refinement_retry' : 'proposal_decline_retry')
+      );
+      assert.equal((await invoke(fresh, request)).status, 'completed');
+      assert.equal(dispatches, 2);
+      fresh.dispose();
+    });
+  }
+
+  test('an in-flight decline cannot allocate a duplicate lease', async () => {
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    let dispatches = 0;
+    agent.declineProposals = async () => {
+      dispatches += 1;
+      return working('decline_proposals');
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-duplicate-decline-lease' });
+    const request = {
+      idempotency_key: 'duplicate-decline-lease-0001',
+      declines: [{ proposal_id: 'duplicate-decline-proposal', reason: 'other' }],
+    };
+    assert.equal((await coordinator.declineProposals(request)).status, 'working');
+    await assert.rejects(
+      coordinator.declineProposals(request),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_decline_pending'
+    );
+    assert.equal(dispatches, 1);
+    assert.equal(coordinator.proposalSnapshotStore.pendingDeclines.size, 1);
+    assert.equal(coordinator.proposalSnapshotStore.pendingDeclineProposalIdCount, 1);
+    coordinator.dispose();
+  });
+
+  for (const operation of ['refinement', 'decline']) {
+    test(`an established ${operation} pause permits only the exact projected retry`, async () => {
+      const proposalId = `established-paused-${operation}-proposal`;
+      const agent = clientWithCaps(capabilities({ version: '3.1' }));
+      const requests = [];
+      agent.getProducts = async request => {
+        requests.push(structuredClone(request));
+        if (requests.length === 1) return { ...working('get_products'), status: 'auth-required' };
+        return completed('get_products', { products: [], proposals: [] });
+      };
+      const coordinator = await agent.negotiateMediaBuyLifecycle({
+        principalScope: `buyer-established-paused-${operation}`,
+        ...(operation === 'decline' && {
+          allowedLosses: ['proposal_decline_not_terminal', 'proposal_decline_reason_not_forwarded'],
+        }),
+      });
+      const request =
+        operation === 'refinement'
+          ? {
+              idempotency_key: 'established-paused-refinement-0001',
+              refinements: [{ proposal_id: proposalId, action: 'revise', ask: 'Keep this exact request' }],
+            }
+          : {
+              idempotency_key: 'established-paused-decline-0001',
+              declines: [{ proposal_id: proposalId, reason: 'other' }],
+            };
+      const invoke = value =>
+        operation === 'refinement' ? coordinator.refineProposals(value) : coordinator.declineProposals(value);
+
+      assert.equal((await invoke(request)).status, 'auth-required');
+      await assert.rejects(
+        invoke({ ...request, idempotency_key: `${request.idempotency_key}-different` }),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError &&
+          error.feature === (operation === 'refinement' ? 'proposal_refinement_retry' : 'proposal_decline_retry')
+      );
+      assert.equal(requests.length, 1);
+      assert.equal((await invoke(request)).status, 'completed');
+      assert.deepEqual(requests[1], requests[0]);
+      coordinator.dispose();
+    });
+  }
+
+  test('pending decline leases are bounded per principal and released by owner', async () => {
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    let dispatches = 0;
+    agent.declineProposals = async () => {
+      dispatches += 1;
+      return submitted(
+        'decline_proposals',
+        completed('decline_proposals', { results: [{ proposal_id: 'unused', outcome: 'declined' }] })
+      );
+    };
+    const first = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-pending-decline-limit' });
+    const second = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-pending-decline-limit' });
+    assert.equal(first.proposalSnapshotStore, second.proposalSnapshotStore);
+
+    for (let index = 0; index < 255; index += 1) {
+      const result = await first.declineProposals({
+        idempotency_key: `pending-decline-${String(index).padStart(4, '0')}`,
+        declines: [{ proposal_id: `pending-proposal-${index}`, reason: 'other' }],
+      });
+      assert.equal(result.status, 'submitted');
+    }
+    const secondOwned = await second.declineProposals({
+      idempotency_key: 'pending-decline-second-owner',
+      declines: [{ proposal_id: 'pending-proposal-second-owner', reason: 'other' }],
+    });
+    assert.equal(secondOwned.status, 'submitted');
+    assert.equal(first.proposalSnapshotStore.pendingDeclines.size, 256);
+    assert.equal(first.proposalSnapshotStore.pendingDeclineProposalIdCount, 256);
+    await assert.rejects(
+      second.declineProposals({
+        idempotency_key: 'pending-decline-overflow',
+        declines: [{ proposal_id: 'pending-proposal-overflow', reason: 'other' }],
+      }),
+      error => error.code === 'CONFIGURATION_ERROR' && error.configField === 'mediaBuy.pendingDeclines'
+    );
+    assert.equal(dispatches, 256, 'the over-limit decline must fail before seller dispatch');
+
+    first.dispose();
+    assert.equal(second.proposalSnapshotStore.pendingDeclines.size, 256);
+    assert.equal(second.proposalSnapshotStore.pendingDeclineProposalIdCount, 256);
+    assert.equal(
+      [...second.proposalSnapshotStore.pendingDeclines].filter(lease => lease.state === 'commit-uncertain').length,
+      255
+    );
+    assert.equal(second.proposalSnapshotStore.registry.retiredAcceptanceSegments, undefined);
+    second.dispose();
+    assert.equal(second.proposalSnapshotStore.pendingDeclines.size, 256);
+    assert.equal(second.proposalSnapshotStore.pendingDeclineProposalIdCount, 256);
+  });
+
+  test('pending refinement leases are bounded per principal and released by owner', async () => {
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    let dispatches = 0;
+    agent.refineProposals = async () => {
+      dispatches += 1;
+      return submitted(
+        'refine_proposals',
+        completed('refine_proposals', {
+          products: [],
+          results: [
+            {
+              source_proposal_id: 'unused',
+              outcome: 'unable',
+              reason_code: 'commercially_declined',
+              reason: 'Unused terminal fixture',
+            },
+          ],
+        })
+      );
+    };
+    const first = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-pending-refinement-limit' });
+    const second = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-pending-refinement-limit' });
+    assert.equal(first.proposalSnapshotStore, second.proposalSnapshotStore);
+
+    for (let index = 0; index < 255; index += 1) {
+      const result = await first.refineProposals({
+        idempotency_key: `pending-refinement-${String(index).padStart(4, '0')}`,
+        refinements: [{ proposal_id: `pending-refinement-source-${index}`, action: 'revise', ask: 'test' }],
+      });
+      assert.equal(result.status, 'submitted');
+    }
+    const secondOwned = await second.refineProposals({
+      idempotency_key: 'pending-refinement-second-owner',
+      refinements: [{ proposal_id: 'pending-refinement-second-owner', action: 'revise', ask: 'test' }],
+    });
+    assert.equal(secondOwned.status, 'submitted');
+    assert.equal(first.proposalSnapshotStore.pendingRefinements.size, 256);
+    assert.equal(first.proposalSnapshotStore.pendingRefinementProposalIdCount, 256);
+    await assert.rejects(
+      second.refineProposals({
+        idempotency_key: 'pending-refinement-overflow',
+        refinements: [{ proposal_id: 'pending-refinement-overflow', action: 'revise', ask: 'test' }],
+      }),
+      error => error.code === 'CONFIGURATION_ERROR' && error.configField === 'mediaBuy.pendingRefinements'
+    );
+    assert.equal(dispatches, 256, 'the over-limit refinement must fail before seller dispatch');
+
+    first.dispose();
+    assert.equal(second.proposalSnapshotStore.pendingRefinements.size, 256);
+    assert.equal(second.proposalSnapshotStore.pendingRefinementProposalIdCount, 256);
+    assert.equal(
+      [...second.proposalSnapshotStore.pendingRefinements].filter(lease => lease.state === 'commit-uncertain').length,
+      255
+    );
+    second.dispose();
+    assert.equal(second.proposalSnapshotStore.pendingRefinements.size, 256);
+    assert.equal(second.proposalSnapshotStore.pendingRefinementProposalIdCount, 256);
+  });
+
+  test('terminal decline retires paused acceptance retries across coordinators', async () => {
+    for (const pausedStatus of ['input-required', 'auth-required']) {
+      const proposalId = `paused-then-declined-${pausedStatus}`;
+      const commercialTerms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+        total_budget: { amount: 1000, currency: 'USD' },
+      };
+      const proposal = {
+        proposal_id: proposalId,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        commercial_terms: commercialTerms,
+        terms_digest: proposalTermsDigest(commercialTerms),
+      };
+      const agent = clientWithCaps(
+        capabilities({
+          tools: COMPACT_TOOLS,
+          discoveredTools: ['get_products', 'create_media_buy', 'update_media_buy'],
+        })
+      );
+      agent.requestProposals = async () =>
+        completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+      agent.declineProposals = async () =>
+        completed('decline_proposals', { results: [{ proposal_id: proposalId, outcome: 'declined' }] });
+      let mutations = 0;
+      agent.createMediaBuy = async () => {
+        mutations += 1;
+        return { ...working('create_media_buy'), status: pausedStatus };
+      };
+      const principalScope = `buyer-paused-then-declined-${pausedStatus}`;
+      const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      const established = await agent.negotiateMediaBuyLifecycle({
+        principalScope,
+        preferredLifecycle: 'established',
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      });
+      seedProposalSnapshot(compact, proposal);
+      const acceptance = {
+        idempotency_key: `accept-paused-then-declined-${pausedStatus}-0001`,
+        account: { account_id: 'account-1' },
+        proposal_id: proposalId,
+        proposal_terms_digest: proposal.terms_digest,
+      };
+      assert.equal((await established.acceptProposal(acceptance)).status, pausedStatus);
+      assert.equal(mutations, 1);
+
+      const decliningCoordinator = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      await decliningCoordinator.declineProposals({
+        idempotency_key: `decline-paused-then-declined-${pausedStatus}-0001`,
+        declines: [{ proposal_id: proposalId, reason: 'other' }],
+      });
+
+      await assert.rejects(
+        established.acceptProposal(acceptance),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+      );
+      assert.equal(mutations, 1, 'terminal decline must prevent any additional create mutation');
+    }
+  });
+
+  test('terminal decline tombstone blocks late proposal observations from restoring acceptance', async () => {
+    for (const observation of ['completion', 'track']) {
+      const proposalId = `late-proposal-after-decline-${observation}`;
+      const commercialTerms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+        total_budget: { amount: 1000, currency: 'USD' },
+      };
+      const proposal = {
+        proposal_id: proposalId,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        commercial_terms: commercialTerms,
+        terms_digest: proposalTermsDigest(commercialTerms),
+      };
+      const agent = clientWithCaps(
+        capabilities({
+          tools: COMPACT_TOOLS,
+          discoveredTools: ['get_products', 'create_media_buy', 'update_media_buy'],
+        })
+      );
+      agent.declineProposals = async () =>
+        completed('decline_proposals', { results: [{ proposal_id: proposalId, outcome: 'declined' }] });
+      let mutations = 0;
+      agent.createMediaBuy = async () => {
+        mutations += 1;
+        return completed('create_media_buy', { media_buy_id: `should-not-run-${observation}` });
+      };
+      const principalScope = `buyer-late-proposal-after-decline-${observation}`;
+      const compact = await agent.negotiateMediaBuyLifecycle({ principalScope });
+
+      const decliningCoordinator = await agent.negotiateMediaBuyLifecycle({ principalScope });
+      await decliningCoordinator.declineProposals({
+        idempotency_key: `decline-late-proposal-${observation}-0001`,
+        declines: [{ proposal_id: proposalId, reason: 'other' }],
+      });
+      seedProposalSnapshot(compact, proposal);
+
+      const established = await agent.negotiateMediaBuyLifecycle({
+        principalScope,
+        preferredLifecycle: 'established',
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      });
+      await assert.rejects(
+        established.acceptProposal({
+          idempotency_key: `accept-late-proposal-${observation}-0001`,
+          account: { account_id: 'account-1' },
+          proposal_id: proposalId,
+          proposal_terms_digest: proposal.terms_digest,
+        }),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+      );
+      assert.equal(mutations, 0, 'late proposal observation must not restore a terminally declined proposal');
+    }
+  });
+
+  test('principal scope is non-empty and coordinator-local', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    await assert.rejects(
+      agent.negotiateMediaBuyLifecycle({ principalScope: '   ' }),
+      error => error instanceof TypeError && /principalScope/.test(error.message)
+    );
+    await assert.rejects(
+      agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer\nadmin' }),
+      error => error instanceof TypeError && /control characters/.test(error.message)
+    );
+    await assert.rejects(
+      agent.negotiateMediaBuyLifecycle({ principalScope: 'x'.repeat(257) }),
+      error => error instanceof TypeError && /256 UTF-8 bytes/.test(error.message)
+    );
+    const first = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-tenant-1' });
+    const second = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-tenant-2' });
+    assert.notEqual(first, second);
+    assert.equal(first.proposalSnapshotStore.registry.retiredAcceptanceSegments, undefined);
+
+    agent.getProducts = async () =>
+      completed('get_products', { proposals: [{ proposal_id: 'proposal-without-scope' }] });
+    const unscoped = await agent.negotiateMediaBuyLifecycle();
+    await unscoped.requestProposals({ brief: 'test', account: { account_id: 'account-1' } });
+    await assert.rejects(
+      unscoped.acceptProposal({ account: { account_id: 'account-1' }, proposal_id: 'proposal-without-scope' }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'principal_scope'
+    );
+  });
+
+  test('principal snapshot partitions are bounded without evicting live tombstones', async () => {
+    const proposalId = 'bounded-principal-terminal-proposal';
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    agent.declineProposals = async () =>
+      completed('decline_proposals', { results: [{ proposal_id: proposalId, outcome: 'declined' }] });
+    agent.requestProposals = async () =>
+      completed('request_proposals', {
+        outcome: 'proposed',
+        proposals: [
+          {
+            proposal_id: proposalId,
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: {
+              brand: { domain: 'example.com' },
+              start_time: '2027-01-01T00:00:00Z',
+              end_time: '2027-02-01T00:00:00Z',
+            },
+          },
+        ],
+      });
+    const protectedCoordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'bounded-principal-0' });
+    await protectedCoordinator.declineProposals({
+      idempotency_key: 'bounded-principal-decline-0001',
+      declines: [{ proposal_id: proposalId, reason: 'other' }],
+    });
+    const fillers = [];
+    for (let index = 1; index < 256; index += 1) {
+      fillers.push(await agent.negotiateMediaBuyLifecycle({ principalScope: `bounded-principal-${index}` }));
+    }
+    assert.equal(protectedCoordinator.proposalSnapshotStore.registry.stores.size, 256);
+    await assert.rejects(
+      agent.negotiateMediaBuyLifecycle({ principalScope: 'bounded-principal-overflow' }),
+      error => error.code === 'CONFIGURATION_ERROR' && error.configField === 'mediaBuy.principalScope'
+    );
+
+    seedProposalSnapshot(protectedCoordinator, { proposal_id: proposalId });
+    assert.equal(protectedCoordinator.proposalSnapshotStore.entries.size, 0);
+
+    fillers.forEach(coordinator => coordinator.dispose());
+    const reclaimed = await agent.negotiateMediaBuyLifecycle({ principalScope: 'bounded-principal-reclaimed' });
+    assert.equal(protectedCoordinator.proposalSnapshotStore.registry.stores.size, 256);
+    reclaimed.dispose();
+    protectedCoordinator.dispose();
+  });
+
+  test('retired proposals survive reclamation of more than 256 disposed principal stores', async () => {
+    const proposalId = 'registry-level-retired-proposal';
+    const proposal = {
+      proposal_id: proposalId,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      },
+    };
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    agent.declineProposals = async () =>
+      completed('decline_proposals', { results: [{ proposal_id: proposalId, outcome: 'declined' }] });
+    agent.requestProposals = async () => completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+
+    let registry;
+    for (let index = 0; index < 257; index += 1) {
+      const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: `retired-principal-${index}` });
+      registry ??= coordinator.proposalSnapshotStore.registry;
+      await coordinator.declineProposals({
+        idempotency_key: `registry-retire-${index}-0001`,
+        declines: [{ proposal_id: proposalId, reason: 'other' }],
+      });
+      coordinator.dispose();
+    }
+
+    assert.equal(registry.stores.size, 256);
+    assert.ok(registry.retiredAcceptanceSegments.size > 0);
+    assert.ok(registry.retiredAcceptanceSegments.size <= 256);
+    for (const segment of registry.retiredAcceptanceSegments.values()) {
+      assert.equal(segment.byteLength, 256 * 1024);
+    }
+
+    const recreated = await agent.negotiateMediaBuyLifecycle({ principalScope: 'retired-principal-0' });
+    seedProposalSnapshot(recreated, proposal);
+    assert.equal(recreated.proposalSnapshotStore.entries.size, 0);
+    recreated.dispose();
+  });
+
+  test('disposed coordinators cannot repopulate a reclaimed principal partition', async () => {
+    const proposal = {
+      proposal_id: 'disposed-race-proposal',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      },
+    };
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    const taskListeners = new Set();
+    agent.onTaskUpdate = listener => {
+      taskListeners.add(listener);
+      return () => taskListeners.delete(listener);
+    };
+    let resolveDispatch;
+    agent.requestProposals = () =>
+      new Promise(resolve => {
+        resolveDispatch = resolve;
+      });
+
+    const original = await agent.negotiateMediaBuyLifecycle({ principalScope: 'disposed-race-original' });
+    const detachedOriginalStore = original.proposalSnapshotStore;
+    const pending = original.requestProposals({
+      idempotency_key: 'disposed-race-request-0001',
+      account: { account_id: 'account-1' },
+      brand: { domain: 'example.com' },
+      brief: 'Response resolves after disposal and partition reclamation',
+    });
+    assert.equal(taskListeners.size, 1);
+
+    const fillers = [];
+    for (let index = 1; index < 256; index += 1) {
+      fillers.push(await agent.negotiateMediaBuyLifecycle({ principalScope: `disposed-race-filler-${index}` }));
+    }
+    original.dispose();
+    assert.equal(taskListeners.size, 0);
+    const continuationCoordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'disposed-race-continuation',
+    });
+    assert.equal(detachedOriginalStore.registry.stores.has('principal:disposed-race-original'), false);
+
+    resolveDispatch(
+      completed('request_proposals', {
+        outcome: 'proposed',
+        proposals: [proposal],
+      })
+    );
+    await assert.rejects(
+      pending,
+      error => error.code === 'CONFIGURATION_ERROR' && error.configField === 'mediaBuy.lifecycleCoordinator'
+    );
+    assert.equal(detachedOriginalStore.entries.size, 0);
+    assert.equal(taskListeners.size, 0);
+
+    const terminal = completed('request_proposals', { outcome: 'proposed', proposals: [proposal] });
+    agent.requestProposals = async () => submitted('request_proposals', terminal);
+    const savedContinuation = await continuationCoordinator.requestProposals({
+      idempotency_key: 'disposed-race-request-0002',
+      account: { account_id: 'account-1' },
+      brand: { domain: 'example.com' },
+      brief: 'Continuation is retained across disposal',
+    });
+    const detachedContinuationStore = continuationCoordinator.proposalSnapshotStore;
+    assert.equal(taskListeners.size, 1);
+    continuationCoordinator.dispose();
+    assert.equal(taskListeners.size, 0);
+    const replacement = await agent.negotiateMediaBuyLifecycle({ principalScope: 'disposed-race-replacement' });
+    assert.equal(detachedContinuationStore.registry.stores.has('principal:disposed-race-continuation'), false);
+
+    await assert.rejects(
+      savedContinuation.submitted.track(),
+      error => error.code === 'CONFIGURATION_ERROR' && error.configField === 'mediaBuy.lifecycleCoordinator'
+    );
+    await assert.rejects(
+      savedContinuation.submitted.waitForCompletion(),
+      error => error.code === 'CONFIGURATION_ERROR' && error.configField === 'mediaBuy.lifecycleCoordinator'
+    );
+    assert.equal(detachedContinuationStore.entries.size, 0);
+    assert.equal(taskListeners.size, 0);
+
+    fillers.forEach(coordinator => coordinator.dispose());
+    replacement.dispose();
+  });
+
+  test('dual-surface seller supports a separately forced established lane', async () => {
+    const agent = clientWithCaps(capabilities({ tools: [...COMPACT_TOOLS, 'get_products'] }));
+    const calls = [];
+    agent.listProducts = async () => {
+      calls.push('list_products');
+      return completed('list_products', { products: [], feed_version: 'compact' });
+    };
+    agent.getProducts = async () => {
+      calls.push('get_products');
+      return completed('get_products', { products: [], wholesale_feed_version: 'legacy', cache_scope: 'public' });
+    };
+
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ preferredLifecycle: 'established' });
+    const result = await coordinator.listProducts({});
+
+    assert.deepEqual(calls, ['get_products']);
+    assert.equal(result.compatibility.compatibility, 'lossless_projection');
+  });
+
+  test('forced established lane fails closed when a compact-only seller advertises no legacy tool', async () => {
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+
+    await assert.rejects(
+      agent.negotiateMediaBuyLifecycle({ preferredLifecycle: 'established' }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError &&
+        error.feature === 'established_lifecycle_not_advertised' &&
+        error.lifecycle === 'compact'
+    );
+  });
+
+  test('a 3.1-pinned buyer does not select compact from a dual-surface 3.2 seller', async () => {
+    const caps = capabilities({ tools: COMPACT_TOOLS });
+    caps.supportedVersions = ['3.0', '3.1', '3.2.0-beta.5'];
+    const agent = clientWithCaps(caps, '3.1.18');
+    const calls = [];
+    agent.listProducts = async () => {
+      calls.push('list_products');
+      return completed('list_products', {});
+    };
+    agent.getProducts = async () => {
+      calls.push('get_products');
+      return completed('get_products', { products: [], cache_scope: 'public' });
+    };
+
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-tenant-1' });
+    const result = await coordinator.listProducts({});
+
+    assert.equal(coordinator.negotiated_version, '3.1');
+    assert.deepEqual(calls, ['get_products']);
+    assert.equal(result.compatibility.lifecycle, 'established');
+  });
+
+  test('authoritative served release wins over the seller support window', async () => {
+    const caps = capabilities({ tools: COMPACT_TOOLS });
+    caps.supportedVersions = ['3.0', '3.1', '3.2.0-beta.5'];
+    caps.servedVersion = '3.1';
+    const agent = clientWithCaps(caps);
+    const calls = [];
+    agent.listProducts = async () => {
+      calls.push('list_products');
+      return completed('list_products', {});
+    };
+    agent.getProducts = async () => {
+      calls.push('get_products');
+      return completed('get_products', { products: [], cache_scope: 'public' });
+    };
+
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+    const result = await coordinator.listProducts({});
+
+    assert.equal(coordinator.negotiated_version, '3.1');
+    assert.deepEqual(calls, ['get_products']);
+    assert.equal(result.compatibility.lifecycle, 'established');
+  });
+
+  test('a metadata-free v3 capability response is reported as the 3.0 lane', async () => {
+    const caps = capabilities({ version: '3.0' });
+    delete caps.supportedVersions;
+    const agent = clientWithCaps(caps);
+    agent.getProducts = async () => completed('get_products', { products: [], cache_scope: 'public' });
+
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+    const result = await coordinator.listProducts({});
+
+    assert.equal(coordinator.negotiated_version, '3.0');
+    assert.equal(result.compatibility.negotiated_version, '3.0');
+  });
+
+  test('does not select a newer prerelease than the compact buyer pin', async () => {
+    const caps = capabilities({ tools: COMPACT_TOOLS });
+    caps.supportedVersions = ['3.1', ONE_BEYOND_SDK_PIN];
+    const agent = clientWithCaps(caps, SDK_PIN);
+    const calls = [];
+    agent.getProducts = async () => {
+      calls.push('get_products');
+      return completed('get_products', { products: [], cache_scope: 'public' });
+    };
+
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+    await coordinator.listProducts({});
+
+    assert.equal(coordinator.negotiated_version, '3.1');
+    assert.deepEqual(calls, ['get_products']);
+  });
+
+  test('fails closed when every valid advertised version is newer than the buyer pin', async () => {
+    const caps = capabilities({ tools: COMPACT_TOOLS });
+    caps.supportedVersions = [ONE_BEYOND_SDK_PIN];
+    const agent = clientWithCaps(caps, SDK_PIN);
+
+    await assert.rejects(
+      agent.negotiateMediaBuyLifecycle(),
+      new RegExp(`advertises only AdCP versions newer than the client pin ${SDK_PIN.replace(/\./g, '\\.')}`)
+    );
+  });
+
+  test('authoritative compact tool discovery survives synthetic capability fallback', async () => {
+    const caps = capabilities({ tools: COMPACT_TOOLS });
+    delete caps.supportedVersions;
+    caps._synthetic = true;
+    const agent = clientWithCaps(caps, '3.2.1');
+    const calls = [];
+    agent.listProducts = async () => {
+      calls.push('list_products');
+      return completed('list_products', { products: [], feed_version: 'feed-1' });
+    };
+    agent.getProducts = async () => assert.fail('compact discovery must not fall back to an absent alias');
+
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+    await coordinator.listProducts({});
+
+    assert.equal(coordinator.negotiated_version, '3.2.1');
+    assert.deepEqual(calls, ['list_products']);
+  });
+
+  test('fails closed when a future seller serves a release newer than the buyer pin', async () => {
+    const caps = capabilities({ version: '3.3', tools: COMPACT_TOOLS });
+    caps.servedVersion = '3.3';
+    const agent = clientWithCaps(caps);
+
+    await assert.rejects(
+      agent.negotiateMediaBuyLifecycle(),
+      new RegExp(`served AdCP 3\\.3, which is newer than the client pin ${SDK_PIN.replace(/\./g, '\\.')}`)
+    );
+  });
+
+  test('fails closed when an exact newer prerelease is served despite an older advertised fallback', async () => {
+    const caps = capabilities({ tools: COMPACT_TOOLS });
+    caps.servedVersion = ONE_BEYOND_SDK_PIN;
+    caps.supportedVersions = [ONE_BEYOND_SDK_PIN, SDK_PIN];
+    const agent = clientWithCaps(caps, SDK_PIN);
+
+    await assert.rejects(
+      agent.negotiateMediaBuyLifecycle(),
+      new RegExp(
+        `served AdCP ${ONE_BEYOND_SDK_PIN.replace(/\./g, '\\.')}, which is newer than the client pin ${SDK_PIN.replace(/\./g, '\\.')}`
+      )
+    );
+  });
+
+  test('fails closed when a newer patch release is served on the same minor line', async () => {
+    const caps = capabilities({ tools: COMPACT_TOOLS });
+    caps.servedVersion = '3.1.18';
+    caps.supportedVersions = ['3.1', '3.1.18'];
+    const agent = clientWithCaps(caps, '3.1');
+
+    await assert.rejects(
+      agent.negotiateMediaBuyLifecycle(),
+      /served AdCP 3\.1\.18, which is newer than the client pin 3\.1/
+    );
+  });
+
+  test('accepts an authoritative served release at or below the buyer pin', async () => {
+    const caps = capabilities({ tools: COMPACT_TOOLS });
+    caps.servedVersion = '3.2.0-beta.2';
+    caps.supportedVersions = ['3.2.1'];
+    const agent = clientWithCaps(caps, '3.2.1');
+    agent.listProducts = async () => completed('list_products', { products: [], feed_version: 'feed-1' });
+
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+    const listed = await coordinator.listProducts({});
+
+    assert.equal(coordinator.negotiated_version, '3.2.0-beta.2');
+    assert.equal(listed.success, true);
+  });
+
+  test('advisory build metadata cannot select a compact wire lifecycle', async () => {
+    const caps = capabilities({ tools: COMPACT_TOOLS });
+    delete caps.supportedVersions;
+    caps.buildVersion = '3.2.0-beta.5+sha.abc123';
+    const agent = clientWithCaps(caps, '3.2.1');
+    agent.getProducts = async () => completed('get_products', { products: [] });
+    agent.listProducts = async () => assert.fail('build metadata must not enable compact wire tools');
+
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+    await coordinator.listProducts({});
+
+    assert.equal(coordinator.negotiated_version, '3.0');
+    assert.equal(coordinator.lifecycle, 'established');
+  });
+
+  test('malformed capability version strings fail closed to the established 3.0 lane', async () => {
+    const caps = capabilities({ tools: COMPACT_TOOLS });
+    caps.servedVersion = 'not-a-version';
+    caps.supportedVersions = ['also-invalid'];
+    caps.buildVersion = 'still-invalid';
+    const agent = clientWithCaps(caps);
+    agent.getProducts = async () => completed('get_products', { products: [] });
+    agent.listProducts = async () => assert.fail('malformed version evidence must not enable compact tools');
+
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+    await coordinator.listProducts({});
+
+    assert.equal(coordinator.negotiated_version, '3.0');
+    assert.equal(coordinator.lifecycle, 'established');
+  });
+});
+
+describe('durable established proposal compatibility', () => {
+  const durableCreateSuccess = mediaBuyId =>
+    completed('create_media_buy', {
+      media_buy_id: mediaBuyId,
+      confirmed_at: '2099-01-01T00:00:00Z',
+      revision: 1,
+      packages: [],
+    });
+
+  for (const version of ['3.0', '3.1']) {
+    test(`${version} discovery can be accepted through a fresh AgentClient`, async () => {
+      const store = createInMemoryEstablishedProposalStore();
+      const terms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+        purchases: [{ product_id: 'product-1', quantity: 1 }],
+      };
+      const proposal = {
+        proposal_id: `durable-accept-${version}`,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        commercial_terms: terms,
+        terms_digest: proposalTermsDigest(terms),
+      };
+      const firstAgent = clientWithCaps(capabilities({ version }));
+      firstAgent.getProducts = async () => completed('get_products', { proposals: [proposal] });
+      const first = await firstAgent.negotiateMediaBuyLifecycle({
+        principalScope: 'durable-buyer',
+        establishedProposalStore: store,
+      });
+      await first.requestProposals({ brief: 'durable proposal', account: { account_id: 'account-1' } });
+      first.dispose();
+
+      const calls = [];
+      const secondAgent = clientWithCaps(capabilities({ version }));
+      secondAgent.createMediaBuy = async input => {
+        calls.push(input);
+        return durableCreateSuccess(`mb-${version}`);
+      };
+      const second = await secondAgent.negotiateMediaBuyLifecycle({
+        principalScope: 'durable-buyer',
+        establishedProposalStore: store,
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      });
+      const result = await second.acceptProposal({
+        idempotency_key: `durable-accept-${version}-key-0001`,
+        account: { account_id: 'account-1' },
+        proposal_id: proposal.proposal_id,
+        proposal_terms_digest: proposal.terms_digest,
+      });
+      assert.equal(result.status, 'completed');
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].proposal_id, proposal.proposal_id);
+    });
+  }
+
+  test('fresh workers refine and decline snapshots retained by another process', async () => {
+    for (const version of ['3.0', '3.1']) {
+      for (const operation of ['refine', 'decline']) {
+        const store = createInMemoryEstablishedProposalStore();
+        const proposal = {
+          proposal_id: `durable-${version}-${operation}-proposal`,
+          name: `${version} ${operation} proposal`,
+          proposal_status: 'committed',
+          expires_at: '2099-12-31T23:59:59Z',
+          allocations: [{ product_id: 'product-1', pricing_option_id: 'option-1', allocation_percentage: 100 }],
+        };
+        const firstAgent = clientWithCaps(capabilities({ version }));
+        firstAgent.getProducts = async () => completed('get_products', { proposals: [proposal] });
+        const first = await firstAgent.negotiateMediaBuyLifecycle({
+          principalScope: `durable-${operation}-buyer`,
+          establishedProposalStore: store,
+        });
+        await first.requestProposals({ brief: operation, account: { account_id: 'account-1' } });
+        first.dispose();
+
+        const secondAgent = clientWithCaps(capabilities({ version }));
+        let dispatches = 0;
+        secondAgent.getProducts = async () => {
+          dispatches += 1;
+          return completed('get_products', {
+            products: [],
+            cache_scope: 'account',
+            proposals: operation === 'refine' ? [{ ...proposal, proposal_id: 'child' }] : [],
+            refinement_applied: [{ scope: 'proposal', proposal_id: proposal.proposal_id, status: 'applied' }],
+          });
+        };
+        const second = await secondAgent.negotiateMediaBuyLifecycle({
+          principalScope: `durable-${operation}-buyer`,
+          establishedProposalStore: store,
+          allowedLosses:
+            operation === 'decline' ? ['proposal_decline_not_terminal', 'proposal_decline_reason_not_forwarded'] : [],
+        });
+        const result =
+          operation === 'refine'
+            ? await second.refineProposals({
+                idempotency_key: 'durable-refine-key-0001',
+                refinements: [{ proposal_id: proposal.proposal_id, action: 'revise', ask: 'less expensive' }],
+              })
+            : await second.declineProposals({
+                idempotency_key: 'durable-decline-key-0001',
+                declines: [{ proposal_id: proposal.proposal_id, reason: 'other' }],
+              });
+        assert.equal(result.status, 'completed');
+        assert.equal(dispatches, 1);
+      }
+    }
+  });
+
+  test('invalid established declines fail before durable hydration', async () => {
+    const backing = createInMemoryEstablishedProposalStore();
+    let durableFinds = 0;
+    const store = new Proxy(backing, {
+      get(target, property, receiver) {
+        if (property === 'find') {
+          return async (...args) => {
+            durableFinds += 1;
+            return target.find(...args);
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const lifecycle = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'durable-invalid-decline-buyer',
+      establishedProposalStore: store,
+      allowedLosses: ['proposal_decline_not_terminal', 'proposal_decline_reason_not_forwarded'],
+    });
+
+    await assert.rejects(
+      lifecycle.declineProposals({ declines: [{ proposal_id: 'invalid-decline' }] }),
+      /compact decline_proposals intent is invalid/
+    );
+    assert.equal(durableFinds, 0);
+  });
+
+  test('same-ID refinement installs a successor that a fresh worker can accept', async () => {
+    const store = createInMemoryEstablishedProposalStore();
+    const sourceTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const source = {
+      proposal_id: 'durable-same-id-refinement',
+      name: 'Durable same-ID refinement',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      allocations: [{ product_id: 'product-1', pricing_option_id: 'option-1', allocation_percentage: 100 }],
+      commercial_terms: sourceTerms,
+      terms_digest: proposalTermsDigest(sourceTerms),
+    };
+    const successorTerms = { ...sourceTerms, end_time: '2027-03-01T00:00:00Z' };
+    const successor = {
+      ...source,
+      commercial_terms: successorTerms,
+      terms_digest: proposalTermsDigest(successorTerms),
+    };
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let call = 0;
+    agent.getProducts = async () => {
+      call += 1;
+      return completed(
+        'get_products',
+        call === 1
+          ? { proposals: [source] }
+          : {
+              products: [],
+              cache_scope: 'account',
+              proposals: [successor],
+              refinement_applied: [{ scope: 'proposal', proposal_id: source.proposal_id, status: 'applied' }],
+            }
+      );
+    };
+    const options = { principalScope: 'durable-same-id-buyer', establishedProposalStore: store };
+    const coordinator = await agent.negotiateMediaBuyLifecycle(options);
+    await coordinator.requestProposals({ brief: 'same ID', account: { account_id: 'account-1' } });
+    await coordinator.refineProposals({
+      idempotency_key: 'same-id-refine-key-0001',
+      refinements: [{ proposal_id: source.proposal_id, action: 'finalize' }],
+    });
+
+    let dispatches = 0;
+    const freshAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    freshAgent.createMediaBuy = async () => {
+      dispatches += 1;
+      return durableCreateSuccess('mb-same-id');
+    };
+    const fresh = await freshAgent.negotiateMediaBuyLifecycle({
+      ...options,
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    const accepted = await fresh.acceptProposal({
+      account: { account_id: 'account-1' },
+      proposal_id: successor.proposal_id,
+      proposal_terms_digest: successor.terms_digest,
+      idempotency_key: 'same-id-accept-key-0001',
+    });
+    assert.equal(accepted.status, 'completed');
+    assert.equal(dispatches, 1);
+  });
+
+  test('rediscovery atomically replaces an older available durable generation', async () => {
+    const store = createInMemoryEstablishedProposalStore();
+    const firstTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const first = {
+      proposal_id: 'durable-rediscovery-generation',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: firstTerms,
+      terms_digest: proposalTermsDigest(firstTerms),
+    };
+    const secondTerms = { ...firstTerms, end_time: '2027-03-01T00:00:00Z' };
+    const second = {
+      ...first,
+      commercial_terms: secondTerms,
+      terms_digest: proposalTermsDigest(secondTerms),
+    };
+    const discoveryAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    let generation = first;
+    discoveryAgent.getProducts = async () => completed('get_products', { proposals: [generation] });
+    const options = { principalScope: 'durable-rediscovery-buyer', establishedProposalStore: store };
+    const discovery = await discoveryAgent.negotiateMediaBuyLifecycle(options);
+    await discovery.requestProposals({ brief: 'first', account: { account_id: 'account-1' } });
+    generation = second;
+    await discovery.requestProposals({ brief: 'second', account: { account_id: 'account-1' } });
+    discovery.dispose();
+
+    const freshAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    freshAgent.createMediaBuy = async () => durableCreateSuccess('mb-rediscovered');
+    const fresh = await freshAgent.negotiateMediaBuyLifecycle({
+      ...options,
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    assert.equal(
+      (
+        await fresh.acceptProposal({
+          account: { account_id: 'account-1' },
+          proposal_id: second.proposal_id,
+          proposal_terms_digest: second.terms_digest,
+          idempotency_key: 'rediscovered-accept-key-0001',
+        })
+      ).status,
+      'completed'
+    );
+  });
+
+  test('configured durable acceptance never falls back to a shared process-local snapshot', async () => {
+    const populated = createInMemoryEstablishedProposalStore();
+    const empty = createInMemoryEstablishedProposalStore();
+    const terms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const proposal = {
+      proposal_id: 'durable-store-miss',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: terms,
+      terms_digest: proposalTermsDigest(terms),
+    };
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () => completed('get_products', { proposals: [proposal] });
+    const discovery = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'durable-store-miss-buyer',
+      establishedProposalStore: populated,
+    });
+    await discovery.requestProposals({ brief: 'store miss', account: { account_id: 'account-1' } });
+    let dispatches = 0;
+    agent.createMediaBuy = async () => {
+      dispatches += 1;
+      return completed('create_media_buy', {});
+    };
+    const mutation = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'durable-store-miss-buyer',
+      establishedProposalStore: empty,
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    await assert.rejects(
+      mutation.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: proposal.proposal_id,
+        proposal_terms_digest: proposal.terms_digest,
+        idempotency_key: 'store-miss-accept-key-0001',
+      }),
+      /durable established proposal store has no scoped snapshot/
+    );
+    assert.equal(dispatches, 0);
+  });
+
+  test('an established unable refinement keeps the durable source executable', async () => {
+    const store = createInMemoryEstablishedProposalStore();
+    const terms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const proposal = {
+      proposal_id: 'durable-unable-refinement',
+      name: 'Durable unable refinement',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      allocations: [{ product_id: 'product-1', pricing_option_id: 'option-1', allocation_percentage: 100 }],
+      commercial_terms: terms,
+      terms_digest: proposalTermsDigest(terms),
+    };
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let calls = 0;
+    agent.getProducts = async () =>
+      completed(
+        'get_products',
+        calls++ === 0
+          ? { proposals: [proposal] }
+          : {
+              products: [],
+              cache_scope: 'account',
+              proposals: [],
+              refinement_applied: [
+                { scope: 'proposal', proposal_id: proposal.proposal_id, status: 'unable', notes: 'unchanged' },
+              ],
+            }
+      );
+    const options = { principalScope: 'durable-unable-buyer', establishedProposalStore: store };
+    const coordinator = await agent.negotiateMediaBuyLifecycle(options);
+    await coordinator.requestProposals({ brief: 'unable', account: { account_id: 'account-1' } });
+    await coordinator.refineProposals({
+      idempotency_key: 'unable-refine-key-0001',
+      refinements: [{ proposal_id: proposal.proposal_id, action: 'revise', ask: 'impossible' }],
+    });
+
+    const freshAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    freshAgent.createMediaBuy = async () => durableCreateSuccess('mb-unable');
+    const fresh = await freshAgent.negotiateMediaBuyLifecycle({
+      ...options,
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    assert.equal(
+      (
+        await fresh.acceptProposal({
+          account: { account_id: 'account-1' },
+          proposal_id: proposal.proposal_id,
+          proposal_terms_digest: proposal.terms_digest,
+          idempotency_key: 'unable-accept-key-0001',
+        })
+      ).status,
+      'completed'
+    );
+  });
+
+  test('concurrent fresh acceptance workers share one atomic reservation', async () => {
+    const store = createInMemoryEstablishedProposalStore();
+    const terms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const proposal = {
+      proposal_id: 'durable-concurrent-accept',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: terms,
+      terms_digest: proposalTermsDigest(terms),
+    };
+    const discoveryAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    discoveryAgent.getProducts = async () => completed('get_products', { proposals: [proposal] });
+    const discovery = await discoveryAgent.negotiateMediaBuyLifecycle({
+      principalScope: 'durable-concurrent-buyer',
+      establishedProposalStore: store,
+    });
+    await discovery.requestProposals({ brief: 'concurrent', account: { account_id: 'account-1' } });
+
+    let release;
+    let dispatches = 0;
+    const gate = new Promise(resolve => (release = resolve));
+    const worker = async () => {
+      const agent = clientWithCaps(capabilities({ version: '3.1' }));
+      agent.createMediaBuy = async () => {
+        dispatches += 1;
+        await gate;
+        return durableCreateSuccess('mb-concurrent');
+      };
+      return agent.negotiateMediaBuyLifecycle({
+        principalScope: 'durable-concurrent-buyer',
+        establishedProposalStore: store,
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      });
+    };
+    const [left, right] = await Promise.all([worker(), worker()]);
+    const acceptance = {
+      idempotency_key: 'durable-concurrent-key-0001',
+      account: { account_id: 'account-1' },
+      proposal_id: proposal.proposal_id,
+      proposal_terms_digest: proposal.terms_digest,
+    };
+    const first = left.acceptProposal(acceptance);
+    await new Promise(resolve => setImmediate(resolve));
+    await assert.rejects(right.acceptProposal(acceptance), /durable established proposal reservation was in_flight/);
+    release();
+    assert.equal((await first).status, 'completed');
+    assert.equal(dispatches, 1);
+  });
+
+  test('transport ambiguity permits only an exact retry from a fresh worker', async () => {
+    const store = createInMemoryEstablishedProposalStore();
+    const terms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const proposal = {
+      proposal_id: 'durable-ambiguous-accept',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: terms,
+      terms_digest: proposalTermsDigest(terms),
+    };
+    const discoveryAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    discoveryAgent.getProducts = async () => completed('get_products', { proposals: [proposal] });
+    const discovery = await discoveryAgent.negotiateMediaBuyLifecycle({
+      principalScope: 'durable-ambiguous-buyer',
+      establishedProposalStore: store,
+    });
+    await discovery.requestProposals({ brief: 'ambiguous', account: { account_id: 'account-1' } });
+
+    const acceptance = {
+      idempotency_key: 'durable-ambiguous-key-0001',
+      account: { account_id: 'account-1' },
+      proposal_id: proposal.proposal_id,
+      proposal_terms_digest: proposal.terms_digest,
+    };
+    const uncertainAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    uncertainAgent.createMediaBuy = async () => {
+      throw new Error('connection closed after dispatch');
+    };
+    const uncertain = await uncertainAgent.negotiateMediaBuyLifecycle({
+      principalScope: 'durable-ambiguous-buyer',
+      establishedProposalStore: store,
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    await assert.rejects(uncertain.acceptProposal(acceptance), /connection closed/);
+
+    let dispatches = 0;
+    const retryAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    retryAgent.createMediaBuy = async () => {
+      dispatches += 1;
+      return durableCreateSuccess('mb-ambiguous');
+    };
+    const retry = await retryAgent.negotiateMediaBuyLifecycle({
+      principalScope: 'durable-ambiguous-buyer',
+      establishedProposalStore: store,
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    await assert.rejects(
+      retry.acceptProposal({ ...acceptance, idempotency_key: 'durable-ambiguous-key-0002' }),
+      /durable established proposal reservation was conflict/
+    );
+    assert.equal((await retry.acceptProposal(acceptance)).status, 'completed');
+    assert.equal(dispatches, 1);
+  });
+
+  test('submitted acceptance task identity and terminal fence survive a restart', async () => {
+    const store = createInMemoryEstablishedProposalStore();
+    const recordSubmittedTask = store.recordSubmittedTask.bind(store);
+    let recordedSellerTaskId;
+    store.recordSubmittedTask = (request, sellerTaskId) => {
+      recordedSellerTaskId = sellerTaskId;
+      return recordSubmittedTask(request, sellerTaskId);
+    };
+    const terms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const proposal = {
+      proposal_id: 'durable-submitted-accept',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: terms,
+      terms_digest: proposalTermsDigest(terms),
+    };
+    const firstAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    firstAgent.getProducts = async () => completed('get_products', { proposals: [proposal] });
+    const terminal = durableCreateSuccess('mb-submitted');
+    firstAgent.createMediaBuy = async () =>
+      submitted('create_media_buy', terminal, {
+        localTaskId: 'local-runner-task-123',
+        sellerTaskId: 'seller-task-456',
+      });
+    const options = {
+      principalScope: 'durable-submitted-buyer',
+      establishedProposalStore: store,
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    };
+    const first = await firstAgent.negotiateMediaBuyLifecycle(options);
+    await first.requestProposals({ brief: 'submitted', account: { account_id: 'account-1' } });
+    const acceptance = {
+      idempotency_key: 'durable-submitted-key-0001',
+      account: { account_id: 'account-1' },
+      proposal_id: proposal.proposal_id,
+      proposal_terms_digest: proposal.terms_digest,
+    };
+    const pending = await first.acceptProposal(acceptance);
+    assert.equal(pending.status, 'submitted');
+    assert.equal(recordedSellerTaskId, 'seller-task-456');
+
+    const secondAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    secondAgent.getTaskStatus = async taskId => ({
+      taskId,
+      taskType: 'create_media_buy',
+      status: 'completed',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      result: terminal.data,
+    });
+    let redispatches = 0;
+    secondAgent.createMediaBuy = async () => {
+      redispatches += 1;
+      return terminal;
+    };
+    const second = await secondAgent.negotiateMediaBuyLifecycle(options);
+    await assert.rejects(second.acceptProposal(acceptance), /durable established proposal reservation was in_flight/);
+    first.dispose();
+    assert.equal(
+      (
+        await second.reconcileEstablishedProposalTask({
+          account: acceptance.account,
+          sellerTaskId: 'seller-task-456',
+        })
+      ).status,
+      'completed'
+    );
+    secondAgent.getTaskStatus = async () => assert.fail('settled reconciliation must not poll an evicted seller task');
+    assert.equal(
+      (
+        await second.reconcileEstablishedProposalTask({
+          account: acceptance.account,
+          sellerTaskId: 'seller-task-456',
+        })
+      ).status,
+      'completed'
+    );
+
+    const thirdAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    const third = await thirdAgent.negotiateMediaBuyLifecycle(options);
+    await assert.rejects(third.acceptProposal(acceptance), /durable established proposal record is terminal/);
+    assert.equal(redispatches, 0);
+  });
+
+  test('submitted webhook settlement commits the durable fence before exposing completion', async () => {
+    const store = createInMemoryEstablishedProposalStore();
+    const terms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const proposal = {
+      proposal_id: 'durable-push-proposal',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: terms,
+      terms_digest: proposalTermsDigest(terms),
+    };
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () => completed('get_products', { proposals: [proposal] });
+    agent.createMediaBuy = async () =>
+      submitted('create_media_buy', durableCreateSuccess('mb-push'), { sellerTaskId: 'seller-push-task' });
+    const options = {
+      principalScope: 'durable-push-buyer',
+      establishedProposalStore: store,
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    };
+    const lifecycle = await agent.negotiateMediaBuyLifecycle(options);
+    await lifecycle.requestProposals({ brief: 'push', account: { account_id: 'account-1' } });
+    await lifecycle.acceptProposal({
+      account: { account_id: 'account-1' },
+      proposal_id: proposal.proposal_id,
+      proposal_terms_digest: proposal.terms_digest,
+      idempotency_key: 'durable-push-key-0001',
+    });
+    assert.equal(typeof agent.externalTaskSettlementHandler, 'function');
+    const pushed = await agent.externalTaskSettlementHandler({
+      status: 'completed',
+      result: durableCreateSuccess('mb-push').data,
+      serverTaskId: 'seller-push-task',
+      taskType: 'create_media_buy',
+    });
+    assert.equal(pushed.status, 'completed');
+
+    const freshAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    freshAgent.createMediaBuy = async () => assert.fail('terminal push settlement must prevent redispatch');
+    const fresh = await freshAgent.negotiateMediaBuyLifecycle(options);
+    await assert.rejects(
+      fresh.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: proposal.proposal_id,
+        proposal_terms_digest: proposal.terms_digest,
+        idempotency_key: 'durable-push-key-0002',
+      }),
+      /durable established proposal record is terminal/
+    );
+  });
+
+  test('governance rewrites fail before an established durable claim or seller dispatch', async () => {
+    const store = createInMemoryEstablishedProposalStore();
+    const terms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const proposal = {
+      proposal_id: 'durable-governance-proposal',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: terms,
+      terms_digest: proposalTermsDigest(terms),
+    };
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () => completed('get_products', { proposals: [proposal] });
+    let dispatches = 0;
+    agent.createMediaBuy = async () => {
+      dispatches += 1;
+      return durableCreateSuccess('mb-governance');
+    };
+    const options = {
+      principalScope: 'durable-governance-buyer',
+      establishedProposalStore: store,
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    };
+    const lifecycle = await agent.negotiateMediaBuyLifecycle(options);
+    await lifecycle.requestProposals({ brief: 'governance', account: { account_id: 'account-1' } });
+    const normalPreDispatch = agent.createMediaBuyLegacyWithPreDispatch;
+    agent.createMediaBuyLegacyWithPreDispatch = async (params, beforeDispatch) =>
+      beforeDispatch(
+        { ...params, proposal_id: 'rewritten-proposal' },
+        {
+          governanceAdjusted: true,
+          publishSettledTaskStatus: () => {},
+          registerExternalTaskSettlement: () => {},
+        }
+      );
+    const acceptance = {
+      account: { account_id: 'account-1' },
+      proposal_id: proposal.proposal_id,
+      proposal_terms_digest: proposal.terms_digest,
+      idempotency_key: 'durable-governance-key-0001',
+    };
+    await assert.rejects(
+      lifecycle.acceptProposal(acceptance),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'governance_adjustment'
+    );
+    assert.equal(dispatches, 0);
+
+    agent.createMediaBuyLegacyWithPreDispatch = normalPreDispatch;
+    assert.equal((await lifecycle.acceptProposal(acceptance)).status, 'completed');
+    assert.equal(dispatches, 1);
+  });
+
+  test('restart reconciliation preserves the fence for paused and non-authoritative task observations', async () => {
+    const observations = [
+      { name: 'paused', status: 'needs_input', result: undefined, rejects: false },
+      {
+        name: 'unknown-status',
+        status: 'seller-specific-state',
+        result: undefined,
+        rejects: /not authoritative enough/,
+      },
+      {
+        name: 'malformed-completion',
+        status: 'completed',
+        result: { media_buy_id: 'incomplete' },
+        rejects: /not authoritative enough/,
+      },
+      {
+        name: 'unstructured-failure',
+        status: 'failed',
+        result: undefined,
+        rejects: /not an authoritative structured AdCP error/,
+      },
+    ];
+    for (const observation of observations) {
+      const store = createInMemoryEstablishedProposalStore();
+      const terms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      };
+      const proposal = {
+        proposal_id: `durable-reconcile-${observation.name}`,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        commercial_terms: terms,
+        terms_digest: proposalTermsDigest(terms),
+      };
+      const sellerTaskId = `seller-${observation.name}-task`;
+      const firstAgent = clientWithCaps(capabilities({ version: '3.1' }));
+      firstAgent.getProducts = async () => completed('get_products', { proposals: [proposal] });
+      firstAgent.createMediaBuy = async () =>
+        submitted('create_media_buy', durableCreateSuccess(`mb-${observation.name}`), { sellerTaskId });
+      const options = {
+        principalScope: `durable-reconcile-${observation.name}-buyer`,
+        establishedProposalStore: store,
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      };
+      const first = await firstAgent.negotiateMediaBuyLifecycle(options);
+      await first.requestProposals({ brief: observation.name, account: { account_id: 'account-1' } });
+      const acceptance = {
+        idempotency_key: `durable-${observation.name}-key-0001`,
+        account: { account_id: 'account-1' },
+        proposal_id: proposal.proposal_id,
+        proposal_terms_digest: proposal.terms_digest,
+      };
+      await first.acceptProposal(acceptance);
+      first.dispose();
+
+      const recoveryAgent = clientWithCaps(capabilities({ version: '3.1' }));
+      recoveryAgent.getTaskStatus = async taskId => ({
+        taskId,
+        taskType: 'create_media_buy',
+        status: observation.status,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        ...(observation.result !== undefined && { result: observation.result }),
+      });
+      const recovery = await recoveryAgent.negotiateMediaBuyLifecycle(options);
+      const reconcile = recovery.reconcileEstablishedProposalTask({
+        account: acceptance.account,
+        sellerTaskId,
+      });
+      if (observation.rejects) {
+        await assert.rejects(reconcile, observation.rejects);
+      } else {
+        assert.equal((await reconcile).status, observation.status);
+      }
+      await assert.rejects(
+        recovery.acceptProposal({ ...acceptance, idempotency_key: `durable-${observation.name}-key-0002` }),
+        /durable established proposal reservation was conflict/
+      );
+    }
+  });
+
+  test('restart reconciliation settles permanent and replay-expired uncertainty fences', async () => {
+    for (const mode of ['no-replay-ttl', 'expired-replay-ttl']) {
+      let now = Date.parse('2026-08-22T00:00:00.000Z');
+      const store = createInMemoryEstablishedProposalStore({ clock: () => new Date(now) });
+      const terms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      };
+      const proposal = {
+        proposal_id: `durable-${mode}-proposal`,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        commercial_terms: terms,
+        terms_digest: proposalTermsDigest(terms),
+      };
+      const caps = capabilities({ version: '3.1', replayTtlSeconds: 3_600 });
+      if (mode === 'no-replay-ttl') delete caps.idempotency;
+      const sellerTaskId = `seller-${mode}-task`;
+      const firstAgent = clientWithCaps(caps);
+      firstAgent.getProducts = async () => completed('get_products', { proposals: [proposal] });
+      firstAgent.createMediaBuy = async () =>
+        submitted('create_media_buy', completed('create_media_buy', { media_buy_id: 'malformed' }), {
+          sellerTaskId,
+        });
+      const options = {
+        principalScope: `durable-${mode}-buyer`,
+        establishedProposalStore: store,
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      };
+      const first = await firstAgent.negotiateMediaBuyLifecycle(options);
+      await first.requestProposals({ brief: mode, account: { account_id: 'account-1' } });
+      const acceptance = {
+        account: { account_id: 'account-1' },
+        proposal_id: proposal.proposal_id,
+        proposal_terms_digest: proposal.terms_digest,
+        idempotency_key: `durable-${mode}-key-0001`,
+      };
+      const pending = await first.acceptProposal(acceptance);
+      await assert.rejects(pending.submitted.track(), /not authoritative enough/);
+      if (mode === 'expired-replay-ttl') now += 3_600_001;
+      first.dispose();
+
+      const recoveryAgent = clientWithCaps(caps);
+      recoveryAgent.getTaskStatus = async taskId => ({
+        taskId,
+        taskType: 'create_media_buy',
+        status: 'completed',
+        createdAt: now,
+        updatedAt: now,
+        result: durableCreateSuccess(`mb-${mode}`).data,
+      });
+      const recovery = await recoveryAgent.negotiateMediaBuyLifecycle(options);
+      assert.equal(
+        (
+          await recovery.reconcileEstablishedProposalTask({
+            account: acceptance.account,
+            sellerTaskId,
+          })
+        ).status,
+        'completed'
+      );
+      await assert.rejects(recovery.acceptProposal(acceptance), /durable established proposal record is terminal/);
+    }
+  });
+
+  test('restart reconciliation validates ledger scope and reacquires paused claims before polling', async () => {
+    for (const mode of ['corrupt-scope', 'lost-reacquire-race']) {
+      const backing = createInMemoryEstablishedProposalStore();
+      let submittedRequest;
+      let corruptScope = false;
+      let raceReacquire = false;
+      const store = {
+        putSnapshot: (value, expected) => backing.putSnapshot(value, expected),
+        discardSnapshot: (value, fingerprint) => backing.discardSnapshot(value, fingerprint),
+        get: value => backing.get(value),
+        find: (scope, ids) => backing.find(scope, ids),
+        findSubmittedTask: async (scope, taskId) => {
+          const recovered = await backing.findSubmittedTask(scope, taskId);
+          if (recovered && corruptScope) recovered.request.bindings[0].principalScope = 'different-buyer';
+          return recovered;
+        },
+        reserveMutation: async value => {
+          if (raceReacquire) {
+            raceReacquire = false;
+            await backing.reserveMutation(value);
+            return backing.reserveMutation(value);
+          }
+          return backing.reserveMutation(value);
+        },
+        completeMutation: (value, disposition, fingerprint) =>
+          backing.completeMutation(value, disposition, fingerprint),
+        completeRefinement: (value, replacements, retained) =>
+          backing.completeRefinement(value, replacements, retained),
+        completeDecline: (value, retained) => backing.completeDecline(value, retained),
+        releaseMutation: value => backing.releaseMutation(value),
+        recordSubmittedTask: (value, taskId) => {
+          submittedRequest = value;
+          return backing.recordSubmittedTask(value, taskId);
+        },
+        markAmbiguous: (value, ambiguity) => backing.markAmbiguous(value, ambiguity),
+      };
+      const terms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      };
+      const proposal = {
+        proposal_id: `durable-recovery-${mode}`,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        commercial_terms: terms,
+        terms_digest: proposalTermsDigest(terms),
+      };
+      const sellerTaskId = `durable-recovery-${mode}-task`;
+      const options = {
+        principalScope: `durable-recovery-${mode}-buyer`,
+        establishedProposalStore: store,
+        allowedLosses: ['proposal_terms_digest_not_enforced'],
+      };
+      const firstAgent = clientWithCaps(capabilities({ version: '3.1' }));
+      firstAgent.getProducts = async () => completed('get_products', { proposals: [proposal] });
+      firstAgent.createMediaBuy = async () =>
+        submitted('create_media_buy', durableCreateSuccess(`mb-${mode}`), { sellerTaskId });
+      const first = await firstAgent.negotiateMediaBuyLifecycle(options);
+      await first.requestProposals({ brief: mode, account: { account_id: 'account-1' } });
+      await first.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: proposal.proposal_id,
+        proposal_terms_digest: proposal.terms_digest,
+        idempotency_key: `durable-recovery-${mode}-key-0001`,
+      });
+      first.dispose();
+
+      if (mode === 'corrupt-scope') corruptScope = true;
+      else {
+        await backing.markAmbiguous(submittedRequest, 'paused');
+        raceReacquire = true;
+      }
+      let polls = 0;
+      const recoveryAgent = clientWithCaps(capabilities({ version: '3.1' }));
+      recoveryAgent.getTaskStatus = async () => {
+        polls += 1;
+        return assert.fail('invalid or unowned recovery must fail before polling');
+      };
+      const recovery = await recoveryAgent.negotiateMediaBuyLifecycle(options);
+      await assert.rejects(
+        recovery.reconcileEstablishedProposalTask({ account: { account_id: 'account-1' }, sellerTaskId }),
+        mode === 'corrupt-scope' ? /outside the requested/ : /changed while reconciliation was acquiring/
+      );
+      assert.equal(polls, 0);
+    }
+  });
+
+  test('live submitted observers keep malformed completions commit-uncertain on 3.0 and 3.1', async () => {
+    for (const version of ['3.0', '3.1']) {
+      for (const observer of ['track', 'wait']) {
+        const store = createInMemoryEstablishedProposalStore();
+        const terms = {
+          brand: { domain: 'example.com' },
+          start_time: '2027-01-01T00:00:00Z',
+          end_time: '2027-02-01T00:00:00Z',
+        };
+        const proposal = {
+          proposal_id: `durable-malformed-${version}-${observer}`,
+          proposal_kind: 'new_media_buy',
+          proposal_status: 'committed',
+          expires_at: '2099-12-31T23:59:59Z',
+          commercial_terms: terms,
+          terms_digest: proposalTermsDigest(terms),
+        };
+        const agent = clientWithCaps(capabilities({ version }));
+        agent.getProducts = async () => completed('get_products', { proposals: [proposal] });
+        agent.createMediaBuy = async () =>
+          submitted('create_media_buy', completed('create_media_buy', { media_buy_id: 'incomplete' }), {
+            sellerTaskId: `malformed-${version}-${observer}-task`,
+          });
+        const options = {
+          principalScope: `durable-malformed-${version}-${observer}-buyer`,
+          establishedProposalStore: store,
+          allowedLosses: ['proposal_terms_digest_not_enforced'],
+        };
+        const coordinator = await agent.negotiateMediaBuyLifecycle(options);
+        await coordinator.requestProposals({ brief: observer, account: { account_id: 'account-1' } });
+        const acceptance = {
+          account: { account_id: 'account-1' },
+          proposal_id: proposal.proposal_id,
+          proposal_terms_digest: proposal.terms_digest,
+          idempotency_key: `malformed-${version}-${observer}-key-0001`,
+        };
+        const pending = await coordinator.acceptProposal(acceptance);
+        await assert.rejects(
+          observer === 'track' ? pending.submitted.track() : pending.submitted.waitForCompletion(),
+          /not authoritative enough/
+        );
+        coordinator.dispose();
+
+        const freshAgent = clientWithCaps(capabilities({ version }));
+        freshAgent.createMediaBuy = async () => assert.fail('a competing mutation must remain fenced');
+        const fresh = await freshAgent.negotiateMediaBuyLifecycle(options);
+        await assert.rejects(
+          fresh.acceptProposal({ ...acceptance, idempotency_key: `malformed-${version}-${observer}-key-0002` }),
+          /durable established proposal reservation was conflict/
+        );
+      }
+    }
+  });
+
+  test('projected continuations forward the internal exact-task-identity requirement', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+    const terminal = durableCreateSuccess('mb-projected-identity');
+    const source = submitted('create_media_buy', terminal, { sellerTaskId: 'seller-projected-identity' });
+    let requireExactTaskIdentity;
+    source.submitted.waitForCompletion = async (_pollInterval, _signal, requireExactIdentity) => {
+      requireExactTaskIdentity = requireExactIdentity;
+      return terminal;
+    };
+    const projected = coordinator.adaptProjectedResult(
+      source,
+      {
+        negotiated_version: '3.1',
+        lifecycle: 'established',
+        tools_used: ['create_media_buy'],
+        compatibility: 'native',
+        warnings: [],
+        losses: [],
+      },
+      data => data
+    );
+
+    await projected.submitted.waitForCompletion(undefined, undefined, true);
+    assert.equal(requireExactTaskIdentity, true);
+  });
+
+  test('fresh coordinators reconcile submitted refine and unable-decline results', async () => {
+    for (const operation of ['refine', 'decline']) {
+      let storeNow = Date.parse('2026-08-23T00:00:00.000Z');
+      const store = createInMemoryEstablishedProposalStore({ clock: () => new Date(storeNow) });
+      const terms = {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      };
+      const proposal = {
+        proposal_id: `restart-${operation}-proposal`,
+        name: `Restart ${operation} proposal`,
+        proposal_kind: 'new_media_buy',
+        proposal_status: 'committed',
+        expires_at: '2099-12-31T23:59:59Z',
+        allocations: [{ product_id: 'product-1', pricing_option_id: 'option-1', allocation_percentage: 100 }],
+        commercial_terms: terms,
+        terms_digest: proposalTermsDigest(terms),
+      };
+      const successorTerms = { ...terms, end_time: '2027-03-01T00:00:00Z' };
+      const executableProposal =
+        operation === 'refine'
+          ? {
+              ...proposal,
+              commercial_terms: successorTerms,
+              terms_digest: proposalTermsDigest(successorTerms),
+            }
+          : proposal;
+      const completionData =
+        operation === 'refine'
+          ? {
+              products: [],
+              cache_scope: 'account',
+              proposals: [executableProposal],
+              refinement_applied: [{ scope: 'proposal', proposal_id: proposal.proposal_id, status: 'applied' }],
+            }
+          : {
+              products: [],
+              cache_scope: 'account',
+              proposals: [],
+              refinement_applied: [
+                { scope: 'proposal', proposal_id: proposal.proposal_id, status: 'unable', notes: 'unchanged' },
+              ],
+            };
+      const agent = clientWithCaps(capabilities({ version: '3.1' }));
+      agent.getProducts = async input =>
+        input.buying_mode === 'brief'
+          ? completed('get_products', { proposals: [proposal] })
+          : submitted('get_products', completed('get_products', completionData), {
+              sellerTaskId: `seller-${operation}-task`,
+            });
+      const options = {
+        principalScope: `restart-${operation}-buyer`,
+        establishedProposalStore: store,
+        ...(operation === 'decline' && {
+          allowedLosses: ['proposal_decline_not_terminal', 'proposal_decline_reason_not_forwarded'],
+        }),
+      };
+      const first = await agent.negotiateMediaBuyLifecycle(options);
+      await first.requestProposals({ brief: operation, account: { account_id: 'account-1' } });
+      if (operation === 'refine') {
+        await first.refineProposals({
+          idempotency_key: 'restart-refine-key-0001',
+          refinements: [{ proposal_id: proposal.proposal_id, action: 'finalize' }],
+        });
+      } else {
+        await first.declineProposals({
+          idempotency_key: 'restart-decline-key-0001',
+          declines: [{ proposal_id: proposal.proposal_id, reason: 'other' }],
+        });
+      }
+      first.dispose();
+
+      const recoveryAgent = clientWithCaps(capabilities({ version: '3.1' }));
+      recoveryAgent.getTaskStatus = async taskId => ({
+        taskId,
+        taskType: 'get_products',
+        status: 'completed',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        result: completionData,
+      });
+      const recovery = await recoveryAgent.negotiateMediaBuyLifecycle(options);
+      assert.equal(
+        (
+          await recovery.reconcileEstablishedProposalTask({
+            account: { account_id: 'account-1' },
+            sellerTaskId: `seller-${operation}-task`,
+          })
+        ).status,
+        'completed'
+      );
+
+      const settledAgent = clientWithCaps(capabilities({ version: '3.1' }));
+      settledAgent.getTaskStatus = async () => assert.fail('retained completion proof must avoid seller polling');
+      const settled = await settledAgent.negotiateMediaBuyLifecycle(options);
+      assert.equal(
+        (
+          await settled.reconcileEstablishedProposalTask({
+            account: { account_id: 'account-1' },
+            sellerTaskId: `seller-${operation}-task`,
+          })
+        ).status,
+        'completed'
+      );
+      settled.dispose();
+
+      storeNow += ESTABLISHED_PROPOSAL_COMPLETION_TOMBSTONE_RETENTION_MS;
+      assert.equal(await store.pruneCompletionTombstones(), 1);
+      const prunedAgent = clientWithCaps(capabilities({ version: '3.1' }));
+      prunedAgent.getTaskStatus = async () => assert.fail('pruned recovery must fail before seller polling');
+      const pruned = await prunedAgent.negotiateMediaBuyLifecycle(options);
+      await assert.rejects(
+        pruned.reconcileEstablishedProposalTask({
+          account: { account_id: 'account-1' },
+          sellerTaskId: `seller-${operation}-task`,
+        }),
+        /No submitted established proposal mutation exists/
+      );
+      pruned.dispose();
+
+      const acceptAgent = clientWithCaps(capabilities({ version: '3.1' }));
+      acceptAgent.createMediaBuy = async () => durableCreateSuccess(`mb-${operation}`);
+      const accept = await acceptAgent.negotiateMediaBuyLifecycle({
+        ...options,
+        allowedLosses: [...(options.allowedLosses ?? []), 'proposal_terms_digest_not_enforced'],
+      });
+      assert.equal(
+        (
+          await accept.acceptProposal({
+            account: { account_id: 'account-1' },
+            proposal_id: proposal.proposal_id,
+            proposal_terms_digest: executableProposal.terms_digest,
+            idempotency_key: `restart-${operation}-accept-key-0001`,
+          })
+        ).status,
+        'completed'
+      );
+    }
+  });
+
+  test('an adopter ledger can reconcile seller success after local completion fails', async () => {
+    const backing = createInMemoryEstablishedProposalStore();
+    let interruptedRequest;
+    const store = {
+      putSnapshot: value => backing.putSnapshot(value),
+      discardSnapshot: (value, fingerprint) => backing.discardSnapshot(value, fingerprint),
+      get: value => backing.get(value),
+      find: (scope, ids) => backing.find(scope, ids),
+      findSubmittedTask: (scope, taskId) => backing.findSubmittedTask(scope, taskId),
+      reserveMutation: value => backing.reserveMutation(value),
+      completeMutation: async (value, disposition, fingerprint) => {
+        interruptedRequest = { value, disposition, fingerprint };
+        return { outcome: 'conflict', records: await backing.find(value.bindings[0], [value.bindings[0].proposalId]) };
+      },
+      completeRefinement: (value, replacements, retainedBindings) =>
+        backing.completeRefinement(value, replacements, retainedBindings),
+      completeDecline: (value, retainedBindings) => backing.completeDecline(value, retainedBindings),
+      releaseMutation: value => backing.releaseMutation(value),
+      recordSubmittedTask: (value, taskId) => backing.recordSubmittedTask(value, taskId),
+      markAmbiguous: (value, ambiguity) => backing.markAmbiguous(value, ambiguity),
+    };
+    const terms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const proposal = {
+      proposal_id: 'durable-reconciled-accept',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: terms,
+      terms_digest: proposalTermsDigest(terms),
+    };
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () => completed('get_products', { proposals: [proposal] });
+    let dispatches = 0;
+    agent.createMediaBuy = async () => {
+      dispatches += 1;
+      return durableCreateSuccess('mb-reconciled');
+    };
+    const options = {
+      principalScope: 'durable-reconciled-buyer',
+      establishedProposalStore: store,
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle(options);
+    await coordinator.requestProposals({ brief: 'reconcile', account: { account_id: 'account-1' } });
+    const acceptance = {
+      idempotency_key: 'durable-reconciled-key-0001',
+      account: { account_id: 'account-1' },
+      proposal_id: proposal.proposal_id,
+      proposal_terms_digest: proposal.terms_digest,
+    };
+    await assert.rejects(coordinator.acceptProposal(acceptance), /store could not persist the seller result/);
+    assert.equal(dispatches, 1);
+
+    await backing.completeMutation(
+      interruptedRequest.value,
+      interruptedRequest.disposition,
+      interruptedRequest.fingerprint
+    );
+    const freshAgent = clientWithCaps(capabilities({ version: '3.1' }));
+    freshAgent.createMediaBuy = async () => {
+      dispatches += 1;
+      return completed('create_media_buy', {});
+    };
+    const fresh = await freshAgent.negotiateMediaBuyLifecycle(options);
+    await assert.rejects(fresh.acceptProposal(acceptance), /durable established proposal record is terminal/);
+    assert.equal(dispatches, 1);
+  });
+});
+
+describe('legacy products-only purchase continuations', () => {
+  test('hashes account bindings and rejects non-minted continuation token shapes', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-binding-hardening' });
+    const scope = coordinator.accountScope({
+      account_id: 'account-binding-hardening',
+      ctx_metadata: { authorization: 'Bearer must-not-persist' },
+    });
+    assert.match(scope, /^sha256:[A-Za-z0-9_-]{43}$/);
+    assert.strictEqual(scope.includes('must-not-persist'), false);
+    assert.strictEqual(scope.includes('account-binding-hardening'), false);
+    const binding = coordinator.legacyPurchaseBinding(scope);
+    assert.match(binding.clientSessionScope, /^sha256:[A-Za-z0-9_-]{43}$/);
+    assert.strictEqual(binding.clientSessionScope.includes('test-authenticated-seller-session'), false);
+
+    for (const continuation_token of ['A'.repeat(31), 'A'.repeat(33), 'A'.repeat(100_000), `${'A'.repeat(31)}!`]) {
+      await assert.rejects(
+        coordinator.continueLegacyPurchase({
+          idempotency_key: '3d787652-ae8f-45a8-9fea-016670a66fd1',
+          continuation_token,
+          account: { account_id: 'account-binding-hardening' },
+          selected_product_ids: ['p-binding-hardening'],
+          accepted_losses: [],
+          legacy_create_request: {},
+        }),
+        error => error.code === 'request_invalid' && /32-character base64url/.test(error.message)
+      );
+    }
+  });
+  function validLegacyCreateResponse(sourceVersion, request, productId) {
+    return {
+      media_buy_id: `buy-${productId}`,
+      packages: [],
+      ...(sourceVersion.startsWith('3.1') && { confirmed_at: '2099-01-01T00:00:00Z', revision: 1 }),
+    };
+  }
+
+  test('purchases a tokenless 3.0 catalog through restart recovery and deterministic replay', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const firstAgent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    const product = legacyListedProduct('p-tokenless-catalog', 'Tokenless catalog');
+    firstAgent.getProducts = async () =>
+      completed('get_products', {
+        products: [product],
+        pagination: { cursor: 'catalog-next', has_more: true },
+        cache_scope: 'account',
+      });
+    const coordinatorOptions = {
+      principalScope: 'buyer-tokenless-catalog',
+      legacyPurchaseSellerSessionScope: 'seller-session-tokenless-catalog',
+      legacyPurchaseContinuationStore: store,
+      allowedLosses: ['feed_version_not_atomic', 'pricing_version_not_atomic'],
+    };
+    const first = await firstAgent.negotiateMediaBuyLifecycle(coordinatorOptions);
+    const listed = await first.listProducts({
+      account: { account_id: 'account-tokenless-catalog' },
+      criteria: { offer_filters: { countries: ['US'] } },
+      max_results: 1,
+    });
+
+    assert.equal(listed.data.feed_version, undefined);
+    assert.equal(listed.data.next_cursor, 'catalog-next');
+    assert.equal(listed.data.purchase_continuation.kind, 'legacy_create');
+    assert.deepEqual(listed.data.purchase_continuation.product_ids, ['p-tokenless-catalog']);
+    assert.deepEqual(listed.data.purchase_continuation.losses, [
+      'feed_version_not_atomic',
+      'pricing_version_not_atomic',
+    ]);
+    assert.equal(listed.data.raw.purchase_continuation, undefined, 'raw must remain the seller response');
+
+    let creates = 0;
+    firstAgent.createMediaBuy = async () => {
+      creates += 1;
+      return completed('create_media_buy', {});
+    };
+    await assert.rejects(
+      first.buyProducts({
+        idempotency_key: 'strict-tokenless-buy-0001',
+        account: { account_id: 'account-tokenless-catalog' },
+        brand: { domain: 'example.com' },
+        purchases: [{ product_id: 'p-tokenless-catalog', pricing_option_id: 'fixed-cpm', budget: 10 }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'feed_version'
+    );
+    assert.equal(creates, 0, 'strict compact selection must fail before mutation');
+
+    const recoveredAgent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    const recoveredCreates = [];
+    recoveredAgent.createMediaBuyLegacy = async request => {
+      recoveredCreates.push(structuredClone(request));
+      return completed('create_media_buy', {
+        media_buy_id: 'buy-tokenless-catalog',
+        packages: [],
+      });
+    };
+    const recovered = await recoveredAgent.negotiateMediaBuyLifecycle(coordinatorOptions);
+    const continuationInput = {
+      idempotency_key: 'a2f9f142-e760-4b53-8f64-a4e24070dc4e',
+      continuation_token: listed.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-tokenless-catalog' },
+      selected_product_ids: ['p-tokenless-catalog'],
+      accepted_losses: listed.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-tokenless-create-0001',
+        account: { account_id: 'account-tokenless-catalog' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-tokenless-catalog', pricing_option_id: 'fixed-cpm', budget: 10 }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    await assert.rejects(
+      recovered.continueLegacyPurchase({
+        ...continuationInput,
+        accepted_losses: ['feed_version_not_atomic'],
+      }),
+      error => error.code === 'loss_mismatch'
+    );
+    assert.equal(recoveredCreates.length, 0, 'loss consent must be complete before mutation');
+
+    const purchased = await recovered.continueLegacyPurchase(continuationInput);
+    const replayed = await recovered.continueLegacyPurchase(continuationInput);
+
+    assert.equal(purchased.data.media_buy_id, 'buy-tokenless-catalog');
+    assert.equal(replayed.data.media_buy_id, purchased.data.media_buy_id);
+    assert.equal(recoveredCreates.length, 1);
+    assert.deepEqual(recoveredCreates[0], continuationInput.legacy_create_request);
+
+    recoveredAgent.getProducts = async () =>
+      completed('get_products', {
+        products: [product],
+        pagination: { cursor: 'catalog-next', has_more: true },
+        cache_scope: 'account',
+      });
+    const relisted = await recovered.listProducts({
+      account: { account_id: 'account-tokenless-catalog' },
+      criteria: { offer_filters: { countries: ['US'] } },
+      max_results: 1,
+    });
+    assert.notEqual(
+      relisted.data.purchase_continuation.continuation_token,
+      listed.data.purchase_continuation.continuation_token,
+      'a fresh listing must not reuse a consumed purchase continuation'
+    );
+    await recovered.continueLegacyPurchase({
+      ...continuationInput,
+      idempotency_key: '047165ce-43a5-45d9-8c81-8fe671d52879',
+      continuation_token: relisted.data.purchase_continuation.continuation_token,
+      legacy_create_request: {
+        ...continuationInput.legacy_create_request,
+        idempotency_key: 'legacy-tokenless-create-0002',
+      },
+    });
+    assert.equal(recoveredCreates.length, 2);
+  });
+
+  test('listing continuations are limited to purchasable catalogs without a real feed token', async () => {
+    const responses = [
+      {
+        products: [legacyListedProduct('p-feed-backed', 'Feed backed')],
+        wholesale_feed_version: 'feed-real',
+        cache_scope: 'account',
+        purchase_continuation: {
+          kind: 'legacy_create',
+          continuation_token: 'seller-controlled',
+        },
+      },
+      { products: [{ product_id: 'p-no-pricing', name: 'No pricing' }], cache_scope: 'account' },
+      {
+        products: [legacyListedProduct('p-no-session-binding', 'No session binding')],
+        cache_scope: 'account',
+      },
+    ];
+    const agent = clientWithCaps(capabilities({ version: '3.1' }), '3.1');
+    agent.getProducts = async () => completed('get_products', responses.shift());
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-list-eligibility',
+      legacyPurchaseSellerSessionScope: undefined,
+      legacyPurchaseContinuationStore: createInMemoryLegacyPurchaseContinuationStore(),
+    });
+
+    const feedBacked = await coordinator.listProducts({ account: { account_id: 'account-list-eligibility' } });
+    const unpurchasable = await coordinator.listProducts({ account: { account_id: 'account-list-eligibility' } });
+    const unbound = await coordinator.listProducts({ account: { account_id: 'account-list-eligibility' } });
+
+    assert.equal(feedBacked.data.feed_version, 'feed-real');
+    assert.equal(feedBacked.data.purchase_continuation, undefined);
+    assert.equal(feedBacked.data.raw.purchase_continuation.continuation_token, 'seller-controlled');
+    assert.equal(unpurchasable.data.purchase_continuation, undefined);
+    assert.equal(unbound.data.products[0].product_id, 'p-no-session-binding');
+    assert.equal(unbound.data.purchase_continuation, undefined);
+  });
+
+  test('keeps unsafe products-only discovery readable without issuing a purchase continuation', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }), '3.1');
+    let products = [legacyListedProduct('p-readable-only', 'Readable only')];
+    agent.getProducts = async () => completed('get_products', { products });
+
+    const withoutPrincipal = await agent.negotiateMediaBuyLifecycle();
+    const principalResult = await withoutPrincipal.requestProposals({
+      idempotency_key: 'request-proposals-readable-principal-0001',
+      account: { account_id: 'account-readable' },
+      brand: { domain: 'example.com' },
+      brief: 'Readable discovery',
+    });
+    assert.equal(principalResult.data.outcome, 'legacy_unavailable');
+    assert.equal(principalResult.data.purchase_continuation, undefined);
+    assert.equal(principalResult.data.products[0].product_id, 'p-readable-only');
+
+    const withoutAccount = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-readable' });
+    const accountResult = await withoutAccount.requestProposals({
+      idempotency_key: 'request-proposals-readable-account-0001',
+      brand: { domain: 'example.com' },
+      brief: 'Readable discovery',
+    });
+    assert.equal(accountResult.data.outcome, 'legacy_unavailable');
+    assert.equal(accountResult.data.purchase_continuation, undefined);
+
+    products = [{ product_id: 'p-no-pricing', name: 'No pricing' }];
+    const missingPricing = await withoutAccount.requestProposals({
+      idempotency_key: 'request-proposals-readable-pricing-0001',
+      account: { account_id: 'account-readable' },
+      brand: { domain: 'example.com' },
+      brief: 'Readable discovery',
+    });
+    assert.equal(missingPricing.data.outcome, 'legacy_unavailable');
+    assert.equal(missingPricing.data.purchase_continuation, undefined);
+  });
+
+  test('runs deterministic create preflight before atomically claiming the continuation', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-preflight-claim', 'Preflight claim')] });
+    agent.createMediaBuyLegacyWithPreDispatch = async () => {
+      throw new Error('deterministic local preflight failed');
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-preflight-claim',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-preflight-claim-0001',
+      account: { account_id: 'account-preflight-claim' },
+      brand: { domain: 'example.com' },
+      brief: 'Preflight before claim',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+    await assert.rejects(
+      coordinator.continueLegacyPurchase({
+        idempotency_key: '16a32ab9-9d5b-4578-91eb-c9e8ef810a09',
+        continuation_token: token,
+        account: { account_id: 'account-preflight-claim' },
+        selected_product_ids: ['p-preflight-claim'],
+        accepted_losses: discovery.data.purchase_continuation.losses,
+        legacy_create_request: {
+          idempotency_key: 'legacy-preflight-claim-create-0001',
+          account: { account_id: 'account-preflight-claim' },
+          brand: { domain: 'example.com' },
+          packages: [{ product_id: 'p-preflight-claim', budget: 10, pricing_option_id: 'fixed-cpm' }],
+          start_time: '2099-01-01T00:00:00Z',
+          end_time: '2099-02-01T00:00:00Z',
+        },
+      }),
+      /deterministic local preflight failed/
+    );
+    assert.equal((await store.get(token)).operation.state, 'available');
+  });
+
+  test('snapshots nested continuation input before awaiting durable storage', async () => {
+    const baseStore = createInMemoryLegacyPurchaseContinuationStore();
+    let releaseGet;
+    const getRelease = new Promise(resolve => {
+      releaseGet = resolve;
+    });
+    let markGetStarted;
+    const getStarted = new Promise(resolve => {
+      markGetStarted = resolve;
+    });
+    const store = {
+      create: record => baseStore.create(record),
+      get: async token => {
+        markGetStarted();
+        await getRelease;
+        return baseStore.get(token);
+      },
+      claim: (token, request) => baseStore.claim(token, request),
+      complete: (token, claim, result) => baseStore.complete(token, claim, result),
+      recordSubmittedTask: (token, claim, taskId) => baseStore.recordSubmittedTask(token, claim, taskId),
+      markAmbiguous: (token, claim, reason) => baseStore.markAmbiguous(token, claim, reason),
+    };
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-snapshot', 'Snapshot')] });
+    let dispatched;
+    let dispatchOptions;
+    agent.createMediaBuyLegacy = async (request, _inputHandler, options) => {
+      dispatched = request;
+      dispatchOptions = options;
+      return completed('create_media_buy', { media_buy_id: 'buy-snapshot', packages: [] });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-snapshot',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-snapshot-0001',
+      account: { account_id: 'account-snapshot' },
+      brand: { domain: 'example.com' },
+      brief: 'Snapshot nested terms',
+    });
+    const input = {
+      idempotency_key: 'a8190964-71bb-49af-a760-c06f10527ea8',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-snapshot' },
+      selected_product_ids: ['p-snapshot'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-snapshot-create-0001',
+        account: { account_id: 'account-snapshot' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-snapshot', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+
+    const trustedFetch = async () => new Response('{}', { status: 200 });
+    const substitutedFetch = async () => new Response('{}', { status: 500 });
+    const taskOptions = {
+      transport: { trustedFetchFn: trustedFetch, allowPrivateIp: false, requestTimeoutMs: 1_000 },
+      metadata: { tenant: { id: 'tenant-snapshot' } },
+      delegatedOperatorAuthorization: { brand: 'brand_a', scope: 'media_buying', country: 'GB' },
+    };
+    const purchase = coordinator.continueLegacyPurchase(input, undefined, taskOptions);
+    await getStarted;
+    input.account.account_id = 'attacker-account';
+    input.legacy_create_request.account.account_id = 'attacker-account';
+    input.legacy_create_request.packages[0].budget = 999999;
+    input.legacy_create_request.packages[0].pricing_option_id = 'attacker-price';
+    taskOptions.transport.trustedFetchFn = substitutedFetch;
+    taskOptions.transport.allowPrivateIp = true;
+    taskOptions.metadata.tenant.id = 'attacker-tenant';
+    taskOptions.delegatedOperatorAuthorization.brand = 'mutated_after_store_read';
+    releaseGet();
+
+    assert.equal((await purchase).status, 'completed');
+    assert.equal(dispatched.account.account_id, 'account-snapshot');
+    assert.equal(dispatched.packages[0].budget, 10);
+    assert.equal(dispatched.packages[0].pricing_option_id, 'fixed-cpm');
+    assert.equal(dispatchOptions.disableWebhook, true, 'polling-only custom stores must suppress task webhooks');
+    assert.strictEqual(dispatchOptions.transport.trustedFetchFn, trustedFetch);
+    assert.equal(dispatchOptions.transport.allowPrivateIp, false);
+    assert.equal(dispatchOptions.metadata.tenant.id, 'tenant-snapshot');
+    assert.deepStrictEqual(dispatchOptions.delegatedOperatorAuthorization, {
+      brand: 'brand_a',
+      scope: 'media_buying',
+      country: 'GB',
+    });
+  });
+
+  test('continuation replay fingerprints exclude only write-only webhook credentials', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', {
+        products: [legacyListedProduct('p-credential-fingerprint', 'Credential fingerprint')],
+      });
+    let dispatches = 0;
+    agent.createMediaBuyLegacy = async () => {
+      dispatches += 1;
+      return completed('create_media_buy', { media_buy_id: 'buy-credential-fingerprint', packages: [] });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-credential-fingerprint',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-credential-fingerprint-0001',
+      account: { account_id: 'account-credential-fingerprint' },
+      brand: { domain: 'example.com' },
+      brief: 'Credential-safe replay fingerprint',
+    });
+    const input = {
+      idempotency_key: '7ed655a5-dbc0-455a-8dc7-5f8d2052aa81',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-credential-fingerprint' },
+      selected_product_ids: ['p-credential-fingerprint'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-credential-fingerprint-create-0001',
+        account: { account_id: 'account-credential-fingerprint' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-credential-fingerprint', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+        push_notification_config: {
+          url: 'https://buyer.example/tasks',
+          authentication: {
+            schemes: ['HMAC-SHA256'],
+            credentials: 'task-secret-first-0123456789abcdef',
+          },
+        },
+        reporting_webhook: {
+          url: 'https://buyer.example/reports',
+          authentication: {
+            schemes: ['HMAC-SHA256'],
+            credentials: 'report-secret-first-0123456789abcdef',
+          },
+          reporting_frequency: 'daily',
+        },
+      },
+    };
+
+    assert.equal((await coordinator.continueLegacyPurchase(input)).status, 'completed');
+    const rotated = structuredClone(input);
+    rotated.legacy_create_request.push_notification_config.authentication.credentials =
+      'task-secret-rotated-0123456789abcdef';
+    rotated.legacy_create_request.reporting_webhook.authentication.credentials =
+      'report-secret-rotated-0123456789abcdef';
+    assert.equal((await coordinator.continueLegacyPurchase(rotated)).status, 'completed');
+    assert.equal(dispatches, 1, 'credential rotation must replay the original mutation');
+
+    const rerouted = structuredClone(rotated);
+    rerouted.legacy_create_request.reporting_webhook.url = 'https://other-buyer.example/reports';
+    await assert.rejects(coordinator.continueLegacyPurchase(rerouted), error => error.code === 'conflict');
+    assert.equal(dispatches, 1, 'routing changes remain bound by the replay fingerprint');
+
+    const persisted = await store.get(input.continuation_token);
+    assert.doesNotMatch(JSON.stringify(persisted), /task-secret|report-secret/);
+  });
+
+  test('rejects governance rewrites and final pricing drift before claiming the continuation', async () => {
+    const issueContinuation = async suffix => {
+      const store = createInMemoryLegacyPurchaseContinuationStore();
+      const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+      agent.getProducts = async () =>
+        completed('get_products', { products: [legacyListedProduct(`p-${suffix}`, 'Bound product')] });
+      const coordinator = await agent.negotiateMediaBuyLifecycle({
+        principalScope: `buyer-${suffix}`,
+        legacyPurchaseContinuationStore: store,
+      });
+      const discovery = await coordinator.requestProposals({
+        idempotency_key: `request-proposals-${suffix}`,
+        account: { account_id: `account-${suffix}` },
+        brand: { domain: 'example.com' },
+        brief: 'Bind the final seller payload',
+      });
+      const input = {
+        idempotency_key:
+          suffix === 'governance-rewrite'
+            ? 'bd71379f-1c36-41a5-8ed0-0a33a629f91f'
+            : '3aa4d66a-d542-434f-8f57-bf2ed17fd717',
+        continuation_token: discovery.data.purchase_continuation.continuation_token,
+        account: { account_id: `account-${suffix}` },
+        selected_product_ids: [`p-${suffix}`],
+        accepted_losses: discovery.data.purchase_continuation.losses,
+        legacy_create_request: {
+          idempotency_key: `create-${suffix}`,
+          account: { account_id: `account-${suffix}` },
+          brand: { domain: 'example.com' },
+          packages: [{ product_id: `p-${suffix}`, budget: 10, pricing_option_id: 'fixed-cpm' }],
+          start_time: '2099-01-01T00:00:00Z',
+          end_time: '2099-02-01T00:00:00Z',
+        },
+      };
+      return { agent, coordinator, input, store, token: input.continuation_token };
+    };
+
+    const governance = await issueContinuation('governance-rewrite');
+    governance.agent.createMediaBuyLegacyWithPreDispatch = async (params, beforeDispatch) => {
+      const decision = await beforeDispatch(params, { governanceAdjusted: true });
+      assert.fail(`unexpected dispatch decision: ${decision.action}`);
+    };
+    await assert.rejects(governance.coordinator.continueLegacyPurchase(governance.input), /cannot rewrite/i);
+    assert.equal((await governance.store.get(governance.token)).operation.state, 'available');
+
+    const pricing = await issueContinuation('pricing-drift');
+    pricing.agent.createMediaBuyLegacyWithPreDispatch = async (params, beforeDispatch) => {
+      const altered = {
+        ...params,
+        packages: params.packages.map(pkg => ({ ...pkg, pricing_option_id: 'unobserved-price' })),
+      };
+      const decision = await beforeDispatch(altered, { governanceAdjusted: false });
+      assert.fail(`unexpected dispatch decision: ${decision.action}`);
+    };
+    await assert.rejects(pricing.coordinator.continueLegacyPurchase(pricing.input), /pricing options must match/i);
+    assert.equal((await pricing.store.get(pricing.token)).operation.state, 'available');
+  });
+
+  for (const vector of PRODUCTS_ONLY_BRIEF_VECTORS.cases.filter(vector => !vector.source_version.startsWith('2.5'))) {
+    const version = vector.source_version.startsWith('3.0') ? '3.0' : '3.1';
+    const productId = vector.continuation_input.selected_product_ids[0];
+    test(`projects and redeems signed ${vector.source_version} products-only vector`, async () => {
+      const agent = clientWithCaps(capabilities({ version }), vector.source_version);
+      const creates = [];
+      agent.getProducts = async () => completed('get_products', vector.legacy_response);
+      agent.createMediaBuyLegacy = async request => {
+        creates.push(request);
+        return completed('create_media_buy', validLegacyCreateResponse(vector.source_version, request, productId));
+      };
+      const coordinator = await agent.negotiateMediaBuyLifecycle({
+        principalScope: 'buyer-acme',
+      });
+      const projected = await coordinator.requestProposals({
+        idempotency_key: 'request-proposals-vector-0001',
+        account: { account_id: 'account-acme' },
+        brand: { domain: 'acme.example' },
+        brief: 'A premium display campaign for Acme.',
+      });
+
+      assert.equal(projected.data.outcome, 'products_available');
+      assert.deepEqual(
+        projected.data.products.map(({ product_id, name, description, pricing_options }) => ({
+          product_id,
+          name,
+          description,
+          pricing_options,
+        })),
+        vector.compact_projection.products
+      );
+      assert.equal(
+        projected.data.purchase_continuation.source_adcp_version,
+        vector.compact_projection.purchase_continuation.source_adcp_version
+      );
+      assert.deepEqual(
+        projected.data.purchase_continuation.product_ids,
+        vector.compact_projection.purchase_continuation.product_ids
+      );
+      assert.deepEqual(
+        projected.data.purchase_continuation.losses,
+        vector.compact_projection.purchase_continuation.losses
+      );
+      assert.equal('feed_version' in projected.data, false);
+      assert.equal('proposals' in projected.data, false);
+
+      const continuationInput = {
+        ...vector.continuation_input,
+        continuation_token: projected.data.purchase_continuation.continuation_token,
+      };
+      const purchased = await coordinator.continueLegacyPurchase(continuationInput);
+      const replayed = await coordinator.continueLegacyPurchase(continuationInput);
+
+      assert.equal(purchased.data.media_buy_id, `buy-${productId}`);
+      assert.equal(replayed.data.media_buy_id, purchased.data.media_buy_id);
+      assert.equal(creates.length, 1);
+      assert.deepEqual(creates[0], vector.continuation_input.legacy_create_request);
+    });
+  }
+
+  test('atomically rejects a concurrent second claim and fails closed after ambiguity', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }), '3.1');
+    let releaseCreate;
+    const createStarted = new Promise(resolve => {
+      agent.createMediaBuyLegacy = async () => {
+        await new Promise(release => {
+          releaseCreate = release;
+          resolve();
+        });
+        return completed('create_media_buy', {
+          media_buy_id: 'buy-concurrent',
+          packages: [],
+          confirmed_at: '2099-01-01T00:00:00Z',
+          revision: 1,
+        });
+      };
+    });
+    agent.getProducts = async () =>
+      completed('get_products', {
+        products: [legacyListedProduct('p-concurrent', 'Concurrent', { description: 'Test' })],
+      });
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-concurrent' });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-concurrent-0001',
+      account: { account_id: 'account-1' },
+      brand: { domain: 'example.com' },
+      brief: 'Test concurrent claims',
+    });
+    const input = {
+      idempotency_key: '754d5421-52a6-4e93-8e32-917bb107fd24',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-1' },
+      selected_product_ids: ['p-concurrent'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-concurrent-create-0001',
+        account: { account_id: 'account-1' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-concurrent', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    const first = coordinator.continueLegacyPurchase(input);
+    await createStarted;
+    await assert.rejects(coordinator.continueLegacyPurchase(input), error => error.code === 'in_flight');
+    releaseCreate();
+    await first;
+
+    const failedDiscovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-ambiguous-0001',
+      account: { account_id: 'account-1' },
+      brand: { domain: 'example.com' },
+      brief: 'Test ambiguous claim',
+    });
+    agent.createMediaBuyLegacy = async () => {
+      throw new Error('connection reset');
+    };
+    const ambiguousInput = {
+      ...input,
+      idempotency_key: '60888384-bdb4-4388-a9ce-c08597492c0c',
+      continuation_token: failedDiscovery.data.purchase_continuation.continuation_token,
+    };
+    await assert.rejects(
+      coordinator.continueLegacyPurchase(ambiguousInput),
+      error => error.code === 'ambiguous' && /reconcileLegacyPurchase/.test(error.recovery)
+    );
+    await assert.rejects(coordinator.continueLegacyPurchase(ambiguousInput), error => error.code === 'ambiguous');
+  });
+
+  test('a restart retry validates and settles a queued callback before seller task binding', async () => {
+    const baseStore = createInMemoryLegacyPurchaseContinuationStore();
+    const completedClaims = [];
+    const store = {
+      create: record => baseStore.create(record),
+      get: token => baseStore.get(token),
+      getByCallbackOperationId: operationId => baseStore.getByCallbackOperationId(operationId),
+      claim: (token, request) => baseStore.claim(token, request),
+      complete: (token, claim, result) => {
+        completedClaims.push(claim);
+        return baseStore.complete(token, claim, result);
+      },
+      recordPendingSettlement: (token, claim, settlement) =>
+        baseStore.recordPendingSettlement(token, claim, settlement),
+      claimPendingSettlementPublication: (token, claim, settlement, lease) =>
+        baseStore.claimPendingSettlementPublication(token, claim, settlement, lease),
+      releasePendingSettlementPublication: (token, claim, settlement, ownerId) =>
+        baseStore.releasePendingSettlementPublication(token, claim, settlement, ownerId),
+      acknowledgePendingSettlement: (token, claim, settlement, ownerId) =>
+        baseStore.acknowledgePendingSettlement(token, claim, settlement, ownerId),
+      recordSubmittedTask: (token, claim, taskId) => baseStore.recordSubmittedTask(token, claim, taskId),
+      recordDeferredTaskToken: (token, claim, deferredToken, expectedDeferredToken) =>
+        baseStore.recordDeferredTaskToken(token, claim, deferredToken, expectedDeferredToken),
+      markAmbiguous: (token, claim, reason) => baseStore.markAmbiguous(token, claim, reason),
+    };
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-retry-push', 'Retry push')] });
+    const callbackResult = completed('create_media_buy', {
+      media_buy_id: 'buy-retry-push',
+      packages: [],
+    });
+    const sellerTaskId = 'seller-retry-push-task';
+    agent.getTaskStatus = async taskId => {
+      assert.equal(taskId, sellerTaskId);
+      return {
+        taskId,
+        taskType: 'create_media_buy',
+        status: 'completed',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        result: callbackResult.data,
+      };
+    };
+    const publications = [];
+    agent.publishDurablySettledWebhook = async publication => publications.push(publication);
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-retry-push',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-retry-push-0001',
+      account: { account_id: 'account-retry-push' },
+      brand: { domain: 'example.com' },
+      brief: 'Retry a queued callback',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+    const input = {
+      idempotency_key: 'da54aab1-4499-4ba4-a437-d618e5710184',
+      continuation_token: token,
+      account: { account_id: 'account-retry-push' },
+      selected_product_ids: ['p-retry-push'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-retry-push-create-0001',
+        account: { account_id: 'account-retry-push' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-retry-push', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    let releaseFirst;
+    const firstRelease = new Promise(resolve => {
+      releaseFirst = resolve;
+    });
+    let signalClaimed;
+    const claimed = new Promise(resolve => {
+      signalClaimed = resolve;
+    });
+    let dispatches = 0;
+    const operationIds = [];
+    agent.createMediaBuyLegacyWithPreDispatch = async (params, beforeDispatch) => {
+      const operationId = `retry-push-operation-${++dispatches}`;
+      operationIds.push(operationId);
+      const decision = await beforeDispatch(params, {
+        operationId,
+        governanceAdjusted: false,
+        publishSettledTaskStatus: () => {},
+        registerExternalTaskSettlement: () => {},
+      });
+      if (decision.action === 'return') return decision.result;
+      const persistedClaim = (await store.get(token)).operation;
+      assert.equal(
+        (
+          await store.recordPendingSettlement(token, persistedClaim, {
+            operationId,
+            serverTaskId: sellerTaskId,
+            taskType: 'create_media_buy',
+            terminal: callbackResult,
+          })
+        ).outcome,
+        'recorded'
+      );
+      signalClaimed();
+      await firstRelease;
+      return callbackResult;
+    };
+
+    const first = coordinator.continueLegacyPurchase(input);
+    await claimed;
+    const retry = await coordinator.continueLegacyPurchase(input);
+    assert.equal(retry.status, 'completed');
+    assert.equal(retry.data.media_buy_id, 'buy-retry-push');
+    assert.equal(operationIds.length, 2);
+    assert.notEqual(operationIds[0], operationIds[1]);
+    assert.equal(completedClaims.at(-1).callbackOperationId, operationIds[0]);
+    assert.equal(publications.length, 1);
+    assert.equal(publications[0].operationId, operationIds[0]);
+    assert.equal(publications[0].serverTaskId, sellerTaskId);
+    assert.equal(publications[0].result.media_buy_id, 'buy-retry-push');
+    releaseFirst();
+    assert.equal((await first).status, 'completed');
+  });
+
+  test('retries durable callback publication after a transient handler failure', async () => {
+    const baseStore = createInMemoryLegacyPurchaseContinuationStore();
+    let strictCompletionObserved = false;
+    const store = {
+      create: record => baseStore.create(record),
+      get: token => baseStore.get(token),
+      getByCallbackOperationId: operationId => baseStore.getByCallbackOperationId(operationId),
+      claim: (token, request) => baseStore.claim(token, request),
+      complete: async (token, claim, result) => {
+        const persisted = await baseStore.get(token);
+        assert.notEqual(persisted.operation.state, 'available');
+        assert.equal(claim.sellerTaskId, persisted.operation.sellerTaskId);
+        strictCompletionObserved = true;
+        return baseStore.complete(token, claim, result);
+      },
+      recordPendingSettlement: (token, claim, settlement) =>
+        baseStore.recordPendingSettlement(token, claim, settlement),
+      claimPendingSettlementPublication: (token, claim, settlement, lease) =>
+        baseStore.claimPendingSettlementPublication(token, claim, settlement, lease),
+      releasePendingSettlementPublication: (token, claim, settlement, ownerId) =>
+        baseStore.releasePendingSettlementPublication(token, claim, settlement, ownerId),
+      acknowledgePendingSettlement: (token, claim, settlement, ownerId) =>
+        baseStore.acknowledgePendingSettlement(token, claim, settlement, ownerId),
+      recordSubmittedTask: (token, claim, taskId) => baseStore.recordSubmittedTask(token, claim, taskId),
+      recordDeferredTaskToken: (token, claim, deferredToken, expectedDeferredToken) =>
+        baseStore.recordDeferredTaskToken(token, claim, deferredToken, expectedDeferredToken),
+      markAmbiguous: (token, claim, reason) => baseStore.markAmbiguous(token, claim, reason),
+    };
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-strict-bind', 'Strict bind')] });
+    const terminal = completed('create_media_buy', { media_buy_id: 'buy-strict-bind', packages: [] });
+    const sellerTaskId = 'seller-strict-bind-task';
+    const publications = [];
+    let publicationAttempts = 0;
+    agent.publishDurablySettledWebhook = async publication => {
+      publicationAttempts += 1;
+      if (publicationAttempts === 1) throw new Error('transient adopter handler failure');
+      publications.push(publication);
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-strict-bind',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-strict-bind-0001',
+      account: { account_id: 'account-strict-bind' },
+      brand: { domain: 'example.com' },
+      brief: 'Strict durable binding',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+    const input = {
+      idempotency_key: '7ce62f36-2cf8-429b-8abf-a56fddc65376',
+      continuation_token: token,
+      account: { account_id: 'account-strict-bind' },
+      selected_product_ids: ['p-strict-bind'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-strict-bind-create-0001',
+        account: { account_id: 'account-strict-bind' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-strict-bind', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    agent.createMediaBuyLegacyWithPreDispatch = async (params, beforeDispatch) => {
+      const operationId = 'strict-bind-operation';
+      const decision = await beforeDispatch(params, {
+        operationId,
+        governanceAdjusted: false,
+        publishSettledTaskStatus: () => {},
+        registerExternalTaskSettlement: () => {},
+      });
+      if (decision.action === 'return') return decision.result;
+      const persistedClaim = (await store.get(token)).operation;
+      assert.equal(
+        (
+          await store.recordPendingSettlement(token, persistedClaim, {
+            operationId,
+            serverTaskId: sellerTaskId,
+            taskType: 'create_media_buy',
+            terminal,
+          })
+        ).outcome,
+        'recorded'
+      );
+      return decision.onResult(terminal);
+    };
+
+    await assert.rejects(
+      coordinator.continueLegacyPurchase(input),
+      error => error.code === 'store_error' && error.cause?.message === 'transient adopter handler failure'
+    );
+    const awaitingPublication = await store.get(token);
+    assert.equal(awaitingPublication.operation.state, 'completed');
+    assert.equal(awaitingPublication.operation.pendingSettlement.serverTaskId, sellerTaskId);
+    const result = await coordinator.continueLegacyPurchase(input);
+    assert.equal(result.status, 'completed');
+    assert.equal(result.data.media_buy_id, 'buy-strict-bind');
+    assert.equal(strictCompletionObserved, true);
+    assert.equal((await store.get(token)).operation.sellerTaskId, sellerTaskId);
+    assert.equal(publications.length, 1);
+    assert.equal(publications[0].operationId, 'strict-bind-operation');
+    assert.equal((await store.get(token)).operation.pendingSettlement, undefined);
+  });
+
+  test('an ambiguous retry reconciles a queued callback with the original durable operation identity', async () => {
+    const baseStore = createInMemoryLegacyPurchaseContinuationStore();
+    const completedClaims = [];
+    const store = {
+      create: record => baseStore.create(record),
+      get: token => baseStore.get(token),
+      getByCallbackOperationId: operationId => baseStore.getByCallbackOperationId(operationId),
+      claim: (token, request) => baseStore.claim(token, request),
+      complete: (token, claim, result) => {
+        completedClaims.push(claim);
+        return baseStore.complete(token, claim, result);
+      },
+      recordPendingSettlement: (token, claim, settlement) =>
+        baseStore.recordPendingSettlement(token, claim, settlement),
+      claimPendingSettlementPublication: (token, claim, settlement, lease) =>
+        baseStore.claimPendingSettlementPublication(token, claim, settlement, lease),
+      releasePendingSettlementPublication: (token, claim, settlement, ownerId) =>
+        baseStore.releasePendingSettlementPublication(token, claim, settlement, ownerId),
+      acknowledgePendingSettlement: (token, claim, settlement, ownerId) =>
+        baseStore.acknowledgePendingSettlement(token, claim, settlement, ownerId),
+      recordSubmittedTask: (token, claim, taskId) => baseStore.recordSubmittedTask(token, claim, taskId),
+      recordDeferredTaskToken: (token, claim, deferredToken, expectedDeferredToken) =>
+        baseStore.recordDeferredTaskToken(token, claim, deferredToken, expectedDeferredToken),
+      markAmbiguous: (token, claim, reason) => baseStore.markAmbiguous(token, claim, reason),
+    };
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-reconcile-push', 'Reconcile push')] });
+    const publications = [];
+    agent.publishDurablySettledWebhook = async publication => publications.push(publication);
+    const callbackResult = completed('create_media_buy', {
+      media_buy_id: 'buy-reconcile-push',
+      packages: [],
+    });
+    let reconciledSellerTaskId = 'conflicting-reconcile-push-task';
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-reconcile-push',
+      legacyPurchaseContinuationStore: store,
+      reconcileLegacyPurchase: async () => ({
+        outcome: 'completed',
+        result: {
+          ...callbackResult,
+          metadata: { ...callbackResult.metadata, serverTaskId: reconciledSellerTaskId },
+        },
+      }),
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-reconcile-push-0001',
+      account: { account_id: 'account-reconcile-push' },
+      brand: { domain: 'example.com' },
+      brief: 'Reconcile a queued callback',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+    const input = {
+      idempotency_key: 'ffbca0d4-aa0c-4904-890e-23f614502c5f',
+      continuation_token: token,
+      account: { account_id: 'account-reconcile-push' },
+      selected_product_ids: ['p-reconcile-push'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-reconcile-push-create-0001',
+        account: { account_id: 'account-reconcile-push' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-reconcile-push', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    let dispatches = 0;
+    const operationIds = [];
+    agent.createMediaBuyLegacyWithPreDispatch = async (params, beforeDispatch) => {
+      const operationId = `reconcile-push-operation-${++dispatches}`;
+      operationIds.push(operationId);
+      const decision = await beforeDispatch(params, {
+        operationId,
+        governanceAdjusted: false,
+        publishSettledTaskStatus: () => {},
+        registerExternalTaskSettlement: () => {},
+      });
+      if (decision.action === 'return') return decision.result;
+      const persistedClaim = (await store.get(token)).operation;
+      assert.equal(
+        (
+          await store.recordPendingSettlement(token, persistedClaim, {
+            operationId,
+            serverTaskId: 'seller-reconcile-push-task',
+            taskType: 'create_media_buy',
+            terminal: callbackResult,
+          })
+        ).outcome,
+        'recorded'
+      );
+      throw new Error('simulated transport loss after seller dispatch');
+    };
+
+    await assert.rejects(coordinator.continueLegacyPurchase(input), error => error.code === 'ambiguous');
+    await assert.rejects(
+      coordinator.continueLegacyPurchase(input),
+      error => error.code === 'ambiguous' && /task identity conflicts/.test(error.message)
+    );
+    assert.equal(publications.length, 0);
+    reconciledSellerTaskId = 'seller-reconcile-push-task';
+    const retry = await coordinator.continueLegacyPurchase(input);
+    assert.equal(retry.status, 'completed');
+    assert.equal(retry.data.media_buy_id, 'buy-reconcile-push');
+    assert.equal(operationIds.length, 3);
+    assert.notEqual(operationIds[0], operationIds[1]);
+    assert.equal(completedClaims.at(-1).callbackOperationId, operationIds[0]);
+    assert.equal(publications.length, 1);
+    assert.equal(publications[0].operationId, operationIds[0]);
+    assert.equal(publications[0].serverTaskId, 'seller-reconcile-push-task');
+    assert.equal(publications[0].result.media_buy_id, 'buy-reconcile-push');
+  });
+
+  test('replays a completed operation after issuance expiry but rejects an unclaimed expired token', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    let creates = 0;
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-expiry', 'Expiry')] });
+    agent.createMediaBuyLegacy = async () => {
+      creates += 1;
+      return completed('create_media_buy', { media_buy_id: 'buy-expiry', packages: [] });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-expiry',
+      legacyPurchaseContinuationTtlMs: 1000,
+      legacyPurchaseOperationTtlMs: 1000,
+    });
+    const discover = idempotency_key =>
+      coordinator.requestProposals({
+        idempotency_key,
+        account: { account_id: 'account-expiry' },
+        brand: { domain: 'example.com' },
+        brief: 'Expiry test',
+      });
+    const first = await discover('request-proposals-expiry-0001');
+    const input = {
+      idempotency_key: '26701544-60b7-4b52-8124-6ef4669ea26b',
+      continuation_token: first.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-expiry' },
+      selected_product_ids: ['p-expiry'],
+      accepted_losses: first.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-expiry-create-0001',
+        account: { account_id: 'account-expiry' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-expiry', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    await coordinator.continueLegacyPurchase(input);
+    const completedRecord = await coordinator.legacyPurchaseContinuationStore.get(
+      first.data.purchase_continuation.continuation_token
+    );
+    assert.ok(
+      Date.parse(completedRecord.operation.replayExpiresAt) >= Date.now() + 6 * 24 * 60 * 60 * 1000,
+      'a short monitoring timeout cannot shorten the seven-day terminal replay fence'
+    );
+    const unused = await discover('request-proposals-expiry-0002');
+    await new Promise(resolve => setTimeout(resolve, 1025));
+    assert.equal((await coordinator.continueLegacyPurchase(input)).data.media_buy_id, 'buy-expiry');
+    await assert.rejects(
+      coordinator.continueLegacyPurchase({
+        ...input,
+        idempotency_key: '781a6d21-9e2b-4f3b-94b1-54d2891835b9',
+        continuation_token: unused.data.purchase_continuation.continuation_token,
+      }),
+      error => error.code === 'expired'
+    );
+    assert.equal(creates, 1);
+  });
+
+  test('enforces seller binding and operation-wide idempotency across continuation tokens', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    let creates = 0;
+    agent.getProducts = async () => completed('get_products', { products: [legacyListedProduct('p-bound', 'Bound')] });
+    agent.createMediaBuyLegacy = async () => {
+      creates += 1;
+      return completed('create_media_buy', { media_buy_id: 'buy-bound', packages: [] });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-bound',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discover = idempotency_key =>
+      coordinator.requestProposals({
+        idempotency_key,
+        account: { account_id: 'account-bound' },
+        brand: { domain: 'example.com' },
+        brief: 'Binding test',
+      });
+    const [first, second] = await Promise.all([
+      discover('request-proposals-bound-0001'),
+      discover('request-proposals-bound-0002'),
+    ]);
+    const base = {
+      idempotency_key: '17cb18b0-2857-49a1-8073-9f4618f2094d',
+      account: { account_id: 'account-bound' },
+      selected_product_ids: ['p-bound'],
+      accepted_losses: first.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-bound-create-0001',
+        account: { account_id: 'account-bound' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-bound', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    await coordinator.continueLegacyPurchase({
+      ...base,
+      continuation_token: first.data.purchase_continuation.continuation_token,
+    });
+    await assert.rejects(
+      coordinator.continueLegacyPurchase({
+        ...base,
+        continuation_token: second.data.purchase_continuation.continuation_token,
+      }),
+      error => error.code === 'conflict'
+    );
+
+    const otherSeller = new AgentClient(
+      { ...AGENT, id: 'other-seller', agent_uri: 'https://other-seller.example/mcp' },
+      { validateFeatures: false, adcpVersion: '3.0' }
+    );
+    otherSeller.getCapabilities = async () => capabilities({ version: '3.0' });
+    otherSeller.createMediaBuyLegacy = async () => assert.fail('seller binding must fail before mutation');
+    const otherCoordinator = await otherSeller.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-bound',
+      legacyPurchaseSellerSessionScope: 'test-authenticated-seller-session',
+      legacyPurchaseContinuationStore: store,
+    });
+    const third = await discover('request-proposals-bound-0003');
+    await assert.rejects(
+      otherCoordinator.continueLegacyPurchase({
+        ...base,
+        idempotency_key: '6de32b73-469d-44c7-8135-387b1fe5c14d',
+        continuation_token: third.data.purchase_continuation.continuation_token,
+      }),
+      error => error.code === 'binding_mismatch'
+    );
+    assert.equal(creates, 1);
+  });
+
+  test('rejects shared-vector substitution, incomplete consent, account drift, and unknown fields before mutation', async () => {
+    const vector = PRODUCTS_ONLY_BRIEF_VECTORS.cases[1];
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    let creates = 0;
+    agent.getProducts = async () => completed('get_products', { products: vector.compact_projection.products });
+    agent.createMediaBuyLegacy = async () => {
+      creates += 1;
+      return completed('create_media_buy', { media_buy_id: 'must-not-run', packages: [] });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-negative' });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-negative-0001',
+      account: vector.continuation_input.account,
+      brand: { domain: 'acme.example' },
+      brief: vector.legacy_request.brief,
+    });
+    const valid = {
+      ...vector.continuation_input,
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+    };
+    for (const [candidate, code] of [
+      [{ ...valid, selected_product_ids: ['substituted-product'] }, 'selection_mismatch'],
+      [
+        {
+          ...valid,
+          legacy_create_request: {
+            ...valid.legacy_create_request,
+            packages: valid.legacy_create_request.packages.map(pkg => ({
+              ...pkg,
+              pricing_option_id: 'substituted-pricing-option',
+            })),
+          },
+        },
+        'selection_mismatch',
+      ],
+      [{ ...valid, accepted_losses: ['feed_version_not_atomic'] }, 'loss_mismatch'],
+      [{ ...valid, account: { account_id: 'other-account' } }, 'binding_mismatch'],
+      [{ ...valid, unexpected: true }, 'request_invalid'],
+    ]) {
+      await assert.rejects(coordinator.continueLegacyPurchase(candidate), error => error.code === code);
+    }
+    assert.equal(creates, 0);
+  });
+
+  test('re-observing one async discovery returns one token and native 3.2 never emits the projection arm', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }), '3.1');
+    const terminal = completed('get_products', { products: [legacyListedProduct('p-async', 'Async')] });
+    agent.getProducts = async () => submitted('get_products', terminal);
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-async' });
+    const pending = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-async-0001',
+      account: { account_id: 'account-async' },
+      brand: { domain: 'example.com' },
+      brief: 'Async products',
+    });
+    const [first, second] = await Promise.all([
+      pending.submitted.waitForCompletion(),
+      pending.submitted.waitForCompletion(),
+    ]);
+    assert.equal(
+      first.data.purchase_continuation.continuation_token,
+      second.data.purchase_continuation.continuation_token
+    );
+
+    const native = clientWithCaps(
+      capabilities({
+        version: '3.2.1',
+        tools: COMPACT_TOOLS,
+        discoveredTools: ['get_products', ...COMPACT_TOOLS],
+      }),
+      '3.2.1'
+    );
+    native.getProducts = async () =>
+      completed('get_products', { products: [{ product_id: 'p-native', name: 'Native' }] });
+    const forced = await native.negotiateMediaBuyLifecycle({
+      preferredLifecycle: 'established',
+      principalScope: 'buyer-native',
+    });
+    const nativeResult = await forced.requestProposals({
+      idempotency_key: 'request-proposals-native-0001',
+      account: { account_id: 'account-native' },
+      brand: { domain: 'example.com' },
+      brief: 'Native products',
+    });
+    assert.equal(nativeResult.data.outcome, 'legacy_unavailable');
+    assert.equal(nativeResult.data.purchase_continuation, undefined);
+  });
+
+  test('executes the signed account-fenced listed_purchase vector through native buy_products', async () => {
+    const vector = PRODUCTS_ONLY_BRIEF_VECTORS.listed_purchase_cases[0];
+    const agent = clientWithCaps(capabilities({ version: '3.2.1', tools: COMPACT_TOOLS }), '3.2.1');
+    const calls = [];
+    agent.buyProducts = async request => {
+      calls.push(request);
+      return completed('buy_products', { media_buy_id: 'buy-listed', revision: 1 });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-listed' });
+    const result = await coordinator.buyProducts(vector.buy_products_request);
+    assert.equal(result.data.media_buy_id, 'buy-listed');
+    assert.deepEqual(calls, [vector.buy_products_request]);
+    assert.equal(calls[0].feed_version, vector.compact_projection.purchase_continuation.feed_version);
+    assert.equal(calls[0].pricing_version, vector.compact_projection.purchase_continuation.pricing_version);
+  });
+
+  test('reconciles an ambiguous claim from its durable natural key and rejects malformed completion', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-reconcile', 'Reconcile')] });
+    let mutationMode = 'throw';
+    agent.createMediaBuyLegacy = async () => {
+      if (mutationMode === 'throw') throw new Error('connection lost');
+      return completed('create_media_buy', undefined);
+    };
+    let reconciliationCalls = 0;
+    let reconciliationHasTaskId = false;
+    const publications = [];
+    agent.publishDurablySettledWebhook = async publication => publications.push(publication);
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-reconcile',
+      reconcileLegacyPurchase: async (record, exactInput) => {
+        reconciliationCalls += 1;
+        assert.equal(record.operation.sourceMutationKey, 'legacy-reconcile-create-0001');
+        assert.deepEqual(record.operation.selectedProductIds, ['p-reconcile']);
+        assert.equal(exactInput.legacy_create_request.idempotency_key, record.operation.sourceMutationKey);
+        return {
+          outcome: 'completed',
+          result: {
+            ...completed('create_media_buy', { media_buy_id: 'buy-reconciled', packages: [] }),
+            metadata: {
+              ...completed('create_media_buy', {}).metadata,
+              ...(reconciliationHasTaskId && { serverTaskId: 'seller-reconciled-task' }),
+            },
+          },
+        };
+      },
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-reconcile-0001',
+      account: { account_id: 'account-reconcile' },
+      brand: { domain: 'example.com' },
+      brief: 'Reconcile products',
+    });
+    const input = {
+      idempotency_key: '117b3ee1-8034-4195-bf64-365eaac08cb0',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-reconcile' },
+      selected_product_ids: ['p-reconcile'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-reconcile-create-0001',
+        account: { account_id: 'account-reconcile' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-reconcile', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    await assert.rejects(coordinator.continueLegacyPurchase(input), error => error.code === 'ambiguous');
+    await assert.rejects(
+      coordinator.continueLegacyPurchase(input),
+      error => error.code === 'ambiguous' && /authoritative seller task identity/.test(error.message)
+    );
+    assert.equal(publications.length, 0);
+    reconciliationHasTaskId = true;
+    assert.equal((await coordinator.continueLegacyPurchase(input)).data.media_buy_id, 'buy-reconciled');
+    assert.equal(reconciliationCalls, 2);
+    assert.equal(publications.length, 1, 'reconciliation durably publishes the completion handler exactly once');
+    assert.equal(publications[0].serverTaskId, 'seller-reconciled-task');
+    assert.equal((await coordinator.continueLegacyPurchase(input)).data.media_buy_id, 'buy-reconciled');
+    assert.equal(publications.length, 1, 'completed reconciliation replay restores its publication proof');
+
+    const malformedDiscovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-malformed-0001',
+      account: { account_id: 'account-reconcile' },
+      brand: { domain: 'example.com' },
+      brief: 'Malformed completion',
+    });
+    mutationMode = 'malformed';
+    await assert.rejects(
+      coordinator.continueLegacyPurchase({
+        ...input,
+        idempotency_key: 'f3aad00b-24a8-42c8-b948-3269f488032e',
+        continuation_token: malformedDiscovery.data.purchase_continuation.continuation_token,
+        legacy_create_request: {
+          ...input.legacy_create_request,
+          idempotency_key: 'legacy-malformed-create-0001',
+        },
+      }),
+      error => error.code === 'ambiguous'
+    );
+  });
+
+  test('rejects reconciliation when the seller task is bound concurrently to another route', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-reconcile-race', 'Reconcile race')] });
+    agent.createMediaBuyLegacy = async () => {
+      throw new Error('connection lost');
+    };
+    let reconciliationStarted;
+    const started = new Promise(resolve => {
+      reconciliationStarted = resolve;
+    });
+    let releaseReconciliation;
+    const release = new Promise(resolve => {
+      releaseReconciliation = resolve;
+    });
+    const publications = [];
+    agent.publishDurablySettledWebhook = async publication => publications.push(publication);
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-reconcile-race',
+      legacyPurchaseContinuationStore: store,
+      reconcileLegacyPurchase: async () => {
+        reconciliationStarted();
+        await release;
+        return {
+          outcome: 'completed',
+          result: {
+            ...completed('create_media_buy', { media_buy_id: 'buy-wrong-route', packages: [] }),
+            metadata: {
+              ...completed('create_media_buy', {}).metadata,
+              serverTaskId: 'seller-task-b',
+            },
+          },
+        };
+      },
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-reconcile-race-0001',
+      account: { account_id: 'account-reconcile-race' },
+      brand: { domain: 'example.com' },
+      brief: 'Reconcile a concurrently bound task',
+    });
+    const input = {
+      idempotency_key: '68708bbc-cc86-412f-ad24-845e9ef493ca',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-reconcile-race' },
+      selected_product_ids: ['p-reconcile-race'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-reconcile-race-create-0001',
+        account: { account_id: 'account-reconcile-race' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-reconcile-race', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    await assert.rejects(coordinator.continueLegacyPurchase(input), error => error.code === 'ambiguous');
+
+    const reconciling = coordinator.continueLegacyPurchase(input);
+    await started;
+    const beforeBinding = await store.get(input.continuation_token);
+    assert.ok(beforeBinding && beforeBinding.operation.state !== 'available');
+    assert.equal(
+      await store.recordSubmittedTask(input.continuation_token, beforeBinding.operation, 'seller-task-a'),
+      true
+    );
+    releaseReconciliation();
+
+    await assert.rejects(
+      reconciling,
+      error => error.code === 'ambiguous' && /freshly loaded durable purchase route/.test(error.message)
+    );
+    const afterConflict = await store.get(input.continuation_token);
+    assert.equal(afterConflict.operation.state, 'ambiguous');
+    assert.equal(afterConflict.operation.sellerTaskId, 'seller-task-a');
+    assert.equal(publications.length, 0);
+  });
+
+  test('background-observes submitted legacy purchase completion for deterministic replay', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-submitted', 'Submitted')] });
+    agent.createMediaBuyLegacy = async () =>
+      submitted('create_media_buy', completed('create_media_buy', { media_buy_id: 'buy-submitted', packages: [] }));
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-submitted' });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-submitted-0001',
+      account: { account_id: 'account-submitted' },
+      brand: { domain: 'example.com' },
+      brief: 'Submitted purchase',
+    });
+    const input = {
+      idempotency_key: 'e52cf054-a288-4781-8018-c48cb8da0451',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-submitted' },
+      selected_product_ids: ['p-submitted'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-submitted-create-0001',
+        account: { account_id: 'account-submitted' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-submitted', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    assert.equal((await coordinator.continueLegacyPurchase(input)).status, 'submitted');
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const replay = await coordinator.continueLegacyPurchase(input);
+    assert.equal(replay.status, 'completed');
+    assert.equal(replay.data.media_buy_id, 'buy-submitted');
+  });
+
+  test('restores completion-handler publication proof when seller binding reloads a completed winner', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const originalGet = store.get.bind(store);
+    const originalRecordSubmittedTask = store.recordSubmittedTask.bind(store);
+    const terminal = completed('create_media_buy', { media_buy_id: 'buy-proof-race', packages: [] });
+    terminal.metadata.serverTaskId = 'create_media_buy-task';
+    let exposeCompletedWinner = false;
+    store.recordSubmittedTask = async (token, claim, sellerTaskId) => {
+      const recorded = await originalRecordSubmittedTask(token, claim, sellerTaskId);
+      exposeCompletedWinner = recorded;
+      return recorded;
+    };
+    store.get = async token => {
+      const record = await originalGet(token);
+      if (!record || !exposeCompletedWinner || record.operation.state === 'available') return record;
+      const operationId = record.operation.callbackOperationId;
+      assert.equal(typeof operationId, 'string');
+      const completedOperation = {
+        ...record.operation,
+        state: 'completed',
+        sellerTaskId: 'create_media_buy-task',
+        result: terminal,
+      };
+      completedOperation.acknowledgedSettlementFingerprint = legacyPurchaseSettlementFingerprint({
+        operationId,
+        serverTaskId: 'create_media_buy-task',
+        taskType: 'create_media_buy',
+        terminal,
+      });
+      return { ...record, operation: completedOperation };
+    };
+
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-proof-race', 'Proof race')] });
+    agent.createMediaBuyLegacy = async () => submitted('create_media_buy', terminal);
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-proof-race',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-proof-race-0001',
+      account: { account_id: 'account-proof-race' },
+      brand: { domain: 'example.com' },
+      brief: 'Reload an acknowledged winner',
+    });
+    const result = await coordinator.continueLegacyPurchase({
+      idempotency_key: 'f523f107-9044-433b-a524-cce71048a722',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-proof-race' },
+      selected_product_ids: ['p-proof-race'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-proof-race-create-0001',
+        account: { account_id: 'account-proof-race' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-proof-race', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    });
+
+    assert.equal(result.status, 'completed');
+    assert.equal(result.data.media_buy_id, 'buy-proof-race');
+    assert.equal(hasCompletionHandlerAlreadyPublished(result), true);
+  });
+
+  test('restores publication proof when completion loses a concurrent ACK race', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const originalGet = store.get.bind(store);
+    let acknowledgedWinner;
+    store.complete = async (_token, _claim, result) => {
+      acknowledgedWinner = structuredClone(result);
+      return { outcome: 'duplicate', result: structuredClone(result) };
+    };
+    store.get = async token => {
+      const record = await originalGet(token);
+      if (!record || !acknowledgedWinner || record.operation.state === 'available') return record;
+      const operationId = record.operation.callbackOperationId;
+      const sellerTaskId = acknowledgedWinner.metadata.serverTaskId;
+      assert.equal(typeof operationId, 'string');
+      assert.equal(typeof sellerTaskId, 'string');
+      const completedOperation = {
+        ...record.operation,
+        state: 'completed',
+        sellerTaskId,
+        pendingSettlement: undefined,
+        result: acknowledgedWinner,
+        acknowledgedSettlementFingerprint: legacyPurchaseSettlementFingerprint({
+          operationId,
+          serverTaskId: sellerTaskId,
+          taskType: 'create_media_buy',
+          terminal: acknowledgedWinner,
+        }),
+      };
+      return { ...record, operation: completedOperation };
+    };
+
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-proof-complete-race', 'Complete race')] });
+    agent.createMediaBuyLegacy = async () => {
+      const result = completed('create_media_buy', { media_buy_id: 'buy-proof-complete-race', packages: [] });
+      result.metadata.serverTaskId = 'seller-proof-complete-race';
+      return result;
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-proof-complete-race',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-proof-complete-race-0001',
+      account: { account_id: 'account-proof-complete-race' },
+      brand: { domain: 'example.com' },
+      brief: 'Lose completion CAS to an acknowledged winner',
+    });
+    const result = await coordinator.continueLegacyPurchase({
+      idempotency_key: 'c2077f25-b1fc-41b7-a7cf-f0650fcf3b12',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-proof-complete-race' },
+      selected_product_ids: ['p-proof-complete-race'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-proof-complete-race-create-0001',
+        account: { account_id: 'account-proof-complete-race' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-proof-complete-race', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    });
+
+    assert.equal(result.status, 'completed');
+    assert.equal(result.data.media_buy_id, 'buy-proof-complete-race');
+    assert.equal(hasCompletionHandlerAlreadyPublished(result), true);
+  });
+
+  test('rejects a submitted legacy purchase that omits its authoritative seller task handle', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-missing-task-id', 'Missing task ID')] });
+    let trackCalls = 0;
+    agent.createMediaBuyLegacy = async () => {
+      const result = submitted(
+        'create_media_buy',
+        completed('create_media_buy', { media_buy_id: 'must-not-be-authoritative', packages: [] })
+      );
+      delete result.metadata.serverTaskId;
+      result.submitted.taskId = result.metadata.taskId;
+      result.submitted.track = async () => {
+        trackCalls += 1;
+        return {
+          taskId: result.metadata.taskId,
+          status: 'completed',
+          taskType: 'create_media_buy',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result: { media_buy_id: 'must-not-be-authoritative', packages: [] },
+        };
+      };
+      return result;
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-missing-task-id',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-missing-task-id-0001',
+      account: { account_id: 'account-missing-task-id' },
+      brand: { domain: 'example.com' },
+      brief: 'Reject a buyer-local submitted fallback',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+    await assert.rejects(
+      coordinator.continueLegacyPurchase({
+        idempotency_key: '6d78eed3-ee7b-4794-bf35-a2a004b19a2a',
+        continuation_token: token,
+        account: { account_id: 'account-missing-task-id' },
+        selected_product_ids: ['p-missing-task-id'],
+        accepted_losses: discovery.data.purchase_continuation.losses,
+        legacy_create_request: {
+          idempotency_key: 'legacy-missing-task-id-create-0001',
+          account: { account_id: 'account-missing-task-id' },
+          brand: { domain: 'example.com' },
+          packages: [{ product_id: 'p-missing-task-id', budget: 10, pricing_option_id: 'fixed-cpm' }],
+          start_time: '2099-01-01T00:00:00Z',
+          end_time: '2099-02-01T00:00:00Z',
+        },
+      }),
+      error => error.code === 'ambiguous' && /durable seller task identity/.test(error.message)
+    );
+    const persisted = await store.get(token);
+    assert.equal(persisted.operation.state, 'ambiguous');
+    assert.equal(persisted.operation.sellerTaskId, undefined);
+    assert.equal(trackCalls, 0);
+  });
+
+  test('does not background-poll or poison a safely resumable paused legacy purchase', async () => {
+    const baseStore = createInMemoryLegacyPurchaseContinuationStore();
+    const store = {
+      create: record => baseStore.create(record),
+      get: token => baseStore.get(token),
+      claim: (token, request) => baseStore.claim(token, request),
+      complete: (token, claim, result) => baseStore.complete(token, claim, result),
+      recordSubmittedTask: (token, claim, taskId) => baseStore.recordSubmittedTask(token, claim, taskId),
+      markAmbiguous: (token, claim, reason) => baseStore.markAmbiguous(token, claim, reason),
+    };
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-paused-resume', 'Paused resume')] });
+    let pollCalls = 0;
+    agent.getTaskStatus = async () => {
+      pollCalls += 1;
+      throw new Error('paused tasks/get is not an authoritative recovery path');
+    };
+    let resumeCalls = 0;
+    agent.createMediaBuyLegacy = async () => ({
+      success: true,
+      status: 'input-required',
+      metadata: {
+        taskId: 'buyer-paused-resume-operation',
+        serverTaskId: 'seller-paused-resume-work',
+        a2aTaskId: 'a2a-paused-resume-task',
+        contextId: 'a2a-paused-resume-context',
+        taskName: 'create_media_buy',
+        agent: { id: AGENT.id, name: AGENT.name, protocol: 'a2a' },
+        responseTimeMs: 1,
+        timestamp: new Date().toISOString(),
+        clarificationRounds: 0,
+        status: 'input-required',
+      },
+      deferred: {
+        token: 'sdk-paused-resume-token',
+        resume: async () => {
+          resumeCalls += 1;
+          return completed('create_media_buy', { media_buy_id: 'buy-paused-resume', packages: [] });
+        },
+      },
+    });
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-paused-resume',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-paused-resume-0001',
+      account: { account_id: 'account-paused-resume' },
+      brand: { domain: 'example.com' },
+      brief: 'Pause safely before purchase completion',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+    const paused = await coordinator.continueLegacyPurchase({
+      idempotency_key: '67638bb8-a114-466f-a2fc-b6384a728e72',
+      continuation_token: token,
+      account: { account_id: 'account-paused-resume' },
+      selected_product_ids: ['p-paused-resume'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-paused-resume-create-0001',
+        account: { account_id: 'account-paused-resume' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-paused-resume', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    });
+
+    assert.equal(paused.status, 'input-required');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(pollCalls, 0);
+    const pausedRecord = await store.get(token);
+    assert.equal(pausedRecord.operation.state, 'claimed');
+    assert.notEqual(paused.deferred.token, token);
+    assert.equal(pausedRecord.operation.deferredTaskToken, undefined, 'an in-process-only token is not a durable link');
+    const resumed = await paused.deferred.resume({ approved: true });
+    assert.equal(resumed.status, 'completed');
+    assert.equal(resumed.data.media_buy_id, 'buy-paused-resume');
+    assert.equal((await store.get(token)).operation.state, 'completed');
+    await assert.rejects(paused.deferred.resume({ approved: true }), /no longer the current claimed purchase route/);
+    assert.equal(resumeCalls, 1, 'completion invalidates a previously held in-process continuation');
+  });
+
+  test('fails closed when callback-capable purchase recovery cannot persist a pause', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-undurable-pause', 'Undurable pause')] });
+    let resumeCalls = 0;
+    agent.createMediaBuyLegacy = async () =>
+      deferred('create_media_buy', async () => {
+        resumeCalls += 1;
+        return completed('create_media_buy', { media_buy_id: 'must-not-dispatch', packages: [] });
+      });
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-undurable-pause',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-undurable-pause-0001',
+      account: { account_id: 'account-undurable-pause' },
+      brand: { domain: 'example.com' },
+      brief: 'Require a durable checkpoint before callback-capable pause recovery',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+
+    await assert.rejects(
+      coordinator.continueLegacyPurchase({
+        idempotency_key: '2d281340-7c20-4cf1-a96e-f44df51ff0aa',
+        continuation_token: token,
+        account: { account_id: 'account-undurable-pause' },
+        selected_product_ids: ['p-undurable-pause'],
+        accepted_losses: discovery.data.purchase_continuation.losses,
+        legacy_create_request: {
+          idempotency_key: 'legacy-undurable-pause-create-0001',
+          account: { account_id: 'account-undurable-pause' },
+          brand: { domain: 'example.com' },
+          packages: [{ product_id: 'p-undurable-pause', budget: 10, pricing_option_id: 'fixed-cpm' }],
+          start_time: '2099-01-01T00:00:00Z',
+          end_time: '2099-02-01T00:00:00Z',
+        },
+      }),
+      error => error.code === 'ambiguous' && /requires a durable deferred checkpoint/.test(error.message)
+    );
+    assert.equal(resumeCalls, 0);
+    assert.equal((await store.get(token)).operation.state, 'ambiguous');
+    coordinator.dispose();
+  });
+
+  test('carries a live deferred track checkpoint acknowledgement through compatibility waiting', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const deferredStorage = new MemoryStorage({ autoCleanup: false });
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0', { deferredStorage });
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-live-track-ack', 'Live track ACK')] });
+    let acknowledgementCalls = 0;
+    agent.createMediaBuyLegacy = async () =>
+      deferred('create_media_buy', async () => {
+        const result = submitted(
+          'create_media_buy',
+          completed('create_media_buy', { media_buy_id: 'buy-live-track-ack', packages: [] })
+        );
+        const track = result.submitted.track;
+        result.submitted.track = async transport => {
+          const task = await track(transport);
+          Object.defineProperty(task, DEFERRED_SETTLEMENT_ACK, {
+            value: async () => {
+              acknowledgementCalls += 1;
+            },
+            enumerable: true,
+          });
+          return task;
+        };
+        return result;
+      });
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-live-track-ack',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-live-track-ack-0001',
+      account: { account_id: 'account-live-track-ack' },
+      brand: { domain: 'example.com' },
+      brief: 'Preserve the live track checkpoint acknowledgement',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+    const deferredCreatedAt = Date.now();
+    await deferredStorage.putIfAbsent(
+      testDurableToken('create_media_buy-deferred-token'),
+      {
+        continuationVersion: 'live-track-ack-version',
+        taskId: 'live-track-ack-operation',
+        a2aTaskId: 'live-track-ack-a2a-task',
+        serverVersion: 'v3',
+        agentId: AGENT.id,
+        taskName: 'create_media_buy',
+        params: {},
+        messages: [],
+        createdAt: deferredCreatedAt,
+        expiresAt: deferredCreatedAt + 60_000,
+      },
+      60
+    );
+    const paused = await coordinator.continueLegacyPurchase({
+      idempotency_key: '0601c93d-ed40-4c43-a0be-0d5019dc52c8',
+      continuation_token: token,
+      account: { account_id: 'account-live-track-ack' },
+      selected_product_ids: ['p-live-track-ack'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-live-track-ack-create-0001',
+        account: { account_id: 'account-live-track-ack' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-live-track-ack', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    });
+
+    const pending = await paused.deferred.resume({ approved: true });
+    const completion = await pending.submitted.waitForCompletion(0);
+    assert.equal(completion.status, 'completed');
+    assert.equal(completion.data.media_buy_id, 'buy-live-track-ack');
+    assert.equal(typeof completion[DEFERRED_SETTLEMENT_ACK], 'function');
+    await completion[DEFERRED_SETTLEMENT_ACK](completion);
+    assert.equal(acknowledgementCalls, 1);
+    assert.equal((await store.get(token)).operation.state, 'completed');
+    deferredStorage.destroy();
+  });
+
+  for (const initialStatus of ['submitted', 'working']) {
+    test(`durably settles an authoritative ${initialStatus} legacy purchase ${
+      initialStatus === 'working' ? 'poll' : 'push'
+    }`, async () => {
+      const suffix = `push-${initialStatus}`;
+      const sellerTaskId = `${suffix}-seller-task`;
+      let completionHandlerCalls = 0;
+      const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0', {
+        handlers: {
+          onCreateMediaBuyStatusChange: async () => {
+            completionHandlerCalls += 1;
+          },
+          ...(initialStatus === 'working' && {
+            webhookDedup: { backend: memoryBackend({ sweepIntervalMs: 0 }) },
+          }),
+        },
+      });
+      agent.getProducts = async () =>
+        completed('get_products', { products: [legacyListedProduct(`p-${suffix}`, `Push ${initialStatus}`)] });
+      agent.createMediaBuyLegacy = async () => {
+        if (initialStatus === 'submitted') {
+          const result = submitted(
+            'create_media_buy',
+            completed('create_media_buy', { media_buy_id: `${suffix}-background`, packages: [] })
+          );
+          result.submitted.taskId = sellerTaskId;
+          result.metadata.serverTaskId = sellerTaskId;
+          result.submitted.track = async () => ({
+            taskId: sellerTaskId,
+            status: 'completed',
+            taskType: 'create_media_buy',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            result: { media_buy_id: `${suffix}-background`, packages: [] },
+          });
+          return result;
+        }
+        return {
+          success: true,
+          status: 'working',
+          metadata: {
+            taskId: `${suffix}-runner-task`,
+            serverTaskId: sellerTaskId,
+            taskName: 'create_media_buy',
+            agent: { id: AGENT.id, name: AGENT.name, protocol: AGENT.protocol },
+            responseTimeMs: 1,
+            timestamp: new Date().toISOString(),
+            clarificationRounds: 0,
+            status: 'working',
+          },
+        };
+      };
+      let polledTransport;
+      agent.getTaskStatus = async (_taskId, transport) => {
+        polledTransport = transport;
+        return {
+          taskId: sellerTaskId,
+          status: 'completed',
+          taskType: 'create_media_buy',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result: { media_buy_id: `${suffix}-settled`, packages: [] },
+        };
+      };
+      const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: `buyer-${suffix}` });
+      const discovery = await coordinator.requestProposals({
+        idempotency_key: `request-proposals-${suffix}-0001`,
+        account: { account_id: `account-${suffix}` },
+        brand: { domain: 'example.com' },
+        brief: `Push ${initialStatus} purchase`,
+      });
+      const input = {
+        idempotency_key:
+          initialStatus === 'submitted'
+            ? '933d750a-04e0-4ffd-b7e8-dd31a0a20fb0'
+            : 'b54970d2-fcfd-48b4-9cff-e55821ae6cb7',
+        continuation_token: discovery.data.purchase_continuation.continuation_token,
+        account: { account_id: `account-${suffix}` },
+        selected_product_ids: [`p-${suffix}`],
+        accepted_losses: discovery.data.purchase_continuation.losses,
+        legacy_create_request: {
+          idempotency_key: `legacy-create-${suffix}-0001`,
+          account: { account_id: `account-${suffix}` },
+          brand: { domain: 'example.com' },
+          packages: [{ product_id: `p-${suffix}`, budget: 10, pricing_option_id: 'fixed-cpm' }],
+          start_time: '2099-01-01T00:00:00Z',
+          end_time: '2099-02-01T00:00:00Z',
+        },
+      };
+
+      const settlementTransport = { maxResponseBytes: 12345 };
+      const pending = await coordinator.continueLegacyPurchase(input, undefined, { transport: settlementTransport });
+      assert.equal(pending.status, initialStatus);
+      assert.equal(typeof agent.externalTaskSettlementHandler, 'function');
+      if (initialStatus === 'working') {
+        await new Promise(resolve => setTimeout(resolve, 5));
+        const replay = await coordinator.continueLegacyPurchase(input);
+        assert.equal(replay.status, 'completed');
+        assert.equal(replay.data.media_buy_id, `${suffix}-settled`);
+        assert.deepEqual(polledTransport, settlementTransport);
+        assert.notStrictEqual(polledTransport, settlementTransport, 'polling must use the owned transport snapshot');
+        assert.equal(completionHandlerCalls, 1);
+        await agent.externalTaskSettlementHandler({
+          status: 'completed',
+          result: { media_buy_id: `${suffix}-settled`, packages: [] },
+          serverTaskId: sellerTaskId,
+          taskType: 'create_media_buy',
+          idempotencyKey: `${suffix}-later-webhook`,
+        });
+        assert.equal(completionHandlerCalls, 1);
+        return;
+      }
+      const settled = await agent.externalTaskSettlementHandler({
+        status: 'completed',
+        result: { media_buy_id: `${suffix}-settled`, packages: [] },
+        serverTaskId: sellerTaskId,
+        taskType: 'create_media_buy',
+      });
+      assert.equal(settled.status, 'completed');
+      assert.equal(settled.data.media_buy_id, `${suffix}-settled`);
+      await settled.afterDispatch?.();
+      assert.equal(completionHandlerCalls, 1);
+      const replay = await coordinator.continueLegacyPurchase(input);
+      assert.equal(replay.status, 'completed');
+      assert.equal(replay.data.media_buy_id, `${suffix}-settled`);
+    });
+  }
+
+  test('keeps a durable callback pending until its status handler succeeds', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const deferredBackend = new MemoryStorage({ autoCleanup: false });
+    let failNextDeferredFinalization = false;
+    const deferredStorage = {
+      get: (...args) => deferredBackend.get(...args),
+      set: (...args) => deferredBackend.set(...args),
+      delete: (...args) => deferredBackend.delete(...args),
+      putIfAbsent: (...args) => deferredBackend.putIfAbsent(...args),
+      putForSettlementOperationIfAbsent: (...args) => deferredBackend.putForSettlementOperationIfAbsent(...args),
+      getBySettlementOperationId: (...args) => deferredBackend.getBySettlementOperationId(...args),
+      replaceForSettlementOperationIfVersion: (...args) => {
+        const replacementValue = args[4];
+        if (failNextDeferredFinalization && replacementValue.settlementFinalizedResult !== undefined) {
+          failNextDeferredFinalization = false;
+          return Promise.resolve(false);
+        }
+        return deferredBackend.replaceForSettlementOperationIfVersion(...args);
+      },
+      takeIfVersion: (...args) => deferredBackend.takeIfVersion(...args),
+      replaceIfVersion: (key, expectedVersion, value, ttl) => {
+        if (failNextDeferredFinalization && value.settlementFinalizedResult !== undefined) {
+          failNextDeferredFinalization = false;
+          return Promise.resolve(false);
+        }
+        return deferredBackend.replaceIfVersion(key, expectedVersion, value, ttl);
+      },
+    };
+    const webhookRegistrationStore = new InMemoryWebhookRegistrationStore();
+    const webhookSecret = 'durable-handler-retry-webhook-secret';
+    const sellerTaskId = 'durable-handler-retry-seller-task';
+    let handlerCalls = 0;
+    let releaseFirstHandler;
+    let markFirstHandlerEntered;
+    const firstHandlerEntered = new Promise(resolve => {
+      markFirstHandlerEntered = resolve;
+    });
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0', {
+      webhookSecret,
+      webhookRegistrationStore,
+      deferredStorage,
+      handlers: {
+        webhookDedup: { backend: memoryBackend({ sweepIntervalMs: 0 }) },
+        onCreateMediaBuyStatusChange: async () => {
+          handlerCalls += 1;
+          if (handlerCalls === 1) {
+            markFirstHandlerEntered();
+            await new Promise(resolve => {
+              releaseFirstHandler = resolve;
+            });
+            throw new Error('downstream status publication failed');
+          }
+        },
+      },
+    });
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-handler-retry', 'Handler retry')] });
+    agent.createMediaBuyLegacy = async () => {
+      const result = submitted(
+        'create_media_buy',
+        completed('create_media_buy', { media_buy_id: 'buy-background-should-not-win', packages: [] })
+      );
+      result.submitted.taskId = sellerTaskId;
+      result.metadata.serverTaskId = sellerTaskId;
+      result.submitted.track = async () => new Promise(() => {});
+      result.submitted.waitForCompletion = async () => new Promise(() => {});
+      return result;
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-handler-retry',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-handler-retry-0001',
+      account: { account_id: 'account-handler-retry' },
+      brand: { domain: 'example.com' },
+      brief: 'Retry durable callback publication',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+    const pending = await coordinator.continueLegacyPurchase({
+      idempotency_key: '984e7da9-72c9-4eeb-85e7-07f0d403ada0',
+      continuation_token: token,
+      account: { account_id: 'account-handler-retry' },
+      selected_product_ids: ['p-handler-retry'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-handler-retry-create-0001',
+        account: { account_id: 'account-handler-retry' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-handler-retry', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    });
+    assert.equal(pending.status, 'submitted');
+
+    const claimed = await store.get(token);
+    assert.equal(claimed.operation.state, 'claimed');
+    assert.equal(claimed.operation.sellerTaskId, sellerTaskId);
+    const operationId = claimed.operation.callbackOperationId;
+    const deferredToken = testDurableToken('durable-handler-retry-sdk-deferred-token');
+    assert.notEqual(deferredToken, token);
+    assert.equal(await store.recordDeferredTaskToken(token, claimed.operation, deferredToken), true);
+    const deferredNow = Date.now();
+    await deferredStorage.putForSettlementOperationIfAbsent(
+      operationId,
+      deferredToken,
+      {
+        continuationVersion: 'durable-handler-retry-deferred-version',
+        continuationClaimed: true,
+        taskId: operationId,
+        a2aTaskId: 'durable-handler-retry-a2a-task',
+        serverVersion: 'v3',
+        agentId: AGENT.id,
+        taskName: 'create_media_buy',
+        params: {},
+        messages: [],
+        clientContext: {
+          kind: 'single-agent',
+          taskType: 'create_media_buy',
+          handlerName: 'onCreateMediaBuyStatusChange',
+          canonical: false,
+          productPolicyRequest: {},
+        },
+        settlementOperationId: operationId,
+        settlementOperationRouteRequired: true,
+        settlementResumeAuthorizationRequired: true,
+        settlementServerTaskId: sellerTaskId,
+        settlementPendingTaskId: sellerTaskId,
+        createdAt: deferredNow,
+        expiresAt: deferredNow + 60_000,
+      },
+      60
+    );
+    const crashedPublication = completed('create_media_buy', {
+      media_buy_id: 'buy-handler-retry',
+      packages: [],
+    });
+    crashedPublication.metadata.taskId = operationId;
+    crashedPublication.metadata.serverTaskId = sellerTaskId;
+    assert.deepEqual(
+      await store.recordPendingSettlement(token, (await store.get(token)).operation, {
+        operationId,
+        serverTaskId: sellerTaskId,
+        taskType: 'create_media_buy',
+        publicationSource: 'sdk',
+        terminal: crashedPublication,
+      }),
+      { outcome: 'recorded' }
+    );
+    await webhookRegistrationStore.putIfAbsent({
+      agentId: AGENT.id,
+      agentUrl: AGENT.agent_uri,
+      protocol: AGENT.protocol,
+      operationId,
+      taskType: 'create_media_buy',
+      callbackUrl: `https://buyer.example/webhooks/create_media_buy/${operationId}`,
+      method: 'POST',
+      mode: 'hmac-sha256',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      requiresDurableSettlement: true,
+    });
+    const payload = {
+      idempotency_key: 'durable-handler-retry-webhook-event',
+      operation_id: operationId,
+      task_id: sellerTaskId,
+      task_type: 'create_media_buy',
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+      result: { media_buy_id: 'buy-handler-retry', packages: [] },
+    };
+    const rawBody = JSON.stringify(payload);
+    const timestamp = Math.floor(Date.now() / 1000);
+    const signature = `sha256=${crypto
+      .createHmac('sha256', webhookSecret)
+      .update(`${timestamp}.${rawBody}`)
+      .digest('hex')}`;
+    const requestContext = {
+      requestMethod: 'POST',
+      requestUrl: `https://buyer.example/webhooks/create_media_buy/${operationId}`,
+    };
+    const dispatch = () =>
+      agent.handleWebhook(
+        payload,
+        'create_media_buy',
+        operationId,
+        signature,
+        String(timestamp),
+        rawBody,
+        requestContext
+      );
+
+    const firstDispatch = dispatch();
+    await firstHandlerEntered;
+    await assert.rejects(
+      dispatch(),
+      /(?:matching callback publication|deferred settlement finalization).*in progress/i
+    );
+    const concurrentRetry = await store.get(token);
+    assert.equal(concurrentRetry.operation.state, 'completed');
+    assert.equal(concurrentRetry.operation.pendingSettlement.idempotencyKey, undefined);
+    releaseFirstHandler();
+    await assert.rejects(firstDispatch, /downstream status publication failed/);
+    const publicationFailed = await store.get(token);
+    assert.equal(publicationFailed.operation.state, 'completed');
+    assert.equal(publicationFailed.operation.pendingSettlement.idempotencyKey, undefined);
+    assert.equal(publicationFailed.operation.result.data.media_buy_id, 'buy-handler-retry');
+    const retryableCheckpoint = await deferredStorage.get(deferredToken);
+    assert.ok(retryableCheckpoint.settlementTerminalResult);
+    assert.equal(retryableCheckpoint.settlementFinalizationLease, undefined);
+    assert.equal(retryableCheckpoint.settlementFinalizedResult, undefined);
+
+    failNextDeferredFinalization = true;
+    await assert.rejects(
+      agent.resumeDeferredTask(deferredToken, { retry: true }),
+      /committed deferred completion could not be durably acknowledged/i
+    );
+    assert.equal(handlerCalls, 2);
+    const legacyAcknowledged = await store.get(token);
+    assert.equal(legacyAcknowledged.operation.pendingSettlement, undefined);
+    assert.equal(typeof legacyAcknowledged.operation.acknowledgedSettlementFingerprint, 'string');
+    assert.ok(legacyAcknowledged.operation.acknowledgedSettlementFingerprint.length > 0);
+
+    const recovered = await agent.resumeDeferredTask(deferredToken, { retry: true });
+    assert.equal(recovered.status, 'completed');
+    assert.equal(recovered.data.media_buy_id, 'buy-handler-retry');
+    assert.equal(handlerCalls, 2);
+
+    const rotatedPayload = { ...payload, idempotency_key: 'durable-handler-rotated-webhook-event' };
+    const rotatedRawBody = JSON.stringify(rotatedPayload);
+    const rotatedSignature = `sha256=${crypto
+      .createHmac('sha256', webhookSecret)
+      .update(`${timestamp}.${rotatedRawBody}`)
+      .digest('hex')}`;
+    assert.equal(
+      await agent.handleWebhook(
+        rotatedPayload,
+        'create_media_buy',
+        operationId,
+        rotatedSignature,
+        String(timestamp),
+        rotatedRawBody,
+        requestContext
+      ),
+      true
+    );
+    assert.equal(handlerCalls, 2);
+
+    assert.equal(await dispatch(), true);
+    assert.equal(handlerCalls, 2);
+    const published = await store.get(token);
+    assert.equal(published.operation.state, 'completed');
+    assert.equal(published.operation.pendingSettlement, undefined);
+    assert.equal(published.operation.result.data.media_buy_id, 'buy-handler-retry');
+    const finalizedCheckpoint = await deferredStorage.get(deferredToken);
+    assert.equal(finalizedCheckpoint.settlementPendingTaskId, undefined);
+    assert.equal(finalizedCheckpoint.settlementFinalizationLease, undefined);
+    assert.equal(finalizedCheckpoint.settlementFinalizedResult.data.media_buy_id, 'buy-handler-retry');
+    deferredBackend.destroy();
+  });
+
+  test('rejects a callback that conflicts with an earlier deferred terminal checkpoint', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const deferredStorage = new MemoryStorage({ autoCleanup: false });
+    const deferredToken = testDurableToken('callback-conflict-sdk-deferred-token');
+    const sellerTaskId = 'callback-conflict-seller-task';
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0', { deferredStorage });
+    let recoverSettlement;
+    agent.registerDurableSettlementRecovery = recoverer => {
+      recoverSettlement = recoverer;
+      return () => {};
+    };
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-callback-conflict', 'Callback conflict')] });
+    agent.createMediaBuyLegacy = async () => ({
+      success: true,
+      status: 'input-required',
+      metadata: {
+        taskId: 'callback-conflict-client-task',
+        serverTaskId: sellerTaskId,
+        taskName: 'create_media_buy',
+        agent: { id: AGENT.id, name: AGENT.name, protocol: AGENT.protocol },
+        responseTimeMs: 1,
+        timestamp: new Date().toISOString(),
+        clarificationRounds: 0,
+        status: 'input-required',
+      },
+      deferred: { token: deferredToken, resume: async () => new Promise(() => {}) },
+    });
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-callback-conflict',
+      legacyPurchaseContinuationStore: store,
+    });
+
+    try {
+      const discovery = await coordinator.requestProposals({
+        idempotency_key: 'request-proposals-callback-conflict-0001',
+        account: { account_id: 'account-callback-conflict' },
+        brand: { domain: 'example.com' },
+        brief: 'Preserve the first terminal winner',
+      });
+      const token = discovery.data.purchase_continuation.continuation_token;
+      const pauseCreatedAt = Date.now();
+      await deferredStorage.putIfAbsent(
+        deferredToken,
+        {
+          continuationVersion: 'callback-conflict-pause-version',
+          taskId: 'callback-conflict-client-task',
+          a2aTaskId: 'callback-conflict-a2a-task',
+          serverVersion: 'v3',
+          agentId: AGENT.id,
+          taskName: 'create_media_buy',
+          params: {},
+          messages: [],
+          createdAt: pauseCreatedAt,
+          expiresAt: pauseCreatedAt + 60_000,
+        },
+        60
+      );
+      const paused = await coordinator.continueLegacyPurchase({
+        idempotency_key: 'a4b2c3d4-e5f6-4789-8abc-def012345678',
+        continuation_token: token,
+        account: { account_id: 'account-callback-conflict' },
+        selected_product_ids: ['p-callback-conflict'],
+        accepted_losses: discovery.data.purchase_continuation.losses,
+        legacy_create_request: {
+          idempotency_key: 'legacy-callback-conflict-create-0001',
+          account: { account_id: 'account-callback-conflict' },
+          brand: { domain: 'example.com' },
+          packages: [{ product_id: 'p-callback-conflict', budget: 10, pricing_option_id: 'fixed-cpm' }],
+          start_time: '2099-01-01T00:00:00Z',
+          end_time: '2099-02-01T00:00:00Z',
+        },
+      });
+      assert.equal(paused.status, 'input-required');
+      const claimed = await store.get(token);
+      assert.equal(claimed.operation.state, 'claimed');
+      assert.equal(claimed.operation.deferredTaskToken, deferredToken);
+      assert.equal(claimed.operation.sellerTaskId, sellerTaskId);
+      const operationId = claimed.operation.callbackOperationId;
+      const terminalWinner = completed('create_media_buy', {
+        media_buy_id: 'poll-terminal-winner',
+        packages: [],
+      });
+      terminalWinner.metadata.taskId = operationId;
+      terminalWinner.metadata.serverTaskId = sellerTaskId;
+      const now = Date.now();
+      await deferredStorage.set(
+        deferredToken,
+        {
+          continuationVersion: 'callback-conflict-deferred-version',
+          continuationClaimed: true,
+          taskId: operationId,
+          a2aTaskId: 'callback-conflict-a2a-task',
+          serverVersion: 'v3',
+          agentId: AGENT.id,
+          taskName: 'create_media_buy',
+          params: {},
+          messages: [],
+          settlementOperationId: operationId,
+          settlementServerTaskId: sellerTaskId,
+          settlementTerminalResult: terminalWinner,
+          createdAt: now,
+          expiresAt: now + 60_000,
+        },
+        60
+      );
+
+      await assert.rejects(
+        recoverSettlement(operationId, {
+          status: 'completed',
+          result: { media_buy_id: 'conflicting-callback-winner', packages: [] },
+          serverTaskId: sellerTaskId,
+          taskType: 'create_media_buy',
+          idempotencyKey: 'callback-conflict-event',
+        }),
+        /conflicts with the saved deferred terminal observation/
+      );
+      const legacyAfterConflict = await store.get(token);
+      assert.equal(legacyAfterConflict.operation.state, 'claimed');
+      assert.equal(legacyAfterConflict.operation.pendingSettlement, undefined);
+      const deferredAfterConflict = await deferredStorage.get(deferredToken);
+      assert.equal(deferredAfterConflict.settlementTerminalResult.data.media_buy_id, 'poll-terminal-winner');
+      assert.equal(deferredAfterConflict.settlementFinalizationLease, undefined);
+
+      const exact = await recoverSettlement(operationId, {
+        status: 'completed',
+        result: { media_buy_id: 'poll-terminal-winner', packages: [] },
+        serverTaskId: sellerTaskId,
+        taskType: 'create_media_buy',
+        idempotencyKey: 'callback-exact-event',
+      });
+      assert.equal(exact.settled, true);
+      await exact.afterDispatch();
+      const legacyFinal = await store.get(token);
+      assert.equal(legacyFinal.operation.state, 'completed');
+      assert.equal(legacyFinal.operation.result.data.media_buy_id, 'poll-terminal-winner');
+      assert.equal(legacyFinal.operation.pendingSettlement, undefined);
+      const deferredFinal = await deferredStorage.get(deferredToken);
+      assert.equal(deferredFinal.settlementFinalizedResult.data.media_buy_id, 'poll-terminal-winner');
+    } finally {
+      coordinator.dispose();
+      deferredStorage.destroy();
+    }
+  });
+
+  test('hands a restarted callback-capable purchase from deferred token A to nested token B', async () => {
+    const originalCallTool = ProtocolClient.callTool;
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const deferredStorage = new MemoryStorage({ autoCleanup: false });
+    const initialDeferredToken = testDurableToken('restart-nested-token-a');
+    const sellerTaskId = 'restart-nested-seller-work';
+    const a2aAgent = {
+      id: 'restart-nested-seller',
+      name: 'Restart nested seller',
+      agent_uri: 'https://seller.example/a2a',
+      protocol: 'a2a',
+    };
+    const clientOptions = {
+      deferredStorage,
+      resolveDeferredAgent: async agentId => (agentId === a2aAgent.id ? a2aAgent : undefined),
+      validation: { requests: 'off', responses: 'off' },
+    };
+    const first = clientWithCaps(capabilities({ version: '3.0' }), '3.0', clientOptions, a2aAgent);
+    first.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-restart-nested', 'Restart nested')] });
+    first.createMediaBuyLegacy = async () => ({
+      success: true,
+      status: 'input-required',
+      metadata: {
+        taskId: 'restart-nested-client-task',
+        serverTaskId: sellerTaskId,
+        a2aTaskId: 'restart-nested-a2a-a',
+        contextId: 'restart-nested-context-a',
+        taskName: 'create_media_buy',
+        agent: { id: a2aAgent.id, name: a2aAgent.name, protocol: 'a2a' },
+        responseTimeMs: 1,
+        timestamp: new Date().toISOString(),
+        clarificationRounds: 0,
+        status: 'input-required',
+      },
+      deferred: { token: initialDeferredToken, resume: async () => assert.fail('live token must not resume') },
+    });
+
+    let firstCoordinator;
+    let restartedCoordinator;
+    try {
+      const seededAt = Date.now();
+      await deferredStorage.putIfAbsent(
+        initialDeferredToken,
+        {
+          continuationVersion: 'restart-nested-version-a',
+          taskId: 'restart-nested-client-task',
+          contextId: 'restart-nested-context-a',
+          a2aTaskId: 'restart-nested-a2a-a',
+          serverVersion: 'v3',
+          agentId: a2aAgent.id,
+          taskName: 'create_media_buy',
+          params: {},
+          messages: [],
+          createdAt: seededAt,
+          expiresAt: seededAt + 60_000,
+        },
+        60
+      );
+      firstCoordinator = await first.negotiateMediaBuyLifecycle({
+        principalScope: 'buyer-restart-nested',
+        legacyPurchaseContinuationStore: store,
+      });
+      const discovery = await firstCoordinator.requestProposals({
+        idempotency_key: 'request-proposals-restart-nested-0001',
+        account: { account_id: 'account-restart-nested' },
+        brand: { domain: 'example.com' },
+        brief: 'Restart and pause a second time',
+      });
+      const continuationToken = discovery.data.purchase_continuation.continuation_token;
+      const paused = await firstCoordinator.continueLegacyPurchase({
+        idempotency_key: '388932cb-bb9d-4804-bf27-df36f19cb891',
+        continuation_token: continuationToken,
+        account: { account_id: 'account-restart-nested' },
+        selected_product_ids: ['p-restart-nested'],
+        accepted_losses: discovery.data.purchase_continuation.losses,
+        legacy_create_request: {
+          idempotency_key: 'legacy-restart-nested-create-0001',
+          account: { account_id: 'account-restart-nested' },
+          brand: { domain: 'example.com' },
+          packages: [{ product_id: 'p-restart-nested', budget: 10, pricing_option_id: 'fixed-cpm' }],
+          start_time: '2099-01-01T00:00:00Z',
+          end_time: '2099-02-01T00:00:00Z',
+        },
+      });
+      assert.equal(paused.deferred.token, initialDeferredToken);
+      const claimed = await store.get(continuationToken);
+      assert.equal(claimed.operation.state, 'claimed');
+      assert.equal(claimed.operation.deferredTaskToken, initialDeferredToken);
+      const operationId = claimed.operation.callbackOperationId;
+
+      const initialState = await deferredStorage.get(initialDeferredToken);
+      await deferredStorage.delete(initialDeferredToken);
+      await deferredStorage.putForSettlementOperationIfAbsent(
+        operationId,
+        initialDeferredToken,
+        {
+          ...initialState,
+          taskId: operationId,
+          clientContext: {
+            kind: 'single-agent',
+            taskType: 'create_media_buy',
+            canonical: false,
+            productPolicyRequest: {},
+          },
+          settlementOperationId: operationId,
+          settlementOperationRouteRequired: true,
+          settlementResumeAuthorizationRequired: true,
+          settlementServerTaskId: sellerTaskId,
+        },
+        60
+      );
+      firstCoordinator.dispose();
+      firstCoordinator = undefined;
+
+      const restarted = clientWithCaps(capabilities({ version: '3.0' }), '3.0', clientOptions, a2aAgent);
+      let recoverCallback;
+      const registerRecovery = restarted.registerDurableSettlementRecovery.bind(restarted);
+      restarted.registerDurableSettlementRecovery = recoverer => {
+        recoverCallback = recoverer;
+        return registerRecovery(recoverer);
+      };
+      restartedCoordinator = await restarted.negotiateMediaBuyLifecycle({
+        principalScope: 'buyer-restart-nested',
+        legacyPurchaseContinuationStore: store,
+      });
+
+      let sellerCalls = 0;
+      let pollCalls = 0;
+      ProtocolClient.callTool = async (_agent, taskName, params, options) => {
+        if (taskName === 'tasks/get') {
+          pollCalls += 1;
+          assert.deepEqual(params, { task_id: sellerTaskId, include_result: true });
+          return {
+            task_id: sellerTaskId,
+            task_type: 'create_media_buy',
+            status: 'completed',
+            result: { media_buy_id: 'buy-restart-nested', packages: [] },
+          };
+        }
+        assert.equal(taskName, 'create_media_buy');
+        sellerCalls += 1;
+        if (sellerCalls === 1) {
+          assert.deepEqual(params, { input: { approved: true } });
+          assert.equal(options.session.taskId, 'restart-nested-a2a-a');
+          return {
+            result: {
+              kind: 'task',
+              id: 'restart-nested-a2a-b',
+              contextId: 'restart-nested-context-b',
+              status: {
+                state: 'input-required',
+                message: {
+                  kind: 'message',
+                  messageId: 'restart-nested-question-b',
+                  role: 'agent',
+                  parts: [{ kind: 'data', data: { status: 'input-required', question: 'Confirm again?' } }],
+                },
+              },
+              artifacts: [],
+            },
+          };
+        }
+        assert.deepEqual(params, { input: { confirmed: true } });
+        assert.equal(options.session.taskId, 'restart-nested-a2a-b');
+        return { status: 'submitted' };
+      };
+
+      const pausedAgain = await restarted.resumeDeferredTask(initialDeferredToken, { approved: true });
+      assert.equal(pausedAgain.status, 'input-required');
+      assert.equal(pausedAgain.metadata.serverTaskId, sellerTaskId);
+      const replacementToken = pausedAgain.deferred.token;
+      assert.notEqual(replacementToken, initialDeferredToken);
+      assert.equal(await deferredStorage.has(initialDeferredToken), false);
+      assert.equal(await deferredStorage.has(replacementToken), true);
+      const rebound = await store.get(continuationToken);
+      assert.equal(rebound.operation.state, 'claimed');
+      assert.equal(rebound.operation.deferredTaskToken, replacementToken);
+      assert.equal((await store.getByCallbackOperationId(operationId)).operation.deferredTaskToken, replacementToken);
+      assert.equal((await deferredStorage.get(replacementToken)).settlementServerTaskId, sellerTaskId);
+
+      const pendingResult = await restarted.resumeDeferredTask(replacementToken, { confirmed: true });
+      assert.equal(pendingResult.status, 'submitted');
+      assert.equal(pendingResult.metadata.serverTaskId, sellerTaskId);
+      assert.equal(pendingResult.submitted.taskId, sellerTaskId);
+      const completedResult = await pendingResult.submitted.waitForCompletion(0);
+      assert.equal(completedResult.status, 'completed');
+      assert.equal(completedResult.data.media_buy_id, 'buy-restart-nested');
+      assert.equal(sellerCalls, 2);
+      assert.equal(pollCalls, 1);
+
+      const laterCallback = await recoverCallback(operationId, {
+        status: 'completed',
+        result: structuredClone(completedResult.data),
+        serverTaskId: sellerTaskId,
+        taskType: 'create_media_buy',
+        idempotencyKey: 'restart-nested-later-callback',
+      });
+      assert.equal(laterCallback.duplicate, true);
+      assert.equal(laterCallback.settled, true);
+      assert.equal(sellerCalls, 2, 'an exact later callback must not redispatch either continuation input');
+    } finally {
+      ProtocolClient.callTool = originalCallTool;
+      firstCoordinator?.dispose();
+      restartedCoordinator?.dispose();
+      deferredStorage.destroy();
+    }
+  });
+
+  test('callback winning during deferred agent resolution does not poison the completed coordinator route', async () => {
+    const originalCallTool = ProtocolClient.callTool;
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const deferredStorage = new MemoryStorage({ autoCleanup: false });
+    const deferredToken = testDurableToken('resolution-callback-winner-deferred-token');
+    const sellerTaskId = 'resolution-callback-winner-seller-work';
+    const a2aAgent = {
+      id: 'resolution-callback-winner-seller',
+      name: 'Resolution callback winner seller',
+      agent_uri: 'https://seller.example/a2a',
+      protocol: 'a2a',
+    };
+    let releaseResolution;
+    const resolutionGate = new Promise(resolve => {
+      releaseResolution = resolve;
+    });
+    let markResolutionEntered;
+    const resolutionEntered = new Promise(resolve => {
+      markResolutionEntered = resolve;
+    });
+    const agent = clientWithCaps(
+      capabilities({ version: '3.0' }),
+      '3.0',
+      {
+        deferredStorage,
+        resolveDeferredAgent: async agentId => {
+          assert.equal(agentId, a2aAgent.id);
+          markResolutionEntered();
+          await resolutionGate;
+          return a2aAgent;
+        },
+        validation: { requests: 'off', responses: 'off' },
+      },
+      a2aAgent
+    );
+    agent.getProducts = async () =>
+      completed('get_products', {
+        products: [legacyListedProduct('p-resolution-callback-winner', 'Resolution callback winner')],
+      });
+    let continuationToken;
+    agent.createMediaBuyLegacy = async () => {
+      const claimed = await store.get(continuationToken);
+      const operationId = claimed.operation.callbackOperationId;
+      const createdAt = Date.now();
+      assert.equal(
+        await deferredStorage.putForSettlementOperationIfAbsent(
+          operationId,
+          deferredToken,
+          {
+            continuationVersion: 'resolution-callback-winner-version',
+            taskId: operationId,
+            contextId: 'resolution-callback-winner-context',
+            a2aTaskId: 'resolution-callback-winner-a2a-task',
+            serverVersion: 'v3',
+            agentId: a2aAgent.id,
+            taskName: 'create_media_buy',
+            params: {},
+            messages: [],
+            settlementOperationId: operationId,
+            settlementOperationRouteRequired: true,
+            settlementResumeAuthorizationRequired: true,
+            settlementServerTaskId: sellerTaskId,
+            createdAt,
+            expiresAt: createdAt + 500,
+          },
+          60
+        ),
+        true
+      );
+      return {
+        success: true,
+        status: 'input-required',
+        metadata: {
+          taskId: operationId,
+          serverTaskId: sellerTaskId,
+          a2aTaskId: 'resolution-callback-winner-a2a-task',
+          contextId: 'resolution-callback-winner-context',
+          taskName: 'create_media_buy',
+          agent: { id: a2aAgent.id, name: a2aAgent.name, protocol: 'a2a' },
+          responseTimeMs: 1,
+          timestamp: new Date().toISOString(),
+          clarificationRounds: 0,
+          status: 'input-required',
+        },
+        deferred: {
+          token: deferredToken,
+          resume: input => agent.client.executor.resumeDeferredTaskFromLiveClosure(deferredToken, input, false),
+        },
+      };
+    };
+
+    let recoverCallback;
+    const registerRecovery = agent.registerDurableSettlementRecovery.bind(agent);
+    agent.registerDurableSettlementRecovery = recoverer => {
+      recoverCallback = recoverer;
+      return registerRecovery(recoverer);
+    };
+    let coordinator;
+    let sellerCalls = 0;
+    ProtocolClient.callTool = async () => {
+      sellerCalls += 1;
+      assert.fail('the callback winner must prevent deferred seller input dispatch');
+    };
+    try {
+      coordinator = await agent.negotiateMediaBuyLifecycle({
+        principalScope: 'buyer-resolution-callback-winner',
+        legacyPurchaseContinuationStore: store,
+      });
+      const discovery = await coordinator.requestProposals({
+        idempotency_key: 'request-proposals-resolution-callback-winner-0001',
+        account: { account_id: 'account-resolution-callback-winner' },
+        brand: { domain: 'example.com' },
+        brief: 'Let an authoritative callback win during trusted resolution',
+      });
+      continuationToken = discovery.data.purchase_continuation.continuation_token;
+      const input = {
+        idempotency_key: '9658de0d-c377-4247-b722-ab39bc04559f',
+        continuation_token: continuationToken,
+        account: { account_id: 'account-resolution-callback-winner' },
+        selected_product_ids: ['p-resolution-callback-winner'],
+        accepted_losses: discovery.data.purchase_continuation.losses,
+        legacy_create_request: {
+          idempotency_key: 'legacy-resolution-callback-winner-create-0001',
+          account: { account_id: 'account-resolution-callback-winner' },
+          brand: { domain: 'example.com' },
+          packages: [{ product_id: 'p-resolution-callback-winner', budget: 10, pricing_option_id: 'fixed-cpm' }],
+          start_time: '2099-01-01T00:00:00Z',
+          end_time: '2099-02-01T00:00:00Z',
+        },
+      };
+      const paused = await coordinator.continueLegacyPurchase(input);
+      assert.equal(paused.status, 'input-required');
+      assert.equal(paused.deferred.token, deferredToken);
+      const operationId = (await store.get(continuationToken)).operation.callbackOperationId;
+
+      const deferredReadFailure = new Error('injected compatibility deferred storage read outage');
+      const originalDeferredGet = deferredStorage.get.bind(deferredStorage);
+      let failDeferredRead = true;
+      deferredStorage.get = async key => {
+        if (failDeferredRead) {
+          failDeferredRead = false;
+          throw deferredReadFailure;
+        }
+        return originalDeferredGet(key);
+      };
+      await assert.rejects(
+        paused.deferred.resume({ approved: 'retry-after-storage-outage' }),
+        error => error instanceof DeferredSettlementOwnershipError && error.cause === deferredReadFailure
+      );
+      const retainedAfterOutage = await store.get(continuationToken);
+      assert.equal(retainedAfterOutage.operation.state, 'claimed');
+      assert.equal(retainedAfterOutage.operation.deferredTaskToken, deferredToken);
+      assert.equal(sellerCalls, 0);
+      deferredStorage.get = originalDeferredGet;
+
+      const resume = paused.deferred.resume({ approved: true });
+      await resolutionEntered;
+      await new Promise(resolve => setTimeout(resolve, 550));
+      await assert.rejects(
+        paused.deferred.resume({ approved: 'duplicate-must-not-dispatch' }),
+        error => error instanceof DeferredSettlementOwnershipError
+      );
+      assert.equal((await store.get(continuationToken)).operation.state, 'claimed');
+      const callback = await recoverCallback(operationId, {
+        status: 'completed',
+        result: { media_buy_id: 'buy-resolution-callback-winner', packages: [] },
+        serverTaskId: sellerTaskId,
+        taskType: 'create_media_buy',
+        idempotencyKey: 'resolution-callback-winner-event',
+      });
+      assert.equal(callback.settled, true);
+      await callback.afterDispatch?.();
+      releaseResolution();
+
+      await assert.rejects(resume, error => error instanceof DeferredSettlementOwnershipError);
+      assert.equal(sellerCalls, 0);
+      const completedRecord = await store.get(continuationToken);
+      assert.equal(completedRecord.operation.state, 'completed');
+      assert.equal(completedRecord.operation.result.data.media_buy_id, 'buy-resolution-callback-winner');
+      const replay = await coordinator.continueLegacyPurchase(input);
+      assert.equal(replay.status, 'completed');
+      assert.equal(replay.data.media_buy_id, 'buy-resolution-callback-winner');
+    } finally {
+      releaseResolution?.();
+      ProtocolClient.callTool = originalCallTool;
+      coordinator?.dispose();
+      deferredStorage.destroy();
+    }
+  });
+
+  test('pending deferred agent resolution outage preserves a retryable coordinator claim', async () => {
+    const originalCallTool = ProtocolClient.callTool;
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const deferredStorage = new MemoryStorage({ autoCleanup: false });
+    const deferredToken = testDurableToken('pending-resolution-retry-deferred-token');
+    const sellerTaskId = 'pending-resolution-retry-seller-work';
+    const a2aAgent = {
+      id: 'pending-resolution-retry-seller',
+      name: 'Pending resolution retry seller',
+      agent_uri: 'https://seller.example/a2a',
+      protocol: 'a2a',
+    };
+    const resolverFailure = new Error('injected trusted-agent resolver outage');
+    let resolveCalls = 0;
+    const agent = clientWithCaps(
+      capabilities({ version: '3.0' }),
+      '3.0',
+      {
+        deferredStorage,
+        resolveDeferredAgent: async agentId => {
+          assert.equal(agentId, a2aAgent.id);
+          resolveCalls += 1;
+          if (resolveCalls === 1) throw resolverFailure;
+          return a2aAgent;
+        },
+        validation: { requests: 'off', responses: 'off' },
+      },
+      a2aAgent
+    );
+    agent.getProducts = async () =>
+      completed('get_products', {
+        products: [legacyListedProduct('p-pending-resolution-retry', 'Pending resolution retry')],
+      });
+    let continuationToken;
+    agent.createMediaBuyLegacy = async () => {
+      const claimed = await store.get(continuationToken);
+      const operationId = claimed.operation.callbackOperationId;
+      const createdAt = Date.now();
+      assert.equal(
+        await deferredStorage.putForSettlementOperationIfAbsent(
+          operationId,
+          deferredToken,
+          {
+            continuationVersion: 'pending-resolution-retry-version',
+            continuationClaimed: true,
+            taskId: operationId,
+            contextId: 'pending-resolution-retry-context',
+            a2aTaskId: 'pending-resolution-retry-a2a-task',
+            serverVersion: 'v3',
+            agentId: a2aAgent.id,
+            taskName: 'create_media_buy',
+            params: {},
+            messages: [],
+            settlementOperationId: operationId,
+            settlementOperationRouteRequired: true,
+            settlementResumeAuthorizationRequired: true,
+            settlementServerTaskId: sellerTaskId,
+            settlementPendingTaskId: sellerTaskId,
+            createdAt,
+            expiresAt: createdAt + 60_000,
+          },
+          60
+        ),
+        true
+      );
+      return {
+        success: true,
+        status: 'input-required',
+        metadata: {
+          taskId: operationId,
+          serverTaskId: sellerTaskId,
+          a2aTaskId: 'pending-resolution-retry-a2a-task',
+          contextId: 'pending-resolution-retry-context',
+          taskName: 'create_media_buy',
+          agent: { id: a2aAgent.id, name: a2aAgent.name, protocol: 'a2a' },
+          responseTimeMs: 1,
+          timestamp: new Date().toISOString(),
+          clarificationRounds: 0,
+          status: 'input-required',
+        },
+        deferred: {
+          token: deferredToken,
+          resume: input => agent.client.executor.resumeDeferredTaskFromLiveClosure(deferredToken, input, false),
+        },
+      };
+    };
+
+    let coordinator;
+    let pollCalls = 0;
+    ProtocolClient.callTool = async (_agent, taskName, params) => {
+      assert.equal(taskName, 'tasks/get', 'pending recovery must never redispatch continuation input');
+      pollCalls += 1;
+      assert.deepEqual(params, { task_id: sellerTaskId, include_result: true });
+      return {
+        task_id: sellerTaskId,
+        task_type: 'create_media_buy',
+        status: 'completed',
+        result: { media_buy_id: 'buy-pending-resolution-retry', packages: [] },
+      };
+    };
+    try {
+      coordinator = await agent.negotiateMediaBuyLifecycle({
+        principalScope: 'buyer-pending-resolution-retry',
+        legacyPurchaseContinuationStore: store,
+      });
+      const discovery = await coordinator.requestProposals({
+        idempotency_key: 'request-proposals-pending-resolution-retry-0001',
+        account: { account_id: 'account-pending-resolution-retry' },
+        brand: { domain: 'example.com' },
+        brief: 'Retry trusted agent resolution without redispatching seller input',
+      });
+      continuationToken = discovery.data.purchase_continuation.continuation_token;
+      const input = {
+        idempotency_key: 'bf4a4312-e791-4fb3-ad49-d9f30ed2a92f',
+        continuation_token: continuationToken,
+        account: { account_id: 'account-pending-resolution-retry' },
+        selected_product_ids: ['p-pending-resolution-retry'],
+        accepted_losses: discovery.data.purchase_continuation.losses,
+        legacy_create_request: {
+          idempotency_key: 'legacy-pending-resolution-retry-create-0001',
+          account: { account_id: 'account-pending-resolution-retry' },
+          brand: { domain: 'example.com' },
+          packages: [{ product_id: 'p-pending-resolution-retry', budget: 10, pricing_option_id: 'fixed-cpm' }],
+          start_time: '2099-01-01T00:00:00Z',
+          end_time: '2099-02-01T00:00:00Z',
+        },
+      };
+      const paused = await coordinator.continueLegacyPurchase(input);
+      assert.equal(paused.status, 'input-required');
+      assert.equal(paused.deferred.token, deferredToken);
+      const checkpointBeforeOutage = await deferredStorage.get(deferredToken);
+
+      await assert.rejects(
+        paused.deferred.resume({ approved: 'retry-after-resolver-outage' }),
+        error => error instanceof DeferredSettlementOwnershipError && error.cause === resolverFailure
+      );
+
+      assert.equal(resolveCalls, 1);
+      assert.equal(pollCalls, 0);
+      assert.deepEqual(await deferredStorage.get(deferredToken), checkpointBeforeOutage);
+      const retained = await store.get(continuationToken);
+      assert.equal(retained.operation.state, 'claimed');
+      assert.equal(retained.operation.deferredTaskToken, deferredToken);
+      assert.equal(retained.operation.pendingSettlement, undefined);
+      assert.equal(retained.operation.result, undefined);
+
+      const pending = await paused.deferred.resume({ approved: true });
+      assert.equal(pending.status, 'submitted');
+      assert.equal(pending.metadata.serverTaskId, sellerTaskId);
+      assert.equal(pending.submitted.taskId, sellerTaskId);
+      const result = await pending.submitted.waitForCompletion(0);
+      assert.equal(result.status, 'completed');
+      assert.equal(result.data.media_buy_id, 'buy-pending-resolution-retry');
+      assert.equal(resolveCalls, 2);
+      assert.equal(pollCalls, 1);
+      assert.equal((await store.get(continuationToken)).operation.state, 'completed');
+    } finally {
+      ProtocolClient.callTool = originalCallTool;
+      coordinator?.dispose();
+      deferredStorage.destroy();
+    }
+  });
+
+  test('reconciles a terminal callback between the live nested-token CAS and outer confirmation', async () => {
+    const originalCallTool = ProtocolClient.callTool;
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const deferredStorage = new MemoryStorage({ autoCleanup: false });
+    const initialDeferredToken = testDurableToken('live-nested-token-a');
+    const sellerTaskId = 'live-nested-seller-work';
+    const a2aAgent = {
+      id: 'live-nested-seller',
+      name: 'Live nested seller',
+      agent_uri: 'https://seller.example/a2a',
+      protocol: 'a2a',
+    };
+    const agent = clientWithCaps(
+      capabilities({ version: '3.0' }),
+      '3.0',
+      {
+        deferredStorage,
+        resolveDeferredAgent: async agentId => (agentId === a2aAgent.id ? a2aAgent : undefined),
+        validation: { requests: 'off', responses: 'off' },
+      },
+      a2aAgent
+    );
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-live-nested', 'Live nested')] });
+    let continuationToken;
+    agent.createMediaBuyLegacy = async () => {
+      const claimed = await store.get(continuationToken);
+      assert.equal(claimed.operation.state, 'claimed');
+      const operationId = claimed.operation.callbackOperationId;
+      const createdAt = Date.now();
+      assert.equal(
+        await deferredStorage.putForSettlementOperationIfAbsent(
+          operationId,
+          initialDeferredToken,
+          {
+            continuationVersion: 'live-nested-version-a',
+            taskId: operationId,
+            contextId: 'live-nested-context-a',
+            a2aTaskId: 'live-nested-a2a-a',
+            serverVersion: 'v3',
+            agentId: a2aAgent.id,
+            taskName: 'create_media_buy',
+            params: {},
+            messages: [],
+            settlementOperationId: operationId,
+            settlementOperationRouteRequired: true,
+            settlementResumeAuthorizationRequired: true,
+            settlementServerTaskId: sellerTaskId,
+            createdAt,
+            expiresAt: createdAt + 60_000,
+          },
+          60
+        ),
+        true
+      );
+      return {
+        success: true,
+        status: 'input-required',
+        metadata: {
+          taskId: operationId,
+          serverTaskId: sellerTaskId,
+          a2aTaskId: 'live-nested-a2a-a',
+          contextId: 'live-nested-context-a',
+          taskName: 'create_media_buy',
+          agent: { id: a2aAgent.id, name: a2aAgent.name, protocol: 'a2a' },
+          responseTimeMs: 1,
+          timestamp: new Date().toISOString(),
+          clarificationRounds: 0,
+          status: 'input-required',
+        },
+        deferred: {
+          token: initialDeferredToken,
+          resume: input => agent.client.executor.resumeDeferredTaskFromLiveClosure(initialDeferredToken, input, false),
+        },
+      };
+    };
+    let sellerCalls = 0;
+    ProtocolClient.callTool = async (_agent, taskName, params, options) => {
+      assert.equal(taskName, 'create_media_buy');
+      sellerCalls += 1;
+      assert.deepEqual(params, { input: { approved: true } });
+      assert.equal(options.session.taskId, 'live-nested-a2a-a');
+      return {
+        result: {
+          kind: 'task',
+          id: 'live-nested-a2a-b',
+          contextId: 'live-nested-context-b',
+          status: {
+            state: 'input-required',
+            message: {
+              kind: 'message',
+              messageId: 'live-nested-question-b',
+              role: 'agent',
+              parts: [{ kind: 'data', data: { status: 'input-required', question: 'Approve?' } }],
+            },
+          },
+          artifacts: [
+            {
+              artifactId: 'live-nested-work-b',
+              metadata: { adcp_task_id: sellerTaskId },
+              parts: [],
+            },
+          ],
+        },
+      };
+    };
+
+    let recoverCallback;
+    const registerRecovery = agent.registerDurableSettlementRecovery.bind(agent);
+    agent.registerDurableSettlementRecovery = recoverer => {
+      recoverCallback = recoverer;
+      return registerRecovery(recoverer);
+    };
+    let injectedCallback = false;
+    const registerReplacement = agent.registerDurableDeferredResumeTokenReplacement.bind(agent);
+    agent.registerDurableDeferredResumeTokenReplacement = replacer =>
+      registerReplacement(async (operationId, currentToken, replacementToken) => {
+        if (!injectedCallback) {
+          injectedCallback = true;
+          const callback = await recoverCallback(operationId, {
+            status: 'completed',
+            result: { media_buy_id: 'buy-live-nested-callback', packages: [] },
+            serverTaskId: sellerTaskId,
+            taskType: 'create_media_buy',
+            idempotencyKey: 'live-nested-callback-event',
+          });
+          assert.equal(callback.settled, true);
+          await callback.afterDispatch?.();
+        }
+        return replacer(operationId, currentToken, replacementToken);
+      });
+    let coordinator;
+    try {
+      coordinator = await agent.negotiateMediaBuyLifecycle({
+        principalScope: 'buyer-live-nested',
+        legacyPurchaseContinuationStore: store,
+      });
+      const discovery = await coordinator.requestProposals({
+        idempotency_key: 'request-proposals-live-nested-0001',
+        account: { account_id: 'account-live-nested' },
+        brand: { domain: 'example.com' },
+        brief: 'Pause twice through the live compatibility wrapper',
+      });
+      continuationToken = discovery.data.purchase_continuation.continuation_token;
+      const paused = await coordinator.continueLegacyPurchase({
+        idempotency_key: '6aec2638-506c-48c7-909b-b0e1798fcafe',
+        continuation_token: continuationToken,
+        account: { account_id: 'account-live-nested' },
+        selected_product_ids: ['p-live-nested'],
+        accepted_losses: discovery.data.purchase_continuation.losses,
+        legacy_create_request: {
+          idempotency_key: 'legacy-live-nested-create-0001',
+          account: { account_id: 'account-live-nested' },
+          brand: { domain: 'example.com' },
+          packages: [{ product_id: 'p-live-nested', budget: 10, pricing_option_id: 'fixed-cpm' }],
+          start_time: '2099-01-01T00:00:00Z',
+          end_time: '2099-02-01T00:00:00Z',
+        },
+      });
+      assert.equal(paused.status, 'input-required');
+      assert.equal(paused.deferred.token, initialDeferredToken);
+      const claimed = await store.get(continuationToken);
+      assert.equal(claimed.operation.state, 'claimed');
+      assert.equal(claimed.operation.deferredTaskToken, initialDeferredToken);
+
+      const originalRecordDeferredTaskToken = store.recordDeferredTaskToken.bind(store);
+      const handoffObservations = [];
+      store.recordDeferredTaskToken = async (token, claim, replacementToken, expectedToken) => {
+        if (expectedToken !== undefined) {
+          handoffObservations.push({
+            expectedToken,
+            replacementToken,
+            oldCheckpointPresent: await deferredStorage.has(expectedToken),
+            replacementCheckpointPresent: await deferredStorage.has(replacementToken),
+          });
+        }
+        return originalRecordDeferredTaskToken(token, claim, replacementToken, expectedToken);
+      };
+
+      const completedDuringHandoff = await paused.deferred.resume({ approved: true });
+      assert.equal(completedDuringHandoff.status, 'completed');
+      assert.equal(completedDuringHandoff.data.media_buy_id, 'buy-live-nested-callback');
+      const replacementToken = handoffObservations[0].replacementToken;
+      assert.notEqual(replacementToken, initialDeferredToken);
+      assert.equal(handoffObservations.length, 1, 'the callback must bind B before the original coordinator CAS');
+      assert.deepEqual(handoffObservations[0], {
+        expectedToken: initialDeferredToken,
+        replacementToken,
+        oldCheckpointPresent: true,
+        replacementCheckpointPresent: true,
+      });
+      const deferredWinner = await deferredStorage.getBySettlementOperationId(
+        (await store.get(continuationToken)).operation.callbackOperationId
+      );
+      assert.equal(deferredWinner.token, replacementToken);
+      assert.equal(deferredWinner.state.settlementTerminalResult.data.media_buy_id, 'buy-live-nested-callback');
+      const completed = await store.get(continuationToken);
+      assert.equal(completed.operation.state, 'completed');
+      assert.equal(completed.operation.deferredTaskToken, replacementToken);
+      assert.equal(sellerCalls, 1);
+    } finally {
+      ProtocolClient.callTool = originalCallTool;
+      coordinator?.dispose();
+      deferredStorage.destroy();
+    }
+  });
+
+  test('recovers a legacy purchase callback from durable state after the local settlement route is lost', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const webhookRegistrationStore = new InMemoryWebhookRegistrationStore();
+    const webhookSecret = 'restart-recovery-webhook-secret';
+    const sellerTaskId = 'restart-recovery-seller-task';
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0', {
+      webhookSecret,
+      webhookRegistrationStore,
+    });
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-restart-recovery', 'Restart recovery')] });
+    let releaseSellerResponse;
+    let markDispatchStarted;
+    const dispatchStarted = new Promise(resolve => {
+      markDispatchStarted = resolve;
+    });
+    agent.createMediaBuyLegacy = async () => {
+      markDispatchStarted();
+      await new Promise(resolve => {
+        releaseSellerResponse = resolve;
+      });
+      return completed('create_media_buy', { media_buy_id: 'buy-conflicting-inline', packages: [] });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-restart-recovery',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-restart-recovery-0001',
+      account: { account_id: 'account-restart-recovery' },
+      brand: { domain: 'example.com' },
+      brief: 'Restart recovery purchase',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+    const input = {
+      idempotency_key: '8baf407d-2954-4b1b-9dfe-3cf657a446c8',
+      continuation_token: token,
+      account: { account_id: 'account-restart-recovery' },
+      selected_product_ids: ['p-restart-recovery'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-restart-recovery-create-0001',
+        account: { account_id: 'account-restart-recovery' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-restart-recovery', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+
+    const continuation = coordinator.continueLegacyPurchase(input);
+    await dispatchStarted;
+    const claimed = await store.get(token);
+    assert.equal(claimed.operation.state, 'claimed');
+    const operationId = claimed.operation.callbackOperationId;
+    assert.equal(typeof operationId, 'string');
+    await webhookRegistrationStore.putIfAbsent({
+      agentId: AGENT.id,
+      agentUrl: AGENT.agent_uri,
+      protocol: AGENT.protocol,
+      operationId,
+      taskType: 'create_media_buy',
+      callbackUrl: `https://buyer.example/webhooks/create_media_buy/${operationId}`,
+      method: 'POST',
+      mode: 'hmac-sha256',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      requiresDurableSettlement: true,
+    });
+
+    // Simulate a cold replica: a fresh client/coordinator installs recovery
+    // against the shared store and has no executor-local settlement handler.
+    const replicaAgent = clientWithCaps(capabilities({ version: '3.0' }), '3.0', {
+      webhookSecret,
+      webhookRegistrationStore,
+    });
+    const replicaCoordinator = await replicaAgent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-restart-recovery',
+      legacyPurchaseContinuationStore: store,
+    });
+    const payload = {
+      idempotency_key: 'restart-recovery-webhook-event',
+      operation_id: operationId,
+      task_id: sellerTaskId,
+      task_type: 'create_media_buy',
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+      result: { media_buy_id: 'buy-restart-recovery', packages: [] },
+    };
+    const rawBody = JSON.stringify(payload);
+    const timestamp = Math.floor(Date.now() / 1000);
+    const signature = `sha256=${crypto
+      .createHmac('sha256', webhookSecret)
+      .update(`${timestamp}.${rawBody}`)
+      .digest('hex')}`;
+    assert.equal(
+      await replicaAgent.handleWebhook(
+        payload,
+        'create_media_buy',
+        operationId,
+        signature,
+        String(timestamp),
+        rawBody,
+        {
+          requestMethod: 'POST',
+          requestUrl: `https://buyer.example/webhooks/create_media_buy/${operationId}`,
+        }
+      ),
+      true
+    );
+    const queued = await store.get(token);
+    assert.equal(queued.operation.state, 'claimed');
+    assert.equal(queued.operation.pendingSettlement.serverTaskId, sellerTaskId);
+    assert.equal(await store.recordSubmittedTask(token, queued.operation, sellerTaskId), true);
+
+    const laterPayload = {
+      ...payload,
+      idempotency_key: 'restart-recovery-later-webhook-event',
+      result: { media_buy_id: 'buy-conflicting-later-callback', packages: [] },
+    };
+    const laterRawBody = JSON.stringify(laterPayload);
+    const laterTimestamp = timestamp + 1;
+    const laterSignature = `sha256=${crypto
+      .createHmac('sha256', webhookSecret)
+      .update(`${laterTimestamp}.${laterRawBody}`)
+      .digest('hex')}`;
+    await assert.rejects(
+      replicaAgent.handleWebhook(
+        laterPayload,
+        'create_media_buy',
+        operationId,
+        laterSignature,
+        String(laterTimestamp),
+        laterRawBody,
+        {
+          requestMethod: 'POST',
+          requestUrl: `https://buyer.example/webhooks/create_media_buy/${operationId}`,
+        }
+      ),
+      error => error.code === 'ambiguous' && /callback event identity does not match/.test(error.message)
+    );
+    const durableCallbackWinner = await store.get(token);
+    assert.equal(durableCallbackWinner.operation.state, 'claimed');
+    assert.equal(durableCallbackWinner.operation.pendingSettlement.terminal.data.media_buy_id, 'buy-restart-recovery');
+
+    releaseSellerResponse();
+    await assert.rejects(
+      continuation,
+      error => error.code === 'ambiguous' && /earlier durably acknowledged callback/.test(error.message)
+    );
+    const durableWinner = await store.get(token);
+    assert.equal(durableWinner.operation.state, 'completed');
+    assert.equal(durableWinner.operation.result.data.media_buy_id, 'buy-restart-recovery');
+    const replay = await coordinator.continueLegacyPurchase(input);
+    assert.equal(replay.status, 'completed');
+    assert.equal(replay.data.media_buy_id, 'buy-restart-recovery');
+    replicaCoordinator.dispose();
+    coordinator.dispose();
+  });
+
+  test('shares one seller polling loop between the background observer and callers', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-shared-poll', 'Shared poll')] });
+    let polls = 0;
+    let finished = false;
+    let originalWaits = 0;
+    agent.createMediaBuyLegacy = async () => {
+      const result = submitted(
+        'create_media_buy',
+        completed('create_media_buy', { media_buy_id: 'buy-shared-poll', packages: [] })
+      );
+      result.submitted.waitForCompletion = async () => {
+        originalWaits += 1;
+        return new Promise(() => {});
+      };
+      result.submitted.track = async () => {
+        polls += 1;
+        return {
+          taskId: 'create_media_buy-task',
+          status: finished ? 'completed' : 'working',
+          taskType: 'create_media_buy',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          ...(finished && { result: { media_buy_id: 'buy-shared-poll', packages: [] } }),
+        };
+      };
+      return result;
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-shared-poll' });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-shared-poll-0001',
+      account: { account_id: 'account-shared-poll' },
+      brand: { domain: 'example.com' },
+      brief: 'Shared polling',
+    });
+    const input = {
+      idempotency_key: 'cc7f3687-3b44-4c66-9578-7580b03c6a60',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-shared-poll' },
+      selected_product_ids: ['p-shared-poll'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-shared-poll-create-0001',
+        account: { account_id: 'account-shared-poll' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-shared-poll', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    const pending = await coordinator.continueLegacyPurchase(input);
+    const first = pending.submitted.waitForCompletion(1);
+    const second = pending.submitted.waitForCompletion(1);
+    assert.equal(polls, 1);
+    finished = true;
+    const results = await Promise.all([first, second]);
+    assert.deepEqual(
+      results.map(value => value.data.media_buy_id),
+      ['buy-shared-poll', 'buy-shared-poll']
+    );
+    assert.equal(polls, 2);
+    assert.equal(originalWaits, 0, 'SDK observer deadlines must never enter the remote-cancel polling path');
+  });
+
+  test('reports a non-resumable polled pause explicitly and permits later authoritative completion', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-shared-pause', 'Shared pause')] });
+    let status = 'input-required';
+    let polls = 0;
+    agent.createMediaBuyLegacy = async () => {
+      const result = submitted('create_media_buy', completed('create_media_buy', {}));
+      result.submitted.track = async () => {
+        polls += 1;
+        return {
+          taskId: 'create_media_buy-task',
+          status,
+          taskType: 'create_media_buy',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result:
+            status === 'completed'
+              ? { media_buy_id: 'buy-shared-pause', packages: [] }
+              : { question: 'Approval required' },
+        };
+      };
+      return result;
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-shared-pause' });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-shared-pause-0001',
+      account: { account_id: 'account-shared-pause' },
+      brand: { domain: 'example.com' },
+      brief: 'Shared pause',
+    });
+    const pending = await coordinator.continueLegacyPurchase({
+      idempotency_key: 'cb584864-ac5e-4c69-a8b0-d1d12ebf43a3',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-shared-pause' },
+      selected_product_ids: ['p-shared-pause'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-shared-pause-create-0001',
+        account: { account_id: 'account-shared-pause' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-shared-pause', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    });
+    await assert.rejects(pending.submitted.waitForCompletion(1), error => error.code === 'ambiguous');
+    status = 'completed';
+    const completion = await pending.submitted.waitForCompletion(1);
+    assert.equal(completion.status, 'completed');
+    assert.equal(completion.data.media_buy_id, 'buy-shared-pause');
+    assert.ok(polls >= 2);
+  });
+
+  test('rejects invalid shared polling intervals', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-poll-interval', 'Poll interval')] });
+    agent.createMediaBuyLegacy = async () => submitted('create_media_buy', completed('create_media_buy', {}));
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-poll-interval' });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-poll-interval-0001',
+      account: { account_id: 'account-poll-interval' },
+      brand: { domain: 'example.com' },
+      brief: 'Poll interval validation',
+    });
+    const pending = await coordinator.continueLegacyPurchase({
+      idempotency_key: '7e0df2b7-ebda-43a9-ace9-c0e0313a73a7',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-poll-interval' },
+      selected_product_ids: ['p-poll-interval'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-poll-interval-create-0001',
+        account: { account_id: 'account-poll-interval' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-poll-interval', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    });
+    await assert.rejects(pending.submitted.waitForCompletion(Number.NaN), RangeError);
+    await assert.rejects(pending.submitted.waitForCompletion(-1), RangeError);
+    await assert.rejects(pending.submitted.waitForCompletion(2_147_483_648), RangeError);
+  });
+
+  test('treats a seller tracking RangeError as durable mutation uncertainty', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-track-range', 'Track range')] });
+    agent.createMediaBuyLegacy = async () => {
+      const result = submitted('create_media_buy', completed('create_media_buy', {}));
+      result.submitted.track = async () => {
+        throw new RangeError('protocol response exceeded parser bounds');
+      };
+      return result;
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-track-range' });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-track-range-0001',
+      account: { account_id: 'account-track-range' },
+      brand: { domain: 'example.com' },
+      brief: 'Track RangeError',
+    });
+    const input = {
+      idempotency_key: '0c4ff6ce-d295-485e-bb69-a1badb0badf3',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-track-range' },
+      selected_product_ids: ['p-track-range'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-track-range-create-0001',
+        account: { account_id: 'account-track-range' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-track-range', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    const pending = await coordinator.continueLegacyPurchase(input);
+    await assert.rejects(pending.submitted.waitForCompletion(1), error => error.code === 'ambiguous');
+    await assert.rejects(coordinator.continueLegacyPurchase(input), error => error.code === 'ambiguous');
+  });
+
+  test('keeps shared observation authoritative when one caller aborts', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-abort-poll', 'Abort poll')] });
+    let finished = false;
+    let polls = 0;
+    let originalWaits = 0;
+    agent.createMediaBuyLegacy = async () => {
+      const result = submitted(
+        'create_media_buy',
+        completed('create_media_buy', { media_buy_id: 'buy-abort-poll', packages: [] })
+      );
+      result.submitted.waitForCompletion = async () => {
+        originalWaits += 1;
+        return new Promise(() => {});
+      };
+      result.submitted.track = async () => {
+        polls += 1;
+        return {
+          taskId: 'create_media_buy-task',
+          status: finished ? 'completed' : 'working',
+          taskType: 'create_media_buy',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          ...(finished && { result: { media_buy_id: 'buy-abort-poll', packages: [] } }),
+        };
+      };
+      return result;
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-abort-poll' });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-abort-poll-0001',
+      account: { account_id: 'account-abort-poll' },
+      brand: { domain: 'example.com' },
+      brief: 'Abort polling',
+    });
+    const input = {
+      idempotency_key: '898176bd-d07f-45cd-9267-6b8d87cc028d',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-abort-poll' },
+      selected_product_ids: ['p-abort-poll'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-abort-poll-create-0001',
+        account: { account_id: 'account-abort-poll' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-abort-poll', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    const pending = await coordinator.continueLegacyPurchase(input);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const backgroundPolls = polls;
+    const abort = new AbortController();
+    const stopped = pending.submitted.waitForCompletion(1, abort.signal);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    assert.ok(polls > backgroundPolls, 'caller cadence should accelerate the shared observer');
+    abort.abort('caller stopped waiting');
+    await assert.rejects(stopped, error => error.name === 'AbortError');
+    const pollsAfterAbort = polls;
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(polls <= pollsAfterAbort + 1, 'background observer must not retain the departed caller cadence');
+
+    finished = true;
+    const completion = await pending.submitted.waitForCompletion(1);
+    assert.equal(completion.status, 'completed');
+    assert.equal(completion.data.media_buy_id, 'buy-abort-poll');
+    assert.equal(originalWaits, 0);
+  });
+
+  test('does not let the background observation deadline shorten an active caller wait', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-deadline-poll', 'Deadline poll')] });
+    let finished = false;
+    let originalWaits = 0;
+    agent.createMediaBuyLegacy = async () => {
+      const result = submitted(
+        'create_media_buy',
+        completed('create_media_buy', { media_buy_id: 'buy-deadline-poll', packages: [] })
+      );
+      result.submitted.waitForCompletion = async () => {
+        originalWaits += 1;
+        return new Promise(() => {});
+      };
+      result.submitted.track = async () => ({
+        taskId: 'create_media_buy-task',
+        status: finished ? 'completed' : 'working',
+        taskType: 'create_media_buy',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        ...(finished && { result: { media_buy_id: 'buy-deadline-poll', packages: [] } }),
+      });
+      return result;
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-deadline-poll',
+      legacyPurchaseOperationTtlMs: 15,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-deadline-poll-0001',
+      account: { account_id: 'account-deadline-poll' },
+      brand: { domain: 'example.com' },
+      brief: 'Deadline polling',
+    });
+    const input = {
+      idempotency_key: 'd987f636-37c2-4bd5-9098-f0b962ab19a1',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-deadline-poll' },
+      selected_product_ids: ['p-deadline-poll'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-deadline-poll-create-0001',
+        account: { account_id: 'account-deadline-poll' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-deadline-poll', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    const pending = await coordinator.continueLegacyPurchase(input);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const completion = pending.submitted.waitForCompletion(1);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    finished = true;
+    const terminal = await completion;
+    assert.equal(terminal.status, 'completed');
+    assert.equal(terminal.data.media_buy_id, 'buy-deadline-poll');
+    assert.equal(originalWaits, 0);
+  });
+
+  test('does not mark a claim ambiguous when an abandoned background poll rejects late', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-late-rejection', 'Late rejection')] });
+    let rejectTrack;
+    let markTrackStarted;
+    const trackStarted = new Promise(resolve => {
+      markTrackStarted = resolve;
+    });
+    agent.createMediaBuyLegacy = async () => {
+      const result = submitted('create_media_buy', completed('create_media_buy', {}));
+      result.submitted.track = async () =>
+        new Promise((_, reject) => {
+          rejectTrack = reject;
+          markTrackStarted();
+        });
+      return result;
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-late-rejection',
+      legacyPurchaseContinuationStore: store,
+      legacyPurchaseOperationTtlMs: 15,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-late-rejection-0001',
+      account: { account_id: 'account-late-rejection' },
+      brand: { domain: 'example.com' },
+      brief: 'Late poll rejection',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+    const input = {
+      idempotency_key: '31b9774c-7d27-4587-aefd-2ff93ee89535',
+      continuation_token: token,
+      account: { account_id: 'account-late-rejection' },
+      selected_product_ids: ['p-late-rejection'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-late-rejection-create-0001',
+        account: { account_id: 'account-late-rejection' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-late-rejection', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    assert.equal((await coordinator.continueLegacyPurchase(input)).status, 'submitted');
+    await trackStarted;
+    await new Promise(resolve => setTimeout(resolve, 25));
+    rejectTrack(new Error('late tasks/get rejection'));
+    await new Promise(resolve => setImmediate(resolve));
+
+    const record = await store.get(token);
+    assert.equal(record.operation.state, 'claimed');
+  });
+
+  test('persists a completed transport task with an AdCP error payload as a failed replay', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-operation-error', 'Operation error')] });
+    const operationError = {
+      adcp_error: { code: 'BUDGET_INVALID', message: 'Budget rejected' },
+      context: { correlation_id: 'correlation-operation-error' },
+    };
+    agent.createMediaBuyLegacy = async () => {
+      const result = submitted('create_media_buy', completed('create_media_buy', operationError));
+      result.submitted.track = async () => ({
+        taskId: 'create_media_buy-task',
+        status: 'completed',
+        taskType: 'create_media_buy',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        result: operationError,
+      });
+      return result;
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-operation-error' });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-operation-error-0001',
+      account: { account_id: 'account-operation-error' },
+      brand: { domain: 'example.com' },
+      brief: 'Operation error replay',
+    });
+    const input = {
+      idempotency_key: 'e5fc47d0-f308-439c-be46-213b3bf550f2',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-operation-error' },
+      selected_product_ids: ['p-operation-error'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-operation-error-create-0001',
+        account: { account_id: 'account-operation-error' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-operation-error', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    const pending = await coordinator.continueLegacyPurchase(input);
+    const failure = await pending.submitted.waitForCompletion(1);
+    assert.equal(failure.status, 'failed');
+    assert.equal(failure.error, 'Budget rejected');
+    assert.equal(failure.adcpError.code, 'BUDGET_INVALID');
+    assert.equal(failure.correlationId, 'correlation-operation-error');
+    assert.deepEqual(failure.data, operationError);
+
+    const replay = await coordinator.continueLegacyPurchase(input);
+    assert.equal(replay.status, 'failed');
+    assert.equal(replay.error, 'Budget rejected');
+    assert.equal(replay.adcpError.code, 'BUDGET_INVALID');
+    assert.equal(replay.correlationId, 'correlation-operation-error');
+    assert.deepEqual(replay.data, operationError);
+  });
+
+  test('fences an immediate unstructured failure as ambiguous instead of replaying it', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-malformed-completion', 'Malformed')] });
+    agent.createMediaBuyLegacy = async () => ({
+      ...completed('create_media_buy', { media_buy_id: 'possibly-created' }),
+      success: false,
+      status: 'failed',
+      error: 'Schema validation failed: packages is required',
+      metadata: {
+        ...completed('create_media_buy', {}).metadata,
+        status: 'failed',
+      },
+    });
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-malformed-completion',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-malformed-completion-0001',
+      account: { account_id: 'account-malformed-completion' },
+      brand: { domain: 'example.com' },
+      brief: 'Malformed completion',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+    const input = {
+      idempotency_key: '6919bb43-64f3-4a70-b264-8df0f023fce1',
+      continuation_token: token,
+      account: { account_id: 'account-malformed-completion' },
+      selected_product_ids: ['p-malformed-completion'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-malformed-completion-create-0001',
+        account: { account_id: 'account-malformed-completion' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-malformed-completion', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+
+    await assert.rejects(
+      coordinator.continueLegacyPurchase(input),
+      error => error.code === 'ambiguous' && /not an authoritative structured AdCP error/.test(error.message)
+    );
+    assert.equal((await store.get(token)).operation.state, 'ambiguous');
+    await assert.rejects(coordinator.continueLegacyPurchase(input), error => error.code === 'ambiguous');
+  });
+
+  test('fences submitted unstructured terminal failures as ambiguous instead of replaying them', async () => {
+    for (const [index, taskStatus] of ['failed', 'rejected', 'canceled'].entries()) {
+      const store = createInMemoryLegacyPurchaseContinuationStore();
+      const productId = `p-unstructured-${taskStatus}`;
+      const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+      agent.getProducts = async () =>
+        completed('get_products', { products: [legacyListedProduct(productId, `Unstructured ${taskStatus}`)] });
+      agent.createMediaBuyLegacy = async () => {
+        const result = submitted('create_media_buy', { status: taskStatus });
+        result.submitted.track = async () => ({
+          taskId: 'create_media_buy-task',
+          status: taskStatus,
+          taskType: 'create_media_buy',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result: { error: `Seller reported ${taskStatus} without an AdCP error envelope` },
+        });
+        return result;
+      };
+      const coordinator = await agent.negotiateMediaBuyLifecycle({
+        principalScope: `buyer-unstructured-${taskStatus}`,
+        legacyPurchaseContinuationStore: store,
+      });
+      const discovery = await coordinator.requestProposals({
+        idempotency_key: `request-proposals-unstructured-${taskStatus}-0001`,
+        account: { account_id: `account-unstructured-${taskStatus}` },
+        brand: { domain: 'example.com' },
+        brief: `Unstructured submitted ${taskStatus}`,
+      });
+      const token = discovery.data.purchase_continuation.continuation_token;
+      const input = {
+        idempotency_key: `6919bb43-64f3-4a70-b264-8df0f023fce${index + 2}`,
+        continuation_token: token,
+        account: { account_id: `account-unstructured-${taskStatus}` },
+        selected_product_ids: [productId],
+        accepted_losses: discovery.data.purchase_continuation.losses,
+        legacy_create_request: {
+          idempotency_key: `legacy-unstructured-${taskStatus}-create-0001`,
+          account: { account_id: `account-unstructured-${taskStatus}` },
+          brand: { domain: 'example.com' },
+          packages: [{ product_id: productId, budget: 10, pricing_option_id: 'fixed-cpm' }],
+          start_time: '2099-01-01T00:00:00Z',
+          end_time: '2099-02-01T00:00:00Z',
+        },
+      };
+
+      const pending = await coordinator.continueLegacyPurchase(input);
+      await assert.rejects(
+        pending.submitted.waitForCompletion(0),
+        error => error.code === 'ambiguous' && /not an authoritative structured AdCP error/.test(error.message)
+      );
+      assert.equal((await store.get(token)).operation.state, 'ambiguous');
+      await assert.rejects(coordinator.continueLegacyPurchase(input), error => error.code === 'ambiguous');
+    }
+  });
+
+  test('keeps an unrecognizable tracked task fail-closed as ambiguous', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-unknown-task', 'Unknown task')] });
+    agent.createMediaBuyLegacy = async () => {
+      const result = submitted('create_media_buy', completed('create_media_buy', {}));
+      result.submitted.track = async () => ({
+        taskId: 'create_media_buy-task',
+        status: 'unknown',
+        taskType: 'unknown',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      return result;
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-unknown-task' });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-unknown-task-0001',
+      account: { account_id: 'account-unknown-task' },
+      brand: { domain: 'example.com' },
+      brief: 'Unknown tracked task',
+    });
+    const input = {
+      idempotency_key: 'd73411da-982c-4448-ab18-49c5b1c53450',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-unknown-task' },
+      selected_product_ids: ['p-unknown-task'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-unknown-task-create-0001',
+        account: { account_id: 'account-unknown-task' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-unknown-task', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    const pending = await coordinator.continueLegacyPurchase(input);
+    await assert.rejects(pending.submitted.waitForCompletion(1), error => error.code === 'ambiguous');
+    await assert.rejects(coordinator.continueLegacyPurchase(input), error => error.code === 'ambiguous');
+  });
+
+  test('rejects a custom store that substitutes a different submitted terminal winner', async () => {
+    const baseStore = createInMemoryLegacyPurchaseContinuationStore();
+    const winner = completed('create_media_buy', { media_buy_id: 'buy-persisted-winner', packages: [] });
+    const store = {
+      create: record => baseStore.create(record),
+      get: token => baseStore.get(token),
+      claim: (token, request) => baseStore.claim(token, request),
+      complete: (token, claim) => baseStore.complete(token, claim, winner),
+      recordSubmittedTask: (token, claim, taskId) => baseStore.recordSubmittedTask(token, claim, taskId),
+      markAmbiguous: (token, claim, reason) => baseStore.markAmbiguous(token, claim, reason),
+    };
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () => completed('get_products', { products: [legacyListedProduct('p-race', 'Race')] });
+    agent.createMediaBuyLegacy = async () => {
+      const result = submitted(
+        'create_media_buy',
+        completed('create_media_buy', { media_buy_id: 'buy-losing-observer', packages: [] })
+      );
+      result.submitted.waitForCompletion = async () => new Promise(() => {});
+      return result;
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-race',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-race-0001',
+      account: { account_id: 'account-race' },
+      brand: { domain: 'example.com' },
+      brief: 'Race purchase observers',
+    });
+    const input = {
+      idempotency_key: '54ec2250-c4d0-4f03-a669-e77821fb3c7e',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-race' },
+      selected_product_ids: ['p-race'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-race-create-0001',
+        account: { account_id: 'account-race' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-race', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    const pending = await coordinator.continueLegacyPurchase(input);
+    await assert.rejects(
+      pending.submitted.track(),
+      error => error.code === 'ambiguous' && /conflicts with the seller observation/.test(error.message)
+    );
+    assert.equal((await coordinator.continueLegacyPurchase(input)).data.media_buy_id, 'buy-persisted-winner');
+  });
+
+  test('atomically preserves a queued callback that races a stale completion read', async () => {
+    const baseStore = createInMemoryLegacyPurchaseContinuationStore();
+    let releaseComplete;
+    const completeGate = new Promise(resolve => {
+      releaseComplete = resolve;
+    });
+    let signalCompleteEntered;
+    const completeEntered = new Promise(resolve => {
+      signalCompleteEntered = resolve;
+    });
+    const store = {
+      create: record => baseStore.create(record),
+      get: token => baseStore.get(token),
+      getByCallbackOperationId: operationId => baseStore.getByCallbackOperationId(operationId),
+      claim: (token, request) => baseStore.claim(token, request),
+      complete: async (token, claim, result) => {
+        signalCompleteEntered();
+        await completeGate;
+        return baseStore.complete(token, claim, result);
+      },
+      recordPendingSettlement: (token, claim, settlement) =>
+        baseStore.recordPendingSettlement(token, claim, settlement),
+      claimPendingSettlementPublication: (token, claim, settlement, lease) =>
+        baseStore.claimPendingSettlementPublication(token, claim, settlement, lease),
+      releasePendingSettlementPublication: (token, claim, settlement, ownerId) =>
+        baseStore.releasePendingSettlementPublication(token, claim, settlement, ownerId),
+      acknowledgePendingSettlement: (token, claim, settlement, ownerId) =>
+        baseStore.acknowledgePendingSettlement(token, claim, settlement, ownerId),
+      recordSubmittedTask: (token, claim, taskId) => baseStore.recordSubmittedTask(token, claim, taskId),
+      recordDeferredTaskToken: (token, claim, deferredToken, expectedDeferredToken) =>
+        baseStore.recordDeferredTaskToken(token, claim, deferredToken, expectedDeferredToken),
+      markAmbiguous: (token, claim, reason) => baseStore.markAmbiguous(token, claim, reason),
+    };
+    const binding = {
+      principalScope: 'principal-race',
+      accountScope: 'account-race',
+      sellerScope: 'seller-race',
+      clientSessionScope: 'session-race',
+      sourceAdcpVersion: '3.0',
+    };
+    const claim = {
+      idempotencyKey: 'claim-race-key',
+      inputFingerprint: 'claim-race-input',
+      operationKey: 'claim-race-operation',
+      claimedAt: '2027-01-01T00:00:00Z',
+      replayExpiresAt: '2099-01-01T00:00:00Z',
+      selectedProductIds: ['p-race-store'],
+      callbackOperationId: 'callback-race-operation',
+    };
+    const token = 'store-race-token';
+    assert.equal(
+      (
+        await store.create({
+          ...binding,
+          token,
+          expiresAt: '2099-01-01T00:00:00Z',
+          issuanceFingerprint: 'issuance-race',
+          discoveryRequestFingerprint: 'discovery-race',
+          observedResponse: { products: [{ product_id: 'p-race-store' }] },
+          productIds: ['p-race-store'],
+          losses: ['feed_version_not_atomic'],
+          operation: { state: 'available' },
+        })
+      ).outcome,
+      'created'
+    );
+    assert.equal((await store.claim(token, { claim, expected: binding })).outcome, 'claimed');
+    const staleClaim = (await store.get(token)).operation;
+    const inline = completed('create_media_buy', { media_buy_id: 'buy-inline-later', packages: [] });
+    const callback = completed('create_media_buy', { media_buy_id: 'buy-callback-first', packages: [] });
+    const completing = store.complete(token, staleClaim, inline);
+    await completeEntered;
+    assert.equal(
+      (
+        await store.recordPendingSettlement(token, staleClaim, {
+          operationId: claim.callbackOperationId,
+          serverTaskId: 'seller-task-race',
+          taskType: 'create_media_buy',
+          terminal: callback,
+        })
+      ).outcome,
+      'recorded'
+    );
+    assert.equal(await store.recordSubmittedTask(token, staleClaim, 'different-seller-task'), false);
+    assert.equal(await store.recordSubmittedTask(token, staleClaim, 'seller-task-race'), true);
+    releaseComplete();
+
+    const installed = await completing;
+    assert.equal(installed.outcome, 'pending_completed');
+    assert.equal(installed.result.data.media_buy_id, 'buy-callback-first');
+    assert.equal(installed.pendingSettlement.serverTaskId, 'seller-task-race');
+    assert.equal((await store.get(token)).operation.result.data.media_buy_id, 'buy-callback-first');
+    assert.equal((await baseStore.complete(token, staleClaim, inline)).outcome, 'conflict');
+    assert.equal((await store.get(token)).operation.pendingSettlement.serverTaskId, 'seller-task-race');
+    const publicationOwnerId = 'store-race-publication-owner';
+    assert.equal(
+      await store.claimPendingSettlementPublication(token, staleClaim, installed.pendingSettlement, {
+        ownerId: publicationOwnerId,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }),
+      true
+    );
+    assert.equal(
+      await store.acknowledgePendingSettlement(token, staleClaim, installed.pendingSettlement, publicationOwnerId),
+      true
+    );
+    const acknowledged = await store.get(token);
+    assert.equal(acknowledged.operation.pendingSettlement, undefined);
+    assert.equal(typeof acknowledged.operation.acknowledgedSettlementFingerprint, 'string');
+    assert.ok(acknowledged.operation.acknowledgedSettlementFingerprint.length > 0);
+    assert.equal(await store.acknowledgePendingSettlement(token, staleClaim, installed.pendingSettlement), true);
+    assert.equal(
+      (await store.get(token)).operation.acknowledgedSettlementFingerprint,
+      acknowledged.operation.acknowledgedSettlementFingerprint
+    );
+    assert.equal(
+      await store.acknowledgePendingSettlement(token, staleClaim, {
+        ...installed.pendingSettlement,
+        idempotencyKey: 'different-callback-event-id',
+      }),
+      true
+    );
+
+    const boundFirstToken = 'store-race-bound-first-token';
+    const boundFirstDescriptor = {
+      ...claim,
+      idempotencyKey: 'claim-race-key-bound-first',
+      inputFingerprint: 'claim-race-input-bound-first',
+      operationKey: 'claim-race-operation-bound-first',
+      callbackOperationId: 'callback-race-operation-bound-first',
+    };
+    assert.equal(
+      (
+        await store.create({
+          ...binding,
+          token: boundFirstToken,
+          expiresAt: '2099-01-01T00:00:00Z',
+          issuanceFingerprint: 'issuance-race-bound-first',
+          discoveryRequestFingerprint: 'discovery-race-bound-first',
+          observedResponse: { products: [{ product_id: 'p-race-store' }] },
+          productIds: ['p-race-store'],
+          losses: ['feed_version_not_atomic'],
+          operation: { state: 'available' },
+        })
+      ).outcome,
+      'created'
+    );
+    assert.equal(
+      (await store.claim(boundFirstToken, { claim: boundFirstDescriptor, expected: binding })).outcome,
+      'claimed'
+    );
+    const boundFirstClaim = (await store.get(boundFirstToken)).operation;
+    assert.equal(await store.recordSubmittedTask(boundFirstToken, boundFirstClaim, 'seller-task-bound-first'), true);
+    assert.equal(
+      (
+        await store.recordPendingSettlement(boundFirstToken, boundFirstClaim, {
+          operationId: boundFirstDescriptor.callbackOperationId,
+          serverTaskId: 'seller-task-bound-first',
+          taskType: 'get_products',
+          terminal: callback,
+        })
+      ).outcome,
+      'conflict'
+    );
+    assert.equal(
+      (
+        await store.recordPendingSettlement(boundFirstToken, boundFirstClaim, {
+          operationId: boundFirstDescriptor.callbackOperationId,
+          serverTaskId: 'different-seller-task',
+          taskType: 'create_media_buy',
+          terminal: callback,
+        })
+      ).outcome,
+      'conflict'
+    );
+    assert.equal(
+      (
+        await store.recordPendingSettlement(boundFirstToken, boundFirstClaim, {
+          operationId: boundFirstDescriptor.callbackOperationId,
+          serverTaskId: 'seller-task-bound-first',
+          taskType: 'create_media_buy',
+          terminal: callback,
+        })
+      ).outcome,
+      'recorded'
+    );
+  });
+
+  test('surfaces ambiguity when an atomically promoted callback conflicts with an inline seller result', async () => {
+    const baseStore = createInMemoryLegacyPurchaseContinuationStore();
+    const callbackWinner = completed('create_media_buy', {
+      media_buy_id: 'buy-promoted-callback-winner',
+      packages: [],
+    });
+    let injected = false;
+    const store = {
+      create: record => baseStore.create(record),
+      get: token => baseStore.get(token),
+      getByCallbackOperationId: operationId => baseStore.getByCallbackOperationId(operationId),
+      claim: (token, request) => baseStore.claim(token, request),
+      complete: async (token, claim, result) => {
+        if (!injected) {
+          injected = true;
+          assert.equal(
+            (
+              await baseStore.recordPendingSettlement(token, claim, {
+                operationId: claim.callbackOperationId,
+                serverTaskId: 'seller-task-promoted-callback',
+                taskType: 'create_media_buy',
+                terminal: callbackWinner,
+              })
+            ).outcome,
+            'recorded'
+          );
+        }
+        return baseStore.complete(token, claim, result);
+      },
+      recordPendingSettlement: (token, claim, settlement) =>
+        baseStore.recordPendingSettlement(token, claim, settlement),
+      claimPendingSettlementPublication: (token, claim, settlement, lease) =>
+        baseStore.claimPendingSettlementPublication(token, claim, settlement, lease),
+      releasePendingSettlementPublication: (token, claim, settlement, ownerId) =>
+        baseStore.releasePendingSettlementPublication(token, claim, settlement, ownerId),
+      acknowledgePendingSettlement: (token, claim, settlement, ownerId) =>
+        baseStore.acknowledgePendingSettlement(token, claim, settlement, ownerId),
+      recordSubmittedTask: (token, claim, taskId) => baseStore.recordSubmittedTask(token, claim, taskId),
+      recordDeferredTaskToken: (token, claim, deferredToken, expectedDeferredToken) =>
+        baseStore.recordDeferredTaskToken(token, claim, deferredToken, expectedDeferredToken),
+      markAmbiguous: (token, claim, reason) => baseStore.markAmbiguous(token, claim, reason),
+    };
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-promoted-race', 'Promoted race')] });
+    agent.createMediaBuyLegacy = async () =>
+      completed('create_media_buy', { media_buy_id: 'buy-conflicting-inline-result', packages: [] });
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-promoted-race',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-promoted-race-0001',
+      account: { account_id: 'account-promoted-race' },
+      brand: { domain: 'example.com' },
+      brief: 'Promoted callback race',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+    const input = {
+      idempotency_key: '17bcfe41-ac25-4325-bbc7-67122855a84a',
+      continuation_token: token,
+      account: { account_id: 'account-promoted-race' },
+      selected_product_ids: ['p-promoted-race'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-promoted-race-create-0001',
+        account: { account_id: 'account-promoted-race' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-promoted-race', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+
+    await assert.rejects(coordinator.continueLegacyPurchase(input), error => error.code === 'ambiguous');
+    assert.equal((await baseStore.get(token)).operation.result.data.media_buy_id, 'buy-promoted-callback-winner');
+    assert.equal((await coordinator.continueLegacyPurchase(input)).data.media_buy_id, 'buy-promoted-callback-winner');
+    coordinator.dispose();
+  });
+
+  test('preserves the original durable claim descriptor through submitted, ambiguous, and completed states', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const deferredTokenA = testDurableToken('sdk-deferred-token-a');
+    const deferredTokenB = testDurableToken('sdk-deferred-token-b');
+    const deferredTokenC = testDurableToken('sdk-deferred-token-c');
+    const claim = {
+      idempotencyKey: 'claim-key',
+      inputFingerprint: 'input-fingerprint',
+      operationKey: 'operation-key',
+      claimedAt: '2027-01-01T00:00:00Z',
+      replayExpiresAt: '2099-01-01T00:00:00Z',
+      selectedProductIds: ['p-store'],
+      sourceMutationKey: 'source-key',
+    };
+    const binding = {
+      principalScope: 'principal',
+      accountScope: 'account',
+      sellerScope: 'seller',
+      clientSessionScope: 'session',
+      sourceAdcpVersion: '3.0',
+    };
+    const created = await store.create({
+      ...binding,
+      token: 'store-preservation-token',
+      expiresAt: '2099-01-01T00:00:00Z',
+      issuanceFingerprint: 'issuance',
+      discoveryRequestFingerprint: 'discovery',
+      observedResponse: { products: [{ product_id: 'p-store' }] },
+      productIds: ['p-store'],
+      losses: ['feed_version_not_atomic', 'pricing_version_not_atomic'],
+      operation: { state: 'available' },
+    });
+    assert.equal(created.outcome, 'created');
+    assert.equal((await store.claim('store-preservation-token', { claim, expected: binding })).outcome, 'claimed');
+    assert.equal(await store.recordDeferredTaskToken('store-preservation-token', claim, deferredTokenA), true);
+    assert.equal(
+      await store.recordDeferredTaskToken('store-preservation-token', claim, deferredTokenB, deferredTokenA),
+      true
+    );
+    assert.equal(
+      await store.recordDeferredTaskToken('store-preservation-token', claim, deferredTokenC, deferredTokenA),
+      false
+    );
+    assert.equal(
+      await store.recordDeferredTaskToken('store-preservation-token', claim, deferredTokenB, deferredTokenA),
+      true
+    );
+    assert.equal((await store.get('store-preservation-token')).operation.deferredTaskToken, deferredTokenB);
+    assert.equal(await store.recordSubmittedTask('store-preservation-token', claim, 'seller-task-1'), true);
+    assert.equal(await store.recordSubmittedTask('store-preservation-token', claim, 'seller-task-1'), true);
+    assert.equal(await store.recordSubmittedTask('store-preservation-token', claim, 'seller-task-2'), false);
+    assert.equal(await store.markAmbiguous('store-preservation-token', claim, 'transport'), true);
+    const ambiguous = await store.get('store-preservation-token');
+    assert.equal(ambiguous.operation.claimedAt, claim.claimedAt);
+    assert.equal(ambiguous.operation.replayExpiresAt, claim.replayExpiresAt);
+    assert.equal(ambiguous.operation.sellerTaskId, 'seller-task-1');
+    await store.complete('store-preservation-token', claim, winnerForStore());
+    assert.equal(await store.recordSubmittedTask('store-preservation-token', claim, 'seller-task-1'), true);
+    assert.equal(await store.recordSubmittedTask('store-preservation-token', claim, 'seller-task-2'), false);
+    assert.equal(
+      (
+        await store.complete(
+          'store-preservation-token',
+          claim,
+          completed('create_media_buy', { media_buy_id: 'buy-conflicting-store', packages: [] })
+        )
+      ).outcome,
+      'conflict'
+    );
+    assert.equal((await store.complete('store-preservation-token', claim, winnerForStore())).outcome, 'duplicate');
+    const completedRecord = await store.get('store-preservation-token');
+    assert.equal(completedRecord.operation.claimedAt, claim.claimedAt);
+    assert.equal(completedRecord.operation.replayExpiresAt, claim.replayExpiresAt);
+    assert.equal(completedRecord.operation.sellerTaskId, 'seller-task-1');
+
+    function winnerForStore() {
+      return completed('create_media_buy', { media_buy_id: 'buy-store', packages: [] });
+    }
+  });
+
+  test('persists the seller task binding when a pending callback is promoted to completed', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const token = 'pending-promotion-binding-token';
+    const binding = {
+      principalScope: 'principal-promotion',
+      accountScope: 'account-promotion',
+      sellerScope: 'seller-promotion',
+      clientSessionScope: 'session-promotion',
+      sourceAdcpVersion: '3.0',
+    };
+    const claim = {
+      idempotencyKey: 'promotion-idempotency-key',
+      inputFingerprint: 'promotion-input-fingerprint',
+      operationKey: 'promotion-operation-key',
+      callbackOperationId: 'promotion-callback-operation',
+      claimedAt: '2027-01-01T00:00:00Z',
+      replayExpiresAt: '2099-01-01T00:00:00Z',
+      selectedProductIds: ['promotion-product'],
+    };
+    await store.create({
+      ...binding,
+      token,
+      expiresAt: '2099-01-01T00:00:00Z',
+      issuanceFingerprint: 'promotion-issuance',
+      discoveryRequestFingerprint: 'promotion-discovery',
+      observedResponse: { products: [] },
+      productIds: ['promotion-product'],
+      losses: [],
+      operation: { state: 'available' },
+    });
+    assert.equal((await store.claim(token, { claim, expected: binding })).outcome, 'claimed');
+    const settlement = {
+      operationId: claim.callbackOperationId,
+      serverTaskId: 'promotion-seller-task',
+      taskType: 'create_media_buy',
+      terminal: completed('create_media_buy', { media_buy_id: 'promotion-buy', packages: [] }),
+    };
+    assert.equal((await store.recordPendingSettlement(token, claim, settlement)).outcome, 'recorded');
+    assert.equal((await store.complete(token, claim, settlement.terminal)).outcome, 'pending_completed');
+    assert.equal((await store.get(token)).operation.sellerTaskId, settlement.serverTaskId);
+    for (const ownerId of ['', '   ', null, 42, {}, []]) {
+      assert.equal(
+        await store.claimPendingSettlementPublication(token, claim, settlement, {
+          ownerId,
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        }),
+        false
+      );
+      assert.equal((await store.get(token)).operation.pendingSettlementPublicationLease, undefined);
+    }
+    const publicationOwnerId = 'promotion-publication-owner';
+    assert.equal(
+      await store.claimPendingSettlementPublication(token, claim, settlement, {
+        ownerId: publicationOwnerId,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }),
+      true
+    );
+    assert.equal(
+      await store.claimPendingSettlementPublication(token, claim, settlement, {
+        ownerId: 'competing-publication-owner',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }),
+      false
+    );
+    assert.equal(await store.acknowledgePendingSettlement(token, claim, settlement), false);
+    assert.equal(await store.acknowledgePendingSettlement(token, claim, settlement, publicationOwnerId), true);
+    const acknowledged = await store.get(token);
+    assert.equal(typeof acknowledged.operation.acknowledgedSettlementFingerprint, 'string');
+    assert.ok(acknowledged.operation.acknowledgedSettlementFingerprint.length > 0);
+    assert.equal(await store.recordSubmittedTask(token, claim, settlement.serverTaskId), true);
+    assert.equal(await store.recordSubmittedTask(token, claim, 'different-seller-task'), false);
+  });
+
+  test('rejects a partially upgraded durable callback store at negotiation', async () => {
+    const baseStore = createInMemoryLegacyPurchaseContinuationStore();
+    const partialStore = {
+      create: record => baseStore.create(record),
+      get: token => baseStore.get(token),
+      getByCallbackOperationId: operationId => baseStore.getByCallbackOperationId(operationId),
+      claim: (token, request) => baseStore.claim(token, request),
+      complete: (token, claim, result) => baseStore.complete(token, claim, result),
+      recordSubmittedTask: (token, claim, taskId) => baseStore.recordSubmittedTask(token, claim, taskId),
+      recordDeferredTaskToken: (token, claim, deferredToken, expectedDeferredToken) =>
+        baseStore.recordDeferredTaskToken(token, claim, deferredToken, expectedDeferredToken),
+      markAmbiguous: (token, claim, reason) => baseStore.markAmbiguous(token, claim, reason),
+    };
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    await assert.rejects(
+      agent.negotiateMediaBuyLifecycle({ legacyPurchaseContinuationStore: partialStore }),
+      /must implement callback lookup, pending settlement, publication lease, acknowledgement, and deferred-token methods together/
+    );
+  });
+
+  test('retains an ambiguous operation fence after the seller replay window expires', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore({ maxRecords: 2 });
+    const binding = {
+      principalScope: 'principal',
+      accountScope: 'account',
+      sellerScope: 'seller',
+      clientSessionScope: 'session',
+      sourceAdcpVersion: '3.0',
+    };
+    const claim = {
+      idempotencyKey: 'expired-replay-key',
+      inputFingerprint: 'expired-replay-input',
+      operationKey: 'expired-replay-operation',
+      claimedAt: '2027-01-01T00:00:00Z',
+      replayExpiresAt: '2000-01-01T00:00:00Z',
+      selectedProductIds: ['p-expired-replay'],
+      sourceMutationKey: 'expired-replay-source',
+      callbackOperationId: 'expired-replay-callback',
+    };
+    const continuation = (token, issuanceFingerprint) => ({
+      ...binding,
+      token,
+      expiresAt: '2099-01-01T00:00:00Z',
+      issuanceFingerprint,
+      discoveryRequestFingerprint: `${issuanceFingerprint}-discovery`,
+      observedResponse: { products: [{ product_id: 'p-expired-replay' }] },
+      productIds: ['p-expired-replay'],
+      losses: ['feed_version_not_atomic', 'pricing_version_not_atomic'],
+      operation: { state: 'available' },
+    });
+
+    assert.equal((await store.create(continuation('ambiguous-token', 'ambiguous-issuance'))).outcome, 'created');
+    assert.equal((await store.claim('ambiguous-token', { claim, expected: binding })).outcome, 'claimed');
+    assert.equal(await store.markAmbiguous('ambiguous-token', claim, 'transport_uncertain'), true);
+    assert.equal(
+      (
+        await store.recordPendingSettlement('ambiguous-token', claim, {
+          operationId: claim.callbackOperationId,
+          serverTaskId: 'expired-replay-seller-task',
+          taskType: 'create_media_buy',
+          terminal: completed('create_media_buy', { media_buy_id: 'must-not-settle', packages: [] }),
+        })
+      ).outcome,
+      'conflict'
+    );
+
+    // create() runs pruning. The expired replay window must not remove the
+    // ambiguous record or its operation-wide duplicate-dispatch fence.
+    assert.equal((await store.create(continuation('retry-token', 'retry-issuance'))).outcome, 'created');
+    assert.equal((await store.claim('retry-token', { claim, expected: binding })).outcome, 'conflict');
+    assert.equal((await store.get('ambiguous-token')).operation.state, 'ambiguous');
+  });
+
+  test('retains an expired completed SDK publication outbox until owner acknowledgement', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore({ maxRecords: 2 });
+    const binding = {
+      principalScope: 'sdk-publication-principal',
+      accountScope: 'sdk-publication-account',
+      sellerScope: 'sdk-publication-seller',
+      clientSessionScope: 'sdk-publication-session',
+      sourceAdcpVersion: '3.0',
+    };
+    const claim = {
+      idempotencyKey: 'sdk-publication-key',
+      inputFingerprint: 'sdk-publication-input',
+      operationKey: 'sdk-publication-operation',
+      claimedAt: '2027-01-01T00:00:00Z',
+      replayExpiresAt: '2000-01-01T00:00:00Z',
+      selectedProductIds: ['p-sdk-publication'],
+      callbackOperationId: 'sdk-publication-callback',
+      sellerTaskId: 'sdk-publication-task',
+    };
+    const continuation = (token, issuanceFingerprint) => ({
+      ...binding,
+      token,
+      expiresAt: '2099-01-01T00:00:00Z',
+      issuanceFingerprint,
+      discoveryRequestFingerprint: `${issuanceFingerprint}-discovery`,
+      observedResponse: { products: [{ product_id: 'p-sdk-publication' }] },
+      productIds: ['p-sdk-publication'],
+      losses: ['feed_version_not_atomic'],
+      operation: { state: 'available' },
+    });
+    const token = 'sdk-publication-token';
+    assert.equal((await store.create(continuation(token, 'sdk-publication-issuance'))).outcome, 'created');
+    assert.equal((await store.claim(token, { claim, expected: binding })).outcome, 'claimed');
+    assert.equal(await store.recordSubmittedTask(token, claim, claim.sellerTaskId), true);
+    const terminal = completed('create_media_buy', { media_buy_id: 'sdk-publication-buy', packages: [] });
+    const pending = {
+      operationId: claim.callbackOperationId,
+      serverTaskId: claim.sellerTaskId,
+      taskType: 'create_media_buy',
+      publicationSource: 'sdk',
+      terminal,
+    };
+    assert.equal((await store.recordPendingSettlement(token, claim, pending)).outcome, 'recorded');
+    assert.equal((await store.complete(token, claim, terminal)).outcome, 'pending_completed');
+
+    // create() runs pruning, but the unacknowledged SDK outbox is a durable
+    // handler-publication obligation even though the replay deadline elapsed.
+    assert.equal((await store.create(continuation('other-token', 'other-issuance'))).outcome, 'created');
+    assert.ok((await store.get(token)).operation.pendingSettlement);
+
+    const ownerId = 'sdk-publication-owner';
+    assert.equal(
+      await store.claimPendingSettlementPublication(token, claim, pending, {
+        ownerId,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }),
+      true
+    );
+    assert.equal(await store.acknowledgePendingSettlement(token, claim, pending, ownerId), true);
+    assert.equal((await store.create(continuation('replacement-token', 'replacement-issuance'))).outcome, 'capacity');
+    const acknowledgedSdkPublication = await store.get(token);
+    assert.equal(typeof acknowledgedSdkPublication.operation.acknowledgedSettlementFingerprint, 'string');
+    assert.ok(Date.parse(acknowledgedSdkPublication.operation.replayExpiresAt) > Date.now());
+
+    const originalDateNow = Date.now;
+    let senderNow = originalDateNow();
+    Date.now = () => senderNow;
+    try {
+      const senderStore = createInMemoryLegacyPurchaseContinuationStore({ maxRecords: 1 });
+      const senderToken = 'sender-publication-token';
+      const senderClaim = {
+        ...claim,
+        idempotencyKey: 'sender-publication-key',
+        inputFingerprint: 'sender-publication-input',
+        operationKey: 'sender-publication-operation',
+        callbackOperationId: 'sender-publication-callback',
+        sellerTaskId: 'sender-publication-task',
+        replayExpiresAt: new Date(Date.now() + 10).toISOString(),
+      };
+      assert.equal(
+        (await senderStore.create(continuation(senderToken, 'sender-publication-issuance'))).outcome,
+        'created'
+      );
+      assert.equal(
+        (await senderStore.claim(senderToken, { claim: senderClaim, expected: binding })).outcome,
+        'claimed'
+      );
+      assert.equal(await senderStore.recordSubmittedTask(senderToken, senderClaim, senderClaim.sellerTaskId), true);
+      const senderPending = {
+        operationId: senderClaim.callbackOperationId,
+        serverTaskId: senderClaim.sellerTaskId,
+        taskType: 'create_media_buy',
+        idempotencyKey: 'sender-publication-event',
+        terminal,
+      };
+      assert.equal(
+        (await senderStore.recordPendingSettlement(senderToken, senderClaim, senderPending)).outcome,
+        'recorded'
+      );
+      assert.equal((await senderStore.complete(senderToken, senderClaim, terminal)).outcome, 'pending_completed');
+      const senderOwnerId = 'sender-publication-owner';
+      assert.equal(
+        await senderStore.claimPendingSettlementPublication(senderToken, senderClaim, senderPending, {
+          ownerId: senderOwnerId,
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        }),
+        true
+      );
+      senderNow += 11;
+      assert.equal(
+        (await senderStore.create(continuation('blocked-replacement-token', 'blocked-replacement-issuance'))).outcome,
+        'capacity'
+      );
+      assert.ok(await senderStore.get(senderToken));
+      assert.equal(
+        await senderStore.releasePendingSettlementPublication(senderToken, senderClaim, senderPending, senderOwnerId),
+        true
+      );
+      assert.equal(
+        (await senderStore.create(continuation('sender-replacement-token', 'sender-replacement-issuance'))).outcome,
+        'capacity'
+      );
+      const retainedSenderPublication = await senderStore.get(senderToken);
+      assert.ok(retainedSenderPublication.operation.pendingSettlement);
+      assert.ok(Date.parse(retainedSenderPublication.operation.replayExpiresAt) > Date.now());
+    } finally {
+      Date.now = originalDateNow;
+    }
+  });
+
+  test('extends SDK proof retention when acknowledging a completed result without an outbox', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const binding = {
+      principalScope: 'sdk-proof-principal',
+      accountScope: 'sdk-proof-account',
+      sellerScope: 'sdk-proof-seller',
+      clientSessionScope: 'sdk-proof-session',
+      sourceAdcpVersion: '3.0',
+    };
+    const claim = {
+      idempotencyKey: 'sdk-proof-key',
+      inputFingerprint: 'sdk-proof-input',
+      operationKey: 'sdk-proof-operation',
+      claimedAt: new Date().toISOString(),
+      replayExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      selectedProductIds: ['p-sdk-proof'],
+      callbackOperationId: 'sdk-proof-callback',
+      sellerTaskId: 'sdk-proof-task',
+    };
+    const token = 'sdk-proof-token';
+    assert.equal(
+      (
+        await store.create({
+          ...binding,
+          token,
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          issuanceFingerprint: 'sdk-proof-issuance',
+          discoveryRequestFingerprint: 'sdk-proof-discovery',
+          observedResponse: { products: [{ product_id: 'p-sdk-proof' }] },
+          productIds: ['p-sdk-proof'],
+          losses: [],
+          operation: { state: 'available' },
+        })
+      ).outcome,
+      'created'
+    );
+    assert.equal((await store.claim(token, { claim, expected: binding })).outcome, 'claimed');
+    assert.equal(await store.recordSubmittedTask(token, claim, claim.sellerTaskId), true);
+    const terminal = completed('create_media_buy', { media_buy_id: 'sdk-proof-buy', packages: [] });
+    assert.equal((await store.complete(token, claim, terminal)).outcome, 'completed');
+    const settlement = {
+      operationId: claim.callbackOperationId,
+      serverTaskId: claim.sellerTaskId,
+      taskType: 'create_media_buy',
+      publicationSource: 'sdk',
+      terminal,
+    };
+    const acknowledgedAt = Date.now();
+    assert.equal(await store.acknowledgePendingSettlement(token, claim, settlement), true);
+    const acknowledged = await store.get(token);
+    assert.ok(Date.parse(acknowledged.operation.replayExpiresAt) >= acknowledgedAt + 7 * 24 * 60 * 60 * 1000);
+  });
+
+  test('completed callback re-emissions reserve exactly one publication owner before dispatch', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const binding = {
+      principalScope: 'completed-publication-principal',
+      accountScope: 'completed-publication-account',
+      sellerScope: 'completed-publication-seller',
+      clientSessionScope: 'completed-publication-session',
+      sourceAdcpVersion: '3.0',
+    };
+    const claim = {
+      idempotencyKey: 'completed-publication-key',
+      inputFingerprint: 'completed-publication-input',
+      operationKey: 'completed-publication-operation',
+      claimedAt: new Date().toISOString(),
+      replayExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      selectedProductIds: ['p-completed-publication'],
+      callbackOperationId: 'completed-publication-callback',
+      sellerTaskId: 'completed-publication-task',
+    };
+    const token = 'completed-publication-token';
+    assert.equal(
+      (
+        await store.create({
+          ...binding,
+          token,
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          issuanceFingerprint: 'completed-publication-issuance',
+          discoveryRequestFingerprint: 'completed-publication-discovery',
+          observedResponse: { products: [{ product_id: 'p-completed-publication' }] },
+          productIds: ['p-completed-publication'],
+          losses: [],
+          operation: { state: 'available' },
+        })
+      ).outcome,
+      'created'
+    );
+    assert.equal((await store.claim(token, { claim, expected: binding })).outcome, 'claimed');
+    assert.equal(await store.recordSubmittedTask(token, claim, claim.sellerTaskId), true);
+    const terminal = completed('create_media_buy', { media_buy_id: 'completed-publication-buy', packages: [] });
+    assert.equal((await store.complete(token, claim, terminal)).outcome, 'completed');
+    const first = {
+      operationId: claim.callbackOperationId,
+      serverTaskId: claim.sellerTaskId,
+      taskType: 'create_media_buy',
+      idempotencyKey: 'completed-publication-delivery-a',
+      terminal,
+    };
+    const second = { ...first, idempotencyKey: 'completed-publication-delivery-b' };
+    const reservations = await Promise.all([
+      store.recordPendingSettlement(token, claim, first),
+      store.recordPendingSettlement(token, claim, second),
+    ]);
+    assert.deepEqual(reservations.map(result => result.outcome).sort(), ['duplicate', 'recorded']);
+    const reserved = await store.get(token);
+    assert.equal(reserved.operation.state, 'completed');
+    assert.equal(reserved.operation.pendingSettlement.idempotencyKey, first.idempotencyKey);
+
+    const leases = await Promise.all([
+      store.claimPendingSettlementPublication(token, claim, reserved.operation.pendingSettlement, {
+        ownerId: 'completed-publication-owner-a',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }),
+      store.claimPendingSettlementPublication(token, claim, reserved.operation.pendingSettlement, {
+        ownerId: 'completed-publication-owner-b',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }),
+    ]);
+    assert.deepEqual(leases.slice().sort(), [false, true]);
+    const ownerId = leases[0] ? 'completed-publication-owner-a' : 'completed-publication-owner-b';
+    assert.equal(
+      await store.acknowledgePendingSettlement(token, claim, reserved.operation.pendingSettlement, ownerId),
+      true
+    );
+    const acknowledged = await store.get(token);
+    assert.equal(acknowledged.operation.pendingSettlement, undefined);
+    assert.equal(acknowledged.operation.acknowledgedSettlementFingerprint, legacyPurchaseSettlementFingerprint(first));
+  });
+
+  test('declares missing seller replay guarantees for 3.0 and 3.1 continuations', async () => {
+    for (const version of ['3.0', '3.1']) {
+      const caps = capabilities({ version });
+      delete caps.idempotency;
+      const agent = clientWithCaps(caps, version);
+      agent.getProducts = async () =>
+        completed('get_products', { products: [legacyListedProduct(`p-no-replay-${version}`, 'No replay')] });
+      const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: `buyer-no-replay-${version}` });
+      const discovery = await coordinator.requestProposals({
+        idempotency_key: `request-proposals-no-replay-${version}`,
+        account: { account_id: `account-no-replay-${version}` },
+        brand: { domain: 'example.com' },
+        brief: 'No replay guarantee',
+      });
+      assert.ok(discovery.data.purchase_continuation.losses.includes('mutation_idempotency_not_guaranteed'));
+    }
+  });
+
+  test('uses a caller-supplied restart-stable authenticated binding when 3.0 omits context ID', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const firstAgent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    firstAgent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-restart-stable', 'Restart stable')] });
+    const first = await firstAgent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-restart-stable',
+      legacyPurchaseSellerSessionScope: 'authenticated-session-restart-stable',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await first.requestProposals({
+      idempotency_key: 'request-proposals-restart-stable-0001',
+      account: { account_id: 'account-restart-stable' },
+      brand: { domain: 'example.com' },
+      brief: 'Restart-safe continuation',
+    });
+
+    const rehydratedAgent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    rehydratedAgent.createMediaBuyLegacy = async () =>
+      completed('create_media_buy', { media_buy_id: 'buy-restart-stable', packages: [] });
+    const rehydrated = await rehydratedAgent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-restart-stable',
+      legacyPurchaseSellerSessionScope: 'authenticated-session-restart-stable',
+      legacyPurchaseContinuationStore: store,
+    });
+    const continuationInput = {
+      idempotency_key: '6e94a193-0c76-461c-b048-85ca03349008',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-restart-stable' },
+      selected_product_ids: ['p-restart-stable'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-restart-stable-create-0001',
+        account: { account_id: 'account-restart-stable' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-restart-stable', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    };
+    const wrongSession = await rehydratedAgent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-restart-stable',
+      legacyPurchaseSellerSessionScope: 'different-authenticated-session',
+      legacyPurchaseContinuationStore: store,
+    });
+    await assert.rejects(
+      wrongSession.continueLegacyPurchase(continuationInput),
+      error => error.code === 'binding_mismatch'
+    );
+    const result = await rehydrated.continueLegacyPurchase(continuationInput);
+    assert.equal(result.data.media_buy_id, 'buy-restart-stable');
+  });
+
+  test('rejects URL credentials before a legacy products snapshot enters durable storage', async () => {
+    const credentialUrls = [
+      'https://username:password@assets.example/preview',
+      'https://assets.example/preview?api_key=secret',
+      'https://assets.example/preview?authorization=Bearer',
+      'https://assets.example/preview#access_token=secret',
+      '/preview?X-Amz-Signature=secret',
+    ];
+    for (const [index, previewUrl] of credentialUrls.entries()) {
+      const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+      agent.getProducts = async () =>
+        completed('get_products', {
+          products: [
+            legacyListedProduct(`p-credential-url-${index}`, 'Credential URL', {
+              ext: { preview_url: previewUrl },
+            }),
+          ],
+        });
+      const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: `buyer-credential-url-${index}` });
+      await assert.rejects(
+        coordinator.requestProposals({
+          idempotency_key: `request-proposals-credential-url-${index}`,
+          account: { account_id: `account-credential-url-${index}` },
+          brand: { domain: 'example.com' },
+          brief: 'Credential-bearing URL',
+        }),
+        error => error.code === 'request_invalid' && /credential-shaped material/.test(error.message)
+      );
+    }
+  });
+
+  test('allows multiple legacy packages to purchase the same selected product', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-multi-package', 'Multi-package')] });
+    let dispatched;
+    agent.createMediaBuyLegacy = async request => {
+      dispatched = request;
+      return completed('create_media_buy', { media_buy_id: 'buy-multi-package', packages: [] });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-multi-package' });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-multi-package-0001',
+      account: { account_id: 'account-multi-package' },
+      brand: { domain: 'example.com' },
+      brief: 'Two packages for one product',
+    });
+    const result = await coordinator.continueLegacyPurchase({
+      idempotency_key: '315501f1-72e8-4dc4-a436-288a3d64dfe6',
+      continuation_token: discovery.data.purchase_continuation.continuation_token,
+      account: { account_id: 'account-multi-package' },
+      selected_product_ids: ['p-multi-package'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-multi-package-create-0001',
+        account: { account_id: 'account-multi-package' },
+        brand: { domain: 'example.com' },
+        packages: [
+          { product_id: 'p-multi-package', budget: 10, pricing_option_id: 'fixed-cpm' },
+          { product_id: 'p-multi-package', budget: 20, pricing_option_id: 'fixed-cpm' },
+        ],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    });
+    assert.equal(result.data.media_buy_id, 'buy-multi-package');
+    assert.equal(dispatched.packages.length, 2);
+  });
+
+  test('fences a submitted completion whose task ID differs from the recorded seller task', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-task-mismatch', 'Task mismatch')] });
+    agent.createMediaBuyLegacy = async () => {
+      const result = submitted(
+        'create_media_buy',
+        completed('create_media_buy', { media_buy_id: 'wrong-task-buy', packages: [] })
+      );
+      result.submitted.track = async () => ({
+        taskId: 'different-seller-task',
+        status: 'completed',
+        taskType: 'create_media_buy',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        result: { media_buy_id: 'wrong-task-buy', packages: [] },
+      });
+      return result;
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-task-mismatch',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-task-mismatch-0001',
+      account: { account_id: 'account-task-mismatch' },
+      brand: { domain: 'example.com' },
+      brief: 'Task mismatch',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+    const pending = await coordinator.continueLegacyPurchase({
+      idempotency_key: '7681b778-c414-44d7-a21a-70108ec0be0c',
+      continuation_token: token,
+      account: { account_id: 'account-task-mismatch' },
+      selected_product_ids: ['p-task-mismatch'],
+      accepted_losses: discovery.data.purchase_continuation.losses,
+      legacy_create_request: {
+        idempotency_key: 'legacy-task-mismatch-create-0001',
+        account: { account_id: 'account-task-mismatch' },
+        brand: { domain: 'example.com' },
+        packages: [{ product_id: 'p-task-mismatch', budget: 10, pricing_option_id: 'fixed-cpm' }],
+        start_time: '2099-01-01T00:00:00Z',
+        end_time: '2099-02-01T00:00:00Z',
+      },
+    });
+    await assert.rejects(pending.submitted.waitForCompletion(0), /task ID does not match/);
+    assert.equal((await store.get(token)).operation.state, 'ambiguous');
+  });
+
+  test('treats an SDK-synthetic AdCP error as ambiguous rather than authoritative', async () => {
+    const store = createInMemoryLegacyPurchaseContinuationStore();
+    const agent = clientWithCaps(capabilities({ version: '3.0' }), '3.0');
+    agent.getProducts = async () =>
+      completed('get_products', { products: [legacyListedProduct('p-synthetic-error', 'Synthetic error')] });
+    agent.createMediaBuyLegacy = async () => ({
+      success: false,
+      status: 'failed',
+      error: 'raw seller text',
+      adcpError: { code: 'mcp_error', message: 'raw seller text', synthetic: true },
+      metadata: { ...completed('create_media_buy', {}).metadata, status: 'failed' },
+    });
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-synthetic-error',
+      legacyPurchaseContinuationStore: store,
+    });
+    const discovery = await coordinator.requestProposals({
+      idempotency_key: 'request-proposals-synthetic-error-0001',
+      account: { account_id: 'account-synthetic-error' },
+      brand: { domain: 'example.com' },
+      brief: 'Synthetic error',
+    });
+    const token = discovery.data.purchase_continuation.continuation_token;
+    await assert.rejects(
+      coordinator.continueLegacyPurchase({
+        idempotency_key: 'adce5540-b171-4272-b0e9-f2241dde4ea9',
+        continuation_token: token,
+        account: { account_id: 'account-synthetic-error' },
+        selected_product_ids: ['p-synthetic-error'],
+        accepted_losses: discovery.data.purchase_continuation.losses,
+        legacy_create_request: {
+          idempotency_key: 'legacy-synthetic-error-create-0001',
+          account: { account_id: 'account-synthetic-error' },
+          brand: { domain: 'example.com' },
+          packages: [{ product_id: 'p-synthetic-error', budget: 10, pricing_option_id: 'fixed-cpm' }],
+          start_time: '2099-01-01T00:00:00Z',
+          end_time: '2099-02-01T00:00:00Z',
+        },
+      }),
+      error => error.code === 'ambiguous'
+    );
+    assert.equal((await store.get(token)).operation.state, 'ambiguous');
+  });
+});
+
+describe('MediaBuyLifecycleCoordinator mutation boundaries', () => {
+  const directIntent = {
+    idempotency_key: 'direct-compat-key-0001',
+    account: { account_id: 'account-1' },
+    brand: { domain: 'example.com' },
+    feed_version: 'feed-1',
+    pricing_version: 'price-1',
+    purchases: [{ product_id: 'product-1', pricing_option_id: 'option-1', budget: 100 }],
+    start_time: '2027-01-01T00:00:00Z',
+    end_time: '2027-02-01T00:00:00Z',
+  };
+
+  test('legacy direct buy rejects named snapshot losses before mutation by default', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    await assert.rejects(coordinator.buyProducts(directIntent), error => {
+      assert.ok(error instanceof MediaBuyLifecycleCompatibilityError);
+      assert.equal(error.code, 'UNSUPPORTED_FEATURE');
+      assert.deepEqual(error.losses, ['feed_version_not_atomic', 'pricing_version_not_atomic']);
+      return true;
+    });
+    assert.equal(mutations, 0);
+  });
+
+  test('explicitly accepted direct-buy losses are reported and preserve the retry key', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0', replayTtlSeconds: undefined }));
+    const calls = [];
+    agent.createMediaBuy = async request => {
+      calls.push(request);
+      return completed('create_media_buy', { media_buy_id: 'mb-1', revision: 1 });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      allowedLosses: ['feed_version_not_atomic', 'pricing_version_not_atomic'],
+    });
+
+    const result = await coordinator.buyProducts(directIntent);
+
+    assert.equal(result.success, true);
+    assert.equal(result.compatibility.compatibility, 'lossy_projection');
+    assert.deepEqual(result.compatibility.tools_used, ['create_media_buy']);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].idempotency_key, directIntent.idempotency_key);
+    assert.equal(calls[0].packages[0].product_id, 'product-1');
+    assert.equal(calls[0].feed_version, undefined);
+  });
+
+  test('3.0/3.1 projections reject compact-only request fields before dispatch', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let proposalReads = 0;
+    let mutations = 0;
+    agent.getProducts = async () => {
+      proposalReads += 1;
+      return completed('get_products', { proposals: [] });
+    };
+    agent.createMediaBuy = agent.updateMediaBuy = async () => {
+      mutations += 1;
+      return completed('mutation', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      allowedLosses: ['feed_version_not_atomic', 'pricing_version_not_atomic'],
+    });
+
+    await assert.rejects(
+      coordinator.requestProposals({ brief: 'test', criteria: { targeting_overlay: {} } }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'targeting_overlay'
+    );
+    await assert.rejects(
+      coordinator.buyProducts({ ...directIntent, budget_allocation: { mode: 'fixed' } }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'budget_allocation'
+    );
+    await assert.rejects(
+      coordinator.buyProducts({ ...directIntent, total_budget: { amount: 100, currency: 'USD' } }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'total_budget'
+    );
+    for (const field of ['measurement_terms', 'optimization_goals', 'performance_standards']) {
+      await assert.rejects(
+        coordinator.buyProducts({
+          ...directIntent,
+          purchases: [{ ...directIntent.purchases[0], [field]: {} }],
+        }),
+        error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === `purchases[0].${field}`
+      );
+    }
+    await assert.rejects(
+      coordinator.listProducts({ brand: { domain: 'example.com', countries: ['US'] } }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'brand.countries'
+    );
+    await assert.rejects(
+      coordinator.buyProducts({
+        ...directIntent,
+        account: {
+          brand: { domain: 'example.com' },
+          operator: 'example.com',
+          currency: 'USD',
+        },
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'account.currency'
+    );
+    await assert.rejects(
+      coordinator.requestProposals({
+        brief: 'test',
+        criteria: { offer_filters: { is_fixed_price: false } },
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError &&
+        error.feature === 'criteria.offer_filters.is_fixed_price'
+    );
+    await assert.rejects(
+      coordinator.requestProposals({
+        brief: 'test',
+        criteria: {
+          offer_filters: {
+            required_performance_standards: [
+              {
+                metric: 'viewability',
+                threshold: 0.7,
+                vendor: { domain: 'measurement.example', countries: ['US'] },
+              },
+            ],
+          },
+        },
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError &&
+        error.feature === 'criteria.offer_filters.required_performance_standards[0].vendor.countries'
+    );
+    await assert.rejects(
+      coordinator.controlMediaBuy({
+        account: { account_id: 'account-1' },
+        media_buy_id: 'mb-1',
+        revision: 1,
+        total_budget: { amount: 200, currency: 'USD' },
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'total_budget'
+    );
+    await assert.rejects(
+      coordinator.controlMediaBuy({
+        account: { account_id: 'account-1' },
+        media_buy_id: 'mb-1',
+        revision: 1,
+        packages: [{ package_id: 'package-1', bidding: { automatic: true } }],
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'bidding'
+    );
+
+    assert.equal(proposalReads, 0);
+    assert.equal(mutations, 0);
+  });
+
+  test('compatibility diagnostics escape and cap buyer-controlled field names', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+    const hostileField = `future\n\u001b[31m\u061c\u202e${'x'.repeat(3000)}`;
+
+    await assert.rejects(coordinator.listProducts({ [hostileField]: true }), error => {
+      assert.ok(error instanceof MediaBuyLifecycleCompatibilityError);
+      assert.doesNotMatch(error.feature, /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u);
+      assert.doesNotMatch(error.message, /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u);
+      assert.match(error.feature, /\\u000a\\u001b\[31m\\u061c\\u202e/);
+      assert.ok(error.feature.length < 550);
+      assert.ok(error.message.length < 2100);
+      return true;
+    });
+  });
+
+  test('auto-negotiated established validation errors identify the established lifecycle', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      allowedLosses: ['feed_version_not_atomic', 'pricing_version_not_atomic'],
+    });
+
+    await assert.rejects(coordinator.buyProducts({ ...directIntent, brand: 'not-an-object' }), error => {
+      assert.ok(error instanceof MediaBuyLifecycleCompatibilityError);
+      assert.equal(error.feature, 'compact_request_validation');
+      assert.equal(error.lifecycle, 'established');
+      return true;
+    });
+    assert.equal(mutations, 0);
+  });
+
+  test('forced established 3.2 lane retains fields that the 3.2 established schemas support', async () => {
+    const agent = clientWithCaps(
+      capabilities({ tools: [...COMPACT_TOOLS, 'get_products', 'create_media_buy', 'update_media_buy'] })
+    );
+    const calls = [];
+    agent.createMediaBuy = async request => {
+      calls.push(request);
+      return completed('create_media_buy', { media_buy_id: 'mb-1' });
+    };
+    agent.updateMediaBuy = async request => {
+      calls.push(request);
+      return completed('update_media_buy', { media_buy_id: 'mb-1', revision: 2 });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      preferredLifecycle: 'established',
+      allowedLosses: ['feed_version_not_atomic', 'pricing_version_not_atomic'],
+    });
+
+    await coordinator.buyProducts({
+      ...directIntent,
+      purchases: [
+        {
+          ...directIntent.purchases[0],
+          context: { buyer_ref: 'line-1' },
+          daily_budget_cap: 25,
+          impressions: 1000,
+          pacing: 'even',
+        },
+      ],
+      daily_budget_cap: 50,
+      budget_cap_timezone: 'UTC',
+      pacing: 'even',
+      bidding: { automatic: true },
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].daily_budget_cap, 50);
+    assert.deepEqual(calls[0].bidding, { automatic: true });
+    assert.deepEqual(calls[0].packages[0].context, { buyer_ref: 'line-1' });
+    assert.equal(calls[0].packages[0].daily_budget_cap, 25);
+    assert.equal(calls[0].packages[0].impressions, 1000);
+    assert.equal(calls[0].packages[0].pacing, 'even');
+
+    await coordinator.controlMediaBuy({
+      account: { account_id: 'account-1' },
+      media_buy_id: 'mb-1',
+      revision: 1,
+      packages: [{ package_id: 'package-1', bidding: { automatic: true }, daily_budget_cap: 10 }],
+    });
+    assert.deepEqual(calls[1].packages[0].bidding, { automatic: true });
+    assert.equal(calls[1].packages[0].daily_budget_cap, 10);
+
+    await assert.rejects(
+      coordinator.controlMediaBuy({
+        account: { account_id: 'account-1' },
+        media_buy_id: 'mb-1',
+        revision: 2,
+        packages: [{ package_id: 'package-1', catalog_ids: ['catalog-1'] }],
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'packages[0].catalog_ids'
+    );
+  });
+
+  test('compact direct buy dispatches only buy_products', async () => {
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    const calls = [];
+    agent.buyProducts = async request => {
+      calls.push(['buy_products', request]);
+      return completed('buy_products', { media_buy_id: 'mb-compact', revision: 1 });
+    };
+    agent.createMediaBuy = async request => {
+      calls.push(['create_media_buy', request]);
+      return completed('create_media_buy', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    const result = await coordinator.buyProducts(directIntent);
+
+    assert.deepEqual(
+      calls.map(call => call[0]),
+      ['buy_products']
+    );
+    assert.equal(result.compatibility.compatibility, 'native');
+  });
+
+  test('compact lane dispatches every lifecycle operation without established aliases', async () => {
+    const agent = clientWithCaps(
+      capabilities({ tools: COMPACT_TOOLS, discoveredTools: ['get_media_buys', 'get_media_buy_delivery'] })
+    );
+    const calls = [];
+    for (const [method, tool, data] of [
+      ['listProducts', 'list_products', { products: [], feed_version: 'feed-1' }],
+      ['requestProposals', 'request_proposals', { outcome: 'rejected', reason: 'no match' }],
+      [
+        'refineProposals',
+        'refine_proposals',
+        {
+          products: [],
+          results: [
+            {
+              source_proposal_id: 'proposal-1',
+              outcome: 'unable',
+              reason_code: 'commercially_declined',
+              reason: 'no match',
+            },
+          ],
+        },
+      ],
+      ['declineProposals', 'decline_proposals', { results: [{ proposal_id: 'proposal-2', outcome: 'declined' }] }],
+      ['buyProducts', 'buy_products', { media_buy_id: 'mb-1' }],
+      ['acceptProposal', 'accept_proposal', { media_buy_id: 'mb-2' }],
+      ['controlMediaBuy', 'control_media_buy', { media_buy_id: 'mb-1', revision: 2 }],
+      ['getMediaBuys', 'get_media_buys', { media_buys: [] }],
+      ['getMediaBuyDelivery', 'get_media_buy_delivery', { media_buy_deliveries: [] }],
+    ]) {
+      agent[method] = async () => {
+        calls.push(tool);
+        return completed(tool, data);
+      };
+    }
+    agent.getProducts = async () => assert.fail('compact lane must not call get_products');
+    agent.createMediaBuy = async () => assert.fail('compact lane must not call create_media_buy');
+    agent.updateMediaBuy = async () => assert.fail('compact lane must not call update_media_buy');
+
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+    await coordinator.listProducts({});
+    await coordinator.requestProposals({ brand: { domain: 'example.com' }, brief: 'proposal request' });
+    await coordinator.refineProposals({ refinements: [{ proposal_id: 'proposal-1', action: 'finalize' }] });
+    await coordinator.declineProposals({ declines: [{ proposal_id: 'proposal-2', reason: 'budget_changed' }] });
+    await coordinator.buyProducts(directIntent);
+    await coordinator.acceptProposal({
+      account: { account_id: 'account-1' },
+      proposal_id: 'proposal-1',
+      proposal_terms_digest: `sha256:${'A'.repeat(43)}`,
+    });
+    await coordinator.controlMediaBuy({
+      account: { account_id: 'account-1' },
+      media_buy_id: 'mb-1',
+      revision: 1,
+    });
+    await coordinator.getMediaBuys({ account: { account_id: 'account-1' } });
+    await coordinator.getMediaBuyDelivery({ account: { account_id: 'account-1' } });
+
+    assert.deepEqual(calls, [
+      'list_products',
+      'request_proposals',
+      'refine_proposals',
+      'decline_proposals',
+      'buy_products',
+      'accept_proposal',
+      'control_media_buy',
+      'get_media_buys',
+      'get_media_buy_delivery',
+    ]);
+  });
+
+  test('compact proposal advisory errors preserve successful safe proposal snapshots', async () => {
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    const pricing = {
+      pricing_option_id: 'compact-advisory-price',
+      pricing_model: 'cpm',
+      currency: 'USD',
+      fixed_price: 10,
+    };
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+      purchases: [
+        {
+          product_id: 'compact-advisory-product',
+          pricing_option_id: pricing.pricing_option_id,
+          pricing,
+          start_time: '2027-01-01T00:00:00Z',
+          end_time: '2027-02-01T00:00:00Z',
+        },
+      ],
+    };
+    agent.requestProposals = async () =>
+      completed('request_proposals', {
+        outcome: 'proposed',
+        status: 'completed',
+        proposals: [
+          {
+            proposal_id: 'compact-advisory-proposal',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'draft',
+            name: 'Compact advisory proposal',
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: commercialTerms,
+            terms_digest: proposalTermsDigest(commercialTerms),
+          },
+        ],
+        products: [
+          {
+            product_id: 'compact-advisory-product',
+            name: 'Compact advisory product',
+            pricing_options: [pricing],
+          },
+        ],
+        errors: [{ code: 'PARTIAL_AVAILABILITY', message: 'One alternative was unavailable' }],
+      });
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-compact-advisory',
+    });
+
+    const result = await coordinator.requestProposals({
+      account: { account_id: 'account-1' },
+      brand: { domain: 'example.com' },
+      brief: 'proposal with advisory',
+    });
+
+    assert.equal(result.data.proposals[0].proposal_id, 'compact-advisory-proposal');
+    assert.equal(coordinator.proposalSnapshotStore.entries.size, 1);
+    assert.equal([...coordinator.proposalSnapshotStore.entries.values()][0].proposal.proposal_status, 'draft');
+  });
+
+  test('compact validation failures report the compact lifecycle before dispatch', async () => {
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    let calls = 0;
+    agent.requestProposals = async () => {
+      calls += 1;
+      return completed('request_proposals', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    await assert.rejects(coordinator.requestProposals({ brief: '' }), error => {
+      assert.ok(error instanceof MediaBuyLifecycleCompatibilityError);
+      assert.equal(error.feature, 'compact_request_validation');
+      assert.equal(error.lifecycle, 'compact');
+      return true;
+    });
+    assert.equal(calls, 0);
+  });
+
+  test('async task states keep compatibility provenance without fabricating completed data', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () => working('get_products');
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    const result = await coordinator.requestProposals({ brief: 'async proposal request' });
+
+    assert.equal(result.status, 'working');
+    assert.deepEqual(result.data, { task_id: 'get_products-task' });
+    assert.deepEqual(result.compatibility.tools_used, ['get_products']);
+    assert.equal(result.compatibility.lifecycle, 'established');
+  });
+
+  test('working and webhook completion is ingested through AgentClient task updates', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const taskListeners = new Set();
+    agent.onTaskUpdate = listener => {
+      taskListeners.add(listener);
+      return () => {
+        taskListeners.delete(listener);
+      };
+    };
+    agent.getProducts = async () => working('get_products');
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', { media_buy_id: 'mb-working', revision: 1 });
+    };
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const digest = proposalTermsDigest(commercialTerms);
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    await coordinator.requestProposals({ brief: 'working proposal', account: { account_id: 'account-1' } });
+    assert.equal(taskListeners.size, 1);
+    const taskUpdate = Object.freeze({
+      taskId: 'get_products-task',
+      status: 'completed',
+      taskType: 'get_products',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      result: {
+        proposals: [
+          {
+            proposal_id: 'working-proposal-1',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            terms_digest: digest,
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: commercialTerms,
+          },
+        ],
+      },
+    });
+    for (const listener of [...taskListeners]) listener(taskUpdate);
+
+    await coordinator.acceptProposal({
+      account: { account_id: 'account-1' },
+      proposal_id: 'working-proposal-1',
+      proposal_terms_digest: digest,
+    });
+    assert.equal(mutations, 1);
+  });
+
+  test('a proposal completion racing dispatch return is captured before the long-lived listener', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const taskListeners = new Set();
+    agent.onTaskUpdate = listener => {
+      taskListeners.add(listener);
+      return () => {
+        taskListeners.delete(listener);
+      };
+    };
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const digest = proposalTermsDigest(commercialTerms);
+    agent.getProducts = async () => {
+      const update = {
+        taskId: 'get_products-task',
+        status: 'completed',
+        taskType: 'get_products',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        result: {
+          proposals: [
+            {
+              proposal_id: 'raced-proposal-1',
+              proposal_kind: 'new_media_buy',
+              proposal_status: 'committed',
+              terms_digest: digest,
+              expires_at: '2099-12-31T23:59:59Z',
+              commercial_terms: commercialTerms,
+            },
+          ],
+        },
+      };
+      for (const listener of [...taskListeners]) listener(update);
+      return working('get_products');
+    };
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', { media_buy_id: 'mb-raced', revision: 1 });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+
+    await coordinator.requestProposals({ brief: 'raced proposal', account: { account_id: 'account-1' } });
+    assert.equal(taskListeners.size, 0);
+    await coordinator.acceptProposal({
+      account: { account_id: 'account-1' },
+      proposal_id: 'raced-proposal-1',
+      proposal_terms_digest: digest,
+    });
+
+    assert.equal(mutations, 1);
+  });
+
+  for (const terminalStatus of ['input-required', 'auth-required', 'deferred', 'governance-denied', 'aborted']) {
+    test(`${terminalStatus} proposal task update releases its listener`, async () => {
+      const agent = clientWithCaps(capabilities({ version: '3.1' }));
+      const taskListeners = new Set();
+      agent.onTaskUpdate = listener => {
+        taskListeners.add(listener);
+        return () => {
+          taskListeners.delete(listener);
+        };
+      };
+      agent.getProducts = async () => working('get_products');
+      const update = {
+        taskId: 'get_products-task',
+        status: terminalStatus,
+        taskType: 'get_products',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-tenant-1' });
+
+      await coordinator.requestProposals({ brief: 'paused proposal request' });
+      assert.equal(taskListeners.size, 1);
+      for (const listener of [...taskListeners]) listener(update);
+
+      assert.equal(taskListeners.size, 0);
+    });
+  }
+
+  test('terminal proposal failures do not leave a task-update listener attached', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const taskListeners = new Set();
+    agent.onTaskUpdate = listener => {
+      taskListeners.add(listener);
+      return () => taskListeners.delete(listener);
+    };
+    agent.getProducts = async () => failed('get_products');
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-tenant-1' });
+
+    const result = await coordinator.requestProposals({ brief: 'failed proposal request' });
+
+    assert.equal(result.status, 'failed');
+    assert.equal(taskListeners.size, 0);
+  });
+
+  test('dispose releases a permanently working proposal listener', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const taskListeners = new Set();
+    agent.onTaskUpdate = listener => {
+      taskListeners.add(listener);
+      return () => taskListeners.delete(listener);
+    };
+    agent.getProducts = async () => working('get_products');
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-tenant-1' });
+
+    await coordinator.requestProposals({ brief: 'working forever' });
+    assert.equal(taskListeners.size, 1);
+    coordinator.dispose();
+
+    assert.equal(taskListeners.size, 0);
+  });
+
+  test('submitted proposal completion is projected and retained before established acceptance', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const digest = proposalTermsDigest(commercialTerms);
+    const terminal = completed('get_products', {
+      proposals: [
+        {
+          proposal_id: 'async-proposal-1',
+          proposal_kind: 'new_media_buy',
+          proposal_status: 'committed',
+          terms_digest: digest,
+          expires_at: '2099-12-31T23:59:59Z',
+          commercial_terms: commercialTerms,
+        },
+      ],
+    });
+    agent.getProducts = async () => submitted('get_products', terminal);
+    const mutations = [];
+    agent.createMediaBuy = async request => {
+      mutations.push(request);
+      return completed('create_media_buy', { media_buy_id: 'mb-async', revision: 1 });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+
+    const pending = await coordinator.requestProposals({
+      brief: 'async proposal request',
+      account: { account_id: 'account-1' },
+    });
+    const tracked = await pending.submitted.track();
+    assert.equal(tracked.result.proposals[0].proposal_id, 'async-proposal-1');
+    const finished = await pending.submitted.waitForCompletion();
+    assert.equal(finished.data.proposals[0].proposal_id, 'async-proposal-1');
+    assert.deepEqual(finished.compatibility.tools_used, ['get_products']);
+
+    await coordinator.acceptProposal({
+      account: { account_id: 'account-1' },
+      proposal_id: 'async-proposal-1',
+      proposal_terms_digest: digest,
+    });
+    assert.equal(mutations.length, 1);
+  });
+
+  test('operation-error proposal completions invalidate only their correlated stale snapshots', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const proposal = proposal_id => ({
+      proposal_id,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      },
+    });
+    const ids = {
+      direct: 'proposal-stale-direct-error',
+      event: 'proposal-stale-event-error',
+      track: 'proposal-stale-track-error',
+      unrelated: 'proposal-unrelated-race-error',
+      raced: 'proposal-stale-race-error',
+      taskFailedRaced: 'proposal-stale-task-failed-race',
+      pausedRaced: 'proposal-stale-paused-race',
+      unsafeRacedSuccess: 'proposal-stale-unsafe-race-success',
+      safeRacedSuccess: 'proposal-safe-race-success',
+      duplicateRacedSuccess: 'proposal-stale-duplicate-race-success',
+      digestRacedSuccess: 'proposal-digest-race-success',
+      oversizedRacedSuccess: 'proposal-stale-oversized-race-success',
+      overflowRacedSuccess: 'proposal-stale-overflow-race-success',
+      rejectedOverflowSuccess: 'proposal-stale-rejected-overflow-success',
+    };
+    const taskListeners = new Set();
+    agent.onTaskUpdate = listener => {
+      taskListeners.add(listener);
+      return () => taskListeners.delete(listener);
+    };
+    agent.getProducts = async () =>
+      completed('get_products', { proposals: Object.values(ids).map(proposal), cache_scope: 'account' });
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-proposal-operation-error',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    const account = { account_id: 'account-1' };
+    await coordinator.requestProposals({ brief: 'seed stale proposals', account });
+    const operationError = proposalId => ({
+      success: false,
+      error: 'seller proposal operation failed',
+      proposals: [proposal(proposalId)],
+    });
+    const assertUnavailable = proposalId =>
+      assert.rejects(
+        coordinator.acceptProposal({ account, proposal_id: proposalId }),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+      );
+
+    agent.getProducts = async () => completed('get_products', operationError(ids.direct));
+    await coordinator.requestProposals({ brief: 'direct operation error', account });
+    await assertUnavailable(ids.direct);
+
+    agent.getProducts = async () => working('get_products');
+    await coordinator.requestProposals({ brief: 'event operation error', account });
+    for (const listener of [...taskListeners]) {
+      listener({
+        taskId: 'get_products-task',
+        status: 'completed',
+        taskType: 'get_products',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        result: operationError(ids.event),
+      });
+    }
+    await assertUnavailable(ids.event);
+
+    agent.getProducts = async () => submitted('get_products', completed('get_products', operationError(ids.track)));
+    const pending = await coordinator.requestProposals({ brief: 'track operation error', account });
+    assert.equal((await pending.submitted.track()).status, 'completed');
+    await assertUnavailable(ids.track);
+
+    agent.getProducts = async () => {
+      for (const listener of [...taskListeners]) {
+        listener({
+          taskId: 'unrelated-task',
+          status: 'completed',
+          taskType: 'get_products',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result: operationError(ids.unrelated),
+        });
+      }
+      return working('get_products');
+    };
+    await coordinator.requestProposals({ brief: 'unrelated raced error', account });
+    assert.equal(taskListeners.size, 1);
+    for (const listener of [...taskListeners]) {
+      listener({
+        taskId: 'get_products-task',
+        status: 'failed',
+        taskType: 'get_products',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    }
+    assert.equal(taskListeners.size, 0);
+
+    agent.getProducts = async () => {
+      for (const listener of [...taskListeners]) {
+        listener({
+          taskId: 'get_products-task',
+          status: 'completed',
+          taskType: 'get_products',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result: operationError(ids.raced),
+        });
+      }
+      return working('get_products');
+    };
+    await coordinator.requestProposals({ brief: 'matched raced error', account });
+    assert.equal(taskListeners.size, 0, 'matched terminal race must not leave a long-lived watcher');
+    await assertUnavailable(ids.raced);
+
+    agent.getProducts = async () => {
+      for (const listener of [...taskListeners]) {
+        listener({
+          taskId: 'get_products-task',
+          status: 'failed',
+          taskType: 'get_products',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result: operationError(ids.taskFailedRaced),
+        });
+      }
+      return working('get_products');
+    };
+    await coordinator.requestProposals({ brief: 'matched raced task failure', account });
+    assert.equal(taskListeners.size, 0, 'raced task failure must not leave a long-lived watcher');
+    await assertUnavailable(ids.taskFailedRaced);
+
+    agent.getProducts = async () => {
+      for (const listener of [...taskListeners]) {
+        listener({
+          taskId: 'get_products-task',
+          status: 'input-required',
+          taskType: 'get_products',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result: operationError(ids.pausedRaced),
+        });
+      }
+      return working('get_products');
+    };
+    await coordinator.requestProposals({ brief: 'matched raced paused task', account });
+    assert.equal(taskListeners.size, 0, 'raced paused task must not leave a long-lived watcher');
+    await assertUnavailable(ids.pausedRaced);
+
+    agent.getProducts = async () => {
+      for (const listener of [...taskListeners]) {
+        listener({
+          taskId: 'get_products-task',
+          status: 'completed',
+          taskType: 'get_products',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result: {
+            proposals: [
+              ...Array.from({ length: 256 }, (_, index) => ({
+                proposal_id: `uncached-padding-${index}`,
+                commercial_terms: { accessToken: 'unsafe-padding' },
+              })),
+              {
+                proposal_id: ids.unsafeRacedSuccess,
+                commercial_terms: { accessToken: 'must-not-be-retained' },
+              },
+              proposal(ids.safeRacedSuccess),
+            ],
+          },
+        });
+      }
+      return working('get_products');
+    };
+    await coordinator.requestProposals({ brief: 'matched raced mixed success', account });
+    assert.equal(taskListeners.size, 0, 'matched terminal race must not leave a long-lived watcher');
+    await assertUnavailable(ids.unsafeRacedSuccess);
+    await assertUnavailable(ids.safeRacedSuccess);
+
+    agent.getProducts = async () => {
+      for (const listener of [...taskListeners]) {
+        listener({
+          taskId: 'get_products-task',
+          status: 'completed',
+          taskType: 'get_products',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result: {
+            proposals: [
+              proposal(ids.duplicateRacedSuccess),
+              {
+                proposal_id: ids.duplicateRacedSuccess,
+                commercial_terms: { accessToken: 'later-duplicate-must-revoke' },
+              },
+            ],
+          },
+        });
+      }
+      return working('get_products');
+    };
+    await coordinator.requestProposals({ brief: 'matched raced duplicate success', account });
+    assert.equal(taskListeners.size, 0, 'duplicate terminal race must not leave a long-lived watcher');
+    await assertUnavailable(ids.duplicateRacedSuccess);
+
+    const digestCommercialTerms = {
+      ...proposal(ids.digestRacedSuccess).commercial_terms,
+      seller_planning_note: 'benign term retained in the seller digest but not the legacy create request',
+    };
+    const racedTermsDigest = proposalTermsDigest(digestCommercialTerms);
+    agent.getProducts = async () => {
+      const unsubscribeMutator = agent.onTaskUpdate(task => {
+        if (task.taskId !== 'get_products-task' || task.status !== 'completed') return;
+        task.result.proposals[0].commercial_terms.brand.accessToken = 'injected-after-safety-check';
+      });
+      for (const listener of [...taskListeners]) {
+        listener({
+          taskId: 'get_products-task',
+          status: 'completed',
+          taskType: 'get_products',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result: {
+            proposals: [
+              {
+                ...proposal(ids.digestRacedSuccess),
+                name: 'Digest-bound raced proposal',
+                allocations: [{ product_id: 'product-1', allocation_percentage: 100 }],
+                commercial_terms: digestCommercialTerms,
+                terms_digest: racedTermsDigest,
+              },
+            ],
+            products: [],
+            cache_scope: 'account',
+          },
+        });
+      }
+      unsubscribeMutator();
+      return working('get_products');
+    };
+    await coordinator.requestProposals({ brief: 'matched raced full-terms digest', account });
+    assert.equal(taskListeners.size, 0, 'digest-bound terminal race must not leave a long-lived watcher');
+    assert.doesNotMatch(
+      JSON.stringify([...coordinator.proposalSnapshotStore.entries.values()]),
+      /injected-after-safety-check/
+    );
+
+    const oversizedSafeProposals = Array.from({ length: 16 }, (_, index) => {
+      const candidate = proposal(`oversized-safe-${String(index).padStart(2, '0')}`);
+      candidate.commercial_terms.purchase_order_ref = 'x'.repeat(261_860);
+      return candidate;
+    });
+    agent.getProducts = async () => {
+      for (const listener of [...taskListeners]) {
+        listener({
+          taskId: 'get_products-task',
+          status: 'completed',
+          taskType: 'get_products',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result: {
+            proposals: [
+              ...oversizedSafeProposals,
+              {
+                proposal_id: ids.oversizedRacedSuccess,
+                commercial_terms: { accessToken: 'must-not-survive-capture-pressure' },
+              },
+            ],
+          },
+        });
+      }
+      return working('get_products');
+    };
+    await coordinator.requestProposals({ brief: 'matched oversized raced success', account });
+    assert.equal(taskListeners.size, 0, 'oversized terminal race must not leave a long-lived watcher');
+    await assertUnavailable(ids.oversizedRacedSuccess);
+
+    let mutations = 0;
+    const mutationRequests = [];
+    agent.createMediaBuy = async request => {
+      mutations += 1;
+      mutationRequests.push(request);
+      return completed('create_media_buy', { media_buy_id: 'mb-unrelated-race' });
+    };
+    assert.equal((await coordinator.acceptProposal({ account, proposal_id: ids.unrelated })).status, 'completed');
+    assert.equal(
+      (
+        await coordinator.acceptProposal({
+          account,
+          proposal_id: ids.digestRacedSuccess,
+          proposal_terms_digest: racedTermsDigest,
+        })
+      ).status,
+      'completed'
+    );
+    assert.deepEqual(mutationRequests[1].brand, { domain: 'example.com' });
+    assert.equal(mutations, 2, 'raced results must preserve unrelated and full-terms-bound snapshots');
+
+    agent.getProducts = async () => {
+      for (const listener of [...taskListeners]) {
+        listener({
+          taskId: 'get_products-task',
+          status: 'completed',
+          taskType: 'get_products',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result: {
+            proposals: [
+              {
+                proposal_id: ids.overflowRacedSuccess,
+                commercial_terms: { accessToken: 'must-not-survive-correlation-overflow' },
+              },
+            ],
+          },
+        });
+      }
+      for (let index = 0; index < 33; index += 1) {
+        for (const listener of [...taskListeners]) {
+          listener({
+            taskId: `unrelated-terminal-${index}`,
+            status: 'completed',
+            taskType: 'get_products',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            result: { proposals: [] },
+          });
+        }
+      }
+      return working('get_products');
+    };
+    await coordinator.requestProposals({ brief: 'matched raced success under correlation pressure', account });
+    assert.equal(taskListeners.size, 0, 'overflow fallback must suppress an ambiguous long-lived watcher');
+    await assertUnavailable(ids.overflowRacedSuccess);
+    assert.equal(mutations, 2, 'capture pressure must never authorize an additional mutation');
+
+    agent.getProducts = async () => completed('get_products', { proposals: [proposal(ids.rejectedOverflowSuccess)] });
+    await coordinator.requestProposals({ brief: 'seed transport rejection race', account });
+    agent.getProducts = async () => {
+      for (const listener of [...taskListeners]) {
+        listener({
+          taskId: 'get_products-task',
+          status: 'completed',
+          taskType: 'get_products',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          result: {
+            proposals: [
+              {
+                proposal_id: ids.rejectedOverflowSuccess,
+                commercial_terms: { accessToken: 'must-not-survive-transport-rejection' },
+              },
+            ],
+          },
+        });
+      }
+      for (let index = 0; index < 33; index += 1) {
+        for (const listener of [...taskListeners]) {
+          listener({
+            taskId: `rejected-unrelated-terminal-${index}`,
+            status: 'completed',
+            taskType: 'get_products',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            result: { proposals: [] },
+          });
+        }
+      }
+      throw new Error('transport failed after terminal event');
+    };
+    await assert.rejects(
+      coordinator.requestProposals({ brief: 'transport rejection after terminal race', account }),
+      /transport failed after terminal event/
+    );
+    assert.equal(taskListeners.size, 0, 'transport rejection must release the pre-dispatch listener');
+    await assertUnavailable(ids.rejectedOverflowSuccess);
+    assert.equal(mutations, 2, 'transport rejection after a terminal race must fail closed');
+  });
+
+  test('submitted compact mutations retain compatibility on completion', async () => {
+    const agent = clientWithCaps(capabilities({ tools: COMPACT_TOOLS }));
+    agent.buyProducts = async () =>
+      submitted('buy_products', completed('buy_products', { media_buy_id: 'mb-submitted', revision: 1 }));
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    const pending = await coordinator.buyProducts(directIntent);
+    assert.equal(pending.compatibility.lifecycle, 'compact');
+    const finished = await pending.submitted.waitForCompletion();
+    assert.equal(finished.data.media_buy_id, 'mb-submitted');
+    assert.equal(finished.compatibility.lifecycle, 'compact');
+    assert.deepEqual(finished.compatibility.tools_used, ['buy_products']);
+  });
+
+  test('readback fields are gated by the exact established schema version', async () => {
+    for (const version of ['3.0', '3.1', '3.2.1']) {
+      const tools = version.startsWith('3.2')
+        ? [...COMPACT_TOOLS, 'get_media_buys', 'get_media_buy_delivery']
+        : undefined;
+      const agent = clientWithCaps(capabilities({ version, tools }));
+      let readbacks = 0;
+      agent.getMediaBuys = async () => {
+        readbacks += 1;
+        return completed('get_media_buys', { media_buys: [] });
+      };
+      agent.getMediaBuyDelivery = async () => {
+        readbacks += 1;
+        return completed('get_media_buy_delivery', { media_buy_deliveries: [] });
+      };
+      const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+      if (version === '3.0') {
+        await assert.rejects(
+          coordinator.getMediaBuys({ include_webhook_activity: true }),
+          error =>
+            error instanceof MediaBuyLifecycleCompatibilityError && /include_webhook_activity/.test(error.feature)
+        );
+        await assert.rejects(
+          coordinator.getMediaBuyDelivery({ include_window_breakdown: true }),
+          error =>
+            error instanceof MediaBuyLifecycleCompatibilityError && /include_window_breakdown/.test(error.feature)
+        );
+      } else {
+        await coordinator.getMediaBuys({ include_webhook_activity: true, webhook_activity_limit: 5 });
+        await coordinator.getMediaBuyDelivery({ include_window_breakdown: true, time_granularity: 'daily' });
+        if (version === '3.1') {
+          await assert.rejects(
+            coordinator.getMediaBuyDelivery({ time_granularity: 'weekly' }),
+            error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'time_granularity'
+          );
+        }
+      }
+
+      if (version === '3.0' || version === '3.1') {
+        await assert.rejects(
+          coordinator.getMediaBuys({ indicator_types: ['delivery'] }),
+          error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'indicator_types'
+        );
+        await assert.rejects(
+          coordinator.getMediaBuyDelivery({ reporting_dimensions: { demographic: {} } }),
+          error =>
+            error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'reporting_dimensions.demographic'
+        );
+        if (version === '3.0') {
+          await assert.rejects(
+            coordinator.getMediaBuyDelivery({
+              reporting_dimensions: { geo: { geo_level: 'postal_area', country: 'US', system: 'zip' } },
+            }),
+            error =>
+              error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'reporting_dimensions.geo'
+          );
+          for (const geo_level of ['metro', 'postal_area']) {
+            await assert.rejects(
+              coordinator.getMediaBuyDelivery({ reporting_dimensions: { geo: { geo_level } } }),
+              error =>
+                error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'reporting_dimensions.geo'
+            );
+          }
+        }
+      } else {
+        await coordinator.getMediaBuys({ indicator_types: ['delivery'] });
+        await coordinator.getMediaBuyDelivery({ time_granularity: 'weekly' });
+      }
+      assert.equal(readbacks, version === '3.0' ? 0 : version === '3.1' ? 2 : 4);
+    }
+  });
+
+  test('beta.6 delivery metric and sorting requests fail closed for older sellers', async () => {
+    for (const version of ['3.2.0-beta.5', '3.2.0-beta.6']) {
+      const agent = clientWithCaps(capabilities({ version, tools: [...COMPACT_TOOLS, 'get_media_buy_delivery'] }));
+      let readbacks = 0;
+      agent.getMediaBuyDelivery = async () => {
+        readbacks += 1;
+        return completed('get_media_buy_delivery', { media_buy_deliveries: [] });
+      };
+      const coordinator = await agent.negotiateMediaBuyLifecycle();
+      const requests = [
+        [{ requested_metrics: ['viewable_rate'] }, 'requested_metrics'],
+        [
+          { reporting_dimensions: { placement: { sort_by: 'viewable_rate' } } },
+          'reporting_dimensions.placement.sort_by',
+        ],
+        [
+          { reporting_dimensions: { placement: { sort_direction: 'asc' } } },
+          'reporting_dimensions.placement.sort_direction',
+        ],
+        [{ reporting_dimensions: { format: {} } }, 'reporting_dimensions.format'],
+      ];
+
+      for (const [request, feature] of requests) {
+        if (version === '3.2.0-beta.5') {
+          await assert.rejects(
+            coordinator.getMediaBuyDelivery(request),
+            error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === feature
+          );
+        } else {
+          await coordinator.getMediaBuyDelivery(request);
+        }
+      }
+      assert.equal(readbacks, version === '3.2.0-beta.5' ? 0 : requests.length);
+    }
+  });
+
+  test('beta.6 metric identities fail closed across compact beta.5 requests', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.2.0-beta.5', tools: COMPACT_TOOLS }));
+    let calls = 0;
+    for (const method of [
+      'listProducts',
+      'requestProposals',
+      'refineProposals',
+      'buyProducts',
+      'acceptProposal',
+      'controlMediaBuy',
+    ]) {
+      agent[method] = async () => {
+        calls += 1;
+        return completed('unexpected', {});
+      };
+    }
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+    const cases = [
+      [
+        () =>
+          coordinator.listProducts({
+            criteria: { offer_filters: { required_metrics: ['viewable_rate'] } },
+          }),
+        'criteria.offer_filters.required_metrics',
+      ],
+      [
+        () =>
+          coordinator.requestProposals({
+            criteria: { offer_filters: { required_metrics: ['quartile_100'] } },
+          }),
+        'criteria.offer_filters.required_metrics',
+      ],
+      [
+        () =>
+          coordinator.refineProposals({
+            refinements: [
+              {
+                proposal_id: 'proposal-1',
+                criteria: { offer_filters: { required_metrics: ['time_based_views'] } },
+              },
+            ],
+          }),
+        'refinements[0].criteria.offer_filters.required_metrics',
+      ],
+      [
+        () =>
+          coordinator.buyProducts({
+            purchases: [
+              {
+                committed_metrics: [
+                  { scope: 'standard', metric_id: 'measurable_impressions', committed_at: '2026-08-24T00:00:00Z' },
+                ],
+              },
+            ],
+          }),
+        'purchases[0].committed_metrics[0].metric_id',
+      ],
+      [
+        () => coordinator.acceptProposal({ reporting_webhook: { requested_metrics: ['viewed_seconds'] } }),
+        'reporting_webhook.requested_metrics',
+      ],
+      [
+        () => coordinator.controlMediaBuy({ reporting_webhook: { requested_metrics: ['quartile_25'] } }),
+        'reporting_webhook.requested_metrics',
+      ],
+    ];
+
+    for (const [invoke, feature] of cases) {
+      await assert.rejects(
+        invoke(),
+        error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === feature
+      );
+    }
+    assert.equal(calls, 0);
+  });
+
+  test('product field selection is gated by the exact established enum', async () => {
+    for (const [version, field] of [
+      ['3.0', 'format_options'],
+      ['3.1', 'measurement_terms'],
+    ]) {
+      const agent = clientWithCaps(capabilities({ version }));
+      let calls = 0;
+      agent.getProducts = async () => {
+        calls += 1;
+        return completed('get_products', { products: [] });
+      };
+      const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+      await assert.rejects(
+        coordinator.listProducts({ fields: [field] }),
+        error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'fields'
+      );
+      assert.equal(calls, 0);
+    }
+  });
+
+  test('hard proposal constraints fail before legacy get_products', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let calls = 0;
+    agent.getProducts = async () => {
+      calls += 1;
+      return completed('get_products', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    await assert.rejects(
+      coordinator.refineProposals({
+        refinements: [
+          {
+            proposal_id: 'proposal-1',
+            action: 'revise',
+            constraints: { total_budget: { currency: 'USD', max: 1000 } },
+          },
+        ],
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'structured proposal refinement'
+    );
+    assert.equal(calls, 0);
+  });
+
+  test('compact-only proposal filters fail before legacy get_products', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let calls = 0;
+    agent.getProducts = async () => {
+      calls += 1;
+      return completed('get_products', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    await assert.rejects(
+      coordinator.requestProposals({
+        brief: 'test',
+        criteria: { product_ids: ['product-1'] },
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'criteria.product_ids'
+    );
+    await assert.rejects(
+      coordinator.requestProposals({
+        brief: 'test',
+        criteria: { offer_filters: { required_features: { property_filtering: true } } },
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError &&
+        error.feature === 'criteria.offer_filters.required_features'
+    );
+    assert.equal(calls, 0);
+  });
+
+  test('nested 3.2 constraints fail before a legacy seller can ignore or reject them', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let calls = 0;
+    agent.getProducts =
+      agent.createMediaBuy =
+      agent.updateMediaBuy =
+        async () => {
+          calls += 1;
+          return completed('unexpected', {});
+        };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      allowedLosses: ['feed_version_not_atomic', 'pricing_version_not_atomic'],
+    });
+
+    for (const targeting of [
+      { browser: ['chrome'] },
+      { demographics: { age_ranges: ['25-34'] } },
+      { language: ['en-US'] },
+    ]) {
+      await assert.rejects(
+        coordinator.buyProducts({
+          ...directIntent,
+          purchases: [{ ...directIntent.purchases[0], targeting_overlay: targeting }],
+        }),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError &&
+          error.feature.startsWith('purchases[0].targeting_overlay.')
+      );
+    }
+    await assert.rejects(
+      coordinator.controlMediaBuy({
+        account: { account_id: 'account-1' },
+        media_buy_id: 'mb-1',
+        revision: 1,
+        packages: [
+          {
+            package_id: 'package-1',
+            optimization_goals: [
+              {
+                kind: 'vendor_metric',
+                vendor: { domain: 'measurement.example' },
+                metric_id: 'attention_units',
+              },
+            ],
+          },
+        ],
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'packages[0].optimization_goals'
+    );
+    await assert.rejects(
+      coordinator.controlMediaBuy({
+        account: { account_id: 'account-1' },
+        media_buy_id: 'mb-1',
+        revision: 1,
+        packages: [{ package_id: 'package-1', budget: null }],
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'packages[0].budget'
+    );
+    await assert.rejects(
+      coordinator.requestProposals({
+        brief: 'metric drift',
+        criteria: { offer_filters: { required_metrics: ['commissionable_value'] } },
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError &&
+        error.feature === 'criteria.offer_filters.required_metrics'
+    );
+    await assert.rejects(
+      coordinator.buyProducts({
+        ...directIntent,
+        reporting_webhook: { requested_metrics: ['commissionable_value'] },
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'reporting_webhook.requested_metrics'
+    );
+    await assert.rejects(
+      coordinator.requestProposals({
+        brief: 'catalog drift',
+        criteria: { catalog: { catalog_id: 'catalog-1' } },
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'criteria.catalog'
+    );
+    await assert.rejects(
+      coordinator.controlMediaBuy({
+        account: { account_id: 'account-1' },
+        media_buy_id: 'mb-1',
+        revision: 1,
+        packages: [
+          {
+            package_id: 'package-1',
+            keyword_targets_remove: [{ keyword: 'sports', match_type: 'broad', bid_price: 1 }],
+          },
+        ],
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError &&
+        error.feature === 'packages[0].keyword_targets_remove[0].bid_price'
+    );
+
+    assert.equal(calls, 0);
+  });
+
+  test('3.0 postal targeting rejects the newer country-local shape before dispatch', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }));
+    let calls = 0;
+    agent.createMediaBuy = agent.updateMediaBuy = async () => {
+      calls += 1;
+      return completed('unexpected', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      allowedLosses: ['feed_version_not_atomic', 'pricing_version_not_atomic'],
+    });
+
+    await assert.rejects(
+      coordinator.buyProducts({
+        ...directIntent,
+        purchases: [
+          {
+            ...directIntent.purchases[0],
+            targeting_overlay: {
+              geo_postal_areas: [{ country: 'US', system: 'zip', values: ['10001'] }],
+            },
+          },
+        ],
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError &&
+        error.feature === 'purchases[0].targeting_overlay.geo_postal_areas[0]'
+    );
+    for (const call of [
+      () =>
+        coordinator.buyProducts({
+          ...directIntent,
+          push_notification_config: { url: 'https://example.com/tasks', operation_id: 'operation-1' },
+        }),
+      () =>
+        coordinator.controlMediaBuy({
+          account: { account_id: 'account-1' },
+          media_buy_id: 'mb-1',
+          revision: 1,
+          push_notification_config: { url: 'https://example.com/tasks', operation_id: 'operation-1' },
+        }),
+    ]) {
+      await assert.rejects(
+        call(),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError &&
+          error.feature === 'push_notification_config.operation_id'
+      );
+    }
+    assert.equal(calls, 0);
+  });
+
+  test('legacy finalize rejects every extra refinement field before dispatch', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let calls = 0;
+    agent.getProducts = async () => {
+      calls += 1;
+      return completed('get_products', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    for (const extra of [
+      { constraints: { total_budget: { currency: 'USD', max: 1000 } } },
+      { product_changes: { 'product-2': 'include' } },
+      { ask: 'finalize only if the rate holds' },
+    ]) {
+      await assert.rejects(
+        coordinator.refineProposals({
+          refinements: [{ proposal_id: 'proposal-1', action: 'finalize', ...extra }],
+        }),
+        error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature.startsWith('finalize.')
+      );
+    }
+    assert.equal(calls, 0);
+  });
+
+  test('legacy proposal mutations receive SDK-generated retry keys when omitted', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const calls = [];
+    agent.getProducts = async request => {
+      calls.push(request);
+      return completed('get_products', { proposals: [], cache_scope: 'account' });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      allowedLosses: ['proposal_decline_not_terminal', 'proposal_decline_reason_not_forwarded'],
+    });
+
+    await coordinator.requestProposals({ brief: 'proposal request' });
+    await coordinator.refineProposals({
+      refinements: [{ proposal_id: 'proposal-1', action: 'revise', ask: 'lower price' }],
+    });
+    await coordinator.declineProposals({ declines: [{ proposal_id: 'proposal-2', reason: 'budget_changed' }] });
+
+    assert.equal(calls.length, 3);
+    for (const call of calls) assert.match(call.idempotency_key, /^[A-Za-z0-9_.:-]{16,255}$/);
+    assert.equal(new Set(calls.map(call => call.idempotency_key)).size, 3);
+  });
+
+  test('compliance omission mode keeps legacy proposal retry keys absent', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const calls = [];
+    agent.getProducts = async request => {
+      calls.push(request);
+      return completed('get_products', { proposals: [], cache_scope: 'account' });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      allowedLosses: ['proposal_decline_not_terminal', 'proposal_decline_reason_not_forwarded'],
+    });
+    const options = { skipIdempotencyAutoInject: true };
+
+    await coordinator.requestProposals({ brief: 'proposal request' }, undefined, options);
+    await coordinator.refineProposals(
+      { refinements: [{ proposal_id: 'proposal-1', action: 'revise', ask: 'lower price' }] },
+      undefined,
+      options
+    );
+    await coordinator.declineProposals(
+      { declines: [{ proposal_id: 'proposal-2', reason: 'budget_changed' }] },
+      undefined,
+      options
+    );
+
+    assert.equal(calls.length, 3);
+    for (const call of calls) assert.equal(call.idempotency_key, undefined);
+  });
+
+  test('malformed legacy proposal refinements fail as structured compatibility errors', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let calls = 0;
+    agent.getProducts = async () => {
+      calls += 1;
+      return completed('get_products', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    await assert.rejects(
+      coordinator.refineProposals({}),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'compact_request_validation'
+    );
+    assert.equal(calls, 0);
+  });
+
+  test('required compact mutation fences fail before any established mutation', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let mutations = 0;
+    agent.createMediaBuy = agent.updateMediaBuy = async () => {
+      mutations += 1;
+      return completed('mutation', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: [
+        'feed_version_not_atomic',
+        'pricing_version_not_atomic',
+        'proposal_terms_digest_not_enforced',
+        'proposal_decline_not_terminal',
+        'proposal_decline_reason_not_forwarded',
+      ],
+    });
+
+    await assert.rejects(
+      coordinator.buyProducts({ ...directIntent, feed_version: '' }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'feed_version'
+    );
+    await assert.rejects(
+      coordinator.acceptProposal({ account: { account_id: 'account-1' }, proposal_id: 'proposal-1' }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    await assert.rejects(
+      coordinator.controlMediaBuy({ account: { account_id: 'account-1' }, media_buy_id: 'mb-1' }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'account/media_buy_id/revision'
+    );
+    await assert.rejects(
+      coordinator.controlMediaBuy({
+        account: { account_id: 'account-1' },
+        media_buy_id: 'mb-1',
+        revision: 0,
+        paused: true,
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'account/media_buy_id/revision'
+    );
+    await assert.rejects(
+      coordinator.buyProducts({
+        ...directIntent,
+        purchases: [{ ...directIntent.purchases[0], buyer_ref: 'unsupported-package-ref' }],
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'purchases[0].buyer_ref'
+    );
+    await assert.rejects(
+      coordinator.controlMediaBuy({
+        account: { account_id: 'account-1' },
+        media_buy_id: 'mb-1',
+        revision: 1,
+        packages: [{ package_id: 'package-1', catalog_ids: ['catalog-1'] }],
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'packages[0].catalog_ids'
+    );
+    await assert.rejects(
+      coordinator.controlMediaBuy({
+        account: { account_id: 'account-1' },
+        media_buy_id: 'mb-1',
+        revision: 1,
+        canceled: true,
+        paused: true,
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'canceled'
+    );
+    await assert.rejects(
+      coordinator.controlMediaBuy({
+        account: { account_id: 'account-1' },
+        media_buy_id: 'mb-1',
+        revision: 1,
+        packages: [
+          {
+            package_id: 'package-1',
+            targeting_overlay: {},
+            keyword_targets_add: [{ keyword: 'sports' }],
+          },
+        ],
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'packages[0].targeting_overlay'
+    );
+    await assert.rejects(
+      coordinator.buyProducts({ ...directIntent, future_purchase_mode: 'unsafe' }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'future_purchase_mode'
+    );
+    await assert.rejects(
+      coordinator.declineProposals({
+        declines: [{ proposal_id: 'proposal-1', reason: 'budget_changed', future_feedback: true }],
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'future_feedback'
+    );
+    assert.equal(mutations, 0);
+  });
+
+  test('legacy proposal request and supported refinement use the established proposal flow', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const calls = [];
+    const proposal = {
+      proposal_id: 'proposal-1',
+      proposal_status: 'draft',
+      commercial_terms: {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      },
+    };
+    agent.getProducts = async request => {
+      calls.push(request);
+      return completed('get_products', { proposals: [proposal], cache_scope: 'account' });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-tenant-1' });
+
+    const requested = await coordinator.requestProposals({
+      idempotency_key: 'proposal-request-key-0001',
+      brief: 'Premium outdoor inventory',
+      criteria: { offer_filters: { channels: ['display'] }, policy_ids: ['policy-1'] },
+    });
+    const refined = await coordinator.refineProposals({
+      idempotency_key: 'proposal-refine-key-0001',
+      refinements: [
+        {
+          proposal_id: 'proposal-1',
+          action: 'revise',
+          ask: 'Reduce the price',
+          product_changes: { 'product-2': 'include', 'product-3': 'omit' },
+        },
+      ],
+    });
+
+    assert.equal(requested.data.proposals.length, 1);
+    assert.equal(requested.data.proposals[0].terms_digest, undefined, 'the coordinator must not invent a digest');
+    assert.deepEqual(calls[0].filters, { channels: ['display'] });
+    assert.deepEqual(calls[0].required_policies, ['policy-1']);
+    assert.equal(calls[0].idempotency_key, 'proposal-request-key-0001');
+    assert.deepEqual(calls[1].refine, [
+      { scope: 'proposal', proposal_id: 'proposal-1', ask: 'Reduce the price' },
+      { scope: 'product', product_id: 'product-2', action: 'include' },
+      { scope: 'product', product_id: 'product-3', action: 'omit' },
+    ]);
+    assert.equal(calls[1].idempotency_key, 'proposal-refine-key-0001');
+    assert.deepEqual(refined.compatibility.tools_used, ['get_products']);
+  });
+
+  test('legacy decline is fail-closed unless terminal-state loss is explicitly accepted', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }));
+    const calls = [];
+    agent.getProducts = async request => {
+      calls.push(request);
+      return completed('get_products', { proposals: [], cache_scope: 'account' });
+    };
+    const intent = {
+      idempotency_key: 'proposal-decline-key-0001',
+      declines: [{ proposal_id: 'proposal-1', reason: 'budget_changed' }],
+    };
+    const strict = await agent.negotiateMediaBuyLifecycle();
+    await assert.rejects(
+      strict.declineProposals(intent),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.losses.includes('proposal_decline_not_terminal')
+    );
+    assert.equal(calls.length, 0);
+
+    const optedIn = await agent.negotiateMediaBuyLifecycle({
+      allowedLosses: ['proposal_decline_not_terminal', 'proposal_decline_reason_not_forwarded'],
+    });
+    const result = await optedIn.declineProposals(intent);
+    assert.deepEqual(calls[0].refine, [{ scope: 'proposal', proposal_id: 'proposal-1', action: 'omit' }]);
+    assert.deepEqual(result.compatibility.losses, [
+      'proposal_decline_not_terminal',
+      'proposal_decline_reason_not_forwarded',
+    ]);
+  });
+
+  test('legacy proposal acceptance requires opt-in when a digest guarantee was requested', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let mutations = 0;
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const digest = proposalTermsDigest(commercialTerms);
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-1',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            terms_digest: digest,
+            commercial_terms: commercialTerms,
+          },
+        ],
+        cache_scope: 'account',
+      });
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', { media_buy_id: 'mb-1' });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-tenant-1' });
+    await coordinator.requestProposals({ brief: 'test', account: { account_id: 'account-1' } });
+
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: 'proposal-1',
+        proposal_terms_digest: digest,
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError &&
+        error.losses.includes('proposal_terms_digest_not_enforced')
+    );
+    assert.equal(mutations, 0);
+  });
+
+  test('accepted proposal digest loss is explicit and dispatches one established mutation', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const calls = [];
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+      total_budget: { amount: 1000, currency: 'USD' },
+    };
+    const digest = proposalTermsDigest(commercialTerms);
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-1',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            terms_digest: digest,
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: commercialTerms,
+          },
+        ],
+        cache_scope: 'account',
+      });
+    agent.createMediaBuy = async request => {
+      calls.push(request);
+      return completed('create_media_buy', { media_buy_id: 'mb-1', revision: 1 });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    await coordinator.requestProposals({ brief: 'test', account: { account_id: 'account-1' } });
+
+    const overlongKey = `oversized-${'x'.repeat(10_000)}`;
+    await assert.rejects(
+      coordinator.acceptProposal({
+        idempotency_key: overlongKey,
+        account: { account_id: 'account-1' },
+        proposal_id: 'proposal-1',
+        proposal_terms_digest: digest,
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'idempotency_key'
+    );
+    assert.doesNotMatch(JSON.stringify([...coordinator.proposalSnapshotStore.entries.values()]), /oversized-/);
+
+    const result = await coordinator.acceptProposal({
+      idempotency_key: 'accept-proposal-key-0001',
+      account: { account_id: 'account-1' },
+      proposal_id: 'proposal-1',
+      proposal_terms_digest: digest,
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].proposal_id, 'proposal-1');
+    assert.equal(calls[0].idempotency_key, 'accept-proposal-key-0001');
+    assert.equal(calls[0].proposal_terms_digest, undefined);
+    assert.deepEqual(result.compatibility.losses, ['proposal_terms_digest_not_enforced']);
+    await assert.rejects(
+      coordinator.acceptProposal({
+        idempotency_key: 'accept-proposal-fresh-key-0002',
+        account: { account_id: 'account-1' },
+        proposal_id: 'proposal-1',
+        proposal_terms_digest: digest,
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    assert.equal(calls.length, 1, 'an accepted legacy proposal snapshot must be one-shot');
+  });
+
+  test('cache pressure cannot erase an accepted-proposal tombstone or lock out later proposals', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const proposal = proposal_id => ({
+      proposal_id,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      },
+    });
+    let proposals = [proposal('proposal-retired-under-pressure')];
+    agent.getProducts = async () => completed('get_products', { proposals, cache_scope: 'account' });
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', { media_buy_id: `mb-pressure-${mutations}` });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-pressure',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    const account = { account_id: 'account-1' };
+    await coordinator.requestProposals({ brief: 'seed accepted proposal', account });
+    await coordinator.acceptProposal({ account, proposal_id: 'proposal-retired-under-pressure' });
+
+    proposals = [
+      proposal('proposal-retired-under-pressure'),
+      ...Array.from({ length: 300 }, (_, index) => proposal(`proposal-pressure-${index}`)),
+    ];
+    await coordinator.requestProposals({ brief: 'fill snapshot cache', account });
+    await assert.rejects(
+      coordinator.acceptProposal({ account, proposal_id: 'proposal-retired-under-pressure' }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    await coordinator.acceptProposal({ account, proposal_id: 'proposal-pressure-299' });
+    assert.equal(mutations, 2);
+  });
+
+  test('cache pressure retires abandoned pauses without locking out later proposals', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const proposal = proposal_id => ({
+      proposal_id,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      },
+    });
+    let proposals = Array.from({ length: 256 }, (_, index) => proposal(`proposal-abandoned-${index}`));
+    agent.getProducts = async () => completed('get_products', { proposals, cache_scope: 'account' });
+    let completeMutations = false;
+    agent.createMediaBuy = async () =>
+      completeMutations
+        ? completed('create_media_buy', { media_buy_id: 'mb-after-abandoned-pauses' })
+        : { ...working('create_media_buy'), status: 'input-required' };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-abandoned-pauses',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    const account = { account_id: 'account-1' };
+    await coordinator.requestProposals({ brief: 'fill with paused acceptances', account });
+    for (let index = 0; index < 256; index += 1) {
+      assert.equal(
+        (await coordinator.acceptProposal({ account, proposal_id: `proposal-abandoned-${index}` })).status,
+        'input-required'
+      );
+    }
+
+    proposals = [proposal('proposal-after-abandoned-pauses')];
+    await coordinator.requestProposals({ brief: 'proposal after paused pressure', account });
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account,
+        proposal_id: 'proposal-abandoned-0',
+        idempotency_key: 'abandoned-pause-fresh-key',
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    completeMutations = true;
+    assert.equal(
+      (await coordinator.acceptProposal({ account, proposal_id: 'proposal-after-abandoned-pauses' })).status,
+      'completed'
+    );
+    coordinator.dispose();
+  });
+
+  test('cache pressure from another principal cannot release a paused reservation owner', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const proposal = proposal_id => ({
+      proposal_id,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      },
+    });
+    let proposals = [proposal('proposal-owned-by-first-coordinator')];
+    agent.getProducts = async () => completed('get_products', { proposals, cache_scope: 'account' });
+    agent.createMediaBuy = async () => ({ ...working('create_media_buy'), status: 'input-required' });
+    const losses = [
+      'proposal_terms_digest_not_enforced',
+      'proposal_terms_digest_unavailable',
+      'proposal_snapshot_not_immutable',
+    ];
+    const first = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-pressure-owner-a',
+      allowedLosses: losses,
+    });
+    const second = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-pressure-owner-b',
+      allowedLosses: losses,
+    });
+    const account = { account_id: 'account-1' };
+    await first.requestProposals({ brief: 'first coordinator proposal', account });
+    assert.equal(
+      (await first.acceptProposal({ account, proposal_id: 'proposal-owned-by-first-coordinator' })).status,
+      'input-required'
+    );
+    assert.equal(first.ownedAcceptanceReservations.size, 1);
+    assert.equal(first.pendingAcceptanceTasks.size, 1);
+
+    proposals = Array.from({ length: 255 }, (_, index) => proposal(`proposal-second-coordinator-${index}`));
+    await second.requestProposals({ brief: 'fill shared cache', account });
+    proposals = [proposal('proposal-trigger-cross-coordinator-pressure')];
+    await second.requestProposals({ brief: 'trigger shared pressure', account });
+
+    assert.equal(first.ownedAcceptanceReservations.size, 1);
+    assert.equal(first.pendingAcceptanceTasks.size, 1);
+    await assert.rejects(
+      first.acceptProposal({
+        account,
+        proposal_id: 'proposal-owned-by-first-coordinator',
+        idempotency_key: 'cross-coordinator-fresh-key',
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_retry'
+    );
+    first.dispose();
+    assert.equal(first.ownedAcceptanceReservations.size, 0);
+    assert.equal(first.pendingAcceptanceTasks.size, 0);
+    second.dispose();
+  });
+
+  test('cross-coordinator paused retries transfer bounded reservation ownership', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-cross-coordinator-retry',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: {
+              brand: { domain: 'example.com' },
+              start_time: '2027-01-01T00:00:00Z',
+              end_time: '2027-02-01T00:00:00Z',
+            },
+          },
+        ],
+        cache_scope: 'account',
+      });
+    const mutationKeys = [];
+    let completeMutation = false;
+    agent.createMediaBuy = async request => {
+      mutationKeys.push(request.idempotency_key);
+      return completeMutation
+        ? completed('create_media_buy', { media_buy_id: 'mb-cross-coordinator-retry' })
+        : { ...working('create_media_buy'), status: 'input-required' };
+    };
+    const options = {
+      principalScope: 'buyer-tenant-cross-coordinator-retry',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    };
+    const first = await agent.negotiateMediaBuyLifecycle(options);
+    const second = await agent.negotiateMediaBuyLifecycle(options);
+    const acceptance = {
+      account: { account_id: 'account-1' },
+      proposal_id: 'proposal-cross-coordinator-retry',
+    };
+    await first.requestProposals({ brief: 'cross-coordinator retries', account: acceptance.account });
+
+    for (let index = 0; index < 32; index += 1) {
+      const coordinator = index % 2 === 0 ? first : second;
+      assert.equal((await coordinator.acceptProposal(acceptance)).status, 'input-required');
+      assert.equal(first.ownedAcceptanceReservations.size + second.ownedAcceptanceReservations.size, 1);
+      assert.equal(first.pendingAcceptanceTasks.size + second.pendingAcceptanceTasks.size, 1);
+    }
+    completeMutation = true;
+    assert.equal((await first.acceptProposal(acceptance)).status, 'completed');
+    assert.equal(first.ownedAcceptanceReservations.size + second.ownedAcceptanceReservations.size, 0);
+    assert.equal(first.pendingAcceptanceTasks.size + second.pendingAcceptanceTasks.size, 0);
+    assert.equal(new Set(mutationKeys).size, 1);
+    first.dispose();
+    second.dispose();
+  });
+
+  test('legacy proposal acceptance retires the snapshot before an in-flight mutation completes', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-concurrent',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: commercialTerms,
+          },
+        ],
+        cache_scope: 'account',
+      });
+    let releaseMutation;
+    const mutationGate = new Promise(resolve => {
+      releaseMutation = resolve;
+    });
+    let signalStarted;
+    const mutationStarted = new Promise(resolve => {
+      signalStarted = resolve;
+    });
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      signalStarted();
+      await mutationGate;
+      return completed('create_media_buy', { media_buy_id: 'mb-concurrent' });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-concurrent',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    await coordinator.requestProposals({ brief: 'concurrent accept', account: { account_id: 'account-1' } });
+
+    const firstAcceptance = coordinator.acceptProposal({
+      idempotency_key: 'concurrent-accept-key-0001',
+      account: { account_id: 'account-1' },
+      proposal_id: 'proposal-concurrent',
+    });
+    await mutationStarted;
+    await coordinator.requestProposals({ brief: 'rediscover in flight', account: { account_id: 'account-1' } });
+    await assert.rejects(
+      coordinator.acceptProposal({
+        idempotency_key: 'concurrent-accept-key-0002',
+        account: { account_id: 'account-1' },
+        proposal_id: 'proposal-concurrent',
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_pending'
+    );
+    assert.equal(mutations, 1);
+    releaseMutation();
+    await firstAcceptance;
+    await coordinator.requestProposals({ brief: 'rediscover retired', account: { account_id: 'account-1' } });
+    await assert.rejects(
+      coordinator.acceptProposal({
+        idempotency_key: 'concurrent-accept-key-0003',
+        account: { account_id: 'account-1' },
+        proposal_id: 'proposal-concurrent',
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    assert.equal(mutations, 1);
+  });
+
+  test('legacy acceptance is one-shot across concurrent and sequential account representations', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-variant-account',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: {
+              brand: { domain: 'example.com' },
+              start_time: '2027-01-01T00:00:00Z',
+              end_time: '2027-02-01T00:00:00Z',
+            },
+          },
+        ],
+        cache_scope: 'account',
+      });
+    let releaseMutation;
+    const mutationGate = new Promise(resolve => {
+      releaseMutation = resolve;
+    });
+    let signalStarted;
+    const mutationStarted = new Promise(resolve => {
+      signalStarted = resolve;
+    });
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      signalStarted();
+      await mutationGate;
+      return completed('create_media_buy', { media_buy_id: 'mb-variant-account' });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-variant-account',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    const firstAccount = { account_id: 'account-1', brand: { domain: 'one.example' } };
+    const secondAccount = { account_id: 'account-1', brand: { domain: 'two.example' } };
+    await coordinator.requestProposals({ brief: 'first representation', account: firstAccount });
+    await coordinator.requestProposals({ brief: 'second representation', account: secondAccount });
+
+    const firstAcceptance = coordinator.acceptProposal({
+      account: firstAccount,
+      proposal_id: 'proposal-variant-account',
+    });
+    await mutationStarted;
+    await assert.rejects(
+      coordinator.acceptProposal({ account: secondAccount, proposal_id: 'proposal-variant-account' }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_pending'
+    );
+    assert.equal(mutations, 1, 'the account alias must not dispatch while acceptance is in flight');
+
+    releaseMutation();
+    await firstAcceptance;
+    await assert.rejects(
+      coordinator.acceptProposal({ account: secondAccount, proposal_id: 'proposal-variant-account' }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    assert.equal(mutations, 1, 'the account alias must remain retired after terminal success');
+  });
+
+  test('ambiguous legacy acceptance permits only the exact pinned-key retry', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-ambiguous',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: {
+              brand: { domain: 'example.com' },
+              start_time: '2027-01-01T00:00:00Z',
+              end_time: '2027-02-01T00:00:00Z',
+            },
+          },
+        ],
+        cache_scope: 'account',
+      });
+    const requests = [];
+    let failTransport = true;
+    agent.createMediaBuy = async request => {
+      requests.push(request);
+      if (failTransport) throw new Error('ambiguous transport failure');
+      return completed('create_media_buy', { media_buy_id: 'mb-ambiguous-retry' });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-ambiguous',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    await coordinator.requestProposals({ brief: 'ambiguous accept', account: { account_id: 'account-1' } });
+
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: 'proposal-ambiguous',
+      }),
+      /ambiguous transport failure/
+    );
+    await assert.rejects(
+      coordinator.acceptProposal({
+        idempotency_key: 'ambiguous-fresh-key-0002',
+        account: { account_id: 'account-1' },
+        proposal_id: 'proposal-ambiguous',
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_retry'
+    );
+    failTransport = false;
+    assert.equal(
+      (
+        await coordinator.acceptProposal({
+          account: { account_id: 'account-1' },
+          proposal_id: 'proposal-ambiguous',
+        })
+      ).status,
+      'completed'
+    );
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].idempotency_key, requests[1].idempotency_key);
+  });
+
+  test('executor-wrapped transport failure permits only the exact pinned-key retry', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-transport-failed',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: {
+              brand: { domain: 'example.com' },
+              start_time: '2027-01-01T00:00:00Z',
+              end_time: '2027-02-01T00:00:00Z',
+            },
+          },
+        ],
+        cache_scope: 'account',
+      });
+    const requests = [];
+    let wrapFailure = true;
+    agent.createMediaBuy = async request => {
+      requests.push(request);
+      if (!wrapFailure) return completed('create_media_buy', { media_buy_id: 'mb-wrapped-retry' });
+      const result = failed('create_media_buy');
+      result.metadata.taskName = 'unknown';
+      return result;
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-transport-failed',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    await coordinator.requestProposals({ brief: 'transport failure', account: { account_id: 'account-1' } });
+
+    const first = await coordinator.acceptProposal({
+      account: { account_id: 'account-1' },
+      proposal_id: 'proposal-transport-failed',
+    });
+    assert.equal(first.success, false);
+    await assert.rejects(
+      coordinator.acceptProposal({
+        idempotency_key: 'transport-failure-fresh-key-0002',
+        account: { account_id: 'account-1' },
+        proposal_id: 'proposal-transport-failed',
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_retry'
+    );
+    wrapFailure = false;
+    assert.equal(
+      (
+        await coordinator.acceptProposal({
+          account: { account_id: 'account-1' },
+          proposal_id: 'proposal-transport-failed',
+        })
+      ).status,
+      'completed'
+    );
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].idempotency_key, requests[1].idempotency_key);
+  });
+
+  test('paused legacy acceptance restores the proposal for the required retry', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const pausedExpiresAt = new Date(Date.now() + 100).toISOString();
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-paused',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            expires_at: pausedExpiresAt,
+            commercial_terms: {
+              brand: { domain: 'example.com' },
+              start_time: '2027-01-01T00:00:00Z',
+              end_time: '2027-02-01T00:00:00Z',
+            },
+          },
+        ],
+        cache_scope: 'account',
+      });
+    const mutationKeys = [];
+    agent.createMediaBuy = async request => {
+      mutationKeys.push(request.idempotency_key);
+      const mutations = mutationKeys.length;
+      if (mutations <= 2) {
+        return { ...working('create_media_buy'), status: mutations === 1 ? 'input-required' : 'auth-required' };
+      }
+      return completed('create_media_buy', { media_buy_id: 'mb-paused-retry' });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-paused',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    await coordinator.requestProposals({ brief: 'paused accept', account: { account_id: 'account-1' } });
+    const pausedCredential = 'paused-secret-must-not-be-retained';
+    const acceptance = {
+      account: { account_id: 'account-1' },
+      proposal_id: 'proposal-paused',
+      push_notification_config: {
+        url: 'https://example.com/tasks',
+        authentication: { schemes: ['HMAC-SHA256'], credentials: pausedCredential },
+      },
+    };
+
+    assert.equal((await coordinator.acceptProposal(acceptance)).status, 'input-required');
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.doesNotMatch(
+      JSON.stringify([...coordinator.proposalSnapshotStore.entries.values()]),
+      new RegExp(pausedCredential),
+      'acceptance reservations must retain only a request digest, never credentials'
+    );
+    await assert.rejects(
+      coordinator.acceptProposal({ ...acceptance, idempotency_key: 'paused-fresh-key-0002' }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_retry'
+    );
+    await assert.rejects(
+      coordinator.acceptProposal({
+        ...acceptance,
+        push_notification_config: {
+          ...acceptance.push_notification_config,
+          authentication: { schemes: ['HMAC-SHA256'], credentials: 'changed-secret' },
+        },
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_retry'
+    );
+    assert.equal((await coordinator.acceptProposal(acceptance)).status, 'auth-required');
+    assert.equal((await coordinator.acceptProposal(acceptance)).status, 'completed');
+    await assert.rejects(
+      coordinator.acceptProposal(acceptance),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    assert.equal(mutationKeys.length, 3);
+    assert.equal(new Set(mutationKeys).size, 1, 'paused retries must reuse the coordinator-pinned idempotency key');
+  });
+
+  test('paused acceptance remains exactly retryable after its task watcher expires', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-long-pause',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: {
+              brand: { domain: 'example.com' },
+              start_time: '2027-01-01T00:00:00Z',
+              end_time: '2027-02-01T00:00:00Z',
+            },
+          },
+        ],
+        cache_scope: 'account',
+      });
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return mutations === 1
+        ? { ...working('create_media_buy'), status: 'input-required' }
+        : completed('create_media_buy', { media_buy_id: 'mb-after-long-pause' });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-long-pause',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    const coordinatorClass = coordinator.constructor;
+    const originalTtl = coordinatorClass.PROPOSAL_TASK_WATCH_TTL_MS;
+    coordinatorClass.PROPOSAL_TASK_WATCH_TTL_MS = 10;
+    const acceptance = {
+      account: { account_id: 'account-1' },
+      proposal_id: 'proposal-long-pause',
+    };
+
+    try {
+      await coordinator.requestProposals({ brief: 'long pause', account: acceptance.account });
+      assert.equal((await coordinator.acceptProposal(acceptance)).status, 'input-required');
+      await new Promise(resolve => setTimeout(resolve, 30));
+      assert.equal((await coordinator.acceptProposal(acceptance)).status, 'completed');
+      assert.equal(mutations, 2);
+    } finally {
+      coordinatorClass.PROPOSAL_TASK_WATCH_TTL_MS = originalTtl;
+      coordinator.dispose();
+    }
+  });
+
+  test('paused acceptance retires at the seller idempotency replay deadline', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-replay-deadline',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: {
+              brand: { domain: 'example.com' },
+              start_time: '2027-01-01T00:00:00Z',
+              end_time: '2027-02-01T00:00:00Z',
+            },
+          },
+        ],
+        cache_scope: 'account',
+      });
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return { ...working('create_media_buy'), status: 'input-required' };
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-replay-deadline',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    coordinator.idempotencyReplayTtlMs = 20;
+    const acceptance = {
+      account: { account_id: 'account-1' },
+      proposal_id: 'proposal-replay-deadline',
+    };
+    await coordinator.requestProposals({ brief: 'replay deadline', account: acceptance.account });
+    assert.equal((await coordinator.acceptProposal(acceptance)).status, 'input-required');
+    await new Promise(resolve => setTimeout(resolve, 40));
+    await assert.rejects(
+      coordinator.acceptProposal(acceptance),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    assert.equal(mutations, 1);
+  });
+
+  test('paused retry rechecks the replay deadline immediately before dispatch', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-replay-deadline-race',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: {
+              brand: { domain: 'example.com' },
+              start_time: '2027-01-01T00:00:00Z',
+              end_time: '2027-02-01T00:00:00Z',
+            },
+          },
+        ],
+        cache_scope: 'account',
+      });
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return mutations === 1
+        ? { ...working('create_media_buy'), status: 'input-required' }
+        : completed('create_media_buy', { media_buy_id: 'must-not-dispatch' });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-replay-deadline-race',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    const acceptance = {
+      account: { account_id: 'account-1' },
+      proposal_id: 'proposal-replay-deadline-race',
+    };
+    await coordinator.requestProposals({ brief: 'replay deadline race', account: acceptance.account });
+    assert.equal((await coordinator.acceptProposal(acceptance)).status, 'input-required');
+    const reservation = [...coordinator.ownedAcceptanceReservations.keys()][0];
+    const deadline = reservation.retryDeadlineMs;
+    const realNow = Date.now;
+    let clockReads = 0;
+    Date.now = () => (clockReads++ === 0 ? deadline - 1 : deadline);
+    try {
+      await assert.rejects(
+        coordinator.acceptProposal(acceptance),
+        error =>
+          error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_retry_window'
+      );
+    } finally {
+      Date.now = realNow;
+    }
+    assert.equal(mutations, 1);
+    assert.equal(coordinator.ownedAcceptanceReservations.size, 0);
+  });
+
+  test('paused acceptance without an advertised replay guarantee fails closed', async () => {
+    const caps = capabilities({ version: '3.1' });
+    delete caps.idempotency;
+    const agent = clientWithCaps(caps);
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-missing-replay-guarantee',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: {
+              brand: { domain: 'example.com' },
+              start_time: '2027-01-01T00:00:00Z',
+              end_time: '2027-02-01T00:00:00Z',
+            },
+          },
+        ],
+        cache_scope: 'account',
+      });
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return { ...working('create_media_buy'), status: 'auth-required' };
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-missing-replay-guarantee',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    const acceptance = {
+      account: { account_id: 'account-1' },
+      proposal_id: 'proposal-missing-replay-guarantee',
+    };
+    await coordinator.requestProposals({ brief: 'missing replay guarantee', account: acceptance.account });
+    assert.equal((await coordinator.acceptProposal(acceptance)).status, 'auth-required');
+    assert.equal(coordinator.ownedAcceptanceReservations.size, 0);
+    assert.equal(coordinator.pendingAcceptanceTasks.size, 0);
+    assert.equal(coordinator.acceptanceRetryExpiryTimers.size, 0);
+    await assert.rejects(
+      coordinator.acceptProposal(acceptance),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    assert.equal(mutations, 1);
+  });
+
+  test('paused acceptance without an idempotency key fails closed', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-no-retry-key',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: {
+              brand: { domain: 'example.com' },
+              start_time: '2027-01-01T00:00:00Z',
+              end_time: '2027-02-01T00:00:00Z',
+            },
+          },
+        ],
+        cache_scope: 'account',
+      });
+    const requests = [];
+    agent.createMediaBuy = async request => {
+      requests.push(request);
+      return { ...working('create_media_buy'), status: 'input-required' };
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-no-retry-key',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    const acceptance = {
+      account: { account_id: 'account-1' },
+      proposal_id: 'proposal-no-retry-key',
+    };
+    const options = { skipIdempotencyAutoInject: true };
+    await coordinator.requestProposals({ brief: 'no retry key', account: acceptance.account });
+
+    assert.equal((await coordinator.acceptProposal(acceptance, undefined, options)).status, 'input-required');
+    assert.equal(requests[0].idempotency_key, undefined);
+    await assert.rejects(
+      coordinator.acceptProposal(acceptance, undefined, options),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    assert.equal(requests.length, 1);
+  });
+
+  test('completed task envelopes with operation errors restore submitted acceptance', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-completed-error',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: {
+              brand: { domain: 'example.com' },
+              start_time: '2027-01-01T00:00:00Z',
+              end_time: '2027-02-01T00:00:00Z',
+            },
+          },
+        ],
+        cache_scope: 'account',
+      });
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      if (mutations === 1) {
+        return submitted(
+          'create_media_buy',
+          completed('create_media_buy', { success: false, error: 'seller rejected the operation' })
+        );
+      }
+      return completed('create_media_buy', { media_buy_id: 'mb-after-operation-error' });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-completed-error',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    const acceptance = {
+      account: { account_id: 'account-1' },
+      proposal_id: 'proposal-completed-error',
+    };
+    await coordinator.requestProposals({ brief: 'completed operation error', account: acceptance.account });
+
+    const pending = await coordinator.acceptProposal(acceptance);
+    assert.equal((await pending.submitted.track()).status, 'completed');
+    assert.equal((await coordinator.acceptProposal(acceptance)).status, 'completed');
+    assert.equal(mutations, 2);
+  });
+
+  test('submitted legacy acceptance applies terminal failure and pause transitions', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const proposal = proposal_id => ({
+      proposal_id,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      },
+    });
+    let proposals = [proposal('proposal-submitted-failed')];
+    agent.getProducts = async () => completed('get_products', { proposals, cache_scope: 'account' });
+    const requests = [];
+    let terminal = failed('create_media_buy');
+    agent.createMediaBuy = async request => {
+      requests.push(request);
+      return submitted('create_media_buy', terminal);
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-submitted',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    const account = { account_id: 'account-1' };
+    await coordinator.requestProposals({ brief: 'submitted failure', account });
+
+    const failedPending = await coordinator.acceptProposal({
+      account,
+      proposal_id: 'proposal-submitted-failed',
+    });
+    assert.equal((await failedPending.submitted.waitForCompletion()).status, 'failed');
+    terminal = completed('create_media_buy', { media_buy_id: 'mb-after-submitted-failure' });
+    assert.equal(
+      (await coordinator.acceptProposal({ account, proposal_id: 'proposal-submitted-failed' })).status,
+      'submitted'
+    );
+
+    proposals = [proposal('proposal-submitted-paused')];
+    await coordinator.requestProposals({ brief: 'submitted pause', account });
+    terminal = { ...working('create_media_buy'), status: 'input-required' };
+    const pausedPending = await coordinator.acceptProposal({ account, proposal_id: 'proposal-submitted-paused' });
+    assert.equal((await pausedPending.submitted.waitForCompletion()).status, 'input-required');
+    const pausedKey = requests.at(-1).idempotency_key;
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account,
+        proposal_id: 'proposal-submitted-paused',
+        idempotency_key: 'submitted-paused-fresh-key',
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_retry'
+    );
+    terminal = completed('create_media_buy', { media_buy_id: 'mb-after-submitted-pause' });
+    await coordinator.acceptProposal({ account, proposal_id: 'proposal-submitted-paused' });
+    assert.equal(requests.at(-1).idempotency_key, pausedKey);
+  });
+
+  test('stale submitted continuation cannot mutate a newer completed retry', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const proposal = {
+      proposal_id: 'proposal-stale-continuation',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      },
+    };
+    agent.getProducts = async () => completed('get_products', { proposals: [proposal], cache_scope: 'account' });
+    let firstAttempt = true;
+    agent.createMediaBuy = async () => {
+      if (firstAttempt) {
+        firstAttempt = false;
+        return submitted('create_media_buy', { ...working('create_media_buy'), status: 'input-required' });
+      }
+      return completed('create_media_buy', { media_buy_id: 'mb-stale-retry' });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-stale-continuation',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    const acceptance = {
+      account: { account_id: 'account-1' },
+      proposal_id: proposal.proposal_id,
+    };
+    await coordinator.requestProposals({ brief: 'stale continuation', account: acceptance.account });
+
+    const oldAttempt = await coordinator.acceptProposal(acceptance);
+    assert.equal((await oldAttempt.submitted.track()).status, 'input-required');
+    assert.equal((await coordinator.acceptProposal(acceptance)).status, 'completed');
+    assert.equal((await oldAttempt.submitted.waitForCompletion()).status, 'input-required');
+    await coordinator.requestProposals({ brief: 'rediscover after stale continuation', account: acceptance.account });
+    await assert.rejects(
+      coordinator.acceptProposal({ ...acceptance, idempotency_key: 'stale-fresh-key-0003' }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+  });
+
+  test('unknown track and deferred-to-aborted updates allow only pinned-key retries', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const proposal = proposal_id => ({
+      proposal_id,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      },
+    });
+    let proposals = [proposal('proposal-unknown-track')];
+    agent.getProducts = async () => completed('get_products', { proposals, cache_scope: 'account' });
+    const taskListeners = new Set();
+    agent.onTaskUpdate = listener => {
+      taskListeners.add(listener);
+      return () => taskListeners.delete(listener);
+    };
+    let mode = 'unknown-track';
+    agent.createMediaBuy = async () => {
+      if (mode === 'unknown-track') return submitted('create_media_buy', { status: 'unknown' });
+      if (mode === 'working') return working('create_media_buy');
+      return completed('create_media_buy', { media_buy_id: 'mb-status-retry' });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-ambiguous-status',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    const account = { account_id: 'account-1' };
+    await coordinator.requestProposals({ brief: 'unknown track', account });
+    const unknown = await coordinator.acceptProposal({ account, proposal_id: 'proposal-unknown-track' });
+    assert.equal((await unknown.submitted.track()).status, 'unknown');
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account,
+        proposal_id: 'proposal-unknown-track',
+        idempotency_key: 'unknown-track-fresh-key',
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_retry'
+    );
+    mode = 'completed';
+    assert.equal(
+      (await coordinator.acceptProposal({ account, proposal_id: 'proposal-unknown-track' })).status,
+      'completed'
+    );
+
+    proposals = [proposal('proposal-deferred-aborted')];
+    await coordinator.requestProposals({ brief: 'deferred then aborted', account });
+    mode = 'working';
+    assert.equal(
+      (await coordinator.acceptProposal({ account, proposal_id: 'proposal-deferred-aborted' })).status,
+      'working'
+    );
+    const update = status => ({
+      taskId: 'create_media_buy-task',
+      status,
+      taskType: 'create_media_buy',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    for (const listener of [...taskListeners]) listener(update('deferred'));
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account,
+        proposal_id: 'proposal-deferred-aborted',
+        idempotency_key: 'deferred-fresh-key-0001',
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_retry'
+    );
+    for (const listener of [...taskListeners]) listener(update('aborted'));
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account,
+        proposal_id: 'proposal-deferred-aborted',
+        idempotency_key: 'aborted-fresh-key-0002',
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_acceptance_retry'
+    );
+    mode = 'completed';
+    assert.equal(
+      (await coordinator.acceptProposal({ account, proposal_id: 'proposal-deferred-aborted' })).status,
+      'completed'
+    );
+  });
+
+  test('working legacy acceptance restores after an explicit failed task update', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const taskListeners = new Set();
+    agent.onTaskUpdate = listener => {
+      taskListeners.add(listener);
+      return () => taskListeners.delete(listener);
+    };
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-working-failed',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: {
+              brand: { domain: 'example.com' },
+              start_time: '2027-01-01T00:00:00Z',
+              end_time: '2027-02-01T00:00:00Z',
+            },
+          },
+        ],
+        cache_scope: 'account',
+      });
+    let complete = false;
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return complete
+        ? completed('create_media_buy', { media_buy_id: 'mb-working-retry' })
+        : working('create_media_buy');
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-working-failed',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    const acceptance = {
+      account: { account_id: 'account-1' },
+      proposal_id: 'proposal-working-failed',
+    };
+    await coordinator.requestProposals({ brief: 'working failure', account: acceptance.account });
+    assert.equal((await coordinator.acceptProposal(acceptance)).status, 'working');
+    assert.equal(taskListeners.size, 1);
+    for (const listener of [...taskListeners]) {
+      listener({
+        taskId: 'create_media_buy-task',
+        status: 'failed',
+        taskType: 'create_media_buy',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    }
+    assert.equal(taskListeners.size, 0);
+    complete = true;
+    assert.equal((await coordinator.acceptProposal(acceptance)).status, 'completed');
+    assert.equal(mutations, 2);
+  });
+
+  test('failed acceptance restore remains bounded during a concurrent proposal refill', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const proposal = index => ({
+      proposal_id: `bounded-proposal-${index}`,
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: commercialTerms,
+    });
+    let nextProposals = Array.from({ length: 256 }, (_, index) => proposal(index));
+    agent.getProducts = async () => completed('get_products', { proposals: nextProposals, cache_scope: 'account' });
+    let coordinator;
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      if (mutations === 1) {
+        nextProposals = [proposal(256)];
+        await coordinator.requestProposals({ brief: 'concurrent refill', account: { account_id: 'account-1' } });
+        return failed('create_media_buy');
+      }
+      return completed('create_media_buy', { media_buy_id: 'mb-restored' });
+    };
+    coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-bounded-restore',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    await coordinator.requestProposals({ brief: 'seed cache', account: { account_id: 'account-1' } });
+
+    const failedAcceptance = await coordinator.acceptProposal({
+      account: { account_id: 'account-1' },
+      proposal_id: 'bounded-proposal-0',
+    });
+    assert.equal(failedAcceptance.success, false);
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: 'bounded-proposal-1',
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    await coordinator.acceptProposal({
+      account: { account_id: 'account-1' },
+      proposal_id: 'bounded-proposal-0',
+    });
+    assert.equal(mutations, 2, 'the failed snapshot is restored without exceeding the shared cache ceiling');
+  });
+
+  test('digest-bound proposal terms cannot be overridden during established acceptance', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let mutations = 0;
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+      total_budget: { amount: 1000, currency: 'USD' },
+      daily_budget_cap: 100,
+      purchase_order_ref: 'PO-SELLER',
+    };
+    const digest = proposalTermsDigest(commercialTerms);
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-1',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            terms_digest: digest,
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: commercialTerms,
+          },
+        ],
+      });
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    await coordinator.requestProposals({ brief: 'test', account: { account_id: 'account-1' } });
+
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: 'proposal-1',
+        proposal_terms_digest: digest,
+        total_budget: { amount: 1, currency: 'USD' },
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.code === 'PROPOSAL_DIGEST_MISMATCH'
+    );
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: 'proposal-1',
+        proposal_terms_digest: digest,
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError &&
+        error.feature === 'commercial_terms.daily_budget_cap,budget_cap_timezone'
+    );
+    assert.equal(mutations, 0);
+  });
+
+  test('oversized seller proposals are not retained as executable acceptance snapshots', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let mutations = 0;
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'oversized',
+            commercial_terms: {
+              brand: { domain: 'example.com', padding: 'x'.repeat(300 * 1024) },
+            },
+          },
+        ],
+      });
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+        'proposal_hold_not_verifiable',
+      ],
+    });
+    await coordinator.requestProposals({ brief: 'test', account: { account_id: 'account-1' } });
+
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: 'oversized',
+        established_fallback: {
+          brand: { domain: 'example.com' },
+          start_time: '2027-01-01T00:00:00Z',
+          end_time: '2027-02-01T00:00:00Z',
+        },
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    assert.equal(mutations, 0);
+  });
+
+  test('seller proposals containing camelCase credential-shaped keys are never cached', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let mutations = 0;
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'credential-bearing-proposal',
+            commercial_terms: { accessToken: 'must-not-enter-snapshot-cache' },
+          },
+        ],
+      });
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+        'proposal_hold_not_verifiable',
+      ],
+    });
+    await coordinator.requestProposals({ brief: 'test', account: { account_id: 'account-1' } });
+
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: 'credential-bearing-proposal',
+        established_fallback: {
+          brand: { domain: 'example.com' },
+          start_time: '2027-01-01T00:00:00Z',
+          end_time: '2027-02-01T00:00:00Z',
+        },
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    assert.equal(mutations, 0);
+  });
+
+  test('credential-bearing or schema-invalid proposal metadata is never cached', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'invalid-metadata-proposal',
+            terms_digest: { accessToken: 'must-not-enter-snapshot-cache' },
+            commercial_terms: {
+              brand: { domain: 'example.com' },
+              start_time: '2027-01-01T00:00:00Z',
+              end_time: '2027-02-01T00:00:00Z',
+            },
+          },
+        ],
+      });
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ principalScope: 'buyer-tenant-1' });
+    await coordinator.requestProposals({ brief: 'test', account: { account_id: 'account-1' } });
+
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: 'invalid-metadata-proposal',
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+  });
+
+  test('seller proposals containing presigned URLs are never cached', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let mutations = 0;
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'presigned-url-proposal',
+            commercial_terms: {
+              brand: {
+                domain: 'example.com',
+                logo_url: 'https://assets.example/logo?X-Amz-Signature=must-not-enter-snapshot-cache',
+              },
+            },
+          },
+        ],
+      });
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+        'proposal_hold_not_verifiable',
+      ],
+    });
+    await coordinator.requestProposals({ brief: 'test', account: { account_id: 'account-1' } });
+
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: 'presigned-url-proposal',
+        established_fallback: {
+          brand: { domain: 'example.com' },
+          start_time: '2027-01-01T00:00:00Z',
+          end_time: '2027-02-01T00:00:00Z',
+        },
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    assert.equal(mutations, 0);
+  });
+
+  test('an unsafe or non-terminal same-ID response invalidates an older executable snapshot', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const digest = proposalTermsDigest(commercialTerms);
+    let response = completed('get_products', {
+      proposals: [
+        {
+          proposal_id: 'replace-me',
+          proposal_kind: 'new_media_buy',
+          proposal_status: 'committed',
+          terms_digest: digest,
+          expires_at: '2099-12-31T23:59:59Z',
+          commercial_terms: commercialTerms,
+        },
+      ],
+    });
+    agent.getProducts = async () => response;
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    const request = { brief: 'test', account: { account_id: 'account-1' } };
+    const accept = () =>
+      coordinator.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: 'replace-me',
+        proposal_terms_digest: digest,
+      });
+
+    await coordinator.requestProposals(request);
+    response = completed('get_products', {
+      proposals: [{ proposal_id: 'replace-me', commercial_terms: { accessToken: 'unsafe' } }],
+    });
+    await coordinator.requestProposals(request);
+    await assert.rejects(
+      accept(),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+
+    response = completed('get_products', {
+      proposals: [
+        {
+          proposal_id: 'replace-me',
+          proposal_kind: 'new_media_buy',
+          proposal_status: 'committed',
+          terms_digest: digest,
+          expires_at: '2099-12-31T23:59:59Z',
+          commercial_terms: commercialTerms,
+        },
+      ],
+    });
+    await coordinator.requestProposals(request);
+    response = { ...working('get_products'), data: { proposals: [{ proposal_id: 'replace-me' }] } };
+    await coordinator.requestProposals(request);
+    await assert.rejects(
+      accept(),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    assert.equal(mutations, 0);
+  });
+
+  test('proposal account scope cannot be borrowed across authenticated principals', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const proposal = {
+      proposal_id: 'shared-principal-proposal',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      },
+    };
+    proposal.terms_digest = proposalTermsDigest(proposal.commercial_terms);
+    agent.getProducts = async () => completed('get_products', { proposals: [proposal] });
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', {});
+    };
+    const options = principalScope => ({
+      principalScope,
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    const first = await agent.negotiateMediaBuyLifecycle(options('buyer-tenant-1'));
+    await first.requestProposals({ brief: 'test', account: { account_id: 'account-1' } });
+
+    const second = await agent.negotiateMediaBuyLifecycle(options('buyer-tenant-2'));
+    await second.refineProposals({
+      refinements: [{ proposal_id: proposal.proposal_id, action: 'revise', ask: 'same terms' }],
+    });
+    await assert.rejects(
+      second.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: proposal.proposal_id,
+        proposal_terms_digest: proposal.terms_digest,
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    assert.equal(mutations, 0);
+  });
+
+  test('same-key refinement replay cannot resurrect a source retired by an ambiguous failure', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const proposal = {
+      proposal_id: 'refine-retry-proposal',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      },
+    };
+    proposal.terms_digest = proposalTermsDigest(proposal.commercial_terms);
+    let calls = 0;
+    agent.getProducts = async () => {
+      calls += 1;
+      if (calls === 2) throw new Error('transport closed after seller committed refinement');
+      return completed('get_products', { proposals: [proposal] });
+    };
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', { media_buy_id: 'mb-refined', revision: 1 });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    await coordinator.requestProposals({ brief: 'test', account: { account_id: 'account-1' } });
+    const refinement = {
+      idempotency_key: 'same-refinement-retry-key-0001',
+      refinements: [{ proposal_id: proposal.proposal_id, action: 'revise', ask: 'same terms' }],
+    };
+
+    await assert.rejects(coordinator.refineProposals(refinement), /transport closed/);
+    await coordinator.refineProposals(refinement);
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: proposal.proposal_id,
+        proposal_terms_digest: proposal.terms_digest,
+      }),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    assert.equal(mutations, 0);
+  });
+
+  test('proposal snapshot ceiling is shared by coordinators for the same authenticated AgentClient', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const digest = proposalTermsDigest(commercialTerms);
+    const calls = [];
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'shared-agent-snapshot',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            terms_digest: digest,
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: commercialTerms,
+          },
+        ],
+      });
+    agent.createMediaBuy = async request => {
+      calls.push(request);
+      return completed('create_media_buy', { media_buy_id: 'mb-shared', revision: 1 });
+    };
+    const options = {
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    };
+    const discoveryCoordinator = await agent.negotiateMediaBuyLifecycle(options);
+    await discoveryCoordinator.requestProposals({ brief: 'test', account: { account_id: 'account-1' } });
+
+    const acceptanceCoordinator = await agent.negotiateMediaBuyLifecycle(options);
+    await acceptanceCoordinator.acceptProposal({
+      account: { account_id: 'account-1' },
+      proposal_id: 'shared-agent-snapshot',
+      proposal_terms_digest: digest,
+    });
+
+    assert.equal(calls.length, 1);
+  });
+
+  test('proposal snapshot quotas and tombstones are isolated by authenticated principal', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const digest = proposalTermsDigest(commercialTerms);
+    const protectedProposal = {
+      proposal_id: 'principal-isolated-proposal',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'committed',
+      terms_digest: digest,
+      expires_at: '2099-12-31T23:59:59Z',
+      commercial_terms: commercialTerms,
+    };
+    let response;
+    agent.getProducts = async () => completed('get_products', response);
+    let mutations = 0;
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', { media_buy_id: 'principal-isolated-buy', revision: 1 });
+    };
+    const options = principalScope => ({
+      principalScope,
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    const noisyCoordinators = [];
+    for (let principal = 0; principal < 4; principal += 1) {
+      response = {
+        proposals: Array.from({ length: 300 }, (_, index) => ({
+          ...protectedProposal,
+          proposal_id: `noisy-principal-${principal}-proposal-${index}`,
+        })),
+      };
+      const noisyCoordinator = await agent.negotiateMediaBuyLifecycle(options(`noisy-principal-${principal}`));
+      await noisyCoordinator.requestProposals({ brief: 'pressure', account: { account_id: 'account-1' } });
+      assert.ok(noisyCoordinator.proposalSnapshotStore.entries.size <= 256);
+      noisyCoordinators.push(noisyCoordinator);
+    }
+
+    response = { proposals: [protectedProposal] };
+    const protectedCoordinator = await agent.negotiateMediaBuyLifecycle(options('protected-principal'));
+    await protectedCoordinator.requestProposals({ brief: 'protected', account: { account_id: 'account-1' } });
+    assert.equal(protectedCoordinator.proposalSnapshotStore.entries.size, 1);
+    for (const noisyCoordinator of noisyCoordinators) {
+      assert.notEqual(noisyCoordinator.proposalSnapshotStore, protectedCoordinator.proposalSnapshotStore);
+    }
+
+    await protectedCoordinator.acceptProposal({
+      account: { account_id: 'account-1' },
+      proposal_id: protectedProposal.proposal_id,
+      proposal_terms_digest: digest,
+    });
+    assert.equal(mutations, 1);
+    noisyCoordinators.forEach(coordinator => coordinator.dispose());
+    protectedCoordinator.dispose();
+  });
+
+  test('an honest 3.0/3.1 proposal remains executable with explicit legacy guarantee losses', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    const calls = [];
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'legacy-proposal-1',
+            name: 'Legacy proposal',
+            proposal_status: 'committed',
+            expires_at: '2099-12-31T23:59:59Z',
+            allocations: [{ product_id: 'product-1', pricing_option_id: 'option-1', allocation_percentage: 100 }],
+          },
+        ],
+        cache_scope: 'account',
+      });
+    agent.createMediaBuy = async request => {
+      calls.push(request);
+      return completed('create_media_buy', { media_buy_id: 'mb-legacy', revision: 1 });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: [
+        'proposal_terms_digest_not_enforced',
+        'proposal_terms_digest_unavailable',
+        'proposal_snapshot_not_immutable',
+      ],
+    });
+    await coordinator.requestProposals({
+      brief: 'test',
+      account: { account_id: 'account-1' },
+      brand: { domain: 'example.com' },
+    });
+
+    const result = await coordinator.acceptProposal({
+      account: { account_id: 'account-1' },
+      proposal_id: 'legacy-proposal-1',
+      total_budget: { amount: 1000, currency: 'USD' },
+      established_fallback: {
+        brand: { domain: 'example.com' },
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+      },
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].proposal_id, 'legacy-proposal-1');
+    assert.equal(calls[0].proposal_terms_digest, undefined);
+    assert.deepEqual(result.compatibility.losses, [
+      'proposal_terms_digest_not_enforced',
+      'proposal_terms_digest_unavailable',
+      'proposal_snapshot_not_immutable',
+    ]);
+  });
+
+  test('caller mutation cannot alter the private seller proposal snapshot', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let mutations = 0;
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const sellerDigest = proposalTermsDigest(commercialTerms);
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-1',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            terms_digest: sellerDigest,
+            expires_at: '2099-12-31T23:59:59Z',
+            commercial_terms: commercialTerms,
+          },
+        ],
+        cache_scope: 'account',
+      });
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    const requested = await coordinator.requestProposals({
+      brief: 'test',
+      account: { account_id: 'account-1' },
+    });
+    const exposed = requested.data.proposals[0];
+    exposed.commercial_terms.brand.domain = 'attacker.example';
+    exposed.terms_digest = proposalTermsDigest(exposed.commercial_terms);
+
+    await assert.rejects(
+      coordinator.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: 'proposal-1',
+        proposal_terms_digest: exposed.terms_digest,
+      }),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.code === 'PROPOSAL_DIGEST_MISMATCH'
+    );
+    assert.equal(mutations, 0);
+  });
+
+  test('legacy proposal acceptance is account-scoped and committed-new-buy only', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let mutations = 0;
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const sellerDigest = proposalTermsDigest(commercialTerms);
+    let proposal = {
+      proposal_id: 'proposal-shared',
+      proposal_kind: 'media_buy_cancellation',
+      proposal_status: 'committed',
+      terms_digest: sellerDigest,
+      commercial_terms: commercialTerms,
+    };
+    agent.getProducts = async () => completed('get_products', { proposals: [proposal], cache_scope: 'account' });
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    await coordinator.requestProposals({ brief: 'test', account: { account_id: 'account-a' } });
+
+    const accept = (account_id, proposal_id = 'proposal-shared') =>
+      coordinator.acceptProposal({
+        account: { account_id },
+        proposal_id,
+        proposal_terms_digest: sellerDigest,
+      });
+    await assert.rejects(
+      accept('account-b'),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_snapshot/account_scope'
+    );
+    await assert.rejects(
+      accept('account-a'),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_kind'
+    );
+
+    proposal = { ...proposal, proposal_id: 'proposal-draft', proposal_kind: 'new_media_buy', proposal_status: 'draft' };
+    await coordinator.requestProposals({ brief: 'test', account: { account_id: 'account-a' } });
+    await assert.rejects(
+      accept('account-a', 'proposal-draft'),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'proposal_status'
+    );
+    assert.equal(mutations, 0);
+  });
+
+  test('legacy proposal acceptance requires opt-in for an unverifiable hold and rejects an expired hold', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.1' }));
+    let mutations = 0;
+    let expires_at;
+    const commercialTerms = {
+      brand: { domain: 'example.com' },
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    const digest = proposalTermsDigest(commercialTerms);
+    agent.getProducts = async () =>
+      completed('get_products', {
+        proposals: [
+          {
+            proposal_id: 'proposal-1',
+            proposal_kind: 'new_media_buy',
+            proposal_status: 'committed',
+            terms_digest: digest,
+            ...(expires_at && { expires_at }),
+            commercial_terms: commercialTerms,
+          },
+        ],
+        cache_scope: 'account',
+      });
+    agent.createMediaBuy = async () => {
+      mutations += 1;
+      return completed('create_media_buy', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({
+      principalScope: 'buyer-tenant-1',
+      allowedLosses: ['proposal_terms_digest_not_enforced'],
+    });
+    const accept = () =>
+      coordinator.acceptProposal({
+        account: { account_id: 'account-1' },
+        proposal_id: 'proposal-1',
+        proposal_terms_digest: digest,
+      });
+
+    await coordinator.requestProposals({ brief: 'test', account: { account_id: 'account-1' } });
+    await assert.rejects(
+      accept(),
+      error =>
+        error instanceof MediaBuyLifecycleCompatibilityError && error.losses.includes('proposal_hold_not_verifiable')
+    );
+
+    expires_at = '2000-01-01T00:00:00Z';
+    await coordinator.requestProposals({ brief: 'test', account: { account_id: 'account-1' } });
+    await assert.rejects(
+      accept(),
+      error => error instanceof MediaBuyLifecycleCompatibilityError && error.feature === 'expires_at'
+    );
+    assert.equal(mutations, 0);
+  });
+
+  test('legacy operational control maps revision, pause, and cancellation exactly', async () => {
+    const agent = clientWithCaps(capabilities({ version: '3.0' }));
+    const calls = [];
+    agent.updateMediaBuy = async request => {
+      calls.push(request);
+      return completed('update_media_buy', { media_buy_id: request.media_buy_id, revision: 4 });
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+    const paused = await coordinator.controlMediaBuy({
+      idempotency_key: 'control-compat-key-0001',
+      account: { account_id: 'account-1' },
+      media_buy_id: 'mb-1',
+      revision: 3,
+      paused: true,
+    });
+    const canceled = await coordinator.controlMediaBuy({
+      idempotency_key: 'control-compat-key-0002',
+      account: { account_id: 'account-1' },
+      media_buy_id: 'mb-1',
+      revision: 4,
+      canceled: true,
+      cancellation_reason: 'buyer request',
+    });
+
+    assert.equal(calls.length, 2);
+    assert.deepEqual(
+      {
+        idempotency_key: calls[0].idempotency_key,
+        media_buy_id: calls[0].media_buy_id,
+        revision: calls[0].revision,
+        paused: calls[0].paused,
+        canceled: calls[0].canceled,
+      },
+      {
+        idempotency_key: 'control-compat-key-0001',
+        media_buy_id: 'mb-1',
+        revision: 3,
+        paused: true,
+        canceled: undefined,
+      }
+    );
+    assert.deepEqual(
+      {
+        idempotency_key: calls[1].idempotency_key,
+        media_buy_id: calls[1].media_buy_id,
+        revision: calls[1].revision,
+        paused: calls[1].paused,
+        canceled: calls[1].canceled,
+        cancellation_reason: calls[1].cancellation_reason,
+      },
+      {
+        idempotency_key: 'control-compat-key-0002',
+        media_buy_id: 'mb-1',
+        revision: 4,
+        paused: undefined,
+        canceled: true,
+        cancellation_reason: 'buyer request',
+      }
+    );
+    assert.equal(paused.compatibility.compatibility, 'lossless_projection');
+    assert.equal(canceled.compatibility.compatibility, 'lossless_projection');
+  });
+
+  test('rejects media-buy cancellation combined with name on compact and established lifecycles', async () => {
+    for (const { version, tools } of [{ version: '3.0' }, { version: '3.2.1', tools: COMPACT_TOOLS }]) {
+      const agent = clientWithCaps(capabilities({ version, tools }));
+      let mutations = 0;
+      agent.updateMediaBuy = async () => {
+        mutations += 1;
+        return completed('update_media_buy', {});
+      };
+      agent.controlMediaBuy = async () => {
+        mutations += 1;
+        return completed('control_media_buy', {});
+      };
+      const coordinator = await agent.negotiateMediaBuyLifecycle();
+
+      await assert.rejects(
+        coordinator.controlMediaBuy({
+          idempotency_key: `control-cancel-name-${version}-0001`,
+          account: { account_id: 'account-1' },
+          media_buy_id: 'mb-1',
+          revision: 1,
+          canceled: true,
+          name: 'must not be applied',
+        }),
+        /cancellation cannot be combined/
+      );
+      assert.equal(mutations, 0);
+    }
+  });
+
+  test('projects compact media-buy name changes through the 3.2 established surface', async () => {
+    const agent = clientWithCaps(capabilities({ tools: [...COMPACT_TOOLS, 'get_products', 'update_media_buy'] }));
+    const mutations = [];
+    agent.updateMediaBuy = async request => {
+      mutations.push(request);
+      return completed('update_media_buy', {});
+    };
+    const coordinator = await agent.negotiateMediaBuyLifecycle({ preferredLifecycle: 'established' });
+
+    await coordinator.controlMediaBuy({
+      idempotency_key: 'control-name-compat-key-0001',
+      account: { account_id: 'account-1' },
+      media_buy_id: 'mb-1',
+      revision: 3,
+      name: 'Renamed buy',
+    });
+    assert.equal(mutations.length, 1);
+    assert.equal(mutations[0].name, 'Renamed buy');
+  });
+});

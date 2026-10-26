@@ -1,0 +1,340 @@
+import Ajv from 'ajv';
+import addFormats from 'ajv-formats';
+import type { TaskResult } from '../core/ConversationTypes';
+import type { ConformanceToolName, OracleVerdict } from './types';
+import { loadResponseSchema, type ConformanceSchemaOptions } from './schemaLoader';
+import { injectLegacyEnvelopeStatus, isLegacy30xPayload } from '../utils/envelope-status-compat';
+
+export interface OracleInput {
+  tool: ConformanceToolName;
+  request: unknown;
+  /** TaskResult envelope returned by AgentClient.executeTask. */
+  result: TaskResult<unknown>;
+  /** Auth token that was used to make the request — checked for leaks. */
+  authToken?: string;
+  /** Schema bundle override for same-PR / external conformance runs. */
+  schemas?: ConformanceSchemaOptions;
+}
+
+export interface OracleOutput {
+  verdict: OracleVerdict;
+  invariantFailures: string[];
+}
+
+// Substring signatures (fast) — match language-specific stack frame shapes.
+// Haystack is JSON-encoded so real \n become literal "\n" (two chars);
+// signatures use literal \n characters and match the JSON-escape form.
+const STACK_TRACE_SIGNATURES = [
+  '    at ', // V8 / Node
+  'Traceback (most recent call last)', // Python
+  'node_modules/',
+  '.py", line',
+  '\\n  File "', // Python, JSON-escaped newline
+  'goroutine ', // Go runtime panic header
+  '\\n\\tat ', // JVM "\tat com.foo.Bar(Bar.java:42)" frames in JSON-encoded body
+  'Stack trace:\\n#0 ', // PHP uncaught-exception traceback preamble
+];
+
+// Regex signatures (slower, run second) — shapes that need structure to
+// avoid over-matching on innocent strings.
+const STACK_TRACE_REGEXES: readonly RegExp[] = [
+  // Go: `main.fn(0x1234)\n\t/app/main.go:42 +0x1a`
+  /\.go:\d+ \+0x[0-9a-f]+/,
+  // PHP: `#7 /var/www/foo.php(42): Bar->baz()` — numbered frame with file:line
+  /#\d+ [^\s]+\.php\(\d+\):/,
+  // .NET: `at Foo.Bar.Baz() in /path/to/X.cs:line 42` — method invocation
+  // followed by ` in ` and a file:line marker. The method-name charset
+  // includes parens/brackets for generic and overloaded signatures.
+  /at [\w.<>`,()[\]]+ in [^:\s]+\.(?:cs|vb|fs):line \d+/,
+];
+
+const JVM_STACK_FRAME = /^at [\w$.]+\.[\w$]+\([\w$]+\.(?:java|kt|kts|scala|groovy):\d+\)\s*/;
+
+function isJsonFramingSuffix(value: string): boolean {
+  if (!value.startsWith('"')) return false;
+  for (let index = 1; index < value.length; index++) {
+    const char = value[index];
+    if (char !== '}' && char !== ']' && char !== ',' && char !== ' ' && char !== '\t') return false;
+  }
+  return true;
+}
+
+/**
+ * Detect an indented JVM frame without a regex that can repartition an
+ * arbitrary whitespace run. `safeStringify` encodes newlines as the two
+ * characters `\\n`, so normalize those separators before inspecting lines.
+ */
+function hasJvmStackFrame(haystack: string): boolean {
+  const lines = haystack.replaceAll('\\n', '\n').split('\n');
+  for (const [index, line] of lines.entries()) {
+    const candidate = line.trimStart();
+    // The JSON-escaped-newline branch of the previous detector intentionally
+    // accepted zero indentation; retain that coverage after normalization.
+    if (index > 0 || candidate !== line) {
+      const match = JVM_STACK_FRAME.exec(candidate);
+      if (match && (match[0].length === candidate.length || isJsonFramingSuffix(candidate.slice(match[0].length)))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+const FS_PATH_SIGNATURES = [/\/Users\/[^ "']+/, /\/home\/[^ "']+/, /[A-Z]:\\\\Users\\\\/];
+
+let cachedAjv: Ajv | null = null;
+function getAjv(): Ajv {
+  if (cachedAjv) return cachedAjv;
+  const ajv = new Ajv({ allErrors: true, strict: false, validateFormats: true });
+  addFormats(ajv);
+  cachedAjv = ajv;
+  return ajv;
+}
+
+const compiledValidators = new Map<string, ReturnType<Ajv['compile']>>();
+
+function schemaCacheKey(tool: ConformanceToolName, options: ConformanceSchemaOptions | undefined): string {
+  return `${tool}\0${options?.schemaRoot ?? ''}\0${options?.version ?? ''}`;
+}
+
+function responseValidator(tool: ConformanceToolName, options?: ConformanceSchemaOptions): ReturnType<Ajv['compile']> {
+  const cacheKey = schemaCacheKey(tool, options);
+  const cached = compiledValidators.get(cacheKey);
+  if (cached) return cached;
+  const schema = loadResponseSchema(tool, options);
+  const validator = getAjv().compile(schema);
+  compiledValidators.set(cacheKey, validator);
+  return validator;
+}
+
+/**
+ * Does the response schema declare a top-level `context` property —
+ * either directly or on one of its `oneOf` branches? When it does, a
+ * request-context that's not echoed is an invariant violation; when it
+ * doesn't, a missing context field is silent tolerance.
+ */
+const responseSchemaHasContext = new Map<string, boolean>();
+function responseEchoesContext(tool: ConformanceToolName, options?: ConformanceSchemaOptions): boolean {
+  const cacheKey = schemaCacheKey(tool, options);
+  const cached = responseSchemaHasContext.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const schema = loadResponseSchema(tool, options) as {
+    properties?: Record<string, unknown>;
+    oneOf?: Array<{ properties?: Record<string, unknown> }>;
+  };
+  const direct = !!schema.properties && 'context' in schema.properties;
+  const branched = Array.isArray(schema.oneOf) && schema.oneOf.some(b => !!b.properties && 'context' in b.properties);
+  const answer = direct || branched;
+  responseSchemaHasContext.set(cacheKey, answer);
+  return answer;
+}
+
+/**
+ * Warm the response-schema validator for a tool. Throws if Ajv can't
+ * compile — the runner uses that as the signal to skip the tool rather
+ * than fail every iteration. Separated from `evaluate()` so the failure
+ * surfaces once per tool, not once per sample.
+ */
+export function prepareResponseValidator(tool: ConformanceToolName, options?: ConformanceSchemaOptions): void {
+  responseValidator(tool, options);
+}
+
+/**
+ * Classify a tool response under the two-path oracle.
+ *
+ * Accepted: `TaskResult.data` validates against the response schema.
+ * Rejected: `TaskResult.success === false` with a well-formed error
+ *   envelope (non-empty code, human-readable message).
+ * Invalid: neither — the agent crashed, truncated the envelope, leaked a
+ *   stack trace, or echoed a credential.
+ *
+ * Invariants hold on both accepted and rejected paths: no credential leak,
+ * no stack trace / filesystem path in the response body, and `context` is
+ * echoed unchanged when the caller supplied one.
+ */
+export function evaluate(input: OracleInput): OracleOutput {
+  const { tool, request, result, authToken, schemas } = input;
+  const invariantFailures: string[] = [];
+
+  checkNoAuthLeak(result, authToken, invariantFailures);
+  checkNoStackLeak(result, invariantFailures);
+  checkNoFilesystemLeak(result, invariantFailures);
+  checkContextEchoed(tool, request, result, invariantFailures, schemas);
+
+  if (result.success === false) {
+    checkErrorEnvelope(result, invariantFailures);
+    return {
+      verdict: invariantFailures.length === 0 ? 'rejected' : 'invalid',
+      invariantFailures,
+    };
+  }
+
+  if (result.status !== 'completed' || result.data === undefined) {
+    // Intermediate states (working/submitted/input-required) don't exercise
+    // the response-schema path — treat as rejected (nothing to invariant-check).
+    return { verdict: 'rejected', invariantFailures };
+  }
+
+  const validate = responseValidator(tool, schemas);
+  const data = result.data as Record<string, unknown>;
+  // Keep the established 3.0 status-optional compatibility path only for an
+  // explicit legacy release. Unversioned/current responses must satisfy their
+  // schema as returned. The shared shim excludes status-free compact tools.
+  const payload =
+    data &&
+    typeof data === 'object' &&
+    !Array.isArray(data) &&
+    data.status === undefined &&
+    typeof data.adcp_version === 'string' &&
+    isLegacy30xPayload(data)
+      ? injectLegacyEnvelopeStatus(data, { toolName: tool })
+      : result.data;
+  if (!validate(payload)) {
+    const errors = (validate.errors ?? []).slice(0, 3).map(formatAjvError);
+    invariantFailures.push(`response schema mismatch: ${errors.join('; ')}`);
+    return { verdict: 'invalid', invariantFailures };
+  }
+
+  return {
+    verdict: invariantFailures.length === 0 ? 'accepted' : 'invalid',
+    invariantFailures,
+  };
+}
+
+/**
+ * Stringify every channel an agent can leak through: payload, error
+ * message, `adcpError.code`/`.message`/`.details`, correlation id, and
+ * task metadata. The earlier version scanned only `result.data` and
+ * `result.error`, so leaks through `adcpError.details.stack` slipped
+ * past.
+ */
+function buildLeakHaystack(result: TaskResult<unknown>): string {
+  const parts: unknown[] = [
+    result.data,
+    result.error,
+    result.adcpError,
+    (result as { correlationId?: unknown }).correlationId,
+    (result as { metadata?: unknown }).metadata,
+  ];
+  return parts.map(p => (p === undefined ? '' : safeStringify(p))).join(' ');
+}
+
+function checkNoAuthLeak(result: TaskResult<unknown>, authToken: string | undefined, failures: string[]): void {
+  // 8-char floor catches random 4-byte coincidences without triggering on
+  // every short hex-looking string. Detects verbatim echo only — agents
+  // can evade by re-encoding. Documented in docs/guides/CONFORMANCE.md.
+  if (!authToken || authToken.length < 8) return;
+  if (buildLeakHaystack(result).includes(authToken)) failures.push('auth token echoed in response body');
+}
+
+function checkNoStackLeak(result: TaskResult<unknown>, failures: string[]): void {
+  const haystack = buildLeakHaystack(result);
+  for (const sig of STACK_TRACE_SIGNATURES) {
+    if (haystack.includes(sig)) {
+      failures.push(`stack trace leak (matched ${JSON.stringify(sig)})`);
+      return;
+    }
+  }
+  if (hasJvmStackFrame(haystack)) {
+    failures.push(`stack trace leak (matched ${JVM_STACK_FRAME.source})`);
+    return;
+  }
+  for (const rx of STACK_TRACE_REGEXES) {
+    if (rx.test(haystack)) {
+      failures.push(`stack trace leak (matched ${rx.source})`);
+      return;
+    }
+  }
+}
+
+function checkNoFilesystemLeak(result: TaskResult<unknown>, failures: string[]): void {
+  const haystack = buildLeakHaystack(result);
+  for (const sig of FS_PATH_SIGNATURES) {
+    if (sig.test(haystack)) {
+      failures.push(`filesystem path leak (matched ${sig.source})`);
+      return;
+    }
+  }
+}
+
+function checkContextEchoed(
+  tool: ConformanceToolName,
+  request: unknown,
+  result: TaskResult<unknown>,
+  failures: string[],
+  schemas?: ConformanceSchemaOptions
+): void {
+  const reqContext = (request as { context?: unknown } | undefined)?.context;
+  if (reqContext === undefined) return;
+  const respContext = (result.data as { context?: unknown } | undefined)?.context;
+  if (respContext === undefined) {
+    // When the response schema declares a `context` property, a missing
+    // echo IS a violation — the spec requires unchanged pass-through.
+    // When the schema omits `context` (some discovery-only responses do),
+    // silent tolerance stands.
+    if (responseEchoesContext(tool, schemas)) {
+      failures.push('request.context not echoed on response (schema declares context but response omitted it)');
+    }
+    return;
+  }
+  if (!deepEqual(reqContext, respContext)) {
+    failures.push('request.context not echoed unchanged on response');
+  }
+}
+
+function checkErrorEnvelope(result: TaskResult<unknown>, failures: string[]): void {
+  if (!result.error || typeof result.error !== 'string' || result.error.length === 0) {
+    failures.push('error envelope missing human-readable message');
+  }
+  const code = result.adcpError?.code;
+  if (code === undefined) {
+    failures.push('error envelope missing reason code');
+    return;
+  }
+  if (typeof code !== 'string' || code.length === 0) {
+    failures.push(`reason code is not a non-empty string: ${JSON.stringify(code)}`);
+    return;
+  }
+  if (!/^[A-Z][A-Z0-9_]*$/.test(code)) {
+    failures.push(`reason code "${code}" is not uppercase-snake format per spec`);
+  }
+}
+
+function formatAjvError(e: { instancePath?: string; message?: string; keyword?: string }): string {
+  const path = e.instancePath || '(root)';
+  return `${path}: ${e.message ?? e.keyword ?? 'invalid'}`;
+}
+
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Key-order-insensitive structural equality. JSON.stringify-based compare
+ * produces false positives when an agent round-trips `context` through a
+ * dict/map that doesn't preserve insertion order (Python, Go).
+ */
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== typeof b) return false;
+  if (a === null || b === null) return a === b;
+  if (typeof a !== 'object') return a === b;
+  if (Array.isArray(a)) {
+    if (!Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!deepEqual(a[i], b[i])) return false;
+    return true;
+  }
+  if (Array.isArray(b)) return false;
+  const aKeys = Object.keys(a as object).sort();
+  const bKeys = Object.keys(b as object).sort();
+  if (aKeys.length !== bKeys.length) return false;
+  for (let i = 0; i < aKeys.length; i++) if (aKeys[i] !== bKeys[i]) return false;
+  for (const key of aKeys) {
+    if (!deepEqual((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key])) return false;
+  }
+  return true;
+}
