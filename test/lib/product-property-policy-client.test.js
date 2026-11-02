@@ -1,0 +1,1091 @@
+const { describe, test, mock, afterEach } = require('node:test');
+const assert = require('node:assert');
+
+const { AdCPClient } = require('../../dist/lib/index.js');
+const { ProtocolClient } = require('../../dist/lib/protocols');
+const { memoryBackend } = require('../../dist/lib/server/idempotency/backends/memory.js');
+
+const originalCallTool = ProtocolClient.callTool;
+
+afterEach(() => {
+  ProtocolClient.callTool = originalCallTool;
+});
+
+function makeProduct(product_id, publisher_domain, overrides = {}) {
+  return {
+    product_id,
+    name: product_id,
+    publisher_properties: [{ selection_type: 'all', publisher_domain }],
+    format_options: [{ format_kind: 'image', params: {} }],
+    pricing_options: [{ pricing_option_id: 'po_cpm', pricing_model: 'cpm', currency: 'USD', fixed_price: 5 }],
+    ...overrides,
+  };
+}
+
+function makeClient(config = {}) {
+  const agent = {
+    id: 'seller',
+    name: 'Seller',
+    agent_uri: 'https://seller.example/mcp',
+    protocol: 'mcp',
+  };
+  const client = new AdCPClient([agent], {
+    allowUnauthenticatedWebhooks: true,
+    validateFeatures: false,
+    validation: {
+      responses: 'off',
+      ...config.validation,
+    },
+    ...(config.handlers ? { handlers: config.handlers } : {}),
+    ...(config.onActivity ? { onActivity: config.onActivity } : {}),
+  });
+  const agentClient = client.agent('seller');
+  const inner = agentClient.client;
+  inner.discoveredEndpoint = agent.agent_uri;
+  inner.cachedCapabilities = {
+    version: 'v3',
+    majorVersions: [3],
+    supportedVersions: ['3.2'],
+    protocols: ['media_buy'],
+    features: {
+      inlineCreativeManagement: false,
+      conversionTracking: false,
+      audienceTargeting: false,
+      propertyListFiltering: false,
+      contentStandards: false,
+    },
+    extensions: [],
+    _synthetic: false,
+  };
+  return agentClient;
+}
+
+function stubGetProducts(products) {
+  ProtocolClient.callTool = mock.fn(async (_agent, taskName) => {
+    assert.strictEqual(taskName, 'get_products');
+    return {
+      status: 'completed',
+      products,
+      cache_scope: 'public',
+    };
+  });
+}
+
+describe('client product property policy enforcement', () => {
+  test('undefined nested list fields are absent and do not hide a deprecated reference', async () => {
+    stubGetProducts([makeProduct('safe', 'safe.example'), makeProduct('other', 'other.example')]);
+    let resolutions = 0;
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          propertyListResolveOptions: {
+            cache: false,
+            callTool: async () => {
+              resolutions++;
+              return {
+                list: { list_id: 'allowed', name: 'Allowed' },
+                identifiers: [{ type: 'domain', value: 'safe.example' }],
+              };
+            },
+          },
+        },
+      },
+    });
+    const noList = await agent.getProducts({ brief: 'sports', filters: { property_list: undefined } }, undefined, {
+      project: false,
+    });
+    assert.strictEqual(noList.success, true);
+    assert.strictEqual(noList.data.products.length, 2);
+    assert.strictEqual(resolutions, 0);
+    const legacy = await agent.getProducts(
+      {
+        brief: 'sports',
+        filters: { property_list: undefined },
+        property_list: { list_id: 'allowed', agent_url: 'https://lists.example/mcp' },
+      },
+      undefined,
+      { project: false }
+    );
+    assert.strictEqual(legacy.success, true);
+    assert.deepStrictEqual(
+      legacy.data.products.map(product => product.product_id),
+      ['safe']
+    );
+    assert.strictEqual(resolutions, 1);
+  });
+
+  test('catalog lookups stop at the overall budget and leave pending publishers unknown', async () => {
+    stubGetProducts([makeProduct('one', 'one.example'), makeProduct('two', 'two.example')]);
+    const calls = [];
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          allowedPropertyIdentifiers: [{ type: 'ios_bundle', value: 'com.good.app' }],
+          unknownSelectorBehavior: 'flag',
+          publisherLookupTimeoutMs: 1000,
+          publisherLookupBudgetMs: 10,
+          resolvePublisherProperties: async (domain, options) => {
+            calls.push({ domain, signal: options.signal });
+            return new Promise(() => {});
+          },
+        },
+      },
+    });
+    const result = await agent.getProducts({ brief: 'apps' }, undefined, { project: false });
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.metadata.productPropertyPolicy.flagged_count, 2);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].signal.aborted, true);
+  });
+
+  test('catalog lookup failures stay unknown even for allowed domains, and timeouts abort the hook', async () => {
+    stubGetProducts([makeProduct('uncertain', 'publisher.example')]);
+    let lookupSignal;
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          allowedPropertyIdentifiers: [
+            { type: 'domain', value: 'publisher.example' },
+            { type: 'ios_bundle', value: 'com.good.app' },
+          ],
+          strict: true,
+          publisherLookupTimeoutMs: 1,
+          resolvePublisherProperties: async (_domain, options) => {
+            lookupSignal = options.signal;
+            return new Promise(() => {});
+          },
+        },
+      },
+    });
+    const result = await agent.getProducts({ brief: 'apps' }, undefined, { project: false });
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.data.products.length, 0);
+    assert.strictEqual(result.metadata.productPropertyPolicy.diagnostics[0].code, 'unresolved_property_identifiers');
+    assert.strictEqual(lookupSignal.aborted, true);
+  });
+
+  test('seller-driven publisher lookups are bounded and exclude IP and localhost inputs', async () => {
+    stubGetProducts([
+      makeProduct('one', 'one.example'),
+      makeProduct('two', 'two.example'),
+      makeProduct('local', '127.0.0.1'),
+      makeProduct('localhost', 'localhost'),
+    ]);
+    const calls = [];
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          allowedPropertyIdentifiers: [{ type: 'ios_bundle', value: 'com.good.app' }],
+          unknownSelectorBehavior: 'flag',
+          maxPublisherLookups: 1,
+          resolvePublisherProperties: async domain => {
+            calls.push(domain);
+            return [{ identifiers: [{ type: 'ios_bundle', value: 'com.good.app' }] }];
+          },
+        },
+      },
+    });
+    const result = await agent.getProducts({ brief: 'apps' }, undefined, { project: false });
+    assert.deepStrictEqual(calls, ['one.example']);
+    assert.strictEqual(result.data.products.length, 4);
+    assert.strictEqual(result.metadata.productPropertyPolicy.flagged_count, 3);
+  });
+
+  test('filters.property_list enforces mixed lists using resolved app/CTV publisher metadata', async () => {
+    stubGetProducts([
+      makeProduct('app', 'publisher.example', {
+        publisher_properties: [
+          { selection_type: 'by_id', publisher_domain: 'publisher.example', property_ids: ['opaque-app'] },
+        ],
+      }),
+      makeProduct('ctv', 'publisher.example', {
+        publisher_properties: [
+          { selection_type: 'by_tag', publisher_domain: 'publisher.example', property_tags: ['ctv'] },
+        ],
+      }),
+      makeProduct('blocked', 'publisher.example', {
+        publisher_properties: [
+          { selection_type: 'by_id', publisher_domain: 'publisher.example', property_ids: ['opaque-blocked'] },
+        ],
+      }),
+    ]);
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          resolvePublisherProperties: async domain => {
+            assert.strictEqual(domain, 'publisher.example');
+            return [
+              { property_id: 'opaque-app', identifiers: [{ type: 'ios_bundle', value: 'com.example.App' }] },
+              { property_id: 'opaque-tv', identifiers: [{ type: 'roku_store_id', value: '12345' }], tags: ['ctv'] },
+              { property_id: 'opaque-blocked', identifiers: [{ type: 'android_package', value: 'com.other.app' }] },
+            ];
+          },
+          propertyListResolveOptions: {
+            cache: false,
+            callTool: async () => ({
+              list: { list_id: 'mixed', name: 'Mixed' },
+              identifiers: [
+                { type: 'domain', value: 'web.example' },
+                { type: 'ios_bundle', value: 'com.example.App' },
+                { type: 'roku_store_id', value: '12345' },
+              ],
+            }),
+          },
+        },
+      },
+    });
+    const result = await agent.getProducts(
+      { brief: 'apps', filters: { property_list: { agent_url: 'https://lists.example/mcp', list_id: 'mixed' } } },
+      undefined,
+      { project: false }
+    );
+    assert.strictEqual(result.success, true);
+    assert.deepStrictEqual(
+      result.data.products.map(product => product.product_id),
+      ['app', 'ctv']
+    );
+    assert.strictEqual(result.metadata.productPropertyPolicy.request_property_list.identifier_count, 3);
+  });
+
+  test('conflicting nested and deprecated property lists fail closed without resolving either', async () => {
+    stubGetProducts([makeProduct('safe', 'example.com')]);
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          propertyListResolveOptions: {
+            callTool: async () => {
+              throw new Error('must not call');
+            },
+          },
+        },
+      },
+    });
+    const reference = { agent_url: 'https://lists.example/mcp', list_id: 'nested' };
+    const result = await agent.getProducts(
+      { brief: 'sports', property_list: { ...reference, list_id: 'legacy' }, filters: { property_list: reference } },
+      undefined,
+      { project: false }
+    );
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(
+      result.metadata.productPropertyPolicy.request_property_list.resolution_error,
+      'property_list_conflicting_references'
+    );
+    const malformed = await agent.getProducts(
+      { brief: 'sports', property_list: reference, filters: { property_list: null } },
+      undefined,
+      { project: false }
+    );
+    assert.strictEqual(malformed.success, false);
+    assert.strictEqual(
+      malformed.metadata.productPropertyPolicy.request_property_list.resolution_error,
+      'property_list_invalid_reference'
+    );
+  });
+
+  test('nested enforcement can be disabled and unsupported identifiers are diagnosed without failing the response', async () => {
+    stubGetProducts([makeProduct('unknown', 'publisher.example', { property_targeting_allowed: true })]);
+    const reference = { agent_url: 'https://lists.example/mcp', list_id: 'future' };
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          unknownSelectorBehavior: 'flag',
+          propertyListResolveOptions: {
+            cache: false,
+            callTool: async () => ({
+              list: { list_id: 'future', name: 'Future' },
+              identifiers: [{ type: 'future_type', value: 'opaque' }],
+            }),
+          },
+        },
+      },
+    });
+    const result = await agent.getProducts({ brief: 'apps', filters: { property_list: reference } }, undefined, {
+      project: false,
+    });
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.data.products.length, 1);
+    assert.strictEqual(result.metadata.productPropertyPolicy.flagged_count, 1);
+    assert.deepStrictEqual(result.metadata.productPropertyPolicy.request_property_list.unsupported_identifier_types, [
+      'future_type',
+    ]);
+    const disabled = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          enforceRequestPropertyList: false,
+          propertyListResolveOptions: {
+            callTool: async () => {
+              throw new Error('must not call');
+            },
+          },
+        },
+      },
+    });
+    assert.strictEqual(
+      (
+        await disabled.getProducts({ brief: 'apps', filters: { property_list: reference } }, undefined, {
+          project: false,
+        })
+      ).success,
+      true
+    );
+  });
+
+  test('filters excluded domains before caller and handler receive get_products', async () => {
+    const handlerCalls = [];
+    stubGetProducts([makeProduct('safe', 'example.com'), makeProduct('blocked', 'www.ladbible.com')]);
+
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          excludedDomains: ['ladbible.com'],
+        },
+      },
+      handlers: {
+        onGetProductsStatusChange: response => handlerCalls.push(response),
+      },
+    });
+
+    const result = await agent.getProducts({ brief: 'sports' }, undefined, { project: false });
+
+    assert.strictEqual(result.success, true);
+    assert.deepStrictEqual(
+      result.data.products.map(p => p.product_id),
+      ['safe']
+    );
+    assert.deepStrictEqual(
+      handlerCalls[0].products.map(p => p.product_id),
+      ['safe']
+    );
+    assert.strictEqual(result.metadata.productPropertyPolicy.rejected_count, 1);
+    assert.strictEqual(result.metadata.productPropertyPolicy.diagnostics[0].matched_excluded_domain, 'ladbible.com');
+    assert.strictEqual(result.data.filter_diagnostics, undefined);
+    assert.ok(result.debug_logs.some(entry => entry.type === 'product_property_policy'));
+  });
+
+  test('reject_response mode fails get_products and suppresses completion handler', async () => {
+    const handlerCalls = [];
+    stubGetProducts([makeProduct('safe', 'example.com'), makeProduct('blocked', 'www.ladbible.com')]);
+
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          excludedDomains: ['ladbible.com'],
+          mode: 'reject_response',
+        },
+      },
+      handlers: {
+        onGetProductsStatusChange: response => handlerCalls.push(response),
+      },
+    });
+
+    const result = await agent.getProducts({ brief: 'sports' }, undefined, { project: false });
+
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.status, 'failed');
+    assert.strictEqual(result.error, 'Property list not adhered to');
+    assert.deepStrictEqual(
+      result.data.products.map(p => p.product_id),
+      ['safe', 'blocked']
+    );
+    assert.strictEqual(result.metadata.productPropertyPolicy.rejected_count, 1);
+    assert.deepStrictEqual(handlerCalls, []);
+  });
+
+  test('filters generic executeTask get_products results before caller receives them', async () => {
+    stubGetProducts([makeProduct('safe', 'example.com'), makeProduct('blocked', 'www.ladbible.com')]);
+
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          excludedDomains: ['ladbible.com'],
+        },
+      },
+    });
+
+    const result = await agent.executeTask('get_products', { brief: 'sports' }, undefined, { project: false });
+
+    assert.strictEqual(result.success, true);
+    assert.deepStrictEqual(
+      result.data.products.map(p => p.product_id),
+      ['safe']
+    );
+    assert.strictEqual(result.metadata.productPropertyPolicy.rejected_count, 1);
+  });
+
+  test('uses get_products property_list ref to reject products outside the resolved list', async () => {
+    const handlerCalls = [];
+    const listCalls = [];
+    stubGetProducts([makeProduct('safe', 'www.example.com'), makeProduct('blocked', 'www.ladbible.com')]);
+
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          mode: 'reject_response',
+          propertyListResolveOptions: {
+            callTool: async (agentUrl, toolName, args, authToken) => {
+              listCalls.push({ agentUrl, toolName, args, authToken });
+              return {
+                list: { list_id: 'cope_allowed_properties', name: 'Cope allowed properties' },
+                identifiers: [{ type: 'domain', value: 'example.com' }],
+                cache_valid_until: '2026-06-02T12:05:00.000Z',
+              };
+            },
+          },
+        },
+      },
+      handlers: {
+        onGetProductsStatusChange: response => handlerCalls.push(response),
+      },
+    });
+
+    const result = await agent.getProducts(
+      {
+        brief: 'sports',
+        property_list: {
+          agent_url: 'https://lists.example/mcp',
+          list_id: 'cope_allowed_properties',
+          auth_token: 'list-token',
+        },
+      },
+      undefined,
+      { project: false }
+    );
+
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.status, 'failed');
+    assert.strictEqual(result.error, 'Property list not adhered to');
+    assert.deepStrictEqual(
+      result.data.products.map(p => p.product_id),
+      ['safe', 'blocked']
+    );
+    assert.strictEqual(result.metadata.productPropertyPolicy.request_property_list.list_id, 'cope_allowed_properties');
+    assert.strictEqual(result.metadata.productPropertyPolicy.request_property_list.identifier_count, 1);
+    assert.strictEqual(result.metadata.productPropertyPolicy.diagnostics[0].code, 'outside_property_list');
+    assert.strictEqual(result.metadata.productPropertyPolicy.diagnostics[0].normalized_domain, 'www.ladbible.com');
+    assert.deepStrictEqual(handlerCalls, []);
+    assert.deepStrictEqual(listCalls, [
+      {
+        agentUrl: 'https://lists.example/mcp',
+        toolName: 'get_property_list',
+        args: {
+          list_id: 'cope_allowed_properties',
+          resolve: true,
+          pagination: { max_results: 1000 },
+        },
+        authToken: 'list-token',
+      },
+    ]);
+  });
+
+  test('uses unknownSelectorBehavior for app lists without resolved publisher metadata', async () => {
+    stubGetProducts([makeProduct('app_product', 'www.example.com')]);
+
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          mode: 'reject_response',
+          unknownSelectorBehavior: 'flag',
+          propertyListResolveOptions: {
+            callTool: async () => ({
+              list: { list_id: 'app_allowlist', name: 'App allowlist' },
+              identifiers: [{ type: 'ios_bundle', value: 'com.example.app' }],
+              cache_valid_until: '2026-06-02T12:05:00.000Z',
+            }),
+          },
+        },
+      },
+    });
+
+    const result = await agent.getProducts(
+      {
+        brief: 'apps',
+        property_list: {
+          agent_url: 'https://lists.example/mcp',
+          list_id: 'app_allowlist',
+        },
+      },
+      undefined,
+      { project: false }
+    );
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.status, 'completed');
+    assert.deepStrictEqual(
+      result.data.products.map(p => p.product_id),
+      ['app_product']
+    );
+    assert.strictEqual(result.metadata.productPropertyPolicy.diagnostics[0].code, 'unresolved_property_identifiers');
+    assert.deepStrictEqual(result.metadata.productPropertyPolicy.diagnostics[0].identifier_types, ['ios_bundle']);
+  });
+
+  test('filters completed get_products webhooks using the original request property_list', async () => {
+    const handlerCalls = [];
+    const listCalls = [];
+    const backend = memoryBackend({ sweepIntervalMs: 0 });
+    const replaceIfPayloadHash = backend.replaceIfPayloadHash.bind(backend);
+    let releaseClaimFence;
+    let markClaimFenceEntered;
+    let claimFencePaused = false;
+    const claimFenceEntered = new Promise(resolve => {
+      markClaimFenceEntered = resolve;
+    });
+    backend.replaceIfPayloadHash = async (...args) => {
+      if (
+        !claimFencePaused &&
+        String(args[0]).endsWith('\u001fwebhook_property_event_0001') &&
+        args[2]?.response?.claimToken
+      ) {
+        claimFencePaused = true;
+        markClaimFenceEntered();
+        await new Promise(resolve => {
+          releaseClaimFence = resolve;
+        });
+      }
+      return replaceIfPayloadHash(...args);
+    };
+
+    ProtocolClient.callTool = mock.fn(async (_agent, taskName) => {
+      assert.strictEqual(taskName, 'get_products');
+      return {
+        status: 'submitted',
+        task_id: 'seller-task-1',
+      };
+    });
+
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          propertyListResolveOptions: {
+            callTool: async (agentUrl, toolName, args, authToken) => {
+              listCalls.push({ agentUrl, toolName, args, authToken });
+              return {
+                list: { list_id: 'cope_allowed_properties', name: 'Cope allowed properties' },
+                identifiers: [{ type: 'domain', value: 'example.com' }],
+                cache_valid_until: '2026-06-02T12:05:00.000Z',
+              };
+            },
+          },
+        },
+      },
+      handlers: {
+        webhookDedup: { backend },
+        onGetProductsStatusChange: (response, metadata) => handlerCalls.push({ response, metadata }),
+      },
+    });
+
+    const submitted = await agent.getProducts(
+      {
+        brief: 'sports',
+        filters: {
+          property_list: {
+            agent_url: 'https://lists.example/mcp',
+            list_id: 'cope_allowed_properties',
+            auth_token: 'list-token',
+          },
+        },
+      },
+      undefined,
+      { project: false }
+    );
+
+    assert.strictEqual(submitted.status, 'submitted');
+    const retainedPolicyState = agent.client.productPolicyRequestParamsByTask.get(submitted.metadata.taskId);
+    assert.strictEqual(retainedPolicyState.request.property_list.auth_token, 'list-token');
+    assert.strictEqual(
+      await agent.handleWebhook(
+        {
+          idempotency_key: 'webhook_property_working_0001',
+          operation_id: submitted.metadata.taskId,
+          task_id: 'seller-task-1',
+          task_type: 'get_products',
+          status: 'working',
+          timestamp: '2026-06-02T11:59:00.000Z',
+          result: {},
+        },
+        'get_products',
+        submitted.metadata.taskId
+      ),
+      true
+    );
+    assert.strictEqual(
+      retainedPolicyState.request.property_list.auth_token,
+      'list-token',
+      'a nonterminal event must retain policy state for the eventual completion'
+    );
+    handlerCalls.length = 0;
+    const webhook = {
+      idempotency_key: 'webhook_property_event_0001',
+      operation_id: submitted.metadata.taskId,
+      task_id: 'seller-task-1',
+      task_type: 'get_products',
+      status: 'completed',
+      timestamp: '2026-06-02T12:00:00.000Z',
+      result: {
+        products: [makeProduct('safe', 'www.example.com'), makeProduct('blocked', 'www.ladbible.com')],
+        cache_scope: 'public',
+      },
+    };
+    const winningDelivery = agent.handleWebhook(webhook, 'get_products', submitted.metadata.taskId);
+    await claimFenceEntered;
+    await assert.rejects(
+      agent.handleWebhook(webhook, 'get_products', submitted.metadata.taskId),
+      error => error?.code === 'webhook_publication_in_progress'
+    );
+    assert.strictEqual(
+      retainedPolicyState.request.property_list.auth_token,
+      'list-token',
+      'an in-progress retry must not clear the winning delivery policy context'
+    );
+    releaseClaimFence();
+    const handled = await winningDelivery;
+
+    assert.strictEqual(handled, true);
+    assert.strictEqual(retainedPolicyState.request, undefined);
+    assert.strictEqual(agent.client.productPolicyRequestParamsByTask.has(submitted.metadata.taskId), false);
+    assert.strictEqual(handlerCalls.length, 1);
+    assert.deepStrictEqual(
+      handlerCalls[0].response.products.map(p => p.product_id),
+      ['safe']
+    );
+    assert.strictEqual(handlerCalls[0].metadata.productPropertyPolicy.rejected_count, 1);
+    assert.deepStrictEqual(
+      handlerCalls[0].metadata.rawHTTPPayload.result.products.map(p => p.product_id),
+      ['safe', 'blocked']
+    );
+    assert.strictEqual(
+      handlerCalls[0].metadata.productPropertyPolicy.request_property_list.list_id,
+      'cope_allowed_properties'
+    );
+    assert.deepStrictEqual(listCalls, [
+      {
+        agentUrl: 'https://lists.example/mcp',
+        toolName: 'get_property_list',
+        args: {
+          list_id: 'cope_allowed_properties',
+          resolve: true,
+          pagination: { max_results: 1000 },
+        },
+        authToken: 'list-token',
+      },
+    ]);
+
+    assert.strictEqual(await agent.handleWebhook(webhook, 'get_products', submitted.metadata.taskId), true);
+    assert.strictEqual(handlerCalls.length, 1, 'the exact sender retry must not rerun the handler');
+    assert.strictEqual(listCalls.length, 1, 'the exact sender retry must not rerun request-scoped policy resolution');
+
+    await assert.rejects(
+      agent.handleWebhook(
+        {
+          ...webhook,
+          result: {
+            ...webhook.result,
+            products: [makeProduct('changed', 'www.example.com')],
+          },
+        },
+        'get_products',
+        submitted.metadata.taskId
+      ),
+      error => error?.code === 'webhook_idempotency_conflict'
+    );
+    assert.strictEqual(handlerCalls.length, 1);
+  });
+
+  test('filters submitted get_products polling continuations before caller receives products', async () => {
+    let pollCalls = 0;
+
+    ProtocolClient.callTool = mock.fn(async (_agent, taskName) => {
+      if (taskName === 'tasks_get' || taskName === 'tasks/get') {
+        pollCalls += 1;
+        return {
+          task_id: 'seller-task-1',
+          task_type: 'get_products',
+          protocol: 'media-buy',
+          status: 'completed',
+          created_at: '2026-06-02T12:00:00.000Z',
+          updated_at: '2026-06-02T12:00:01.000Z',
+          result: {
+            products: [makeProduct('safe', 'www.example.com'), makeProduct('blocked', 'www.ladbible.com')],
+            cache_scope: 'public',
+          },
+        };
+      }
+      assert.strictEqual(taskName, 'get_products');
+      return {
+        status: 'submitted',
+        task_id: 'seller-task-1',
+      };
+    });
+
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          excludedDomains: ['ladbible.com'],
+        },
+      },
+    });
+
+    const submitted = await agent.getProducts({ brief: 'sports' }, undefined, { project: false });
+    assert.strictEqual(submitted.status, 'submitted');
+
+    const tracked = await submitted.submitted.track();
+    assert.strictEqual(tracked.status, 'completed');
+    assert.deepStrictEqual(
+      tracked.result.products.map(p => p.product_id),
+      ['safe']
+    );
+
+    const completed = await submitted.submitted.waitForCompletion(1);
+    assert.strictEqual(completed.success, true);
+    assert.deepStrictEqual(
+      completed.data.products.map(p => p.product_id),
+      ['safe']
+    );
+    assert.strictEqual(completed.metadata.productPropertyPolicy.rejected_count, 1);
+    assert.strictEqual(pollCalls, 2);
+  });
+
+  test('rejects submitted get_products polling completions in reject_response mode', async () => {
+    ProtocolClient.callTool = mock.fn(async (_agent, taskName) => {
+      if (taskName === 'tasks_get' || taskName === 'tasks/get') {
+        return {
+          task_id: 'seller-task-1',
+          task_type: 'get_products',
+          protocol: 'media-buy',
+          status: 'completed',
+          created_at: '2026-06-02T12:00:00.000Z',
+          updated_at: '2026-06-02T12:00:01.000Z',
+          result: {
+            products: [makeProduct('safe', 'www.example.com'), makeProduct('blocked', 'www.ladbible.com')],
+            cache_scope: 'public',
+          },
+        };
+      }
+      assert.strictEqual(taskName, 'get_products');
+      return {
+        status: 'submitted',
+        task_id: 'seller-task-1',
+      };
+    });
+
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          excludedDomains: ['ladbible.com'],
+          mode: 'reject_response',
+        },
+      },
+    });
+
+    const submitted = await agent.getProducts({ brief: 'sports' }, undefined, { project: false });
+    const tracked = await submitted.submitted.track();
+    assert.strictEqual(tracked.status, 'failed');
+    assert.deepStrictEqual(
+      tracked.result.products.map(p => p.product_id),
+      ['safe', 'blocked']
+    );
+
+    const completed = await submitted.submitted.waitForCompletion(1);
+    assert.strictEqual(completed.success, false);
+    assert.strictEqual(completed.status, 'failed');
+    assert.strictEqual(completed.error, 'Property list not adhered to');
+    assert.deepStrictEqual(
+      completed.data.products.map(p => p.product_id),
+      ['safe', 'blocked']
+    );
+  });
+
+  test('filters fast get_products webhooks using executor request params before initial response returns', async () => {
+    const handlerCalls = [];
+    let capturedOperationId;
+    let releaseInitialResponse;
+    const callToolStarted = new Promise(resolve => {
+      ProtocolClient.callTool = mock.fn(async (_agent, taskName) => {
+        assert.strictEqual(taskName, 'get_products');
+        resolve();
+        return new Promise(resolveInitial => {
+          releaseInitialResponse = () => resolveInitial({ status: 'submitted', task_id: 'seller-task-1' });
+        });
+      });
+    });
+
+    const agent = makeClient({
+      onActivity: activity => {
+        if (activity.type === 'protocol_request' && activity.task_type === 'get_products') {
+          capturedOperationId = activity.operation_id;
+        }
+      },
+      validation: {
+        productPropertyPolicy: {
+          propertyListResolveOptions: {
+            callTool: async () => ({
+              list: { list_id: 'cope_allowed_properties', name: 'Cope allowed properties' },
+              identifiers: [{ type: 'domain', value: 'example.com' }],
+              cache_valid_until: '2026-06-02T12:05:00.000Z',
+            }),
+          },
+        },
+      },
+      handlers: {
+        onGetProductsStatusChange: (response, metadata) => handlerCalls.push({ response, metadata }),
+      },
+    });
+
+    const submittedPromise = agent.getProducts(
+      {
+        brief: 'sports',
+        property_list: {
+          agent_url: 'https://lists.example/mcp',
+          list_id: 'cope_allowed_properties',
+        },
+      },
+      undefined,
+      { project: false }
+    );
+    await callToolStarted;
+    assert.ok(capturedOperationId, 'protocol_request activity should expose the webhook operation id');
+
+    const handled = await agent.handleWebhook(
+      {
+        idempotency_key: 'webhook-event-fast',
+        operation_id: capturedOperationId,
+        task_id: 'seller-task-1',
+        task_type: 'get_products',
+        status: 'completed',
+        timestamp: '2026-06-02T12:00:00.000Z',
+        result: {
+          products: [makeProduct('safe', 'www.example.com'), makeProduct('blocked', 'www.ladbible.com')],
+          cache_scope: 'public',
+        },
+      },
+      'get_products',
+      capturedOperationId
+    );
+
+    assert.strictEqual(handled, true);
+    assert.deepStrictEqual(
+      handlerCalls[0].response.products.map(p => p.product_id),
+      ['safe']
+    );
+    assert.strictEqual(
+      handlerCalls[0].metadata.productPropertyPolicy.request_property_list.list_id,
+      'cope_allowed_properties'
+    );
+
+    releaseInitialResponse();
+    const submitted = await submittedPromise;
+    assert.strictEqual(submitted.status, 'submitted');
+  });
+
+  test('sanitizes property_list resolution failures in metadata and debug logs', async () => {
+    stubGetProducts([makeProduct('safe', 'www.example.com')]);
+
+    const agent = makeClient({
+      validation: {
+        productPropertyPolicy: {
+          mode: 'reject_response',
+          propertyListResolveOptions: {
+            callTool: async () => {
+              throw new Error('remote payload with secret token');
+            },
+          },
+        },
+      },
+    });
+
+    const result = await agent.getProducts(
+      {
+        brief: 'sports',
+        property_list: {
+          agent_url: 'https://user:pass@lists.example/mcp?token=secret',
+          list_id: 'cope_allowed_properties',
+        },
+      },
+      undefined,
+      { project: false }
+    );
+
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(
+      result.metadata.productPropertyPolicy.request_property_list.resolution_error,
+      'list_agent_url_malformed'
+    );
+    assert.strictEqual(
+      result.metadata.productPropertyPolicy.request_property_list.agent_url,
+      'https://lists.example/mcp'
+    );
+    const policyLog = result.debug_logs.find(entry => entry.type === 'product_property_policy');
+    assert.strictEqual(policyLog.request_property_list.resolution_error, 'list_agent_url_malformed');
+  });
+});
+
+describe('supply-path annotations across discovery completion paths', () => {
+  test('caller cancellation aborts authoritative evidence retrieval', async () => {
+    const product = makeProduct('owner-sold', 'host.example', {
+      collections: [{ publisher_domain: 'owner.example', collection_ids: ['channel'] }],
+    });
+    let started;
+    const evidenceStarted = new Promise(resolve => {
+      started = resolve;
+    });
+    let evidenceSignal;
+    const agent = makeClient({
+      validation: {
+        supplyPathVerification: {
+          source: 'authoritative',
+          trustedFetchFn: async (_url, init) => {
+            evidenceSignal = init.signal;
+            started();
+            return await new Promise((_resolve, reject) => {
+              init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+            });
+          },
+        },
+      },
+    });
+    ProtocolClient.callTool = async () => ({ status: 'completed', products: [product], cache_scope: 'public' });
+    const controller = new AbortController();
+    const pending = agent.getProducts({ brief: 'sports' }, undefined, {
+      project: false,
+      signal: controller.signal,
+    });
+    await evidenceStarted;
+    controller.abort(new Error('caller cancelled'));
+    await assert.rejects(pending, /caller cancelled/);
+    assert.strictEqual(evidenceSignal.aborted, true);
+  });
+
+  test('waitForCompletion cancellation aborts authoritative evidence retrieval', async () => {
+    const product = makeProduct('owner-sold', 'host.example', {
+      collections: [{ publisher_domain: 'owner.example', collection_ids: ['channel'] }],
+    });
+    let started;
+    const evidenceStarted = new Promise(resolve => {
+      started = resolve;
+    });
+    let evidenceSignal;
+    const agent = makeClient({
+      validation: {
+        supplyPathVerification: {
+          source: 'authoritative',
+          trustedFetchFn: async (_url, init) => {
+            evidenceSignal = init.signal;
+            started();
+            return await new Promise((_resolve, reject) => {
+              init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+            });
+          },
+        },
+      },
+    });
+    ProtocolClient.callTool = async (_agent, tool) =>
+      tool === 'get_products'
+        ? { status: 'submitted', task_id: 'cancel-completion' }
+        : {
+            task_id: 'cancel-completion',
+            task_type: 'get_products',
+            protocol: 'media-buy',
+            status: 'completed',
+            created_at: '2026-09-19T00:00:00Z',
+            updated_at: '2026-09-19T00:00:01Z',
+            result: { products: [product], cache_scope: 'public' },
+          };
+    const submitted = await agent.getProducts({ brief: 'sports' }, undefined, { project: false });
+    const controller = new AbortController();
+    const pending = submitted.submitted.waitForCompletion(1, controller.signal);
+    await evidenceStarted;
+    controller.abort(new Error('completion cancelled'));
+    await assert.rejects(pending, /completion cancelled/);
+    assert.strictEqual(evidenceSignal.aborted, true);
+  });
+
+  for (const taskName of ['get_products', 'list_products']) {
+    test(`${taskName} annotates immediate, polled, and webhook products before publication`, async () => {
+      const products = [
+        makeProduct('owner-sold', 'host.example', {
+          collections: [{ publisher_domain: 'owner.example', collection_ids: ['channel'] }],
+          supply_path_state: 'verified_owner_sold',
+        }),
+      ];
+      const handlerCalls = [];
+      const agent = makeClient({
+        validation: {
+          supplyPathVerification: {
+            source: 'registry',
+            registry: {
+              verifySupplyPath: async request => ({
+                ...request,
+                semantics_version: '1',
+                state: 'owner_attested',
+                resolved_collection_id: request.collection_id,
+                legs: {
+                  owner_collection_declared: { ok: true },
+                  owner_distribution_carriage: { ok: true },
+                  owner_agent_declared: { ok: true },
+                  host_authorization: { ok: false, failure: 'no_agent_entry' },
+                  inventory_partner_domain: { ok: false, failure: 'not_declared' },
+                },
+                sources: {
+                  owner_fetched_at: new Date().toISOString(),
+                  host_fetched_at: new Date().toISOString(),
+                  owner_resolved_url: null,
+                  host_resolved_url: null,
+                  cached: true,
+                  owner_adagents_url: `https://${request.owner_domain}/.well-known/adagents.json`,
+                  host_adagents_url: `https://${request.host_domain}/.well-known/adagents.json`,
+                },
+                checked_at: new Date().toISOString(),
+              }),
+            },
+          },
+        },
+        handlers: {
+          [taskName === 'get_products' ? 'onGetProductsStatusChange' : 'onTaskStatusChange']: response =>
+            handlerCalls.push(response),
+        },
+      });
+      ProtocolClient.callTool = async () => ({ status: 'completed', products, cache_scope: 'public' });
+      const immediate = await agent.executeTask(taskName, taskName === 'get_products' ? { brief: 'sports' } : {});
+      assert.strictEqual(immediate.success, true, JSON.stringify(immediate));
+      assert.strictEqual(immediate.data.products[0].supply_path_state, 'owner_attested');
+      ProtocolClient.callTool = async (_agent, tool) =>
+        tool === taskName
+          ? { status: 'submitted', task_id: 'supply-path-task' }
+          : {
+              task_id: 'supply-path-task',
+              task_type: taskName,
+              protocol: 'media-buy',
+              status: 'completed',
+              created_at: '2026-06-02T12:00:00Z',
+              updated_at: '2026-06-02T12:00:01Z',
+              result: { products, cache_scope: 'public' },
+            };
+      const submitted = await agent.executeTask(taskName, taskName === 'get_products' ? { brief: 'sports' } : {});
+      assert.strictEqual(submitted.status, 'submitted');
+      const tracked = await submitted.submitted.track();
+      assert.strictEqual(tracked.result.products[0].supply_path_state, 'owner_attested');
+      const completed = await submitted.submitted.waitForCompletion(1);
+      assert.strictEqual(completed.data.products[0].supply_path_state, 'owner_attested');
+      const next = await agent.executeTask(taskName, taskName === 'get_products' ? { brief: 'sports' } : {});
+      await agent.handleWebhook(
+        {
+          idempotency_key: `supply_path_${taskName}_completed`,
+          operation_id: next.metadata.taskId,
+          task_id: 'supply-path-task',
+          task_type: taskName,
+          status: 'completed',
+          timestamp: new Date().toISOString(),
+          result: { products, cache_scope: 'public' },
+        },
+        taskName,
+        next.metadata.taskId
+      );
+      assert.ok(handlerCalls.some(response => response.products?.[0]?.supply_path_state === 'owner_attested'));
+      assert.ok(
+        handlerCalls.every(
+          response => !response.products || response.products[0].supply_path_state !== 'verified_owner_sold'
+        )
+      );
+    });
+  }
+});

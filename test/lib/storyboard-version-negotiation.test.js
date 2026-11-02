@@ -1,0 +1,1316 @@
+const { test, describe } = require('node:test');
+const assert = require('node:assert');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { ADCP_VERSION, toReleasePrecisionVersion } = require('../../dist/lib/version.js');
+
+const CURRENT_PRERELEASE_VERSION = ADCP_VERSION;
+const CURRENT_IS_PRERELEASE = CURRENT_PRERELEASE_VERSION.includes('-');
+const CURRENT_PRERELEASE_RELEASE_PRECISION = toReleasePrecisionVersion(ADCP_VERSION);
+const CURRENT_RELEASE_LINE = CURRENT_PRERELEASE_RELEASE_PRECISION.match(/^\d+\.\d+/)?.[0] ?? '3.2';
+const CURRENT_PRERELEASE_FAMILY = CURRENT_PRERELEASE_RELEASE_PRECISION.includes('-')
+  ? CURRENT_PRERELEASE_RELEASE_PRECISION.replace(/\.\d+$/, '')
+  : CURRENT_PRERELEASE_RELEASE_PRECISION;
+const CURRENT_PRERELEASE_NUMBER = Number(CURRENT_PRERELEASE_RELEASE_PRECISION.match(/\.(\d+)$/)?.[1] ?? 0);
+const DIFFERENT_PRERELEASE_NUMBER = CURRENT_PRERELEASE_NUMBER + 1;
+// A stable pin's "different" release is the next protocol minor line.
+const NEXT_RELEASE_LINE = CURRENT_RELEASE_LINE.replace(/\.(\d+)$/, (_, minor) => `.${Number(minor) + 1}`);
+const DIFFERENT_PRERELEASE_RELEASE_PRECISION = CURRENT_PRERELEASE_RELEASE_PRECISION.includes('-')
+  ? CURRENT_PRERELEASE_FAMILY + `.${DIFFERENT_PRERELEASE_NUMBER}`
+  : NEXT_RELEASE_LINE;
+const DIFFERENT_PRERELEASE_VERSION = ADCP_VERSION.includes('-')
+  ? ADCP_VERSION.replace(/\.\d+$/, `.${DIFFERENT_PRERELEASE_NUMBER}`)
+  : `${NEXT_RELEASE_LINE}.0`;
+
+function a2aCapabilitiesStoryboard() {
+  return {
+    id: 'a2a_native_transport',
+    version: '1.0.0',
+    adcp_version: CURRENT_PRERELEASE_VERSION,
+    title: 'A2A native transport',
+    category: 'universal',
+    summary: '',
+    narrative: '',
+    agent: { interaction_model: '*', capabilities: [] },
+    caller: { role: 'buyer_agent' },
+    phases: [
+      {
+        id: 'capabilities',
+        title: 'Capabilities',
+        steps: [
+          {
+            id: 'get_capabilities',
+            title: 'Get capabilities',
+            task: 'get_adcp_capabilities',
+            sample_request: { context: { correlation_id: 'a2a-native-transport' } },
+            validations: [],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function writeComplianceIndex(complianceDir, version = '3.0.12') {
+  fs.mkdirSync(complianceDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(complianceDir, 'index.json'),
+    JSON.stringify({ adcp_version: version, universal: [], protocols: [], specialisms: [] })
+  );
+}
+
+function writeComplianceIndexJson(complianceDir, index) {
+  fs.mkdirSync(complianceDir, { recursive: true });
+  fs.writeFileSync(path.join(complianceDir, 'index.json'), JSON.stringify(index));
+}
+
+function writeSchemaIndex(schemaRoot, version) {
+  fs.mkdirSync(schemaRoot, { recursive: true });
+  fs.writeFileSync(path.join(schemaRoot, 'index.json'), JSON.stringify({ adcp_version: version }));
+}
+
+function writeGetProductsRequestSchema(schemaRoot, idVersion, sentinel = 'external') {
+  fs.mkdirSync(path.join(schemaRoot, 'bundled', 'media-buy'), { recursive: true });
+  fs.writeFileSync(
+    path.join(schemaRoot, 'bundled', 'media-buy', 'get-products-request.json'),
+    JSON.stringify({
+      $id: `/schemas/${idVersion}/bundled/media-buy/get-products-request.json`,
+      type: 'object',
+      properties: { sentinel: { const: sentinel } },
+      required: ['sentinel'],
+      additionalProperties: false,
+    })
+  );
+}
+
+function writeListCreativesRequestSchema(schemaRoot, idVersion) {
+  fs.mkdirSync(path.join(schemaRoot, 'bundled', 'creative'), { recursive: true });
+  fs.writeFileSync(
+    path.join(schemaRoot, 'bundled', 'creative', 'list-creatives-request.json'),
+    JSON.stringify({
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      $id: `/schemas/${idVersion}/bundled/creative/list-creatives-request.json`,
+      type: 'object',
+      properties: {
+        fields: { type: 'array', items: { enum: ['assets'] } },
+      },
+      required: ['fields'],
+      additionalProperties: true,
+    })
+  );
+}
+
+function writeComplyControllerAsyncRefSchemas(schemaRoot, idVersion) {
+  fs.mkdirSync(path.join(schemaRoot, 'compliance'), { recursive: true });
+  fs.mkdirSync(path.join(schemaRoot, 'core'), { recursive: true });
+  fs.mkdirSync(path.join(schemaRoot, 'media-buy'), { recursive: true });
+  fs.writeFileSync(
+    path.join(schemaRoot, 'compliance', 'comply-test-controller-request.json'),
+    JSON.stringify({
+      $id: `/schemas/${idVersion}/compliance/comply-test-controller-request.json`,
+      type: 'object',
+      properties: {
+        account: {
+          type: 'object',
+          properties: { sandbox: { type: 'boolean' } },
+          required: ['sandbox'],
+          additionalProperties: false,
+        },
+        scenario: { enum: ['list_scenarios'] },
+        context: {
+          type: 'object',
+          properties: { correlation_id: { type: 'string' } },
+          additionalProperties: true,
+        },
+        response_data: { $ref: `/schemas/${idVersion}/core/async-response-data.json` },
+      },
+      required: ['account', 'scenario'],
+      additionalProperties: false,
+    })
+  );
+  fs.writeFileSync(
+    path.join(schemaRoot, 'core', 'async-response-data.json'),
+    JSON.stringify({
+      $id: `/schemas/${idVersion}/core/async-response-data.json`,
+      oneOf: [{ $ref: `/schemas/${idVersion}/media-buy/get-products-async-response-working.json` }],
+    })
+  );
+  fs.writeFileSync(
+    path.join(schemaRoot, 'media-buy', 'get-products-async-response-working.json'),
+    JSON.stringify({
+      $id: `/schemas/${idVersion}/media-buy/get-products-async-response-working.json`,
+      type: 'object',
+      properties: {
+        status: { const: 'working' },
+        task_id: { type: 'string' },
+      },
+      required: ['status', 'task_id'],
+      additionalProperties: false,
+    })
+  );
+}
+
+describe('storyboard runner AdCP version negotiation', () => {
+  test('derives legacy-major-only version envelope for 3.0 storyboards', () => {
+    const { applyStoryboardVersionOptions } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const options = applyStoryboardVersionOptions({ adcp_version: '3.0.12' }, {});
+
+    assert.strictEqual(options.adcpVersion, '3.0.12');
+    assert.strictEqual(options.versionEnvelope, 'auto');
+  });
+
+  test('derives explicit opt-in envelope for 3.1 storyboards', () => {
+    const { applyStoryboardVersionOptions } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const options = applyStoryboardVersionOptions({ adcp_version: CURRENT_PRERELEASE_VERSION }, {});
+
+    assert.strictEqual(options.adcpVersion, CURRENT_PRERELEASE_VERSION);
+    assert.strictEqual(options.versionEnvelope, 'auto');
+  });
+
+  test('explicit version override does not inherit a mismatched storyboard cache root', () => {
+    const { applyStoryboardVersionOptions } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const options = applyStoryboardVersionOptions(
+      { adcp_version: CURRENT_PRERELEASE_VERSION, compliance_dir: '/cache/3.2' },
+      { adcpVersion: '3.1.18' }
+    );
+
+    assert.strictEqual(options.adcpVersion, '3.1.18');
+    assert.strictEqual(options.complianceDir, undefined);
+  });
+
+  test('version_negotiation evaluates envelope_field_pattern instead of forward-compatible not_applicable', async () => {
+    const { runStoryboard } = require('../../dist/lib/testing/storyboard/runner.js');
+    const { createTestClient } = require('../../dist/lib/testing/client.js');
+
+    const storyboard = {
+      id: 'version_negotiation',
+      version: '1.0.0',
+      adcp_version: CURRENT_PRERELEASE_VERSION,
+      title: 'Version negotiation',
+      category: 'universal',
+      summary: '',
+      narrative: '',
+      agent: { interaction_model: '*', capabilities: [] },
+      caller: { role: 'buyer_agent' },
+      phases: [
+        {
+          id: 'capabilities',
+          title: 'Capabilities',
+          steps: [
+            {
+              id: 'get_capabilities_with_version',
+              title: 'Get capabilities with version envelope',
+              task: 'get_adcp_capabilities',
+              sample_request: {
+                context: {
+                  correlation_id: 'version_negotiation--get_capabilities_with_version',
+                },
+              },
+              validations: [
+                {
+                  check: 'envelope_field_pattern',
+                  path: 'adcp_version',
+                  pattern: '^\\d+\\.\\d+(-[a-zA-Z0-9.-]+)?$',
+                  description: 'Seller echoes release-precision adcp_version on the response envelope',
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    const client = createTestClient('https://example.invalid/mcp', 'mcp', {
+      adcpVersion: CURRENT_PRERELEASE_VERSION,
+      versionEnvelope: 'auto',
+    });
+    client.getAgentInfo = async () => ({ name: 'Test', tools: [{ name: 'get_adcp_capabilities' }] });
+    client.getAdcpCapabilities = async () => ({
+      success: true,
+      data: {
+        status: 'completed',
+        adcp_version: CURRENT_PRERELEASE_RELEASE_PRECISION,
+        adcp: { major_versions: [3], supported_versions: [CURRENT_PRERELEASE_RELEASE_PRECISION] },
+        supported_protocols: ['media_buy'],
+        context: { correlation_id: 'version_negotiation--get_capabilities_with_version' },
+      },
+    });
+
+    const result = await runStoryboard('https://example.invalid/mcp', storyboard, {
+      protocol: 'mcp',
+      agentTools: ['get_adcp_capabilities'],
+      _profile: { name: 'Test', tools: ['get_adcp_capabilities'] },
+      _client: client,
+    });
+
+    const validation = result.phases[0].steps[0].validations.find(v => v.check === 'envelope_field_pattern');
+    assert.ok(validation, 'envelope_field_pattern validation should be present');
+    assert.strictEqual(validation.passed, true, validation.error);
+    assert.strictEqual(validation.not_applicable, undefined);
+    assert.strictEqual(result.validations_not_applicable, undefined);
+  });
+
+  test('caller-supplied version envelope mode wins', () => {
+    const { applyStoryboardVersionOptions } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const options = applyStoryboardVersionOptions(
+      { adcp_version: '3.0.12' },
+      { adcpVersion: '3.0.12', versionEnvelope: 'auto' }
+    );
+
+    assert.strictEqual(options.adcpVersion, '3.0.12');
+    assert.strictEqual(options.versionEnvelope, 'auto');
+  });
+
+  test('legacy v3 alias keeps integer version marker behavior', () => {
+    const { applyAdcpVersionRunOptions } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const options = applyAdcpVersionRunOptions(undefined, { adcpVersion: 'v3' });
+
+    assert.strictEqual(options.adcpVersion, 'v3');
+    assert.strictEqual(options.versionEnvelope, 'auto');
+  });
+
+  test('shared test client is reused only when version options match', () => {
+    const { createTestClient, getOrCreateClient } = require('../../dist/lib/testing/client.js');
+
+    const shared = createTestClient('https://example.com/mcp', 'mcp', {
+      adcpVersion: CURRENT_PRERELEASE_VERSION,
+      versionEnvelope: 'auto',
+    });
+
+    assert.strictEqual(
+      getOrCreateClient('https://example.com/mcp', {
+        _client: shared,
+        adcpVersion: CURRENT_PRERELEASE_VERSION,
+        versionEnvelope: 'auto',
+      }),
+      shared
+    );
+    assert.notStrictEqual(
+      getOrCreateClient('https://example.com/mcp', {
+        _client: shared,
+        adcpVersion: CURRENT_PRERELEASE_VERSION,
+        versionEnvelope: 'none',
+      }),
+      shared
+    );
+    assert.notStrictEqual(
+      getOrCreateClient('https://example.com/mcp', {
+        _client: shared,
+        adcpVersion: CURRENT_PRERELEASE_VERSION,
+        versionEnvelope: 'auto',
+        strictResponseSchemaValidation: false,
+      }),
+      shared
+    );
+  });
+
+  test('A2A compliance transport disables legacy compatibility without changing other protocols', () => {
+    const {
+      applyNativeA2AComplianceTransportOptions,
+    } = require('../../dist/lib/testing/storyboard/native-a2a-compliance.js');
+
+    const a2a = applyNativeA2AComplianceTransportOptions({
+      protocol: 'a2a',
+      transport: { allowPrivateIp: true, legacyCompat: { enabled: true } },
+    });
+    const mcp = applyNativeA2AComplianceTransportOptions({
+      protocol: 'mcp',
+      transport: { legacyCompat: { enabled: true } },
+    });
+
+    assert.deepStrictEqual(a2a.transport, {
+      allowPrivateIp: true,
+      legacyCompat: { enabled: false },
+    });
+    assert.strictEqual(mcp.transport.legacyCompat.enabled, true);
+  });
+
+  test('routed A2A agents use native compatibility mode after their per-entry protocol is resolved', () => {
+    const { routedAgentOptions } = require('../../dist/lib/testing/storyboard/agent-routing.js');
+    const profile = { name: 'Routed A2A seller', tools: ['get_adcp_capabilities'] };
+    const options = routedAgentOptions(
+      { url: 'https://routed.example/a2a', transport: 'a2a' },
+      { protocol: 'mcp', transport: { legacyCompat: { enabled: true } } },
+      profile
+    );
+
+    assert.strictEqual(options.protocol, 'a2a');
+    assert.strictEqual(options.transport.legacyCompat.enabled, false);
+  });
+
+  test('shared A2A clients are reused only when legacy compatibility mode matches', () => {
+    const { createTestClient, getOrCreateClientResolution } = require('../../dist/lib/testing/client.js');
+    const agentUrl = 'https://seller.example/a2a';
+    const nativeOptions = { protocol: 'a2a', transport: { legacyCompat: { enabled: false } } };
+    const nativeClient = createTestClient(agentUrl, 'a2a', nativeOptions);
+
+    assert.strictEqual(
+      getOrCreateClientResolution(agentUrl, { ...nativeOptions, _client: nativeClient }).reusedShared,
+      true
+    );
+    assert.strictEqual(
+      getOrCreateClientResolution(agentUrl, {
+        protocol: 'a2a',
+        transport: { legacyCompat: { enabled: true } },
+        _client: nativeClient,
+      }).reusedShared,
+      false
+    );
+  });
+
+  test('storyboard entrypoints use native A2A while ordinary SDK calls retain the compatibility default', async t => {
+    const shim = require('../../dist/lib/protocols/a2a.js').legacyA2AClientTestShim;
+    const { callA2ATool, closeA2AConnections } = require('../../dist/lib/protocols/a2a.js');
+    const { createTestClient } = require('../../dist/lib/testing/client.js');
+    const { runStoryboard, runStoryboardStep } = require('../../dist/lib/testing/storyboard/runner.js');
+    const originalFromCardUrl = shim.fromCardUrl;
+    const originalNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'test';
+    const compatibilityModes = [];
+    shim.fromCardUrl = async (_cardUrl, options) => {
+      compatibilityModes.push(options.legacyCompat.enabled);
+      return {
+        sendMessage: async () => ({
+          result: {
+            kind: 'task',
+            id: 'capabilities-task',
+            contextId: 'capabilities-context',
+            status: { state: 'completed' },
+            artifacts: [
+              {
+                artifactId: 'capabilities-result',
+                parts: [
+                  {
+                    kind: 'data',
+                    data: {
+                      status: 'completed',
+                      adcp_version: CURRENT_PRERELEASE_RELEASE_PRECISION,
+                      adcp: {
+                        major_versions: [3],
+                        supported_versions: [CURRENT_PRERELEASE_RELEASE_PRECISION],
+                        idempotency: { supported: false },
+                      },
+                      supported_protocols: ['media_buy'],
+                      context: { correlation_id: 'a2a-native-transport' },
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        }),
+      };
+    };
+    t.after(() => {
+      shim.fromCardUrl = originalFromCardUrl;
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+      closeA2AConnections();
+    });
+
+    const profile = { name: 'A2A seller', tools: ['get_adcp_capabilities'] };
+    const storyboard = a2aCapabilitiesStoryboard();
+    const fullRunUrl = 'https://full-run.example/a2a';
+    const defaultModeSharedClient = createTestClient(fullRunUrl, 'a2a', {
+      adcpVersion: CURRENT_PRERELEASE_VERSION,
+    });
+    const fullResult = await runStoryboard(fullRunUrl, storyboard, {
+      protocol: 'a2a',
+      profile,
+      agentTools: profile.tools,
+      _client: defaultModeSharedClient,
+    });
+    const stepResult = await runStoryboardStep('https://single-step.example/a2a', storyboard, 'get_capabilities', {
+      protocol: 'a2a',
+      profile,
+      agentTools: profile.tools,
+    });
+    await callA2ATool('https://ordinary-sdk.example/a2a', 'get_adcp_capabilities', {});
+
+    assert.strictEqual(fullResult.overall_passed, true);
+    assert.strictEqual(stepResult.passed, true);
+    assert.deepStrictEqual(compatibilityModes, [false, false, true]);
+  });
+
+  test('discovery-only _client is not reused for executable storyboard calls', () => {
+    const { getOrCreateClient } = require('../../dist/lib/testing/client.js');
+
+    const discoveryOnly = {
+      getAgentInfo: async () => ({ name: 'T', tools: [] }),
+    };
+
+    const client = getOrCreateClient('https://example.com/mcp', { _client: discoveryOnly });
+
+    assert.notStrictEqual(client, discoveryOnly);
+    assert.strictEqual(typeof client.executeTask, 'function');
+  });
+
+  test('unauthenticated shared client is not reused when test kit supplies auth', () => {
+    const { createTestClient, getOrCreateClient } = require('../../dist/lib/testing/client.js');
+
+    const shared = createTestClient('https://example.com/mcp', 'mcp');
+    const client = getOrCreateClient('https://example.com/mcp', {
+      _client: shared,
+      test_kit: { auth: { api_key: 'sk_test', probe_task: 'list_creatives' } },
+    });
+
+    assert.notStrictEqual(client, shared);
+    assert.strictEqual(typeof client.executeTask, 'function');
+  });
+
+  test('major-only version envelope suppresses exact adcp_version while preserving legacy marker', async () => {
+    const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
+    const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
+    const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js');
+    const { ProtocolClient } = require('../../dist/lib/index.js');
+    const z = require('zod');
+
+    let captured;
+    const server = new McpServer({ name: 'storyboard-version-test', version: '1.0.0' });
+    server.registerTool(
+      'get_adcp_capabilities',
+      {
+        inputSchema: {
+          adcp_major_version: z.number().optional(),
+          adcp_version: z.string().optional(),
+        },
+      },
+      async args => {
+        captured = args;
+        return {
+          content: [{ type: 'text', text: '{}' }],
+          structuredContent: {
+            status: 'completed',
+            adcp: { major_versions: [3] },
+            supported_protocols: ['media_buy'],
+          },
+        };
+      }
+    );
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const mcpClient = new Client({ name: 'test-client', version: '1.0.0' });
+    await mcpClient.connect(clientTransport);
+
+    await ProtocolClient.callTool(
+      {
+        id: 'storyboard-version-test',
+        protocol: 'mcp',
+        agent_uri: 'in-process://storyboard-version-test',
+        _inProcessMcpClient: mcpClient,
+      },
+      'get_adcp_capabilities',
+      {},
+      { adcpVersion: CURRENT_PRERELEASE_VERSION, versionEnvelope: 'major-only' }
+    );
+
+    assert.strictEqual(captured.adcp_major_version, 3);
+    assert.strictEqual(captured.adcp_version, undefined);
+
+    await mcpClient.close();
+    await server.close();
+  });
+
+  test('3.0 storyboards suppress exact adcp_version while preserving legacy major marker', async () => {
+    const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
+    const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
+    const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js');
+    const { ProtocolClient } = require('../../dist/lib/index.js');
+    const z = require('zod');
+
+    let captured;
+    const server = new McpServer({ name: 'storyboard-version-test', version: '1.0.0' });
+    server.registerTool(
+      'get_products',
+      {
+        inputSchema: {
+          brief: z.string().optional(),
+          adcp_major_version: z.number().optional(),
+          adcp_version: z.string().optional(),
+        },
+      },
+      async args => {
+        captured = args;
+        return {
+          content: [{ type: 'text', text: '{}' }],
+          structuredContent: { success: true, products: [] },
+        };
+      }
+    );
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const mcpClient = new Client({ name: 'test-client', version: '1.0.0' });
+    await mcpClient.connect(clientTransport);
+
+    await ProtocolClient.callTool(
+      {
+        id: 'storyboard-version-test',
+        protocol: 'mcp',
+        agent_uri: 'in-process://storyboard-version-test',
+        _inProcessMcpClient: mcpClient,
+      },
+      'get_products',
+      { brief: 'legacy 3.0 storyboard' },
+      { adcpVersion: '3.0.12' }
+    );
+
+    assert.strictEqual(captured.adcp_major_version, 3);
+    assert.strictEqual(captured.adcp_version, undefined);
+
+    await mcpClient.close();
+    await server.close();
+  });
+
+  test('exact seller supported_versions are matched against cache version aliases', () => {
+    const { isComplianceVersionSupported } = require('../../dist/lib/testing/storyboard/index.js');
+
+    assert.strictEqual(isComplianceVersionSupported(CURRENT_PRERELEASE_VERSION, [CURRENT_PRERELEASE_VERSION]), true);
+    assert.strictEqual(
+      isComplianceVersionSupported(CURRENT_PRERELEASE_VERSION, [CURRENT_PRERELEASE_RELEASE_PRECISION]),
+      true
+    );
+    // A stable pin's family alias is its release-precision value, so it matches.
+    assert.strictEqual(
+      isComplianceVersionSupported(CURRENT_PRERELEASE_VERSION, [CURRENT_PRERELEASE_FAMILY]),
+      !CURRENT_IS_PRERELEASE
+    );
+    assert.strictEqual(
+      isComplianceVersionSupported(CURRENT_PRERELEASE_VERSION, [DIFFERENT_PRERELEASE_RELEASE_PRECISION]),
+      false
+    );
+    assert.strictEqual(isComplianceVersionSupported(CURRENT_PRERELEASE_VERSION, [DIFFERENT_PRERELEASE_VERSION]), false);
+    assert.strictEqual(isComplianceVersionSupported('3.0.12', ['3.0.0']), true);
+    assert.strictEqual(isComplianceVersionSupported('3.1.1', ['3.1.0']), true);
+    assert.strictEqual(isComplianceVersionSupported(CURRENT_PRERELEASE_VERSION, ['3.0']), false);
+  });
+
+  test('compliance negotiation uses major-only envelope for strict 3.0 capability profiles', () => {
+    const { applyNegotiatedComplianceVersionOptions } = require('../../dist/lib/testing/compliance/comply.js');
+
+    const options = applyNegotiatedComplianceVersionOptions(
+      {
+        name: 'Strict 3.0',
+        tools: ['get_adcp_capabilities', 'get_products'],
+        adcp_version: 'v3',
+        adcp_major_versions: [3],
+        supported_protocols: ['media_buy'],
+        library_version: '@adcp/client@5.22.0',
+      },
+      { adcpVersion: CURRENT_PRERELEASE_VERSION, versionEnvelope: 'auto' },
+      { complianceVersion: CURRENT_PRERELEASE_VERSION }
+    );
+
+    assert.strictEqual(options.versionEnvelope, 'major-only');
+    assert.strictEqual(options._serverAdcpVersion, '3.0');
+  });
+
+  test('hosted stable-line alias keeps prerelease validators while emitting stable wire version', () => {
+    const { applyNegotiatedComplianceVersionOptions } = require('../../dist/lib/testing/compliance/comply.js');
+
+    const options = applyNegotiatedComplianceVersionOptions(
+      {
+        name: 'Stable-line seller',
+        tools: ['get_adcp_capabilities', 'get_products'],
+        adcp_version: 'v3',
+        adcp_major_versions: [3],
+        adcp_supported_versions: [CURRENT_RELEASE_LINE],
+        supported_protocols: ['media_buy'],
+      },
+      { adcpVersion: CURRENT_PRERELEASE_VERSION, versionEnvelope: 'auto' },
+      { complianceVersion: CURRENT_PRERELEASE_VERSION, hostedStableLineAlias: CURRENT_RELEASE_LINE }
+    );
+
+    assert.strictEqual(options.adcpVersion, CURRENT_PRERELEASE_VERSION);
+    assert.strictEqual(options.wireAdcpVersion, CURRENT_IS_PRERELEASE ? CURRENT_RELEASE_LINE : undefined);
+    assert.strictEqual(
+      options._serverAdcpVersion,
+      CURRENT_IS_PRERELEASE ? CURRENT_RELEASE_LINE : CURRENT_PRERELEASE_VERSION
+    );
+  });
+
+  test('missing supported_versions alone does not downgrade a v3 seller', () => {
+    const { applyNegotiatedComplianceVersionOptions } = require('../../dist/lib/testing/compliance/comply.js');
+
+    const options = applyNegotiatedComplianceVersionOptions(
+      {
+        name: '3.1 seller during SHOULD-emit phase',
+        tools: ['get_adcp_capabilities', 'get_products'],
+        adcp_version: 'v3',
+        adcp_major_versions: [3],
+        supported_protocols: ['media_buy'],
+      },
+      { adcpVersion: CURRENT_PRERELEASE_VERSION, versionEnvelope: 'auto' },
+      { complianceVersion: CURRENT_PRERELEASE_VERSION }
+    );
+
+    assert.strictEqual(options.versionEnvelope, 'auto');
+    assert.strictEqual(options._serverAdcpVersion, CURRENT_PRERELEASE_VERSION);
+  });
+
+  test('pre-3.1 build_version is positive downgrade evidence', () => {
+    const { applyNegotiatedComplianceVersionOptions } = require('../../dist/lib/testing/compliance/comply.js');
+
+    const options = applyNegotiatedComplianceVersionOptions(
+      {
+        name: 'Strict 3.0',
+        tools: ['get_adcp_capabilities', 'get_products'],
+        adcp_version: 'v3',
+        adcp_major_versions: [3],
+        adcp_build_version: '3.0.12',
+        supported_protocols: ['media_buy'],
+      },
+      { adcpVersion: CURRENT_PRERELEASE_VERSION, versionEnvelope: 'auto' },
+      { complianceVersion: CURRENT_PRERELEASE_VERSION }
+    );
+
+    assert.strictEqual(options.versionEnvelope, 'major-only');
+    assert.strictEqual(options._serverAdcpVersion, '3.0.12');
+  });
+
+  test('capability resolution fails loudly on exact version mismatch', () => {
+    const {
+      CapabilityResolutionError,
+      resolveStoryboardsForCapabilities,
+    } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const sellerSupportedVersions = ['3.0'];
+    assert.throws(
+      () =>
+        resolveStoryboardsForCapabilities({
+          supported_protocols: [],
+          supported_versions: sellerSupportedVersions,
+        }),
+      err => {
+        assert.ok(err instanceof CapabilityResolutionError);
+        assert.strictEqual(err.code, 'unsupported_adcp_version');
+        assert.strictEqual(err.complianceVersion, ADCP_VERSION);
+        assert.deepStrictEqual(err.supportedVersions, ['3.0']);
+        assert.ok(Object.isFrozen(err.supportedVersions));
+        sellerSupportedVersions.push('9.9');
+        assert.deepStrictEqual(err.supportedVersions, ['3.0']);
+        assert.throws(() => err.supportedVersions.push('9.9'), TypeError);
+        return true;
+      }
+    );
+  });
+
+  test('hosted stable-line alias can resolve prerelease-backed compliance cache per call', () => {
+    const {
+      CapabilityResolutionError,
+      isComplianceVersionSupported,
+      resolveStoryboardsForCapabilities,
+    } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-hosted-stable-alias-'));
+    const complianceDir = path.join(tempRoot, 'compliance', 'cache', CURRENT_PRERELEASE_VERSION);
+    try {
+      writeComplianceIndex(complianceDir, CURRENT_PRERELEASE_VERSION);
+
+      assert.strictEqual(
+        isComplianceVersionSupported(CURRENT_PRERELEASE_VERSION, [CURRENT_RELEASE_LINE]),
+        !CURRENT_PRERELEASE_VERSION.includes('-')
+      );
+      assert.strictEqual(
+        isComplianceVersionSupported(CURRENT_PRERELEASE_VERSION, [CURRENT_RELEASE_LINE], {
+          hostedStableLineAlias: CURRENT_RELEASE_LINE,
+        }),
+        true
+      );
+      assert.strictEqual(
+        isComplianceVersionSupported(CURRENT_PRERELEASE_VERSION, ['3.0'], {
+          hostedStableLineAlias: CURRENT_RELEASE_LINE,
+        }),
+        false
+      );
+
+      if (CURRENT_IS_PRERELEASE) {
+        assert.throws(
+          () =>
+            resolveStoryboardsForCapabilities(
+              { supported_protocols: [], supported_versions: [CURRENT_RELEASE_LINE] },
+              { complianceDir }
+            ),
+          err => err instanceof CapabilityResolutionError && err.code === 'unsupported_adcp_version'
+        );
+      } else {
+        assert.deepStrictEqual(
+          resolveStoryboardsForCapabilities(
+            { supported_protocols: [], supported_versions: [CURRENT_RELEASE_LINE] },
+            { complianceDir }
+          ).storyboards,
+          []
+        );
+      }
+      assert.deepStrictEqual(
+        resolveStoryboardsForCapabilities(
+          { supported_protocols: [], supported_versions: [CURRENT_RELEASE_LINE] },
+          { complianceDir, hostedStableLineAlias: CURRENT_RELEASE_LINE }
+        ).storyboards,
+        []
+      );
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('external compliance dir resolves its sibling schema bundle for scoped validation', () => {
+    const {
+      getExternalSchemaRootForCompliance,
+      loadComplianceIndex,
+    } = require('../../dist/lib/testing/storyboard/index.js');
+    const { getValidator, _resetValidationLoader } = require('../../dist/lib/validation/schema-loader.js');
+    const { withExternalSchemaRoot } = require('../../dist/lib/testing/index.js');
+    const { resolveAdcpVersion } = require('../../dist/lib/utils/adcp-version-config.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-external-compliance-'));
+    const complianceDir = path.join(tempRoot, 'package', 'compliance', 'cache', '3.0.12');
+    const schemaRoot = path.join(tempRoot, 'package', 'dist', 'lib', 'schemas-data', '3.0');
+    try {
+      writeComplianceIndex(complianceDir);
+      writeGetProductsRequestSchema(schemaRoot, '3.0');
+
+      const index = loadComplianceIndex({ complianceDir });
+      const resolvedRoot = getExternalSchemaRootForCompliance({ complianceDir }, index.adcp_version);
+
+      withExternalSchemaRoot('3.0.12', resolvedRoot, () => {
+        assert.strictEqual(resolveAdcpVersion('3.0.12'), '3.0.12');
+        const validator = getValidator('get_products', 'request', '3.0.12');
+        assert.ok(validator, 'external 3.0 request validator should compile');
+        assert.strictEqual(validator({ sentinel: 'external' }), true);
+        assert.strictEqual(validator({ sentinel: 'installed-sdk-default' }), false);
+      });
+      _resetValidationLoader('3.0.12');
+      const installedValidator = getValidator('get_products', 'request', '3.0.12');
+      assert.ok(installedValidator, 'installed 3.0 fallback validator should compile after external root reset');
+      assert.strictEqual(installedValidator({ sentinel: 'external' }), false);
+    } finally {
+      _resetValidationLoader('3.0.12');
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('explicit schemaRoot registers a non-sibling external schema bundle', () => {
+    const {
+      getExternalSchemaRootForCompliance,
+      loadComplianceIndex,
+    } = require('../../dist/lib/testing/storyboard/index.js');
+    const { withExternalSchemaRoot } = require('../../dist/lib/testing/index.js');
+    const { getValidator, _resetValidationLoader } = require('../../dist/lib/validation/schema-loader.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-explicit-schema-root-'));
+    const complianceDir = path.join(tempRoot, 'compliance-cache', '3.0.12');
+    const schemaRoot = path.join(tempRoot, 'schema-bundles', '3.0');
+    try {
+      writeComplianceIndex(complianceDir);
+      writeGetProductsRequestSchema(schemaRoot, '3.0', 'explicit');
+
+      const index = loadComplianceIndex({ complianceDir, schemaRoot });
+      const resolvedRoot = getExternalSchemaRootForCompliance({ complianceDir, schemaRoot }, index.adcp_version);
+
+      withExternalSchemaRoot('3.0.12', resolvedRoot, () => {
+        const validator = getValidator('get_products', 'request', '3.0.12');
+        assert.ok(validator, 'explicit schema root validator should compile');
+        assert.strictEqual(validator({ sentinel: 'explicit' }), true);
+        assert.strictEqual(validator({ sentinel: 'external' }), false);
+      });
+    } finally {
+      _resetValidationLoader('3.0.12');
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('explicit compliance version fails fast when no matching schema bundle is available', () => {
+    const { getExternalSchemaRootForCompliance } = require('../../dist/lib/testing/storyboard/index.js');
+    const missingVersion = '9.9.0-beta.1';
+
+    assert.throws(
+      () => getExternalSchemaRootForCompliance({ version: missingVersion }, missingVersion),
+      /--compliance-version 9\.9\.0-beta\.1 selected AdCP compliance version "9\.9\.0-beta\.1".*installed default schemas.*--schema-root/
+    );
+  });
+
+  test('explicit compliance version probes the default cache sibling schema tree (#2524)', () => {
+    const { getExternalSchemaRootForCompliance } = require('../../dist/lib/testing/storyboard/index.js');
+    const selectedVersion = require('../../dist/lib/version.js').ADCP_VERSION;
+
+    const resolvedRoot = getExternalSchemaRootForCompliance({ version: selectedVersion }, selectedVersion);
+
+    assert.ok(resolvedRoot, 'an explicit compliance line should resolve an exact schema root');
+    assert.ok(
+      resolvedRoot.endsWith(path.join('schemas', 'cache', selectedVersion)) ||
+        resolvedRoot.endsWith(path.join('schemas-data', selectedVersion)),
+      `expected exact selected-version source or packaged schema root, got ${resolvedRoot}`
+    );
+  });
+
+  test('ADCP_COMPLIANCE_DIR resolves sibling schema bundle for scoped validation', () => {
+    const {
+      getExternalSchemaRootForCompliance,
+      loadComplianceIndex,
+    } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-env-compliance-schema-'));
+    const complianceDir = path.join(tempRoot, 'package', 'compliance', 'cache', '9.9.0-beta.1');
+    const schemaRoot = path.join(tempRoot, 'package', 'dist', 'lib', 'schemas-data', '9.9.0-beta.1');
+    const oldComplianceDir = process.env.ADCP_COMPLIANCE_DIR;
+    const oldSchemaRoot = process.env.ADCP_SCHEMA_ROOT;
+    try {
+      delete process.env.ADCP_SCHEMA_ROOT;
+      process.env.ADCP_COMPLIANCE_DIR = complianceDir;
+      writeComplianceIndex(complianceDir, '9.9.0-beta.1');
+      writeGetProductsRequestSchema(schemaRoot, '9.9.0-beta.1', 'env-sibling');
+
+      const index = loadComplianceIndex({});
+
+      assert.strictEqual(index.adcp_version, '9.9.0-beta.1');
+      assert.strictEqual(getExternalSchemaRootForCompliance({}, index.adcp_version), schemaRoot);
+    } finally {
+      if (oldComplianceDir === undefined) delete process.env.ADCP_COMPLIANCE_DIR;
+      else process.env.ADCP_COMPLIANCE_DIR = oldComplianceDir;
+      if (oldSchemaRoot === undefined) delete process.env.ADCP_SCHEMA_ROOT;
+      else process.env.ADCP_SCHEMA_ROOT = oldSchemaRoot;
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('ADCP_COMPLIANCE_DIR fails fast when matching schemas are unavailable', () => {
+    const {
+      getExternalSchemaRootForCompliance,
+      loadComplianceIndex,
+    } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-env-compliance-missing-schema-'));
+    const complianceDir = path.join(tempRoot, 'package', 'compliance', 'cache', '9.9.0-beta.1');
+    const oldComplianceDir = process.env.ADCP_COMPLIANCE_DIR;
+    const oldSchemaRoot = process.env.ADCP_SCHEMA_ROOT;
+    try {
+      delete process.env.ADCP_SCHEMA_ROOT;
+      process.env.ADCP_COMPLIANCE_DIR = complianceDir;
+      writeComplianceIndex(complianceDir, '9.9.0-beta.1');
+
+      const index = loadComplianceIndex({});
+
+      assert.throws(
+        () => getExternalSchemaRootForCompliance({}, index.adcp_version),
+        /compliance cache .* selected AdCP compliance version "9\.9\.0-beta\.1".*installed default schemas.*--schema-root/
+      );
+    } finally {
+      if (oldComplianceDir === undefined) delete process.env.ADCP_COMPLIANCE_DIR;
+      else process.env.ADCP_COMPLIANCE_DIR = oldComplianceDir;
+      if (oldSchemaRoot === undefined) delete process.env.ADCP_SCHEMA_ROOT;
+      else process.env.ADCP_SCHEMA_ROOT = oldSchemaRoot;
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('latest compliance metadata is repaired from schemaRoot index before storyboard annotation', () => {
+    const {
+      applyAdcpVersionRunOptions,
+      listBundles,
+      loadComplianceIndex,
+    } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-latest-compliance-version-'));
+    const complianceDir = path.join(tempRoot, 'dist', 'compliance', 'latest');
+    const schemaRoot = path.join(tempRoot, 'dist', 'schemas', 'latest');
+    try {
+      writeComplianceIndexJson(complianceDir, {
+        published_version: 'latest',
+        adcp_version: 'latest',
+        generated_at: '2026-06-05T00:00:00.000Z',
+        universal: ['capability-discovery'],
+        protocols: [],
+        specialisms: [],
+      });
+      writeSchemaIndex(schemaRoot, CURRENT_PRERELEASE_VERSION);
+
+      const index = loadComplianceIndex({ complianceDir, schemaRoot });
+      assert.strictEqual(index.published_version, 'latest');
+      assert.strictEqual(index.adcp_version, CURRENT_PRERELEASE_VERSION);
+
+      const bundles = listBundles({ complianceDir, schemaRoot });
+      assert.strictEqual(bundles[0].adcp_version, CURRENT_PRERELEASE_VERSION);
+
+      const options = applyAdcpVersionRunOptions(index.adcp_version, { schemaRoot });
+      assert.strictEqual(options.adcpVersion, CURRENT_PRERELEASE_VERSION);
+      assert.strictEqual(options.versionEnvelope, 'auto');
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('latest schema ids and same-change request fields work through the public storyboard runner', async () => {
+    const { createTestClient } = require('../../dist/lib/testing/client.js');
+    const { runStoryboardStep } = require('../../dist/lib/testing/storyboard/runner.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-latest-current-source-request-'));
+    const schemaRoot = path.join(tempRoot, 'dist', 'schemas', 'latest');
+    writeSchemaIndex(schemaRoot, CURRENT_PRERELEASE_VERSION);
+    writeListCreativesRequestSchema(schemaRoot, 'latest');
+
+    const agent = {
+      id: 'current-source-request-agent',
+      name: 'Current source request agent',
+      agent_uri: 'https://stub.example/mcp',
+      protocol: 'mcp',
+    };
+    const client = createTestClient(agent.agent_uri, 'mcp', {
+      adcpVersion: CURRENT_PRERELEASE_VERSION,
+      versionEnvelope: 'auto',
+    });
+    const innerClient = client.client;
+    let capturedRequest;
+    innerClient.ensureEndpointDiscovered = async () => agent;
+    innerClient.getCapabilities = async () => ({
+      version: 'v3',
+      majorVersions: [3],
+      supportedVersions: [CURRENT_PRERELEASE_RELEASE_PRECISION],
+      protocols: ['media_buy'],
+      features: {},
+      extensions: [],
+      _synthetic: false,
+    });
+    innerClient.validateTaskFeatures = async () => {};
+    innerClient.executor.executeTask = async (_agent, taskName, params) => {
+      capturedRequest = params;
+      return {
+        success: true,
+        status: 'completed',
+        data: {
+          status: 'completed',
+          creatives: [],
+          query_summary: {},
+          pagination: { total: 0, offset: 0, limit: 50, has_more: false },
+        },
+        metadata: {},
+      };
+    };
+
+    const storyboard = {
+      id: 'current_source_request',
+      version: '1.0.0',
+      adcp_version: CURRENT_PRERELEASE_VERSION,
+      title: 'Current-source request',
+      category: 'test',
+      summary: '',
+      narrative: '',
+      agent: { interaction_model: 'sync', capabilities: [] },
+      caller: { role: 'buyer_agent' },
+      phases: [
+        {
+          id: 'creative',
+          title: 'Creative',
+          steps: [
+            {
+              id: 'list',
+              title: 'List creatives with a same-change field value',
+              task: 'list_creatives',
+              sample_request: { fields: ['assets'] },
+            },
+          ],
+        },
+      ],
+    };
+
+    try {
+      const result = await runStoryboardStep('https://stub.example/mcp', storyboard, 'list', {
+        protocol: 'mcp',
+        schemaRoot,
+        _client: client,
+        _profile: {
+          name: agent.name,
+          tools: ['list_creatives'],
+          raw_capabilities: {
+            status: 'completed',
+            adcp: { major_versions: [3], supported_versions: [CURRENT_PRERELEASE_RELEASE_PRECISION] },
+            supported_protocols: ['media_buy'],
+          },
+        },
+      });
+
+      assert.strictEqual(result.passed, true, result.error);
+      assert.deepStrictEqual(capturedRequest.fields, ['assets']);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('latest compliance metadata can be repaired from published_version', () => {
+    const { loadComplianceIndex } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-latest-compliance-published-version-'));
+    const complianceDir = path.join(tempRoot, 'dist', 'compliance', 'latest');
+    try {
+      writeComplianceIndexJson(complianceDir, {
+        published_version: CURRENT_PRERELEASE_VERSION,
+        adcp_version: 'latest',
+        generated_at: '2026-06-05T00:00:00.000Z',
+        universal: [],
+        protocols: [],
+        specialisms: [],
+      });
+
+      const index = loadComplianceIndex({ complianceDir });
+      assert.strictEqual(index.adcp_version, CURRENT_PRERELEASE_VERSION);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('latest compliance metadata is repaired from index-less schemaRoot ids', () => {
+    const { loadComplianceIndex } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-latest-compliance-schema-ids-'));
+    const complianceDir = path.join(tempRoot, 'dist', 'compliance', 'latest');
+    const schemaRoot = path.join(tempRoot, 'schema-bundles', CURRENT_PRERELEASE_VERSION);
+    try {
+      writeComplianceIndexJson(complianceDir, {
+        published_version: 'latest',
+        adcp_version: 'latest',
+        generated_at: '2026-06-05T00:00:00.000Z',
+        universal: [],
+        protocols: [],
+        specialisms: [],
+      });
+      writeGetProductsRequestSchema(schemaRoot, CURRENT_PRERELEASE_VERSION, 'schema-id-version');
+
+      const index = loadComplianceIndex({ complianceDir, schemaRoot });
+      assert.strictEqual(index.adcp_version, CURRENT_PRERELEASE_VERSION);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('latest compliance metadata is repaired from sibling schema bundle without schemaRoot', () => {
+    const {
+      getExternalSchemaRootForCompliance,
+      loadComplianceIndex,
+    } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-latest-compliance-sibling-'));
+    const complianceDir = path.join(tempRoot, 'package', 'dist', 'compliance', 'latest');
+    const schemaRoot = path.join(tempRoot, 'package', 'dist', 'lib', 'schemas-data', CURRENT_PRERELEASE_VERSION);
+    try {
+      writeComplianceIndexJson(complianceDir, {
+        published_version: 'latest',
+        adcp_version: 'latest',
+        generated_at: '2026-06-05T00:00:00.000Z',
+        universal: [],
+        protocols: [],
+        specialisms: [],
+      });
+      writeGetProductsRequestSchema(schemaRoot, CURRENT_PRERELEASE_VERSION, 'sibling-schema-id-version');
+
+      const index = loadComplianceIndex({ complianceDir });
+      assert.strictEqual(index.adcp_version, CURRENT_PRERELEASE_VERSION);
+      assert.strictEqual(getExternalSchemaRootForCompliance({ complianceDir }, index.adcp_version), schemaRoot);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('ADCP_SCHEMA_ROOT repairs latest compliance metadata from the matching schema index', () => {
+    const { loadComplianceIndex } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-latest-compliance-env-'));
+    const complianceDir = path.join(tempRoot, 'dist', 'compliance', 'latest');
+    const schemaRoot = path.join(tempRoot, 'dist', 'schemas', 'latest');
+    const oldSchemaRoot = process.env.ADCP_SCHEMA_ROOT;
+    try {
+      writeComplianceIndexJson(complianceDir, {
+        published_version: 'latest',
+        adcp_version: 'latest',
+        generated_at: '2026-06-05T00:00:00.000Z',
+        universal: [],
+        protocols: [],
+        specialisms: [],
+      });
+      writeSchemaIndex(schemaRoot, CURRENT_PRERELEASE_VERSION);
+
+      process.env.ADCP_SCHEMA_ROOT = schemaRoot;
+      const index = loadComplianceIndex({ complianceDir });
+      assert.strictEqual(index.adcp_version, CURRENT_PRERELEASE_VERSION);
+    } finally {
+      if (oldSchemaRoot === undefined) delete process.env.ADCP_SCHEMA_ROOT;
+      else process.env.ADCP_SCHEMA_ROOT = oldSchemaRoot;
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('unrepairable latest compliance metadata fails before it can reach the wire', () => {
+    const { loadComplianceIndex } = require('../../dist/lib/testing/storyboard/index.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-latest-compliance-invalid-'));
+    const complianceDir = path.join(tempRoot, 'dist', 'compliance', 'latest');
+    const oldSchemaRoot = process.env.ADCP_SCHEMA_ROOT;
+    try {
+      delete process.env.ADCP_SCHEMA_ROOT;
+      writeComplianceIndexJson(complianceDir, {
+        published_version: 'latest',
+        adcp_version: 'latest',
+        generated_at: '2026-06-05T00:00:00.000Z',
+        universal: [],
+        protocols: [],
+        specialisms: [],
+      });
+
+      assert.throws(
+        () => loadComplianceIndex({ complianceDir }),
+        /declares invalid adcp_version "latest".*ADCP_SCHEMA_ROOT/
+      );
+    } finally {
+      if (oldSchemaRoot === undefined) delete process.env.ADCP_SCHEMA_ROOT;
+      else process.env.ADCP_SCHEMA_ROOT = oldSchemaRoot;
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('external schemaRoot resolves async-response-data refs without response validator prewarm', () => {
+    const { loadComplianceIndex } = require('../../dist/lib/testing/storyboard/index.js');
+    const { withExternalSchemaRoot } = require('../../dist/lib/testing/index.js');
+    const { _resetValidationLoader } = require('../../dist/lib/validation/schema-loader.js');
+    const { validateRequest } = require('../../dist/lib/validation/schema-validator.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-async-response-ref-'));
+    const complianceDir = path.join(tempRoot, 'compliance-cache', '3.0.12');
+    const schemaRoot = path.join(tempRoot, 'schema-bundles', '3.0');
+    try {
+      writeComplianceIndex(complianceDir);
+      writeComplyControllerAsyncRefSchemas(schemaRoot, '3.0.12');
+
+      loadComplianceIndex({ complianceDir, schemaRoot });
+      withExternalSchemaRoot('3.0.12', schemaRoot, () => {
+        const outcome = validateRequest(
+          'comply_test_controller',
+          {
+            account: { sandbox: true },
+            scenario: 'list_scenarios',
+            context: { correlation_id: 'deterministic_testing--list_scenarios' },
+          },
+          '3.0.12'
+        );
+
+        assert.strictEqual(outcome.valid, true, JSON.stringify(outcome.issues));
+      });
+    } finally {
+      _resetValidationLoader('3.0.12');
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('explicit schemaRoot accepts release-precision prerelease aliases for an exact external bundle', () => {
+    const { loadComplianceIndex } = require('../../dist/lib/testing/storyboard/index.js');
+    const { withExternalSchemaRoot } = require('../../dist/lib/testing/index.js');
+    const { getValidator, _resetValidationLoader } = require('../../dist/lib/validation/schema-loader.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-prerelease-alias-schema-root-'));
+    const schemaRoot = path.join(tempRoot, 'schema-bundles', CURRENT_PRERELEASE_VERSION);
+    const aliases = [CURRENT_PRERELEASE_RELEASE_PRECISION, CURRENT_PRERELEASE_FAMILY];
+    try {
+      writeGetProductsRequestSchema(schemaRoot, CURRENT_PRERELEASE_VERSION, 'prerelease-alias');
+
+      for (const adcpVersion of aliases) {
+        const complianceDir = path.join(tempRoot, 'compliance-cache', adcpVersion);
+        writeComplianceIndex(complianceDir, adcpVersion);
+
+        loadComplianceIndex({ complianceDir, schemaRoot });
+
+        withExternalSchemaRoot(adcpVersion, schemaRoot, () => {
+          const validator = getValidator('get_products', 'request', adcpVersion);
+          assert.ok(validator, `${adcpVersion} explicit schema root validator should compile`);
+          assert.strictEqual(validator({ sentinel: 'prerelease-alias' }), true);
+          assert.strictEqual(validator({ sentinel: 'installed-sdk-default' }), false);
+        });
+
+        _resetValidationLoader(adcpVersion);
+      }
+    } finally {
+      for (const adcpVersion of [CURRENT_PRERELEASE_VERSION, ...aliases]) {
+        _resetValidationLoader(adcpVersion);
+      }
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('explicit schemaRoot fails fast when missing or version-mismatched', () => {
+    const { withExternalSchemaRoot } = require('../../dist/lib/testing/index.js');
+    const { _resetValidationLoader } = require('../../dist/lib/validation/schema-loader.js');
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-bad-schema-root-'));
+    const complianceDir = path.join(tempRoot, 'compliance-cache', '3.0.12');
+    const wrongSchemaRoot = path.join(tempRoot, 'schema-bundles', '3.1');
+    try {
+      writeComplianceIndex(complianceDir);
+
+      assert.throws(
+        () => withExternalSchemaRoot('3.0.12', path.join(tempRoot, 'missing'), () => {}),
+        /External AdCP schema root for version "3\.0\.12" not found or empty/
+      );
+      assert.throws(
+        () => withExternalSchemaRoot('3.0.12', complianceDir, () => {}),
+        /External AdCP schema root for version "3\.0\.12" not found or empty/
+      );
+
+      writeGetProductsRequestSchema(wrongSchemaRoot, CURRENT_PRERELEASE_VERSION);
+      assert.throws(
+        () => withExternalSchemaRoot('3.0.12', wrongSchemaRoot, () => {}),
+        new RegExp(`does not match the requested version.*${CURRENT_PRERELEASE_VERSION.replaceAll('.', '\\.')}`)
+      );
+
+      const mismatchedLatestRoot = path.join(tempRoot, 'schema-bundles', 'latest');
+      writeSchemaIndex(mismatchedLatestRoot, CURRENT_PRERELEASE_VERSION);
+      writeGetProductsRequestSchema(mismatchedLatestRoot, 'latest');
+      assert.throws(
+        () => withExternalSchemaRoot('3.0.12', mismatchedLatestRoot, () => {}),
+        /does not match the requested version.*"latest" ids pinned by a matching root index/
+      );
+    } finally {
+      _resetValidationLoader('3.0.12');
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('fix commands preserve external schema and hosted alias options', () => {
+    const { extractFailures } = require('../../dist/lib/testing/compliance/comply.js');
+    const failures = extractFailures(
+      [
+        {
+          storyboard_id: 'story',
+          phases: [
+            {
+              steps: [
+                {
+                  passed: false,
+                  skipped: false,
+                  step_id: 'step',
+                  title: 'Step',
+                  task: 'get_products',
+                  validations: [],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+      [{ id: 'story', track: 'core', phases: [{ steps: [{ id: 'step', expected: 'works' }] }] }],
+      'agent-alias',
+      {
+        complianceVersion: CURRENT_PRERELEASE_VERSION,
+        complianceDir: '/tmp/compliance cache',
+        schemaRoot: '/tmp/schema root',
+        hostedStableLineAlias: '3.1',
+        testKitPath: '/tmp/test kit.yaml',
+      }
+    );
+
+    assert.match(failures[0].fix_command, /--schema-root '\/tmp\/schema root'/);
+    assert.match(failures[0].fix_command, /--hosted-stable-line-alias 3\.1/);
+    assert.match(failures[0].fix_command, /--test-kit '\/tmp\/test kit\.yaml'/);
+  });
+});

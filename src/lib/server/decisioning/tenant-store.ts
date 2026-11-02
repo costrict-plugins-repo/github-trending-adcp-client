@@ -1,0 +1,427 @@
+/**
+ * `createTenantStore` — opinionated `AccountStore` builder for multi-tenant
+ * adapters. Canonicalizes the two-path resolution shape (operator-routed
+ * for tools that carry `account` on the wire; auth-derived for tools that
+ * don't) and bakes in the per-entry tenant-isolation gate on the mutating
+ * account-sync tools (`sync_accounts` / `sync_governance`) that adopters
+ * historically had to write — and silently fail to write — by hand.
+ *
+ * NOTE: `refAccess` is REQUIRED and has no default, because the safe value
+ * depends on a fact only the adopter knows. `'ref-routed'` returns whatever
+ * tenant the buyer's ref points at — correct for the agency-hub model where one
+ * credential legitimately spans tenants, and a cross-tenant spend hole where it
+ * doesn't. `'auth-scoped'` gates `resolve` fail-closed.
+ *
+ * `refAccess` governs `resolve` ONLY. `upsert` / `syncGovernance` enforce the
+ * tenant gate either way — so an adopter who has verified those is NOT covered
+ * on `resolve`, and `resolve` is the account path for `create_media_buy` and
+ * `update_media_buy`. See {@link TenantStoreConfig.refAccess}.
+ *
+ * Full walkthrough with same-tenant invariant + production caveats:
+ * `skills/build-holdco-agent/SKILL.md`. Worked example:
+ * `examples/hello_seller_adapter_multi_tenant.ts`.
+ *
+ * Status: Preview / 6.x.
+ *
+ * @public
+ */
+
+import type { ResolveContext, Account, AccountStore, SyncAccountsResultRow } from './account';
+import type { AccountReference, SyncGovernanceRequest, SyncGovernanceSuccess } from '../../types/tools.generated';
+
+type SyncGovernanceEntry = SyncGovernanceRequest['accounts'][number];
+type SyncGovernanceRow = SyncGovernanceSuccess['accounts'][number];
+
+/**
+ * Adopter contract for `createTenantStore`. Every callback is sync OR async;
+ * the helper awaits.
+ *
+ * Tenant isolation is enforced by comparing `tenantId(authTenant)` against
+ * `tenantId(entryTenant)` per-entry on `sync_accounts` / `sync_governance`.
+ * Mismatches produce a `'failed'` row with `code: 'PERMISSION_DENIED'` —
+ * the adopter's `upsertRow` / `syncGovernanceRow` callbacks NEVER see a
+ * cross-tenant entry. Fail-closed when `resolveFromAuth` returns null
+ * (unknown principal): every entry fails `PERMISSION_DENIED` regardless of
+ * its operator. Don't fork this around to fail-open — adopters who copied
+ * the prior fail-open shape (`if (homeTenantId && tenantId !== homeTenantId)`)
+ * silently disabled isolation when a credential lacked a tenant binding.
+ *
+ * @template TTenant Adopter's tenant model (e.g., `TenantState`, a row
+ *                   from a `tenants` table). Compared via `tenantId`,
+ *                   not by reference.
+ * @template TCtxMeta Shape of `Account.ctx_metadata`. Threads through to
+ *                    every specialism handler via `ctx.account.ctx_metadata`.
+ */
+export interface TenantStoreConfig<TTenant, TCtxMeta = Record<string, unknown>> {
+  /**
+   * Controls whether a buyer-supplied account ref on `accounts.resolve` is
+   * gated against the authenticated principal's tenant.
+   *
+   * REQUIRED, deliberately with no default. Both values are correct for some
+   * deployments and catastrophic for others, and nothing in the code can tell
+   * which one you are: `'ref-routed'` is right for an agency hub whose single
+   * credential legitimately spans tenants, and a cross-tenant spend hole for a
+   * hub whose tenants are unrelated clients. A default would silently pick one
+   * of those for you. Making it required turns that into a `tsc` error you
+   * resolve once, at construction, instead of a runtime surprise.
+   *
+   * - `'ref-routed'` — `resolve` returns whatever tenant the ref
+   *   points at, WITHOUT checking the caller. This is correct for the
+   *   agency-hub / account-routed model where one credential legitimately
+   *   spans tenants (see `examples/hello_seller_adapter_multi_tenant.ts`).
+   *   In this mode `resolve` performs NO isolation check — any authenticated
+   *   caller can resolve any tenant's account by naming its `account_id` /
+   *   `operator`. Isolation for such deployments must be layered on top with
+   *   a `resolve-presets` guard (`requireAccountMatch` /
+   *   `requireAdvertiserMatch` / `requireOrgScope`) via `composeMethod`.
+   * - `'auth-scoped'` — `resolve` fails closed: a ref that resolves to a
+   *   tenant other than `resolveFromAuth(ctx)` (or an unresolvable auth
+   *   principal) returns `null` (framework emits `ACCOUNT_NOT_FOUND`). Use
+   *   this when a credential must NOT be able to reach another tenant's
+   *   account by supplying its ref.
+   *
+   * This flag governs ONLY `resolve`. `upsert` / `syncGovernance` always
+   * enforce the tenant gate regardless of this setting.
+   */
+  refAccess: 'ref-routed' | 'auth-scoped';
+
+  /**
+   * Path 1: account ref carries `account_id` OR `(brand, operator)`.
+   * Resolve to the tenant the ref points at. Return null if the ref is
+   * unknown (helper emits `ACCOUNT_NOT_FOUND` for that row).
+   *
+   * Under `refAccess: 'ref-routed'` this resolves independent of who the caller
+   * is. Under `refAccess: 'auth-scoped'` a ref pointing at a tenant other than
+   * the caller's is rejected.
+   *
+   * Receives the full `AccountReference` so adopters can route on
+   * `ref.sandbox` (Pattern 2: separate sandbox tenant) or read the
+   * `account_id` arm of the discriminated union.
+   */
+  resolveByRef(ref: AccountReference): TTenant | null | Promise<TTenant | null>;
+
+  /**
+   * Path 2: no account ref on the wire (`get_brand_identity`, `get_rights`,
+   * `provide_performance_feedback`, `list_creative_formats`). Derive the
+   * tenant from the auth principal. Return null if no principal is
+   * resolvable (no auth, no `agentRegistry`, principal not registered).
+   *
+   * Used by both `accounts.resolve(undefined, ctx)` (no-account tools)
+   * AND the tenant-isolation gate on per-entry tools — `null` here
+   * means EVERY entry on `sync_accounts` / `sync_governance` fails
+   * `PERMISSION_DENIED` (fail-closed).
+   */
+  resolveFromAuth(ctx: ResolveContext): TTenant | null | Promise<TTenant | null>;
+
+  /**
+   * Stable identity for tenant-equality checks. The helper compares
+   * `tenantId(authTenant) === tenantId(entryTenant)` to enforce isolation.
+   * Reference equality is fragile (Postgres-backed stores hand back fresh
+   * objects each fetch); a stable string id closes that gap.
+   */
+  tenantId(tenant: TTenant): string;
+
+  /**
+   * Project `(tenant, ref)` to the framework `Account<TCtxMeta>`. Called by
+   * `accounts.resolve` after tenant resolution. Adopters thread sandbox
+   * routing here (`sandbox: ref?.sandbox`), pin `ctx_metadata` for
+   * downstream handlers, and shape `name` / `operator` / `brand` to match
+   * the wire echo conventions their buyers expect.
+   *
+   * `ref` is `undefined` on Path-2 (no-account tools) — adopters returning
+   * a synthetic publisher-wide singleton omit `ref?.sandbox` (no sandbox
+   * boundary applies).
+   */
+  tenantToAccount(
+    tenant: TTenant,
+    ref: AccountReference | undefined,
+    ctx: ResolveContext
+  ): Account<TCtxMeta> | Promise<Account<TCtxMeta>>;
+
+  /**
+   * Per-entry `sync_accounts` storage callback. Called for each entry whose
+   * `(authTenant === entryTenant)` check passed. Receives the resolved
+   * tenant + the original ref + ctx. Returns a `SyncAccountsResultRow`.
+   *
+   * Cross-tenant entries and unknown-ref entries never reach this callback
+   * — the helper builds `PERMISSION_DENIED` / `ACCOUNT_NOT_FOUND` rows for
+   * those before invoking your code. The adopter's only job is the actual
+   * upsert.
+   *
+   * Optional. Omit if your platform doesn't claim `sync_accounts`; the
+   * helper leaves `accounts.upsert` undefined and the framework returns
+   * `UNSUPPORTED_FEATURE`.
+   */
+  upsertRow?(
+    tenant: TTenant,
+    ref: AccountReference,
+    ctx: ResolveContext
+  ): SyncAccountsResultRow | Promise<SyncAccountsResultRow>;
+
+  /**
+   * Per-entry `sync_governance` storage callback. Same gating rules as
+   * `upsertRow` — cross-tenant entries are rejected before reaching this
+   * code. Adopters persist the buyer's governance-agent binding (including
+   * write-only `authentication.credentials`, which the framework strips
+   * from the response automatically — see `toWireSyncGovernanceRow`).
+   *
+   * Optional. Omit if your platform doesn't claim `sync_governance`.
+   */
+  syncGovernanceRow?(
+    tenant: TTenant,
+    entry: SyncGovernanceEntry,
+    ctx: ResolveContext
+  ): SyncGovernanceRow | Promise<SyncGovernanceRow>;
+}
+
+/**
+ * Build an `AccountStore<TCtxMeta>` whose `resolve` / `upsert` /
+ * `syncGovernance` methods enforce tenant isolation.
+ *
+ * The helper produces:
+ *
+ * - `accounts.resolve(ref, ctx)` — calls `resolveByRef(ref)` when `ref` is
+ *   set, otherwise `resolveFromAuth(ctx)`. Projects via `tenantToAccount`.
+ *   Returns `null` if the resolver returned `null` (framework emits
+ *   `ACCOUNT_REQUIRED` for an account-required operation that omitted the
+ *   reference, preserves `ACCOUNT_NOT_FOUND` for a supplied unresolved ref,
+ *   or treats absence as "no tenant" for tools that don't require one). Under
+ *   `refAccess: 'ref-routed'` this path does NOT check the caller against the
+ *   ref's tenant; `refAccess: 'auth-scoped'` fails closed on a cross-tenant ref.
+ *
+ * - `accounts.upsert(refs, ctx)` — for each ref:
+ *     1. Resolve the entry's tenant via `resolveByRef`.
+ *     2. Resolve the auth principal's tenant via `resolveFromAuth(ctx)`
+ *        (computed once per request).
+ *     3. If the entry tenant is unknown, emit `ACCOUNT_NOT_FOUND`.
+ *     4. If the auth tenant is unknown OR differs from the entry tenant,
+ *        emit `PERMISSION_DENIED` (fail-closed).
+ *     5. Otherwise, invoke the adopter's `upsertRow`.
+ *
+ * - `accounts.syncGovernance(entries, ctx)` — same gating as `upsert`,
+ *   shaped for the `SyncGovernanceResponseRow` arm (`status: 'failed'`
+ *   with per-entry `errors`).
+ *
+ * `accounts.list` and `accounts.reportUsage` / `accounts.getAccountFinancials`
+ * are NOT generated by this helper — those tools have shapes (cursor
+ * pagination; per-row account refs spanning multiple tenants in
+ * `report_usage`) that don't fit the per-entry-then-row pattern. Adopters
+ * who claim those capabilities extend the returned store with
+ * `Object.assign`:
+ *
+ * ```ts
+ * const accounts = Object.assign(
+ *   createTenantStore<TenantState, TenantMeta>({...}),
+ *   { list: async (filter, ctx) => { ... } }
+ * );
+ * ```
+ *
+ * **Direct mutation of `upsert` / `syncGovernance` is locked.** The helper
+ * makes those properties non-writable (`Object.defineProperty`) so an
+ * adopter who writes `accounts.upsert = customHandler` after construction
+ * gets a TypeError instead of silently bypassing the tenant gate. If you
+ * really need a different `upsert`, don't use the helper — write a plain
+ * `AccountStore` and own the gate.
+ */
+export function createTenantStore<TTenant, TCtxMeta = Record<string, unknown>>(
+  config: TenantStoreConfig<TTenant, TCtxMeta>
+): AccountStore<TCtxMeta> {
+  // `refAccess` is required in the type, but the type only protects TypeScript
+  // callers — a JS adopter or an `as any` cast would otherwise fall through to
+  // the permissive branch silently, which is the exact failure this field exists
+  // to prevent. Refuse at construction instead.
+  if (config.refAccess !== 'ref-routed' && config.refAccess !== 'auth-scoped') {
+    throw new Error(
+      'createTenantStore: `refAccess` is required and must be "ref-routed" or "auth-scoped". ' +
+        'There is deliberately no default — the safe value depends on whether one credential is ' +
+        'supposed to span tenants. Use "auth-scoped" when a credential must NOT reach another ' +
+        'tenant\'s account by naming its ref (most multi-tenant deployments), or "ref-routed" for ' +
+        'an agency hub whose single credential legitimately spans tenants. Note this governs ' +
+        '`resolve` only — which is the account path for create_media_buy and update_media_buy — ' +
+        'while `upsert` / `syncGovernance` are gated either way.'
+    );
+  }
+  const store: AccountStore<TCtxMeta> = {
+    resolve: async (ref, ctx) => {
+      const resolveCtx = ctx ?? {};
+      if (!ref) {
+        const authTenant = await config.resolveFromAuth(resolveCtx);
+        if (authTenant == null) return null;
+        return await config.tenantToAccount(authTenant, ref, resolveCtx);
+      }
+      const entryTenant = await config.resolveByRef(ref);
+      if (entryTenant == null) return null;
+      if (config.refAccess === 'auth-scoped') {
+        const authTenant = await config.resolveFromAuth(resolveCtx);
+        // Fail-closed: an unresolvable principal OR a ref pointing at a
+        // different tenant is treated as not found — a caller cannot reach
+        // another tenant's account by naming its ref.
+        if (authTenant == null || config.tenantId(authTenant) !== config.tenantId(entryTenant)) {
+          return null;
+        }
+      }
+      return await config.tenantToAccount(entryTenant, ref, resolveCtx);
+    },
+  };
+
+  if (config.upsertRow) {
+    const upsertRow = config.upsertRow;
+    const upsert: NonNullable<AccountStore<TCtxMeta>['upsert']> = async (refs, ctx) => {
+      const resolveCtx = ctx ?? {};
+      const authTenant = await config.resolveFromAuth(resolveCtx);
+      const authTenantKey = authTenant != null ? config.tenantId(authTenant) : undefined;
+      // Sequential, not Promise.all: adopter `upsertRow` callbacks
+      // commonly mutate shared tenant state (the multi-tenant adapter's
+      // `tenant.accounts.set(...)` is the canonical example). Concurrent
+      // invocations against the same tenant are an entropy source the
+      // helper shouldn't introduce. Adopters who want parallel writes
+      // can fan out inside their callback against an upstream that
+      // tolerates it.
+      const rows: SyncAccountsResultRow[] = [];
+      for (const ref of refs) {
+        const entryTenant = await config.resolveByRef(ref);
+        if (entryTenant == null) {
+          rows.push(buildSyncAccountsFailedRow(ref, 'ACCOUNT_NOT_FOUND', accountNotFoundMessage(ref)));
+          continue;
+        }
+        const entryKey = config.tenantId(entryTenant);
+        if (authTenantKey == null || authTenantKey !== entryKey) {
+          rows.push(buildSyncAccountsFailedRow(ref, 'PERMISSION_DENIED', permissionDeniedMessage(ref)));
+          continue;
+        }
+        rows.push(await upsertRow(entryTenant, ref, resolveCtx));
+      }
+      return rows;
+    };
+    Object.defineProperty(store, 'upsert', { value: upsert, writable: false, configurable: false, enumerable: true });
+  }
+
+  if (config.syncGovernanceRow) {
+    const syncGovernanceRow = config.syncGovernanceRow;
+    const syncGovernance: NonNullable<AccountStore<TCtxMeta>['syncGovernance']> = async (entries, ctx) => {
+      const resolveCtx = ctx ?? {};
+      const authTenant = await config.resolveFromAuth(resolveCtx);
+      const authTenantKey = authTenant != null ? config.tenantId(authTenant) : undefined;
+      const rows: SyncGovernanceRow[] = [];
+      for (const entry of entries) {
+        const entryTenant = await config.resolveByRef(entry.account);
+        if (entryTenant == null) {
+          rows.push(buildSyncGovernanceFailedRow(entry, 'ACCOUNT_NOT_FOUND', accountNotFoundMessage(entry.account)));
+          continue;
+        }
+        const entryKey = config.tenantId(entryTenant);
+        if (authTenantKey == null || authTenantKey !== entryKey) {
+          rows.push(buildSyncGovernanceFailedRow(entry, 'PERMISSION_DENIED', permissionDeniedMessage(entry.account)));
+          continue;
+        }
+        rows.push(await syncGovernanceRow(entryTenant, entry, resolveCtx));
+      }
+      return rows;
+    };
+    Object.defineProperty(store, 'syncGovernance', {
+      value: syncGovernance,
+      writable: false,
+      configurable: false,
+      enumerable: true,
+    });
+  }
+
+  return store;
+}
+
+/**
+ * Read fields from an `AccountReference` without per-arm narrowing. The wire
+ * type is a discriminated union (`{account_id} | {brand, operator}`) — schema
+ * validation upstream guarantees one arm is populated, so widening to an
+ * all-optional record is safe and saves a `'in' ref ? ref.x : fallback` dance
+ * inside `tenantToAccount` / `resolveByRef` / failed-row builders.
+ *
+ * Use inside adopter `createTenantStore({...})` callbacks to read
+ * `ref.operator`, `ref.brand?.domain`, or `ref.account_id` without inline
+ * casts. This is the same helper the framework uses internally for its
+ * `PERMISSION_DENIED` / `ACCOUNT_NOT_FOUND` row construction.
+ *
+ * ```ts
+ * tenantToAccount: (tenant, ref, ctx) => {
+ *   const r = narrowAccountRef(ref);
+ *   return {
+ *     id: tenant.id,
+ *     operator: r?.operator ?? ctx?.agent?.agent_url ?? 'derived',
+ *     ...(r?.brand?.domain && { brand: { domain: r.brand.domain } }),
+ *
+ *   };
+ * }
+ * ```
+ *
+ * Returns `undefined` on `undefined` input — the no-account-tool path.
+ */
+export function narrowAccountRef(ref: AccountReference): {
+  account_id?: string;
+  operator?: string;
+  brand?: { domain?: string };
+  sandbox?: boolean;
+};
+export function narrowAccountRef(ref: undefined): undefined;
+export function narrowAccountRef(ref: AccountReference | undefined):
+  | {
+      account_id?: string;
+      operator?: string;
+      brand?: { domain?: string };
+      sandbox?: boolean;
+    }
+  | undefined;
+export function narrowAccountRef(
+  ref: AccountReference | undefined
+): { account_id?: string; operator?: string; brand?: { domain?: string }; sandbox?: boolean } | undefined {
+  if (ref === undefined) return undefined;
+  return ref as { account_id?: string; operator?: string; brand?: { domain?: string }; sandbox?: boolean };
+}
+
+/**
+ * Build a failed `sync_accounts` row when the helper rejects an entry
+ * (cross-tenant or unknown ref). The wire schema requires `brand` +
+ * `operator` on every row, so when the input ref is `account_id`-only
+ * we synthesize `'unknown'` placeholders — the buyer's `errors[0].code`
+ * is the actionable signal; `brand` / `operator` here are wire-required
+ * scaffolding, not authoritative echoes.
+ */
+function buildSyncAccountsFailedRow(
+  ref: AccountReference,
+  code: 'ACCOUNT_NOT_FOUND' | 'PERMISSION_DENIED',
+  message: string
+): SyncAccountsResultRow {
+  const r = narrowAccountRef(ref);
+  return {
+    brand: { domain: r.brand?.domain ?? 'unknown.example' },
+    operator: r.operator ?? 'unknown',
+    action: 'failed',
+    status: 'rejected',
+    errors: [{ code, message }],
+    ...(r.account_id != null && { account_id: r.account_id }),
+  };
+}
+
+function buildSyncGovernanceFailedRow(
+  entry: SyncGovernanceEntry,
+  code: 'ACCOUNT_NOT_FOUND' | 'PERMISSION_DENIED',
+  message: string
+): SyncGovernanceRow {
+  return {
+    account: entry.account,
+    status: 'failed',
+    errors: [{ code, message }],
+  };
+}
+
+function accountNotFoundMessage(ref: AccountReference): string {
+  const r = narrowAccountRef(ref);
+  if (r.account_id) return `Unknown account_id: ${r.account_id}`;
+  if (r.operator) return `Unknown operator: ${r.operator}`;
+  return 'Unknown account reference';
+}
+
+function permissionDeniedMessage(ref: AccountReference): string {
+  const r = narrowAccountRef(ref);
+  const subject = r.operator ?? r.account_id ?? 'this account';
+  return `Buyer agent has no authority over '${subject}' (tenant mismatch or auth principal not registered).`;
+}

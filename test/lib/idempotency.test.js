@@ -1,0 +1,293 @@
+const { describe, it } = require('node:test');
+const assert = require('node:assert/strict');
+
+const {
+  generateIdempotencyKey,
+  isMutatingTask,
+  requestUsesIdempotency,
+  isValidIdempotencyKey,
+  useIdempotencyKey,
+  redactIdempotencyKey,
+  IDEMPOTENCY_KEY_PATTERN,
+  MUTATING_TASKS,
+  IdempotencyConflictError,
+  IdempotencyExpiredError,
+  adcpErrorToTypedError,
+  isADCPError,
+} = require('../../dist/lib/index.js');
+const { TOOL_REQUEST_SCHEMAS } = require('../../dist/lib/utils/tool-request-schemas.js');
+
+describe('idempotency utilities', () => {
+  describe('generateIdempotencyKey', () => {
+    it('returns a spec-compliant key', () => {
+      const key = generateIdempotencyKey();
+      assert.ok(IDEMPOTENCY_KEY_PATTERN.test(key), `${key} should match spec pattern`);
+      assert.equal(key.length, 36); // UUID v4
+    });
+
+    it('returns a unique key each call', () => {
+      const set = new Set();
+      for (let i = 0; i < 100; i++) set.add(generateIdempotencyKey());
+      assert.equal(set.size, 100);
+    });
+  });
+
+  describe('isValidIdempotencyKey', () => {
+    it('accepts UUID v4', () => {
+      assert.ok(isValidIdempotencyKey('a1b2c3d4-e5f6-7890-abcd-ef1234567890'));
+    });
+
+    it('accepts 16-char minimum', () => {
+      assert.ok(isValidIdempotencyKey('abcdefghij123456'));
+    });
+
+    it('rejects keys under 16 chars', () => {
+      assert.ok(!isValidIdempotencyKey('too-short'));
+    });
+
+    it('rejects keys over 255 chars', () => {
+      assert.ok(!isValidIdempotencyKey('a'.repeat(256)));
+    });
+
+    it('rejects whitespace', () => {
+      assert.ok(!isValidIdempotencyKey('has space here-1234'));
+    });
+
+    it('rejects unicode', () => {
+      assert.ok(!isValidIdempotencyKey('café-abcdefghij1234'));
+    });
+  });
+
+  describe('isMutatingTask', () => {
+    it('returns true for known mutating tools', () => {
+      assert.ok(isMutatingTask('create_media_buy'));
+      assert.ok(isMutatingTask('update_media_buy'));
+      assert.ok(isMutatingTask('activate_signal'));
+      assert.ok(isMutatingTask('sync_accounts'));
+      assert.ok(isMutatingTask('si_send_message'));
+      assert.ok(isMutatingTask('log_event'));
+    });
+
+    it('returns false for read-only tools', () => {
+      assert.ok(!isMutatingTask('get_products'));
+      assert.ok(!isMutatingTask('get_media_buys'));
+      assert.ok(!isMutatingTask('list_creatives'));
+      assert.ok(!isMutatingTask('get_adcp_capabilities'));
+    });
+
+    it('excludes si_terminate_session (naturally idempotent via session_id)', () => {
+      // The request schema for si_terminate_session keeps idempotency_key optional
+      // per the spec; session_id provides natural dedup.
+      assert.ok(!isMutatingTask('si_terminate_session'));
+    });
+
+    it('returns false for unknown tool names', () => {
+      assert.ok(!isMutatingTask('made_up_tool_name'));
+    });
+  });
+
+  describe('requestUsesIdempotency', () => {
+    it('classifies proposal finalization as a state-changing get_products variant', () => {
+      assert.ok(
+        requestUsesIdempotency('get_products', {
+          refine: [{ scope: 'proposal', action: 'finalize', proposal_id: 'proposal_1' }],
+        })
+      );
+      assert.ok(!requestUsesIdempotency('get_products', { brief: 'find inventory' }));
+      assert.ok(
+        !requestUsesIdempotency('get_products', {
+          refine: [{ scope: 'proposal', action: 'adjust', proposal_id: 'proposal_1' }],
+        })
+      );
+    });
+
+    it('fails closed on malformed finalize intent', () => {
+      assert.ok(requestUsesIdempotency('get_products', { refine: [{ action: 'finalize', proposal_id: 123 }] }));
+      assert.ok(
+        requestUsesIdempotency('get_products', {
+          refine: { scope: 'proposal', action: 'finalize', proposal_id: 'proposal_1' },
+        })
+      );
+    });
+
+    it('still classifies schema-required mutating tools', () => {
+      assert.ok(requestUsesIdempotency('create_media_buy', {}));
+    });
+  });
+
+  describe('MUTATING_TASKS set', () => {
+    it('includes the canonical mutating tools', () => {
+      assert.ok(MUTATING_TASKS.has('create_media_buy'));
+      assert.ok(MUTATING_TASKS.has('update_media_buy'));
+      assert.ok(MUTATING_TASKS.has('sync_creatives'));
+      assert.ok(MUTATING_TASKS.has('activate_signal'));
+    });
+
+    it('matches request schemas that require idempotency_key', () => {
+      const schemaRequiredTasks = Object.entries(TOOL_REQUEST_SCHEMAS)
+        .filter(([, schema]) => {
+          const field = schema?.shape?.idempotency_key;
+          return field && !field.safeParse(undefined).success;
+        })
+        .map(([toolName]) => toolName);
+
+      // refine_proposals is a forward surface available before every schema
+      // bundle used by this branch necessarily carries the required field.
+      schemaRequiredTasks.push('refine_proposals');
+      // rc.6 makes feature extraction economically mutating while preserving
+      // keyless 3.x compatibility, so the key remains schema-optional.
+      schemaRequiredTasks.push('get_creative_features');
+
+      assert.deepEqual([...MUTATING_TASKS].sort(), [...new Set(schemaRequiredTasks)].sort());
+    });
+  });
+});
+
+describe('IdempotencyConflictError', () => {
+  it('extends ADCPError', () => {
+    const err = new IdempotencyConflictError('abc-123');
+    assert.ok(isADCPError(err));
+  });
+
+  it('carries the code and key', () => {
+    const err = new IdempotencyConflictError('abc-123');
+    assert.equal(err.code, 'IDEMPOTENCY_CONFLICT');
+    assert.equal(err.idempotencyKey, 'abc-123');
+  });
+
+  it('has a default message pointing at recovery', () => {
+    const err = new IdempotencyConflictError('abc-123');
+    assert.match(err.message, /reconcile.*natural key/i);
+  });
+
+  it('accepts a custom message', () => {
+    const err = new IdempotencyConflictError('abc-123', 'custom');
+    assert.equal(err.message, 'custom');
+  });
+});
+
+describe('IdempotencyExpiredError', () => {
+  it('extends ADCPError with the expected code', () => {
+    const err = new IdempotencyExpiredError('abc-123');
+    assert.ok(isADCPError(err));
+    assert.equal(err.code, 'IDEMPOTENCY_EXPIRED');
+  });
+
+  it('default message nudges callers toward natural-key lookup', () => {
+    const err = new IdempotencyExpiredError('abc-123');
+    assert.match(err.message, /natural key|replay window/i);
+  });
+});
+
+describe('adcpErrorToTypedError', () => {
+  it('maps IDEMPOTENCY_CONFLICT to IdempotencyConflictError with the caller-supplied key', () => {
+    const typed = adcpErrorToTypedError({ code: 'IDEMPOTENCY_CONFLICT', message: 'seller msg' }, 'abc-123');
+    assert.ok(typed instanceof IdempotencyConflictError);
+    assert.equal(typed.idempotencyKey, 'abc-123');
+    assert.equal(typed.message, 'seller msg');
+  });
+
+  it('maps IDEMPOTENCY_EXPIRED to IdempotencyExpiredError', () => {
+    const typed = adcpErrorToTypedError({ code: 'IDEMPOTENCY_EXPIRED' }, 'abc-123');
+    assert.ok(typed instanceof IdempotencyExpiredError);
+  });
+
+  it('returns undefined for codes without a typed mapping', () => {
+    assert.equal(adcpErrorToTypedError({ code: 'RATE_LIMITED' }, 'abc'), undefined);
+    assert.equal(adcpErrorToTypedError({ code: 'INVALID_REQUEST' }), undefined);
+  });
+});
+
+describe('useIdempotencyKey', () => {
+  it('returns a spread-able object for valid keys', () => {
+    const fragment = useIdempotencyKey('abcdefghij1234-abc');
+    assert.deepEqual(fragment, { idempotency_key: 'abcdefghij1234-abc' });
+  });
+
+  it('throws on keys that fail the spec pattern', () => {
+    assert.throws(() => useIdempotencyKey('too-short'), /Invalid idempotency_key/);
+    assert.throws(() => useIdempotencyKey('has space here-1234'), /Invalid idempotency_key/);
+    assert.throws(() => useIdempotencyKey(null), /Invalid idempotency_key/);
+  });
+
+  it('error message does not leak the full key', () => {
+    const longKey = 'a'.repeat(500);
+    try {
+      useIdempotencyKey(longKey);
+      assert.fail('should have thrown');
+    } catch (e) {
+      assert.ok(e.message.length < longKey.length, 'error should truncate the offending key');
+    }
+  });
+});
+
+describe('redactIdempotencyKey', () => {
+  it('truncates to first 8 chars plus ellipsis by default', () => {
+    delete process.env.ADCP_LOG_IDEMPOTENCY_KEYS;
+    const key = 'abcdefgh-1234-5678-ij-this-is-sensitive';
+    const redacted = redactIdempotencyKey(key);
+    assert.equal(redacted, 'abcdefgh…');
+    assert.ok(!redacted.includes('sensitive'));
+  });
+
+  it('returns the full key when ADCP_LOG_IDEMPOTENCY_KEYS is enabled', () => {
+    process.env.ADCP_LOG_IDEMPOTENCY_KEYS = '1';
+    try {
+      const key = 'abcdefgh-1234-5678-ij-full';
+      assert.equal(redactIdempotencyKey(key), key);
+    } finally {
+      delete process.env.ADCP_LOG_IDEMPOTENCY_KEYS;
+    }
+  });
+});
+
+describe('redactIdempotencyKeyInArgs', () => {
+  const { redactIdempotencyKeyInArgs } = require('../../dist/lib/utils/idempotency.js');
+
+  it('returns the same reference when args has no idempotency_key', () => {
+    const args = { brief: 'hi', account: { account_id: 'a1' } };
+    assert.equal(redactIdempotencyKeyInArgs(args), args, 'no-key path must preserve reference (A2A relies on this)');
+  });
+
+  it('returns a shallow clone with the key redacted when present', () => {
+    delete process.env.ADCP_LOG_IDEMPOTENCY_KEYS;
+    const args = { brief: 'hi', idempotency_key: 'abcdefgh-1234-5678-ij-sensitive' };
+    const out = redactIdempotencyKeyInArgs(args);
+    assert.notEqual(out, args, 'must return a clone, not mutate the original');
+    assert.equal(out.idempotency_key, 'abcdefgh…');
+    assert.equal(args.idempotency_key, 'abcdefgh-1234-5678-ij-sensitive', 'original must not be mutated');
+    assert.equal(out.brief, 'hi');
+  });
+
+  it('returns the same reference when ADCP_LOG_IDEMPOTENCY_KEYS is enabled', () => {
+    process.env.ADCP_LOG_IDEMPOTENCY_KEYS = '1';
+    try {
+      const args = { brief: 'hi', idempotency_key: 'abcdefgh-1234-5678-ij-full' };
+      assert.equal(redactIdempotencyKeyInArgs(args), args, 'opt-in full logging must preserve reference');
+    } finally {
+      delete process.env.ADCP_LOG_IDEMPOTENCY_KEYS;
+    }
+  });
+});
+
+describe('IdempotencyConflictError/ExpiredError do not leak key on serialization', () => {
+  it('idempotencyKey is non-enumerable on IdempotencyConflictError', () => {
+    const err = new IdempotencyConflictError('secret-key-abcdefghij1234');
+    assert.equal(err.idempotencyKey, 'secret-key-abcdefghij1234', 'direct access still works');
+    assert.ok(
+      !Object.keys(err).includes('idempotencyKey'),
+      'key must not appear in Object.keys (blocks JSON.stringify leak)'
+    );
+    assert.ok(
+      !JSON.stringify(err).includes('secret-key'),
+      `JSON.stringify(err) leaked the key: ${JSON.stringify(err)}`
+    );
+  });
+
+  it('idempotencyKey is non-enumerable on IdempotencyExpiredError', () => {
+    const err = new IdempotencyExpiredError('secret-key-abcdefghij1234');
+    assert.equal(err.idempotencyKey, 'secret-key-abcdefghij1234');
+    assert.ok(!Object.keys(err).includes('idempotencyKey'));
+    assert.ok(!JSON.stringify(err).includes('secret-key'));
+  });
+});

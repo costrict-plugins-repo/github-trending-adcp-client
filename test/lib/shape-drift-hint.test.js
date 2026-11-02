@@ -1,0 +1,358 @@
+/**
+ * Tests for detectShapeDriftHint — the actionable-recipe emitter that
+ * recognizes common response-shape mistakes and surfaces next to the
+ * schema error.
+ *
+ * The motivating bug: scope3 agentic-adapters#100 returned a build_creative
+ * response with { tag_url, creative_id, media_type } at the top level
+ * instead of { creative_manifest: { format_id, assets } }. A bare AJV
+ * pointer ("/ must have required property 'creative_manifest'") doesn't
+ * tell a developer they have the shape inverted — this hint does.
+ */
+
+const { test } = require('node:test');
+const assert = require('node:assert');
+const { detectShapeDriftHint } = require('../../dist/lib/testing/storyboard/validations');
+
+test('build_creative with platform-native tag_url at top level → hint fires', () => {
+  const hint = detectShapeDriftHint('build_creative', {
+    tag_url: 'https://cdn.example.com/ad.mp3',
+    creative_id: 'c1',
+    media_type: 'audio/mpeg',
+  });
+  assert.ok(hint, 'expected a hint for platform-native shape');
+  assert.match(hint, /platform-native fields at the top level/);
+  assert.match(hint, /creative_manifest/);
+  assert.match(hint, /legacyBuildCreativeResponse/);
+  assert.match(hint, /@adcp\/sdk\/server/);
+  // Names which offending fields were found so the reader sees the evidence
+  assert.match(hint, /tag_url/);
+});
+
+test('build_creative with creative_manifest present → no hint (correct shape)', () => {
+  const hint = detectShapeDriftHint('build_creative', {
+    creative_manifest: {
+      format_id: { agent_url: 'https://audiostack.example', id: 'audio_ad' },
+      assets: {},
+    },
+  });
+  assert.strictEqual(hint, undefined);
+});
+
+test('build_creative with creative_manifests (multi) → no hint', () => {
+  const hint = detectShapeDriftHint('build_creative', {
+    creative_manifests: [
+      {
+        format_id: { agent_url: 'https://x.example', id: 'f1' },
+        assets: {},
+      },
+    ],
+  });
+  assert.strictEqual(hint, undefined);
+});
+
+test('partial drift: tag_type alone without creative_manifest → hint fires', () => {
+  // Any single platform-native key without creative_manifest earns a hint.
+  const hint = detectShapeDriftHint('build_creative', { tag_type: 'url' });
+  assert.ok(hint);
+  assert.match(hint, /tag_type/);
+});
+
+test('each detector branch is scoped to its own tool', () => {
+  // build_creative-specific fields (tag_url, media_type, tag_type) must not
+  // trigger the sync_creatives or preview_creative branches, and vice versa.
+  // Cross-tool patterns must not bleed across branches.
+  assert.strictEqual(detectShapeDriftHint('get_products', { tag_url: 'x' }), undefined);
+  assert.strictEqual(detectShapeDriftHint('preview_creative', { media_type: 'image/png' }), undefined);
+  assert.strictEqual(detectShapeDriftHint('build_creative', { preview_url: 'https://x' }), undefined);
+  // Each new branch must not steal the other new branch's signals:
+  assert.strictEqual(detectShapeDriftHint('sync_creatives', { preview_url: 'x' }), undefined);
+  assert.strictEqual(
+    detectShapeDriftHint('preview_creative', { creative_id: 'c1', platform_id: 'p1', action: 'created' }),
+    undefined
+  );
+});
+
+test('empty / unrelated build_creative payload → no hint', () => {
+  assert.strictEqual(detectShapeDriftHint('build_creative', {}), undefined);
+  assert.strictEqual(detectShapeDriftHint('build_creative', { foo: 'bar' }), undefined);
+});
+
+// ────────────────────────────────────────────────────────────
+// sync_creatives — single-creative shape bubbled up to top level
+// ────────────────────────────────────────────────────────────
+
+test('sync_creatives with top-level creative_id + platform_id + action → hint fires', () => {
+  // Classic drift: handler returned one creative's row without wrapping
+  // it in the creatives array.
+  const hint = detectShapeDriftHint('sync_creatives', {
+    creative_id: 'c1',
+    platform_id: 'plat_abc',
+    action: 'created',
+  });
+  assert.ok(hint, 'expected a hint for unwrapped per-item sync response');
+  assert.match(hint, /single creative's inner shape/);
+  assert.match(hint, /creatives: \[\{/);
+  assert.match(hint, /legacySyncCreativesResponse/);
+  assert.match(hint, /@adcp\/sdk\/server/);
+  assert.match(hint, /creative_id/);
+});
+
+test('sync_creatives with creatives array present → no hint', () => {
+  const hint = detectShapeDriftHint('sync_creatives', {
+    creatives: [{ creative_id: 'c1', action: 'created', platform_id: 'plat_abc' }],
+  });
+  assert.strictEqual(hint, undefined);
+});
+
+test('sync_creatives error branch (errors array) → no hint', () => {
+  const hint = detectShapeDriftHint('sync_creatives', {
+    errors: [{ code: 'UNAUTHENTICATED', message: 'bad token' }],
+  });
+  assert.strictEqual(hint, undefined);
+});
+
+test('sync_creatives submitted branch (task_id) → no hint', () => {
+  const hint = detectShapeDriftHint('sync_creatives', {
+    status: 'submitted',
+    task_id: 'task-abc',
+  });
+  assert.strictEqual(hint, undefined);
+});
+
+test('sync_creatives with unrelated top-level fields → no hint', () => {
+  // Empty payload and no-signal payloads must not trip the detector.
+  assert.strictEqual(detectShapeDriftHint('sync_creatives', {}), undefined);
+  assert.strictEqual(detectShapeDriftHint('sync_creatives', { sandbox: true }), undefined);
+});
+
+test('sync_creatives with wrong wrapper key { results: [...] } → hint suggests { creatives }', () => {
+  // Copy-paste from preview_creative batch or a generic success envelope —
+  // handler used `results` instead of `creatives`. Catch when `results`
+  // contains per-item sync shapes.
+  const hint = detectShapeDriftHint('sync_creatives', {
+    results: [{ creative_id: 'c1', action: 'created', platform_id: 'plat_abc' }],
+  });
+  assert.ok(hint, 'expected a hint for wrong wrapper key');
+  assert.match(hint, /results.*instead of.*creatives/);
+  assert.match(hint, /wrong wrapper key/);
+  assert.match(hint, /legacySyncCreativesResponse/);
+});
+
+test('sync_creatives with results that do NOT look like creative rows → no hint', () => {
+  // Generic `results: [...]` shape that doesn't carry creative_id/action
+  // should not spuriously fire the wrong-wrapper branch.
+  const hint = detectShapeDriftHint('sync_creatives', {
+    results: [{ id: 'x1', value: 42 }],
+  });
+  assert.strictEqual(hint, undefined);
+});
+
+test('sync_creatives with both creatives and results → no hint (creatives wrapper wins)', () => {
+  // If the handler emits BOTH wrappers, the detector must stay silent —
+  // wrong-wrapper detection is gated on `!hasValidWrapper`.
+  const hint = detectShapeDriftHint('sync_creatives', {
+    creatives: [{ creative_id: 'c1', action: 'created' }],
+    results: [{ creative_id: 'c1', action: 'created' }],
+  });
+  assert.strictEqual(hint, undefined);
+});
+
+// ────────────────────────────────────────────────────────────
+// preview_creative — raw render fields at top level
+// ────────────────────────────────────────────────────────────
+
+test('preview_creative with top-level preview_url → hint fires', () => {
+  const hint = detectShapeDriftHint('preview_creative', {
+    preview_url: 'https://cdn.example/preview.html',
+    expires_at: '2026-05-01T00:00:00Z',
+  });
+  assert.ok(hint, 'expected a hint for unwrapped render fields');
+  assert.match(hint, /raw render fields at the top level/);
+  assert.match(hint, /previews: \[\{ renders/);
+  assert.match(hint, /legacyPreviewCreativeResponse/);
+  assert.match(hint, /@adcp\/sdk\/server/);
+  assert.match(hint, /preview_url/);
+});
+
+test('preview_creative with top-level preview_html → hint fires', () => {
+  const hint = detectShapeDriftHint('preview_creative', {
+    preview_html: '<div>ad</div>',
+  });
+  assert.ok(hint);
+  assert.match(hint, /preview_html/);
+});
+
+test('preview_creative single response (response_type + previews) → no hint', () => {
+  const hint = detectShapeDriftHint('preview_creative', {
+    response_type: 'single',
+    previews: [{ preview_id: 'p1', renders: [{ preview_url: 'x' }], input: { name: 'default' } }],
+    expires_at: '2026-05-01T00:00:00Z',
+  });
+  assert.strictEqual(hint, undefined);
+});
+
+test('preview_creative batch response (results array) → no hint', () => {
+  const hint = detectShapeDriftHint('preview_creative', {
+    response_type: 'batch',
+    results: [{ success: true, creative_id: 'c1' }],
+  });
+  assert.strictEqual(hint, undefined);
+});
+
+test('preview_creative with only interactive_url → no hint (legitimate top-level field)', () => {
+  // interactive_url is a valid top-level sibling on the single branch.
+  // Flagging it alone would false-positive on legit responses that happen
+  // to carry only that optional field above the previews array.
+  const hint = detectShapeDriftHint('preview_creative', {
+    response_type: 'single',
+    previews: [{ preview_id: 'p1', renders: [], input: { name: 'default' } }],
+    interactive_url: 'https://cdn.example/sandbox',
+    expires_at: '2026-05-01T00:00:00Z',
+  });
+  assert.strictEqual(hint, undefined);
+});
+
+test('preview_creative with ONLY interactive_url and no wrapper → no hint', () => {
+  // Defensive: even without any wrapper, `interactive_url` alone is not a
+  // drift signal — a future maintainer refactoring the filter could break
+  // the deliberate exclusion without this test catching it.
+  const hint = detectShapeDriftHint('preview_creative', {
+    interactive_url: 'https://cdn.example/sandbox',
+  });
+  assert.strictEqual(hint, undefined);
+});
+
+test('preview_creative empty payload → no hint', () => {
+  assert.strictEqual(detectShapeDriftHint('preview_creative', {}), undefined);
+});
+
+// ────────────────────────────────────────────────────────────
+// List-shaped tools — bare array at the root instead of the wrapper envelope
+// ────────────────────────────────────────────────────────────
+
+test('list_creatives with bare array at the root → hint suggests { creatives: [...] }', () => {
+  // Handler returned the inner array directly instead of wrapping it in the
+  // envelope. AJV's error ("expected object, got array") doesn't name the
+  // required wrapper key — this hint does.
+  const hint = detectShapeDriftHint('list_creatives', [
+    { creative_id: 'c1', format_id: { agent_url: 'https://x', id: 'f1' } },
+  ]);
+  assert.ok(hint, 'expected a hint for bare-array list_creatives response');
+  assert.match(hint, /bare array at the top level/);
+  assert.match(hint, /\{ creatives: \[\.\.\.\] \}/);
+  assert.match(hint, /legacyListCreativesResponse/);
+  assert.match(hint, /@adcp\/sdk\/server/);
+});
+
+test('list_creative_formats with bare array → hint suggests { formats: [...] }', () => {
+  const hint = detectShapeDriftHint('list_creative_formats', [
+    { format_id: { agent_url: 'https://x', id: 'f1' }, name: 'Display 300x250' },
+  ]);
+  assert.ok(hint);
+  assert.match(hint, /\{ formats: \[\.\.\.\] \}/);
+  assert.match(hint, /legacyListCreativeFormatsResponse/);
+});
+
+test('list_accounts with bare array → hint suggests { accounts: [...] }', () => {
+  const hint = detectShapeDriftHint('list_accounts', [{ account_id: 'a1', name: 'Acme' }]);
+  assert.ok(hint);
+  assert.match(hint, /\{ accounts: \[\.\.\.\] \}/);
+  assert.match(hint, /legacyListAccountsResponse/);
+});
+
+test('get_products with bare array → hint suggests { products: [...] }', () => {
+  const hint = detectShapeDriftHint('get_products', [{ product_id: 'p1', name: 'Awareness' }]);
+  assert.ok(hint);
+  assert.match(hint, /\{ products: \[\.\.\.\] \}/);
+  assert.match(hint, /legacyProductsResponse/);
+});
+
+test('list tools with proper object wrapper → no hint', () => {
+  // A valid list response (object with the wrapper key populated) must not
+  // trigger the bare-array branch.
+  assert.strictEqual(
+    detectShapeDriftHint('list_creatives', {
+      creatives: [{ creative_id: 'c1' }],
+      query_summary: { total_matching: 1, returned: 1 },
+      pagination: { has_more: false },
+    }),
+    undefined
+  );
+  assert.strictEqual(detectShapeDriftHint('get_products', { products: [{ product_id: 'p1' }] }), undefined);
+});
+
+test('bare array for an unknown tool → no hint (avoids false positives)', () => {
+  // Some APIs legitimately return top-level arrays. The detector must not
+  // fire on unknown task names — only on the known list tools in
+  // LIST_WRAPPER_TOOLS.
+  assert.strictEqual(detectShapeDriftHint('unknown_tool', [{ id: 1 }]), undefined);
+  assert.strictEqual(detectShapeDriftHint('create_media_buy', [{ media_buy_id: 'mb1' }]), undefined);
+});
+
+test('empty bare array for a list tool → still a hint (shape is still wrong)', () => {
+  // An empty array is the same shape mistake as a populated one — the
+  // handler forgot the wrapper. Hint fires regardless of length.
+  const hint = detectShapeDriftHint('list_creatives', []);
+  assert.ok(hint);
+  assert.match(hint, /bare array at the top level/);
+});
+
+test('get_media_buys with bare array → hint suggests { media_buys: [...] }', () => {
+  const hint = detectShapeDriftHint('get_media_buys', [{ media_buy_id: 'mb1', status: 'active' }]);
+  assert.ok(hint);
+  assert.match(hint, /\{ media_buys: \[\.\.\.\] \}/);
+  assert.match(hint, /legacyGetMediaBuysResponse/);
+});
+
+test('get_signals with bare array → hint suggests { signals: [...] }', () => {
+  const hint = detectShapeDriftHint('get_signals', [{ signal_id: { agent_url: 'x', id: 's1' } }]);
+  assert.ok(hint);
+  assert.match(hint, /\{ signals: \[\.\.\.\] \}/);
+  assert.match(hint, /legacyGetSignalsResponse/);
+});
+
+test('list_property_lists with bare array → hint suggests { lists: [...] }', () => {
+  const hint = detectShapeDriftHint('list_property_lists', [{ list_id: 'pl1', name: 'Premium inventory' }]);
+  assert.ok(hint);
+  assert.match(hint, /\{ lists: \[\.\.\.\] \}/);
+  assert.match(hint, /legacyListPropertyListsResponse/);
+});
+
+test('list_collection_lists with bare array → hint suggests { lists: [...] }', () => {
+  const hint = detectShapeDriftHint('list_collection_lists', [{ list_id: 'cl1', name: 'News collections' }]);
+  assert.ok(hint);
+  assert.match(hint, /\{ lists: \[\.\.\.\] \}/);
+  assert.match(hint, /legacyListCollectionListsResponse/);
+});
+
+test('list_content_standards with bare array → hint suggests { standards: [...] }', () => {
+  // Also covers the error-branch drift — the detector is key-agnostic on
+  // array contents and fires for any bare array at the top level. A
+  // handler that returned a bare array of Error objects hits the same
+  // hint, which is the right behavior: the shape fix is identical.
+  const hint = detectShapeDriftHint('list_content_standards', [{ standard_id: 'cs1', name: 'Brand safety' }]);
+  assert.ok(hint);
+  assert.match(hint, /\{ standards: \[\.\.\.\] \}/);
+  assert.match(hint, /legacyListContentStandardsResponse/);
+});
+
+test('get_plan_audit_logs with bare array → hint suggests { plans: [...] }', () => {
+  // Wrapper key is `plans`, not `logs` — the schema bundles audit entries
+  // under each plan record (`plans[].entries[]`), and the response root
+  // exposes `plans`. Issue #856's body said `logs`; verified against
+  // schemas/cache/3.0.0/governance/get-plan-audit-logs-response.json.
+  const hint = detectShapeDriftHint('get_plan_audit_logs', [{ plan_id: 'plan1', plan_version: 1, status: 'active' }]);
+  assert.ok(hint);
+  assert.match(hint, /\{ plans: \[\.\.\.\] \}/);
+  assert.match(hint, /legacyGetPlanAuditLogsResponse/);
+});
+
+test('null / primitive payloads → no hint (detector exits cleanly)', () => {
+  // Defensive: the detector must handle `null`, strings, numbers without
+  // throwing — they're not a shape-drift pattern but they'd otherwise crash
+  // the object-branch guards.
+  assert.strictEqual(detectShapeDriftHint('list_creatives', null), undefined);
+  assert.strictEqual(detectShapeDriftHint('build_creative', 'oops'), undefined);
+  assert.strictEqual(detectShapeDriftHint('sync_creatives', 42), undefined);
+});

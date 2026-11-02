@@ -1,0 +1,236 @@
+# Reliable Reporting storage moved to `@adcp/reporting-storage`
+
+**Applies to:** SDK 16. **Kind:** breaking, by design. There are no re-export shims: the moved subpaths are gone from `@adcp/sdk`.
+
+The Reliable Reporting storage implementations now ship as their own package, `@adcp/reporting-storage`, on its own version line. `@adcp/sdk` keeps the protocol layer. If you import anything from `@adcp/sdk/reporting/gcs`, `/s3`, `/azure` or `/bigquery`, or the PostgreSQL store, row storage, managed delivery or notification activity from `@adcp/sdk/reporting/ledger`, or `createPostgresReliableReportingProductionService` from `@adcp/sdk/reporting/service`, change those imports. Nothing else changes on the wire, in the database schema, or in the ledger's behavior.
+
+Why: storage keeps its own release cadence, as Auth.js, LangGraph and OpenTelemetry do, so a storage fix does not need an SDK release and an experimental storage break does not need an SDK major. The Python SDK is making the same split (adcp-client-python#1510). See [Reliable Reporting stability policy](guides/REPORTING-STABILITY.md).
+
+## What to do
+
+1. Install the package next to the SDK. `@adcp/sdk` is a peer dependency of it, so the host keeps exactly one copy:
+
+   ```bash
+   npm install @adcp/sdk@^16.0.0 @adcp/reporting-storage@~0.1.0
+   ```
+
+   Pin the storage package with `~` (`"@adcp/reporting-storage": "~0.1.0"`; this stable range does not match the earlier `0.1.0-beta.0` prerelease): it is pre-1.0 and every export is experimental. Choose the storage release whose `@adcp/sdk` peer range covers your SDK: `~0.1.0` for SDK 16.0 to 16.4, `~0.2.0` for SDK 16.5 and later 16.x, and the exact `0.2.1-beta.0` for SDK 17 beta (see the [16 to 17 migration guide](migration-16-to-17.md#companion-packages)). The cloud SDKs are optional peers of the new package, not of `@adcp/sdk` any more, so keep `@aws-sdk/client-s3`, `@azure/storage-blob` and `@google-cloud/storage` in your own dependencies for the providers you use.
+
+2. Change the imports using the table below, then run `tsc --noEmit`. A moved name on `@adcp/sdk/reporting/ledger` or `/service` is `TS2305: Module '"@adcp/sdk/reporting/ledger"' has no exported member 'PostgresReportingLedgerStore'`; a deleted subpath is `TS2307: Cannot find module '@adcp/sdk/reporting/gcs'`. At runtime the deleted subpaths fail with `ERR_PACKAGE_PATH_NOT_EXPORTED`, and a stale CommonJS `require` of a moved name on a kept subpath destructures to `undefined` and fails later as `X is not a constructor`, so grep JavaScript too (see [Self-grade](#self-grade)).
+
+3. If you pass `maintenance` to `createReliableReportingService`, wrap it (see [`maintenance` is now a factory](#maintenance-is-now-a-factory)).
+
+4. Re-run your own tests. No database migration is needed: every migration constant has the same SQL under its new import path.
+
+## BigQuery location discovery
+
+The BigQuery sink now discovers an omitted `location` from dataset metadata,
+including for US/EU datasets. Before upgrading the storage package:
+
+- Grant `bigquery.datasets.get` and expose `dataset.getMetadata()` in any client
+  wrapper, or set `location` explicitly to skip metadata access.
+- Replace empty location strings with an omitted option for discovery, or with
+  the actual dataset location. Empty strings now fail at construction.
+- Replace monitoring of `ADCP_BIGQUERY_SINK_LOCATION_UNSET` with monitoring of
+  rejected `runOnce()` calls. Discovery errors identify the permission and
+  explicit-location alternatives before warehouse state or loads are written.
+
+No database migration is required. See the [warehouse sink guide](guides/REPORTING-LEDGER.md#bigquery-warehouse-sink).
+
+## Import mapping
+
+| Old import                                                                 | New import                                                                  |
+| -------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `@adcp/sdk/reporting/ledger`: `PostgresReportingLedgerStore`, the ledger, row-storage, object-write and change-feed migrations, `sweepExpiredReportingLedgerState`, row storage (`ReportingRowStorageV1`, bindings, providers contract, filesystem provider, conformance suite), object writes, the change feed | `@adcp/reporting-storage` |
+| `@adcp/sdk/reporting/ledger`: the managed-delivery runtime, `PostgresReportingManagedDeliveryStore`, `REPORTING_MANAGED_DELIVERY_MIGRATION`, the adapter contract and router | `@adcp/reporting-storage/managed` |
+| `@adcp/sdk/reporting/ledger`: notification activity (`createPostgresReportingNotificationActivityRuntime`, `createPostgresReportingNotificationAttemptCheckpoint`, `REPORTING_NOTIFICATION_ACTIVITY_MIGRATION`) | `@adcp/reporting-storage/notifications` |
+| `@adcp/sdk/reporting/ledger`: everything else (the `ReportingLedgerStore` interface and its types, `createReportingDeliveryHandler`, `createReportingStatusHandler`, `createSyncReportingStatusHandler`, `createReportingProducer`, health, coverage, lifecycle, row encoding and digests, `ReportingRowStoreError`) | unchanged: `@adcp/sdk/reporting/ledger` |
+| `@adcp/sdk/reporting/service`: `createPostgresReliableReportingProductionService` and its types | `@adcp/reporting-storage/service` |
+| `@adcp/sdk/reporting/service`: retention, compaction, orphan-collection and change-feed maintenance (`runReportingLedgerMaintenance`, `ReportingRetentionOptionsV1`, `ReportingCompactionOptionsV1`, `ReportingMaintenancePartialFailureError`, and the related types); `ReliableReportingMaintenanceOptionsV1` is now `ReportingLedgerMaintenanceOptionsV1` | `@adcp/reporting-storage` |
+| `@adcp/sdk/reporting/service`: `createReliableReportingService`, the conformance runner | unchanged: `@adcp/sdk/reporting/service` |
+| `@adcp/sdk/reporting/gcs` | `@adcp/reporting-storage/gcs` |
+| `@adcp/sdk/reporting/s3` | `@adcp/reporting-storage/s3` |
+| `@adcp/sdk/reporting/azure` | `@adcp/reporting-storage/azure` |
+| `@adcp/sdk/reporting/bigquery` | `@adcp/reporting-storage/bigquery` |
+| `@adcp/sdk/reporting/consumer`, `@adcp/sdk/reporting/source`, `@adcp/sdk` | unchanged |
+
+Before and after:
+
+```ts
+// Before
+import {
+  PostgresReportingLedgerStore,
+  REPORTING_LEDGER_MIGRATION,
+  createReportingProducer,
+} from '@adcp/sdk/reporting/ledger';
+import { createGcsReportingRowObjectProviderV1 } from '@adcp/sdk/reporting/gcs';
+
+// After
+import { createReportingProducer } from '@adcp/sdk/reporting/ledger';
+import { PostgresReportingLedgerStore, REPORTING_LEDGER_MIGRATION } from '@adcp/reporting-storage';
+import { createGcsReportingRowObjectProviderV1 } from '@adcp/reporting-storage/gcs';
+```
+
+### Every moved export, by new subpath
+
+<details>
+<summary>84 exports of <code>@adcp/reporting-storage</code></summary>
+
+`FilesystemReportingRowObjectProviderOptionsV1`, `PostgresReportingLedgerStore`, `PostgresReportingLedgerStoreOptions`, `REPORTING_LEDGER_CHANGES_MIGRATION`, `REPORTING_LEDGER_FINALITY_FENCE_CONSTRAINT`, `REPORTING_LEDGER_FINALITY_WRITER_FENCE_MIGRATION`, `REPORTING_LEDGER_MIGRATION`, `REPORTING_OBJECT_WRITE_AUTHORITY_MIGRATION`, `REPORTING_OBJECT_WRITE_MIGRATION`, `REPORTING_ROW_DEFAULT_KEY_TEMPLATE`, `REPORTING_ROW_KEY_PLACEHOLDERS`, `REPORTING_ROW_NATIVE_VERSION_REF_MAX_LENGTH`, `REPORTING_ROW_OBJECT_REF_MAX_LENGTH`, `REPORTING_ROW_STORAGE_MIGRATION`, `REPORTING_ROW_STORAGE_TABLES`, `ReportingChangeCursorExpiredError`, `ReportingChangeFeedMaintenanceOptionsV1`, `ReportingChangeKindV1`, `ReportingChangeRecordV1`, `ReportingChangesPageV1`, `ReportingCompactionOptionsV1`, `ReportingLedgerMaintenanceOptionsV1`, `ReportingLedgerMaintenanceStoreV1`, `ReportingLedgerMaintenanceTaskNameV1`, `ReportingLedgerMaintenanceTaskResultV1`, `ReportingMaintenancePartialFailureError`, `ReportingObjectRowBindingV1`, `ReportingObjectWriteAuthorityStoreV1`, `ReportingObjectWriteBindingV1`, `ReportingObjectWriteConflictError`, `ReportingObjectWriteContextV1`, `ReportingObjectWriteCursorV1`, `ReportingObjectWriteNotRevokedError`, `ReportingObjectWritePlanV1`, `ReportingObjectWriteScopeV1`, `ReportingObjectWriteStoreV1`, `ReportingObjectWriteV1`, `ReportingOrphanBindingResultV1`, `ReportingOrphanCollectionOptionsV1`, `ReportingOrphanCollectionResultV1`, `ReportingOrphanCollectionStateV1`, `ReportingPgPool`, `ReportingPostgresRowBindingV1`, `ReportingPreparedRowSetV1`, `ReportingRetentionOptionsV1`, `ReportingRowBindingDefinitionV1`, `ReportingRowBindingSelectionInputV1`, `ReportingRowChunkLocatorV1`, `ReportingRowObjectContextV1`, `ReportingRowObjectDeleteInputV1`, `ReportingRowObjectGetInputV1`, `ReportingRowObjectListEntryV1`, `ReportingRowObjectListInputV1`, `ReportingRowObjectLocationV1`, `ReportingRowObjectProviderV1`, `ReportingRowObjectPutInputV1`, `ReportingRowObjectStatInputV1`, `ReportingRowSetHandleV1`, `ReportingRowSetPrepareInputV1`, `ReportingRowStorageOptionsV1`, `ReportingRowStorageV1`, `RunReportingLedgerMaintenanceInputV1`, `assertReportingLedgerMaintenanceOptions`, `assertReportingObjectWriteScope`, `assertReportingRowKeyTemplateV1`, `assertReportingRowPrefixV1`, `createFilesystemReportingRowObjectProviderV1`, `decodeReportingChangeCursorV1`, `encodeReportingChangeCursorV1`, `isLegacyAccountChangeCursor`, `isReportingObjectWriteConflictError`, `isReportingObjectWriteNotRevokedError`, `probeReportingRowStorageSchemaV1`, `renderReportingRowObjectKeyV1`, `reportingLedgerMaintenance`, `reportingObjectWriteName`, `reportingObjectWritePlanFingerprint`, `reportingObjectWriteScopeKey`, `reportingRowAccountKeyV1`, `reportingRowRevisionKeyV1`, `reportingRowWriteIntentIdV1`, `runReportingLedgerMaintenance`, `runReportingRowObjectProviderConformanceV1`, `sweepExpiredReportingLedgerState`
+
+</details>
+
+<details>
+<summary>35 exports of <code>@adcp/reporting-storage/managed</code></summary>
+
+`CreateReportingManagedDeliveryAdapterRouterOptionsV1`, `CreateReportingManagedDeliveryRuntimeOptionsV1`, `PostgresReportingManagedDeliveryStore`, `PostgresReportingManagedDeliveryStoreOptions`, `REPORTING_ADAPTER_PROBE_DEADLINE_MILLISECONDS_V1`, `REPORTING_DESTINATION_PATTERNS_V1`, `REPORTING_DESTINATION_TRANSPORT_PATTERN_V1`, `REPORTING_MANAGED_DELIVERY_MIGRATION`, `ReportingDestinationAuthorizationV1`, `ReportingDestinationPatternV1`, `ReportingDestinationRevocationLeaseV1`, `ReportingManagedDeliveryAdapterRouterV1`, `ReportingManagedDeliveryAdapterV1`, `ReportingManagedDeliveryAdvertisedPoliciesV1`, `ReportingManagedDeliveryLeaseV1`, `ReportingManagedDeliveryProbeErrorV1`, `ReportingManagedDeliveryRouteCountsV1`, `ReportingManagedDeliveryRouteDescriptionV1`, `ReportingManagedDeliveryRouteV1`, `ReportingManagedDeliveryRoutingErrorCodeV1`, `ReportingManagedDeliveryRoutingErrorV1`, `ReportingManagedDeliveryRoutingOperationV1`, `ReportingManagedDeliveryRuntimeV1`, `ReportingManagedDeliveryStore`, `ReportingManagedDeliveryWorkerOptionsV1`, `ReportingManagedDeliveryWorkerResultV1`, `UNROUTED_REPORTING_ROUTE_KEY_V1`, `adjustmentReceiptEvidenceMatches`, `assertCredentialFreeReportingResourceLocationV1`, `assertMaterializationOutcome`, `createReportingManagedDeliveryAdapterRouterV1`, `createReportingManagedDeliveryRuntime`, `readManagedReportingResource`, `receiptEvidenceMatches`, `runManagedDeliveryWorker`
+
+</details>
+
+<details>
+<summary>20 exports of <code>@adcp/reporting-storage/notifications</code></summary>
+
+`PostgresReportingNotificationActivityOptions`, `PostgresReportingNotificationActivityRuntime`, `REPORTING_NOTIFICATION_ACTIVITY_MIGRATION`, `ReportingAccountActivityPageV1`, `ReportingAccountActivityRecordV1`, `ReportingAccountActivityV1`, `ReportingDeliveryReadyActivityV1`, `ReportingLedgerChangedActivityV1`, `ReportingLifecycleActivityV1`, `ReportingNotificationActivityPageV1`, `ReportingNotificationActivityRecordV1`, `ReportingNotificationActivityV1`, `ReportingNotificationAttemptCheckpointV1`, `ReportingNotificationProjectionErrorV1`, `ReportingNotificationRecoveryMetricsV1`, `ReportingNotificationRetryableSuppressionError`, `createPostgresReportingNotificationActivityRuntime`, `createPostgresReportingNotificationAttemptCheckpoint`, `getReportingNotificationActivityMigration`, `recipientTableName`
+
+</details>
+
+<details>
+<summary>3 exports of <code>@adcp/reporting-storage/service</code></summary>
+
+`CreatePostgresReliableReportingProductionServiceOptionsV1`, `PostgresReliableReportingProductionServiceV1`, `createPostgresReliableReportingProductionService`
+
+</details>
+
+<details>
+<summary>13 exports of <code>@adcp/reporting-storage/gcs</code></summary>
+
+`CreateGcsReportingManagedDeliveryAdapterOptionsV1`, `CreateGcsReportingRowObjectProviderOptionsV1`, `GcsReportingObjectFenceV1`, `GcsReportingReadAuthorizationV1`, `GcsReportingReadScopeV1`, `GcsReportingReaderOptionsV1`, `ReportingGcsFenceError`, `createGcsReportingManagedDeliveryAdapterV1`, `createGcsReportingObjectFenceV1`, `createGcsReportingReferenceResolverV1`, `createGcsReportingResourceReaderV1`, `createGcsReportingRowObjectProviderV1`, `isReportingGcsFenceError`
+
+</details>
+
+<details>
+<summary>2 exports of <code>@adcp/reporting-storage/s3</code></summary>
+
+`CreateS3ReportingRowObjectProviderOptionsV1`, `createS3ReportingRowObjectProviderV1`
+
+</details>
+
+<details>
+<summary>2 exports of <code>@adcp/reporting-storage/azure</code></summary>
+
+`CreateAzureBlobReportingRowObjectProviderOptionsV1`, `createAzureBlobReportingRowObjectProviderV1`
+
+</details>
+
+<details>
+<summary>10 exports of <code>@adcp/reporting-storage/bigquery</code></summary>
+
+`BigQueryReportingWarehouseSinkV1`, `CreateBigQueryReportingWarehouseSinkOptionsV1`, `REPORTING_WAREHOUSE_SINK_MIGRATION`, `ReportingBigQueryClientV1`, `ReportingWarehouseRowContextV1`, `createBigQueryReportingWarehouseSinkV1`, `reportingWarehouseCurrentRowsViewSqlV1`, `reportingWarehouseDefaultTablesSqlV1`, `reportingWarehouseJobIdV1`, `reportingWarehouseLoadDeadlineV1`
+
+</details>
+
+## Behavior changes
+
+### `maintenance` is now a factory
+
+The SDK does not know what maintenance a store needs, and retention, compaction and orphan collection are about the PostgreSQL store's data model. So `createReliableReportingService({ maintenance })` takes a factory, and `@adcp/reporting-storage` supplies the PostgreSQL one:
+
+```ts
+// Before
+createReliableReportingService({
+  store,
+  maintenance: { retention: { enabled: true }, changeFeed: true },
+});
+
+// After
+import { reportingLedgerMaintenance } from '@adcp/reporting-storage';
+
+createReliableReportingService({
+  store,
+  maintenance: reportingLedgerMaintenance({ retention: { enabled: true }, changeFeed: true }),
+});
+```
+
+Passing the old options object now fails at construction with `maintenance must be a factory, not an options object` (and in TypeScript as `Type '{ retention: ... }' provides no match for the signature '(context: ReliableReportingMaintenanceContextV1): ReliableReportingMaintenanceV1'`). The options are unchanged. The service still hands the factory the retention and recovery-window commitments it advertises, so retention still cannot disagree with what buyers were told, and a configuration the store cannot serve still fails when the service is constructed, not on the first scheduled pass. `service.runMaintenance()` returns the same per-task results, typed as `ReliableReportingMaintenanceTaskResultV1` (`{ task, status, result | error, partialFailure? }`). A store from another package can supply its own factory. `createPostgresReliableReportingProductionService` is unchanged: it takes `retention`, `compaction`, `changeFeed` and `orphanCollection` directly.
+
+### One storage object and versioned migrations (storage `0.3`, SDK 17 beta)
+
+Reporting storage is now one decision. `postgresStorage({ pool })` (this package) and `memoryStorage()` (`@adcp/sdk/storage`) return a `ReportingStorage` holding the ledger, principal records, reporting-subscription engine state and the buyer consumer's state, and the schema is applied by versioned migrations.
+
+| Before | Now |
+| --- | --- |
+| `createReliableReportingService({ store: new PostgresReportingLedgerStore(pool, { acknowledgeIsolatedDatabase: true }) })` | `createReliableReportingService({ storage: postgresStorage({ pool, acknowledgeIsolatedDatabase: true }) })` (`store` still works; passing both is refused) |
+| `for (const sql of reporting.setup.migrations) await pool.query(sql)`, `pool.query(REPORTING_LEDGER_MIGRATION)` and friends | `npx adcp-reporting-storage migrate` (`--status`, `--dry-run`) or `migrate(pool)`; startup refuses a schema that is behind (`REPORTING_SCHEMA_BEHIND`) |
+| `createPostgresReliableReportingProductionService({ db: pool, ... })` | `createPostgresReliableReportingProductionService({ storage, ... })` |
+| `createPrincipalStateStore({ store, durability: 'durable' })`, `createReportingSubscriptionEngineStateStoreV1({ store, durability })` | `storage.principals`, `storage.subscriptions`; the `durability` option is deprecated (the state store declares it) |
+| `subscriptions: { principals: createPrincipalLifecycle({ store, notifications, agentUrl, resolvePrincipal }), stateStore }` | `subscriptions: { principal: { notifications, agentUrl, resolvePrincipal } }` with `storage`; serve `protocol: reporting.principals.protocol` |
+| `createReliableReportingConsumerV1({ persistence: createPostgresReportingConsumerRuntimeV1({ db, namespace }) })` | `createReliableReportingConsumerV1({ storage })` |
+
+The migration constants (`REPORTING_LEDGER_MIGRATION`, `REPORTING_ROW_STORAGE_MIGRATION`, `REPORTING_LEDGER_CHANGES_MIGRATION`, `REPORTING_MANAGED_DELIVERY_MIGRATION`, the object-write and finality-fence constants) are deprecated re-exports for one beta. A schema they set up migrates cleanly: the first `migrate` re-runs them as no-ops and records versions `0001`–`0010`. See the [package README](https://github.com/adcontextprotocol/adcp-client/blob/main/packages/reporting-storage/README.md#apply-migrations-npx-adcp-reporting-storage-migrate) for the version table.
+
+### Orphan collector ownership fence (storage `0.3`, migration `0009`)
+
+Only deployments that enable `orphanCollection` (or call `collectOrphanedRowObjects`) are affected. A clone or restore of the ledger database shares the live database's namespace key and configuration, including `acknowledgeExclusiveNamespace: true`, and would delete the live database's newer row objects. A real pass now claims the namespace first and refuses to delete when another database holds a newer claim.
+
+1. Run `npx adcp-reporting-storage migrate` (version `0009`, `reporting_orphan_collector_fence`, additive). Until it is applied, every pass, `dryRun` included, reports each binding as `fenced` with cause `migration_required` and deletes nothing. `postgresStorage().checkSchema()` names `0009` as pending.
+2. Roll `0009` out and claim the namespace from the **live** database before any staging copy of it runs a collector: run one real pass there, or call `store.takeOverOrphanCollectorFence({ acknowledgePreviousOwnerGone: true })`, which on a namespace nobody has claimed is a claim and nothing more. The first claim wins, and a copy has no way to tell it is a copy; an already-running copy with `acknowledgeExclusiveNamespace: true` that claims first fences the live database out.
+3. Handle the new result shape: `ReportingOrphanBindingResultV1.status` can be `'fenced'` (with `fence: { cause, detail, fenceEpoch?, recordedEpoch? }`), and `ReportingOrphanCollectionResultV1` has a required `fenced: string[]`. A custom store that implements `collectOrphanedRowObjects` for the maintenance task must return `fenced` (an empty array is fine). The maintenance task raises a warning for each fenced binding.
+4. After restoring a database in place, or when the database that held the namespace is gone, call `store.takeOverOrphanCollectorFence({ acknowledgePreviousOwnerGone: true })` once, then collection resumes. It refuses without the acknowledgement.
+5. The fence chain lives under `{prefix}/{namespace_key}/_collector-fence/` in each object binding's bucket. Your provider needs nothing new (create-only `putIfAbsent`, `get`, `list` and `delete`, which the conformance suite already covers), and a bucket lifecycle rule must not expire objects under the owned prefix (the probe already refuses one that does).
+
+See [Orphaned object collection](guides/REPORTING-OPERATIONS.md#adopting-row-storage-retention-and-the-change-feed) for the claim, check and first-claim-wins rules.
+
+### Binding IDs and `credentialRef` accept 255 characters (storage `0.3`, migration `0010`)
+
+`row_binding_id` and `credentialRef` were capped at 128 characters, tighter than every comparable AdCP identifier (`reporting_revision_id`, `resource_ref` and `destination_ref` use `^[A-Za-z0-9_.:-]{1,255}$`), so an ID derived from an AdCP destination reference could be refused for no protocol reason. Both now use the AdCP bound. Nothing you have stored changes and nothing you configured is refused that was accepted before.
+
+1. Run `npx adcp-reporting-storage migrate` (version `0010`, `reporting_row_binding_id_bounds`). It replaces the 128-character `CHECK` on `adcp_reporting_row_bindings.row_binding_id` with a named 255-character one, only when the database still has the old one. `postgresStorage().checkSchema()` names `0010` as pending until then. Until it runs, a binding ID longer than 128 characters is accepted by the configuration and `readyRowStorage` fails with `STATE_UNAVAILABLE`, naming this migration.
+2. The `adcp_reporting_row_sets` and `adcp_reporting_row_write_intents` columns reference the ID by foreign key and carry no bound of their own, so nothing else changes.
+3. The bound is exported as `REPORTING_ROW_BINDING_ID_MAX_LENGTH` and `REPORTING_ROW_CREDENTIAL_REF_MAX_LENGTH`. A provider's `clients` map accepts the same 255-character references.
+
+### `service.setup.migrations` comes from the store
+
+`createReliableReportingService` no longer names the PostgreSQL migration. `service.setup.migrations` is the store's own `migrations` list (`ReportingLedgerStore.migrations`, optional). `PostgresReportingLedgerStore` lists `[REPORTING_LEDGER_MIGRATION]`. A store with nothing to install (an in-memory test double), or a decorator over the PostgreSQL store that does not forward `migrations`, gives an empty list.
+
+The type changed too: it was the tuple `readonly [typeof REPORTING_LEDGER_MIGRATION]` and is now `readonly string[]`, so `reporting.setup.migrations[0]` is `string | undefined` under `noUncheckedIndexedAccess`, and `pool.query(undefined)` fails at runtime for a store that lists nothing. Apply the list instead:
+
+```ts
+for (const sql of reporting.setup.migrations) await pool.query(sql);
+```
+
+### Error classes now live with the interface
+
+`ReportingLedgerLeaseLostError`, `ReportingLedgerPeriodRetiredError` and `ReportingLedgerContinuityError` are exported from `@adcp/sdk/reporting/ledger`, where the `ReportingLedgerStore` types are. The package re-throws these exact classes. The protocol layer still recognizes them by `name`, so a store from any package, or another copy of the SDK, is understood.
+
+### The Core service refuses managed-delivery offerings
+
+A `createReliableReportingService` without a managed-delivery composition still refuses offerings that need Managed Delivery or Reconciled Billing, now naming `@adcp/reporting-storage/service` in the error. A composition built elsewhere opts in with the exported `REPORTING_MANAGED_DELIVERY_COMPOSITION_V1` key, set to the very `store` it passes as `store`. That is an assertion by the composer, not an authentication boundary (the key is a `Symbol.for`, so any code can write it); it exists so a Core-only service cannot advertise offerings it has no runtime for by accident. Applications should not use it.
+
+### New exports on `@adcp/sdk`
+
+So a store can live outside the SDK against public API only: `compareReportingInstants`, `reportingPeriodDate`, `reportingPeriodSchedule`, `isFrozenCalendarRulesMismatch`, the receipt and verification evidence guards, `isWellFormedUnicodeString` and `getReportingDeliveryOfferingValidatorV1` (from `@adcp/sdk/reporting/ledger`); `reportingManagedDeliveryBindingV1`, `createSyncReportingReceiptsHandler`, `ReportingReceiptSyncStoreV1` and `SyncReportingReceiptsParamsV1` (from `@adcp/sdk/reporting/ledger`; the receipts handler only needs `syncReceiptBatch`); the scheduler helpers `reportingSchedulerErrorMessage`, `reportingSchedulerDelay`, `rotateReportingRoster`, `reportingDeploymentWideAccountIds`, `reportReportingSchedulerError` and `warnReportingSchedulerFailure` (from `@adcp/sdk/reporting/service`); and `DEFAULT_UNKNOWN_ERROR_RECOVERY` (from `@adcp/sdk`).
+
+## Other things that moved
+
+| Was                                                           | Now                                                                                       |
+| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `scripts/validate-reporting-gcp.mjs`                          | `packages/reporting-storage/scripts/validate-reporting-gcp.mjs` (`npm run validate:reporting-gcp` still works at the repository root) |
+| `examples/reliable-reporting-lifecycle`, `examples/reliable-reporting-service` | `packages/reporting-storage/examples/...`                                |
+| Optional peers `@aws-sdk/client-s3`, `@azure/storage-blob`, `@google-cloud/storage` on `@adcp/sdk` | optional peers of `@adcp/reporting-storage` |
+| Experimental policy for `reporting/gcs`, `s3`, `azure`, `bigquery` and the storage exports of `ledger` and `service` | the whole `@adcp/reporting-storage` package is pre-1.0 and experimental; see [REPORTING-STABILITY.md](guides/REPORTING-STABILITY.md) |
+
+The consumer-side Postgres persistence (`createPostgresReportingConsumerRuntimeV1`, `REPORTING_CONSUMER_POSTGRES_MIGRATION` under `@adcp/sdk/reporting/consumer`) and webhook activity (`createPostgresReportingWebhookActivityV1`, exported from `@adcp/sdk`) stay in the SDK for now.
+
+## Self-grade
+
+```bash
+# 1. no deleted subpath
+grep -rnE "@adcp/sdk/reporting/(gcs|s3|azure|bigquery)" src
+# 2. in every file that still imports the ledger or service subpath, no moved name (this also catches multi-line
+#    imports, `require` destructuring and JavaScript, which `tsc` does not check)
+grep -rlE "@adcp/sdk/reporting/(ledger|service)" src | xargs grep -nE "PostgresReporting|createPostgresReliable|REPORTING_[A-Z_]+_MIGRATION|createFilesystemReporting|ReportingRowStorageV1|createReportingManagedDeliveryRuntime|createPostgresReportingNotification|runReportingLedgerMaintenance|\bmaintenance:[[:space:]]*\{"
+# 3. TypeScript
+npx tsc --noEmit
+```
+
+Every line check 2 prints is either a moved name still imported from the SDK or a `maintenance:` options object to wrap.

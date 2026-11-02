@@ -1,0 +1,432 @@
+# Zod Schema Validation
+
+The AdCP client library provides **runtime validation schemas** using [Zod](https://zod.dev), automatically generated from the official AdCP protocol schemas.
+
+## Quick Start
+
+```bash
+npm install @adcp/sdk zod
+```
+
+```typescript
+import { MediaBuySchema, GetProductsRequestSchema } from '@adcp/sdk/schemas';
+
+// Validate data
+const result = MediaBuySchema.safeParse(data);
+if (result.success) {
+  console.log('Valid!', result.data);
+} else {
+  console.error('Errors:', result.error.issues);
+}
+```
+
+### Browser / UI bundles
+
+Browser widgets, dashboards, and forms should import runtime validators from `@adcp/sdk/schemas/browser`:
+
+```typescript
+import { EventSourceHealthSchema } from '@adcp/sdk/schemas/browser';
+
+const health = EventSourceHealthSchema.parse(rawHealth);
+```
+
+This entry has no Node built-ins in its import graph and shares the Node entry's portable validators, including canonical and legacy get-products selectors. Named ESM imports let bundlers remove unused validators while preserving the selected schema's dependencies. JSON Schema loading and tool registration helpers are available from `@adcp/sdk/schemas`.
+
+`npm run test:schemas-browser` bundles a single `EventSourceHealthSchema` import with esbuild (`platform: 'browser'`, `format: 'iife'`, `target: 'es2022'`, `minify: true`). The standalone bundle includes Zod and ajv-formats, with no external dependencies. Measurements for esbuild 0.28.2 and Zod 4.4.3:
+
+| Measure | Before tree-shaking | With pure schema initializers | CI maximum |
+| --- | ---: | ---: | ---: |
+| Minified bundle | 1,539,250 B | 336,182 B | 375,000 B |
+| Gzipped bundle | 265,418 B | 67,420 B | 75,000 B |
+| Generated validators retained | 1,203,529 B | 744 B | 2,048 B |
+
+The original total-size limits left roughly 11% headroom for dependency changes. With Zod 4.6.7 and a direct namespace import in the generated schemas, the same check measures about 100 KB minified / 29 KB gzip, with 607 B of generated validators retained. The namespace import lets bundlers remove unused Zod exports; the CI limits remain unchanged.
+
+The separate generated-code limit catches unrelated validators being retained even if dependencies become smaller. The check also verifies that product, media-buy, and reporting-obligation validators disappear and that the bundled schema still validates without Node globals. Existing tests exercise all exports through ESM and CommonJS, declaration paths, and portable cross-field validation.
+
+## Why Zod Schemas?
+
+- ✅ **Runtime validation** - Catch data issues at runtime, not just compile time
+- 🔒 **Type safety** - Infer TypeScript types from schemas
+- 🎯 **Error messages** - Detailed validation errors with field paths
+- 📝 **Form integration** - Works with React Hook Form, Formik, etc.
+- 🌐 **API validation** - Validate requests/responses
+
+## Available Schemas
+
+### Core Types
+- `MediaBuySchema`, `ProductSchema`, `CreativeAssetSchema`, `TargetingSchema`
+
+### All AdCP Tasks
+- `GetProductsRequestSchema` / `GetProductsResponseSchema`
+- `CreateMediaBuyRequestSchema` / `CreateMediaBuyResponseSchema`
+- `SyncCreativesRequestSchema` / `SyncCreativesResponseSchema`
+- And all other AdCP tasks...
+
+## Common Use Cases
+
+### OAuth Client Credentials Configuration
+
+`AgentOAuthClientCredentialsSchema` validates SDK configuration accepted by an API. It is available from `@adcp/sdk`, `@adcp/sdk/auth`, and `@adcp/sdk/schemas`.
+
+```typescript
+import { AgentOAuthClientCredentialsSchema } from '@adcp/sdk/schemas';
+
+const credentials = AgentOAuthClientCredentialsSchema.parse({
+  token_endpoint: 'https://auth.example.com/oauth/token',
+  client_id: 'client-id',
+  client_secret: '$ENV:ADCP_CLIENT_SECRET',
+  scope: 'adcp',
+  resource: ['https://agent.example.com'],
+  auth_method: 'basic',
+});
+```
+
+The schema requires a valid `token_endpoint` URL and non-empty `client_id` and `client_secret` strings. Optional fields are `scope`, `resource` (a string or string array), `audience`, and `auth_method` (`'basic'` or `'body'`). Parsing preserves `$ENV:VAR_NAME` references and leaves omitted fields unset. Token exchange resolves secrets and enforces HTTPS, URL userinfo, and private-address restrictions; this schema validates the configuration shape.
+
+### API Request Validation
+
+```typescript
+import { GetProductsRequestSchema } from '@adcp/sdk/schemas';
+
+function callGetProducts(request: unknown) {
+  const validated = GetProductsRequestSchema.parse(request);
+  return agent.getProducts(validated); // Type-safe!
+}
+```
+
+### API Response Validation
+
+```typescript
+import { GetProductsResponseSchema } from '@adcp/sdk/schemas';
+
+async function fetchProducts() {
+  const response = await agent.getProducts(request);
+  const validated = GetProductsResponseSchema.parse(response);
+  return validated.products; // Guaranteed valid!
+}
+```
+
+### Digest-pinned placement presentations
+
+Placement `presentation_ref` values point to publisher-controlled documents. Validate the reference before fetching, keep the fetch SSRF-safe and credential-free, verify the digest over the exact `response.body` bytes returned by `ssrfSafeFetch`, and only then parse the document with the canonical schema.
+
+```typescript
+import { createHash } from 'node:crypto';
+import { resolvePreviewAuthority, ssrfSafeFetch } from '@adcp/sdk';
+import {
+  PlacementPresentationDocumentSchema,
+  PlacementPresentationReferenceSchema,
+  type PlacementPresentationDocument,
+} from '@adcp/sdk/schemas';
+
+async function loadPlacementPresentation(rawRef: unknown): Promise<PlacementPresentationDocument> {
+  const ref = PlacementPresentationReferenceSchema.parse(rawRef);
+  const response = await ssrfSafeFetch(ref.uri, {
+    timeoutMs: 5_000,
+    maxBodyBytes: 256 * 1024,
+  });
+
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(`Presentation fetch failed with HTTP ${response.status}`);
+  }
+
+  const actualDigest = `sha256:${createHash('sha256').update(response.body).digest('hex')}`;
+  if (actualDigest !== ref.digest) {
+    throw new Error('Placement presentation digest mismatch');
+  }
+
+  const document = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(response.body));
+  return PlacementPresentationDocumentSchema.parse(document);
+}
+
+const presentation = await loadPlacementPresentation(placement.presentation_ref);
+const authority = resolvePreviewAuthority({
+  targetPlacementId: placement.placement_id,
+  publisherPresentation: { placementId: placement.placement_id, value: presentation },
+  manifest,
+});
+```
+
+`ssrfSafeFetch` rejects private and non-HTTPS targets by default, pins DNS resolution, does not follow redirects, and enforces the supplied timeout and body limit. Do not attach ambient credentials when fetching presentation documents or their image decorations.
+
+### Form Validation
+
+```typescript
+import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { CreateMediaBuyRequestSchema } from '@adcp/sdk/schemas/browser';
+
+function MediaBuyForm() {
+  const { register, handleSubmit } = useForm({
+    resolver: zodResolver(CreateMediaBuyRequestSchema)
+  });
+  // Form data is automatically validated!
+}
+```
+
+### Middleware Validation
+
+```typescript
+app.post('/api/products', async (req, res) => {
+  try {
+    const request = GetProductsRequestSchema.parse(req.body);
+    const response = await agent.getProducts(request);
+    res.json(GetProductsResponseSchema.parse(response));
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ errors: error.issues });
+    }
+  }
+});
+```
+
+## Advanced Usage
+
+### Partial Schemas
+```typescript
+const PartialMediaBuy = MediaBuySchema.partial(); // All fields optional
+```
+
+### Schema Extension
+```typescript
+const ProductWithCache = ProductSchema.extend({
+  _cached_at: z.string().datetime()
+});
+```
+
+### Custom Transforms
+```typescript
+const NormalizedRequest = GetProductsRequestSchema.transform(data => ({
+  ...data,
+  brief: data.brief?.trim().toLowerCase()
+}));
+```
+
+## Automatic Generation
+
+Zod schemas are automatically generated when you update types:
+
+```bash
+# Sync schemas from protocol and generate everything
+npm run sync-schemas && npm run generate-types
+```
+
+This single command:
+1. Downloads latest AdCP JSON schemas
+2. Generates TypeScript types
+3. Generates Zod schemas (automatic)
+
+See `VALIDATION_WORKFLOW.md` for CI integration details.
+
+### JSON Schema parity
+
+Generated Zod validators preserve protocol-authored string length bounds,
+patterns and supported formats, numeric minimum/maximum bounds, and integer checks. JSON Schema
+`default` values remain documentation-only: parsing `{ pagination: {} }` does
+not insert `max_results: 50`, so validation never mutates an adopter's payload.
+
+Array cardinality is not guaranteed to match every source schema. The
+TypeScript generation hop deliberately removes some `minItems` and `maxItems`
+constraints to avoid tuple explosions and preserve compatibility, while direct
+schema projections can retain them. Use the protocol JSON Schema returned by
+`getToolInputSchema()` or the framework's strict request validation when exact
+array cardinality matters.
+
+## Error Handling
+
+```typescript
+const result = MediaBuySchema.safeParse(invalidData);
+
+if (!result.success) {
+  result.error.issues.forEach(issue => {
+    console.log(`Field: ${issue.path.join('.')}`);
+    console.log(`Error: ${issue.message}`);
+  });
+}
+```
+
+## Performance
+
+- Use at API boundaries and user input
+- Zod schemas are immutable - safe to cache
+- Consider skipping validation in performance-critical production paths
+
+## TypeScript Integration
+
+```typescript
+import type { MediaBuy } from '@adcp/sdk';
+import { MediaBuySchema } from '@adcp/sdk/schemas';
+import { z } from 'zod';
+
+type MediaBuyInferred = z.infer<typeof MediaBuySchema>;
+// MediaBuyInferred is compatible with MediaBuy type!
+```
+
+## Platform Implementation
+
+If you're building a platform that **receives** AdCP tool calls (a seller/publisher), import request types for handler signatures from `@adcp/sdk` and schemas for runtime validation from `@adcp/sdk/schemas`.
+
+### Naming Convention
+
+| Pattern | Meaning | Example |
+|---------|---------|---------|
+| `{Tool}Request` | Parameters for a tool call | `CreateMediaBuyRequest` |
+| `{Tool}Response` | Return value from a tool call | `CreateMediaBuyResponse` |
+| `{Noun}Request` | Creation-shaped nested object (required fields) | `PackageRequest` |
+| `{Noun}` (no suffix) | Response-shaped object (from `core.generated`) | `Package` |
+| `*Schema` suffix | Zod runtime validator for any of the above | `CreateMediaBuyRequestSchema` |
+
+The `Request` suffix on `PackageRequest` means "creation-shaped" — it has required fields like `buyer_ref`, `product_id`, `budget`. The plain `Package` type is response-shaped with `package_id` and most fields optional.
+
+### Type Catalog
+
+| Tool | Request Type | Schema | Required Fields |
+|------|-------------|--------|-----------------|
+| `get_products` | `GetProductsRequest` | `GetProductsRequestSchema` | `buying_mode` |
+| `list_creative_formats` | `ListCreativeFormatsRequest` | `ListCreativeFormatsRequestSchema` | *(all optional filters)* |
+| `create_media_buy` | `CreateMediaBuyRequest` | `CreateMediaBuyRequestSchema` | `buyer_ref`, `account`, `brand`, `start_time`, `end_time` |
+| *(nested)* | `PackageRequest` | `PackageRequestSchema` | `buyer_ref`, `product_id`, `budget`, `pricing_option_id` |
+| `update_media_buy` | `UpdateMediaBuyRequest` | `UpdateMediaBuyRequestSchema` | *(identify by `media_buy_id` or `buyer_ref`)* |
+| `sync_creatives` | `SyncCreativesRequest` | `SyncCreativesRequestSchema` | `account`, `creatives` |
+| `get_media_buy_delivery` | `GetMediaBuyDeliveryRequest` | `GetMediaBuyDeliveryRequestSchema` | *(all optional filters)* |
+
+### Typed Handler Example
+
+```typescript
+import {
+  // TypeScript types for handler signatures
+  CreateMediaBuyRequest,
+  CreateMediaBuyResponse,
+  PackageRequest,
+  TargetingOverlay,
+} from '@adcp/sdk';
+import { CreateMediaBuyRequestSchema } from '@adcp/sdk/schemas';
+
+function handleCreateMediaBuy(rawParams: unknown): CreateMediaBuyResponse {
+  // Validate and parse the incoming request
+  const request: CreateMediaBuyRequest = CreateMediaBuyRequestSchema.parse(rawParams);
+
+  // All fields are now typed — IDE autocomplete works
+  const { buyer_ref, account, brand, start_time, end_time } = request;
+
+  // Nested types are also fully typed
+  for (const pkg of request.packages ?? []) {
+    // pkg is PackageRequest — buyer_ref, product_id, budget are required
+    const overlay: TargetingOverlay | undefined = pkg.targeting_overlay;
+    if (overlay?.geo_countries) {
+      // geo_countries is string[]
+    }
+  }
+
+  // Return a typed response (CreateMediaBuyResponse = CreateMediaBuySuccess | CreateMediaBuyError)
+  return { media_buy_id: 'mb_123', buyer_ref, packages: [/* ... */] };
+}
+```
+
+### Quick Import Reference
+
+```typescript
+// Types — for handler signatures and return values
+import type {
+  CreateMediaBuyRequest, CreateMediaBuyResponse,
+  GetProductsRequest, GetProductsResponse,
+  SyncCreativesRequest, SyncCreativesResponse,
+  PackageRequest, TargetingOverlay, FrequencyCap,
+} from '@adcp/sdk';
+
+// Schemas — for runtime validation
+import {
+  CreateMediaBuyRequestSchema,
+  GetProductsRequestSchema,
+  SyncCreativesRequestSchema,
+} from '@adcp/sdk/schemas';
+```
+
+## Example
+
+See `examples/zod-validation-example.ts` for complete examples.
+
+## NPM Package Distribution
+
+**Yes, downstream users automatically get Zod schemas!** Here's how:
+
+### What Gets Published
+
+When you `npm publish`, the package includes:
+```
+@adcp/sdk/
+  ├── dist/lib/types/schemas.generated.js  ← Zod schemas (compiled)
+  ├── dist/lib/types/schemas.generated.d.ts ← Type definitions
+  └── dist/lib/schemas/index.js            ← Re-exports schemas
+```
+
+### What Downstream Users Get
+
+When someone installs `@adcp/sdk`, they get:
+
+```typescript
+// Works immediately after npm install
+import { MediaBuySchema } from '@adcp/sdk/schemas';
+
+const result = MediaBuySchema.safeParse(data);
+```
+
+**No extra steps needed!** The compiled Zod schemas are part of the published package.
+
+### Package Dependencies
+
+The `package.json` declares `zod` as a **peer dependency**:
+
+```json
+{
+  "peerDependencies": {
+    "zod": "^3.22.4"
+  }
+}
+```
+
+This means:
+- Users must install `zod` separately: `npm install @adcp/sdk zod`
+- NPM shows a warning if `zod` is missing
+- Users can choose their `zod` version (within range)
+
+### Verification
+
+After publishing, downstream users can verify:
+
+```bash
+npm install @adcp/sdk zod
+
+# Check what's in the package
+npm ls @adcp/sdk
+
+# Verify exports work
+node -e "console.log(require('@adcp/sdk/schemas').MediaBuySchema)"
+```
+
+## Troubleshooting
+
+### "Cannot find module 'zod'"
+**Solution**: Install zod as a peer dependency: `npm install zod`
+
+### Schema Validation Fails on Valid Data
+Some complex nested schemas may need:
+```typescript
+const FlexibleProduct = ProductSchema.passthrough(); // Allow extra fields
+```
+
+### Schema Updates After Protocol Changes
+```bash
+npm run sync-schemas && npm run generate-types
+# Then check for breaking changes in your code
+```
+
+## Resources
+
+- [Zod Documentation](https://zod.dev)
+- [AdCP Protocol](https://adcontextprotocol.org)
+- [React Hook Form + Zod](https://react-hook-form.com/get-started#SchemaValidation)
+- [Zod to OpenAPI](https://github.com/samchungy/zod-to-openapi)
+
+For CI integration and schema generation workflow, see `VALIDATION_WORKFLOW.md`.

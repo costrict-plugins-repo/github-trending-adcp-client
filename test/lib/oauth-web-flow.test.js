@@ -1,0 +1,1578 @@
+/**
+ * Tests for the web (server-side) OAuth flow helpers.
+ *
+ * Drives `startWebOAuthFlow` and `completeWebOAuthFlow` against an
+ * in-process HTTP server that plays the AS + PRM endpoints. The goal
+ * is to lock in the bits the SDK is responsible for — PRM resolution,
+ * scope priority, resource forwarding into token exchange, atomic
+ * consume, error envelope plumbing — without re-testing the MCP SDK
+ * primitives underneath.
+ */
+
+const { test, describe, before, after, beforeEach } = require('node:test');
+const assert = require('node:assert');
+const http = require('node:http');
+
+const {
+  startWebOAuthFlow: rawStartWebOAuthFlow,
+  completeWebOAuthFlow: rawCompleteWebOAuthFlow,
+  safeReturnTo,
+  InMemoryPendingFlowStore,
+  InvalidOrExpiredFlowError,
+  StateMismatchError,
+  BrowserBindingRequiredError,
+  TokenExchangeError,
+  ProtectedResourceMetadataError,
+  AgentVanishedDuringFlowError,
+  AgentChangedDuringFlowError,
+  ConfidentialClientNotAllowedError,
+  serializePendingWebFlow,
+  parsePendingWebFlow,
+} = require('../../dist/lib/auth/oauth');
+const { assertPendingWebFlowStoreRoundTrip } = require('@adcp/sdk/testing');
+
+// This suite intentionally uses an in-process plaintext authorization server.
+const startWebOAuthFlow = options => rawStartWebOAuthFlow({ allowHttp: true, ...options });
+const completeWebOAuthFlow = options =>
+  rawCompleteWebOAuthFlow({ allowHttp: true, allowUnboundState: true, ...options });
+
+const state = {
+  server: null,
+  port: 0,
+  handlers: {},
+  lastTokenRequest: null,
+  lastRegisterRequest: null,
+};
+
+before(async () => {
+  state.server = http.createServer((req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const handler = state.handlers[url.pathname];
+    if (!handler) {
+      res.statusCode = 404;
+      res.end();
+      return;
+    }
+    let body = '';
+    req.on('data', chunk => (body += chunk));
+    req.on('end', () => {
+      try {
+        handler(req, res, body, url);
+      } catch (err) {
+        console.error('test fixture handler threw:', err);
+        res.statusCode = 500;
+        res.end('test fixture error');
+      }
+    });
+  });
+  await new Promise(r => state.server.listen(0, '127.0.0.1', r));
+  state.port = state.server.address().port;
+});
+
+after(async () => {
+  await new Promise(r => state.server.close(r));
+});
+
+beforeEach(() => {
+  state.handlers = {};
+  state.lastTokenRequest = null;
+  state.lastRegisterRequest = null;
+});
+
+function origin() {
+  return `http://127.0.0.1:${state.port}`;
+}
+function agentUrl() {
+  return `${origin()}/mcp`;
+}
+function jsonRes(res, status, body) {
+  res.statusCode = status;
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify(body));
+}
+
+function makeAgent(overrides = {}) {
+  return {
+    id: 'test-agent',
+    name: 'Test Agent',
+    agent_uri: agentUrl(),
+    protocol: 'mcp',
+    oauth_client: { client_id: 'pre-registered-client' },
+    ...overrides,
+  };
+}
+
+function installStandardASHandlers({ tokenEndpointAuthMethods, registrationEndpoint, registrationResponse } = {}) {
+  state.handlers['/.well-known/oauth-authorization-server'] = (req, res) =>
+    jsonRes(res, 200, {
+      issuer: origin(),
+      authorization_endpoint: `${origin()}/oauth/authorize`,
+      token_endpoint: `${origin()}/oauth/token`,
+      response_types_supported: ['code'],
+      code_challenge_methods_supported: ['S256'],
+      grant_types_supported: ['authorization_code', 'refresh_token'],
+      token_endpoint_auth_methods_supported: tokenEndpointAuthMethods ?? ['none'],
+      ...(registrationEndpoint ? { registration_endpoint: `${origin()}/oauth/register` } : {}),
+      scopes_supported: ['mcp.read', 'mcp.write'],
+    });
+  state.handlers['/oauth/token'] = (req, res, body) => {
+    const params = new URLSearchParams(body);
+    state.lastTokenRequest = {
+      headers: req.headers,
+      params: Object.fromEntries(params),
+    };
+    jsonRes(res, 200, {
+      access_token: 'issued-access-token',
+      refresh_token: 'issued-refresh-token',
+      token_type: 'Bearer',
+      expires_in: 3600,
+      scope: params.get('scope') ?? undefined,
+    });
+  };
+  if (registrationEndpoint) {
+    state.handlers['/oauth/register'] = (req, res, body) => {
+      state.lastRegisterRequest = JSON.parse(body);
+      const merged = { ...JSON.parse(body), ...(registrationResponse ?? {}) };
+      jsonRes(res, 201, {
+        client_id: 'dyn-registered-client',
+        client_id_issued_at: Math.floor(Date.now() / 1000),
+        ...merged,
+      });
+    };
+  }
+}
+
+describe('startWebOAuthFlow', () => {
+  test('rejects an unconstrained PRM authorization server before discovery', async () => {
+    let fetchCount = 0;
+    const customFetch = async url => {
+      fetchCount += 1;
+      if (url.toString().includes('oauth-protected-resource')) {
+        return new Response(
+          JSON.stringify({
+            resource: 'https://example.com/mcp',
+            authorization_servers: ['http://127.0.0.1/internal-as'],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        );
+      }
+      throw new Error('authorization-server discovery should not run');
+    };
+
+    await assert.rejects(
+      () =>
+        rawStartWebOAuthFlow({
+          agent: makeAgent({ agent_uri: 'https://example.com/mcp' }),
+          redirectUri: 'https://app.example.com/callback',
+          pendingFlowStore: new InMemoryPendingFlowStore(),
+          trustedFetchFn: customFetch,
+        }),
+      err => err instanceof ProtectedResourceMetadataError && /must use HTTPS/.test(err.message)
+    );
+    assert.strictEqual(fetchCount, 1);
+  });
+
+  test('prefers PRM.resource over the server-derived fallback', async () => {
+    // The agent_uri carries a trailing slash; the PRM advertises the
+    // canonical no-slash form. The local-guess path would be `/mcp/`
+    // and PRM is `/mcp` — different strings so we can verify which one
+    // landed on the wire. (`checkResourceAllowed` allows requested-longer
+    // -than-configured paths.)
+    const slashedAgentUrl = `${origin()}/mcp/`;
+    const prmResource = `${origin()}/mcp`;
+    // The MCP SDK strips the trailing slash from agent_uri's pathname
+    // when building the well-known URL — handler registers at /mcp not /mcp/.
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, {
+        resource: prmResource,
+        authorization_servers: [origin()],
+      });
+    installStandardASHandlers();
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const result = await startWebOAuthFlow({
+      agent: makeAgent({ agent_uri: slashedAgentUrl }),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+    });
+
+    const url = new URL(result.authorizationUrl);
+    assert.strictEqual(url.searchParams.get('resource'), prmResource);
+    assert.strictEqual(url.searchParams.get('state'), result.state);
+    assert.strictEqual(url.searchParams.get('redirect_uri'), 'http://localhost:9999/callback');
+    assert.ok(url.searchParams.get('code_challenge'), 'PKCE code_challenge missing');
+  });
+
+  test('resourceOverride takes precedence over PRM and permits an operator-configured canonical origin', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: 'https://untrusted-metadata.example.com', authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const resourceOverride = 'https://platform.example.com';
+    const result = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore: new InMemoryPendingFlowStore(),
+      resourceOverride,
+    });
+
+    assert.strictEqual(new URL(result.authorizationUrl).searchParams.get('resource'), new URL(resourceOverride).href);
+  });
+
+  test('reuses a resource override persisted on AgentConfig', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const result = await startWebOAuthFlow({
+      agent: makeAgent({ oauth_resource: 'https://persisted.example.com' }),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore: new InMemoryPendingFlowStore(),
+    });
+
+    assert.strictEqual(new URL(result.authorizationUrl).searchParams.get('resource'), 'https://persisted.example.com/');
+  });
+
+  test('adds an opt-in Auth0 audience without conflating it with RFC 8707 resource', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const result = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore: new InMemoryPendingFlowStore(),
+      resourceOverride: 'https://resource.example.com',
+      audience: 'https://auth0-api.example.com',
+    });
+
+    const url = new URL(result.authorizationUrl);
+    assert.strictEqual(url.searchParams.get('resource'), 'https://resource.example.com/');
+    assert.strictEqual(url.searchParams.get('audience'), 'https://auth0-api.example.com');
+  });
+
+  test('rejects unsafe resource overrides before constructing the authorization URL', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const invalid = [
+      'http://remote.example.com',
+      'javascript:alert(1)',
+      'https://user:secret@example.com',
+      'https://platform.example.com/#fragment',
+      `https://platform.example.com/${'x'.repeat(2048)}`,
+    ];
+    for (const resourceOverride of invalid) {
+      await assert.rejects(
+        () =>
+          startWebOAuthFlow({
+            agent: makeAgent(),
+            redirectUri: 'http://localhost:9999/callback',
+            pendingFlowStore: new InMemoryPendingFlowStore(),
+            resourceOverride,
+            allowHttp: false,
+          }),
+        { code: 'invalid_resource_override' }
+      );
+    }
+  });
+
+  test('falls back to server-derived resource on a 404 PRM (RFC 9728 optional)', async () => {
+    installStandardASHandlers();
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const result = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+    });
+
+    const resource = new URL(result.authorizationUrl).searchParams.get('resource');
+    assert.ok(resource, 'resource indicator missing');
+    assert.ok(resource.startsWith(origin()), `expected resource to start with ${origin()}, got ${resource}`);
+  });
+
+  test('throws ProtectedResourceMetadataError on a malformed PRM body', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) => {
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/json');
+      res.end('{not valid json');
+    };
+    installStandardASHandlers();
+
+    await assert.rejects(
+      () =>
+        startWebOAuthFlow({
+          agent: makeAgent(),
+          redirectUri: 'http://localhost:9999/callback',
+          pendingFlowStore: new InMemoryPendingFlowStore(),
+        }),
+      err => err instanceof ProtectedResourceMetadataError
+    );
+  });
+
+  test('throws ProtectedResourceMetadataError when PRM advertises a foreign resource origin', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, {
+        resource: 'https://victim-bank.example/',
+        authorization_servers: [origin()],
+      });
+    installStandardASHandlers();
+
+    await assert.rejects(
+      () =>
+        startWebOAuthFlow({
+          agent: makeAgent(),
+          redirectUri: 'http://localhost:9999/callback',
+          pendingFlowStore: new InMemoryPendingFlowStore(),
+        }),
+      err => err instanceof ProtectedResourceMetadataError && /does not share an origin/.test(err.message)
+    );
+  });
+
+  test('caller scopeHint overrides PRM.scopes_supported (SEP-835)', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, {
+        resource: agentUrl(),
+        authorization_servers: [origin()],
+        scopes_supported: ['mcp.read', 'mcp.write'],
+      });
+    installStandardASHandlers();
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const result = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+      scopeHint: 'mcp.read',
+    });
+
+    assert.strictEqual(new URL(result.authorizationUrl).searchParams.get('scope'), 'mcp.read');
+  });
+
+  test('uses PRM.scopes_supported when no scopeHint is provided', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, {
+        resource: agentUrl(),
+        authorization_servers: [origin()],
+        scopes_supported: ['mcp.read', 'mcp.write'],
+      });
+    installStandardASHandlers();
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const result = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+    });
+
+    assert.strictEqual(new URL(result.authorizationUrl).searchParams.get('scope'), 'mcp.read mcp.write');
+  });
+
+  test('persists the pending flow keyed by state with PKCE verifier and resource', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const result = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+      carry: { return_to: '/dashboard' },
+    });
+
+    const flow = await pendingFlowStore.consume(result.state);
+    assert.ok(flow, 'flow not found in store');
+    assert.strictEqual(flow.agentId, 'test-agent');
+    assert.strictEqual(flow.agentUrl, agentUrl());
+    assert.strictEqual(flow.redirectUri, 'http://localhost:9999/callback');
+    assert.strictEqual(flow.resource, agentUrl());
+    assert.strictEqual(flow.authorizationServerUrl, `${origin()}/`);
+    assert.deepStrictEqual(flow.carry, { return_to: '/dashboard' });
+    assert.ok(flow.codeVerifier && flow.codeVerifier.length > 0, 'code verifier missing');
+  });
+
+  test('runs dynamic client registration when agent has no oauth_client', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers({ registrationEndpoint: true });
+
+    const agent = makeAgent({ oauth_client: undefined });
+    const savedAgents = [];
+    const agentStorage = {
+      loadAgent: async () => agent,
+      saveAgent: async a => {
+        savedAgents.push(JSON.parse(JSON.stringify(a)));
+      },
+    };
+
+    const result = await startWebOAuthFlow({
+      agent,
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore: new InMemoryPendingFlowStore(),
+      agentStorage,
+    });
+
+    assert.ok(state.lastRegisterRequest, 'DCR not invoked');
+    assert.deepStrictEqual(state.lastRegisterRequest.redirect_uris, ['http://localhost:9999/callback']);
+    assert.strictEqual(new URL(result.authorizationUrl).searchParams.get('client_id'), 'dyn-registered-client');
+    assert.ok(savedAgents.length >= 1, 'agentStorage.saveAgent not called');
+    assert.strictEqual(savedAgents[0].oauth_client.client_id, 'dyn-registered-client');
+  });
+
+  test('throws ConfidentialClientNotAllowedError when DCR returns a client_secret without opt-in', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers({
+      registrationEndpoint: true,
+      registrationResponse: { client_secret: 'oh-no-its-confidential', client_secret_expires_at: 0 },
+    });
+
+    await assert.rejects(
+      () =>
+        startWebOAuthFlow({
+          agent: makeAgent({ oauth_client: undefined }),
+          redirectUri: 'http://localhost:9999/callback',
+          pendingFlowStore: new InMemoryPendingFlowStore(),
+        }),
+      err => err instanceof ConfidentialClientNotAllowedError
+    );
+  });
+
+  test('allowConfidentialClient: true permits the secret and persists it', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers({
+      registrationEndpoint: true,
+      registrationResponse: { client_secret: 'consenting-secret', client_secret_expires_at: 0 },
+    });
+
+    const agent = makeAgent({ oauth_client: undefined });
+    const savedAgents = [];
+    const agentStorage = {
+      loadAgent: async () => agent,
+      saveAgent: async a => savedAgents.push(JSON.parse(JSON.stringify(a))),
+    };
+
+    await startWebOAuthFlow({
+      agent,
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore: new InMemoryPendingFlowStore(),
+      agentStorage,
+      allowConfidentialClient: true,
+    });
+
+    assert.strictEqual(savedAgents[0].oauth_client.client_secret, 'consenting-secret');
+  });
+
+  test('throws when agent has no oauth_client and AS does not advertise DCR', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers({ registrationEndpoint: false });
+
+    await assert.rejects(
+      () =>
+        startWebOAuthFlow({
+          agent: makeAgent({ oauth_client: undefined }),
+          redirectUri: 'http://localhost:9999/callback',
+          pendingFlowStore: new InMemoryPendingFlowStore(),
+        }),
+      /dynamic client registration/i
+    );
+  });
+});
+
+describe('completeWebOAuthFlow', () => {
+  test('forwards resourceOverride to code exchange, omits audience, and persists the override for refresh', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const agent = makeAgent();
+    const savedAgents = [];
+    const agentStorage = {
+      loadAgent: async () => agent,
+      saveAgent: async a => savedAgents.push(JSON.parse(JSON.stringify(a))),
+    };
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const resourceOverride = 'https://platform.example.com';
+    const start = await startWebOAuthFlow({
+      agent,
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+      resourceOverride,
+      audience: 'https://auth0-api.example.com',
+    });
+
+    await completeWebOAuthFlow({
+      state: start.state,
+      expectedState: start.state,
+      code: 'override-code',
+      pendingFlowStore,
+      agentStorage,
+    });
+
+    assert.strictEqual(state.lastTokenRequest.params.resource, new URL(resourceOverride).href);
+    assert.strictEqual(state.lastTokenRequest.params.audience, undefined);
+    assert.strictEqual(savedAgents.at(-1).oauth_resource, new URL(resourceOverride).href);
+  });
+
+  test('exchanges the code, forwards resource, persists tokens via agentStorage', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const agent = makeAgent();
+    const savedAgents = [];
+    const agentStorage = {
+      loadAgent: async () => agent,
+      saveAgent: async a => savedAgents.push(JSON.parse(JSON.stringify(a))),
+    };
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+
+    const start = await startWebOAuthFlow({
+      agent,
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+      carry: { return_to: '/dashboard' },
+    });
+
+    const completion = await completeWebOAuthFlow({
+      state: start.state,
+      code: 'auth-code-from-as',
+      pendingFlowStore,
+      agentStorage,
+    });
+
+    assert.strictEqual(completion.tokens.access_token, 'issued-access-token');
+    assert.strictEqual(completion.tokens.refresh_token, 'issued-refresh-token');
+    assert.deepStrictEqual(completion.carry, { return_to: '/dashboard' });
+    assert.strictEqual(completion.persisted, true);
+
+    assert.ok(state.lastTokenRequest, 'token endpoint never hit');
+    assert.strictEqual(state.lastTokenRequest.params.grant_type, 'authorization_code');
+    assert.strictEqual(state.lastTokenRequest.params.code, 'auth-code-from-as');
+    assert.strictEqual(state.lastTokenRequest.params.resource, agentUrl());
+    assert.strictEqual(state.lastTokenRequest.params.redirect_uri, 'http://localhost:9999/callback');
+    assert.ok(state.lastTokenRequest.params.code_verifier, 'PKCE verifier missing on token exchange');
+
+    assert.ok(savedAgents.length >= 1);
+    const last = savedAgents[savedAgents.length - 1];
+    assert.strictEqual(last.oauth_tokens.access_token, 'issued-access-token');
+  });
+
+  test('rejects an operator override added while a preserve-only flow was pending', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const startAgent = makeAgent();
+    const storedAgent = makeAgent({ oauth_resource: 'https://stale.example.com' });
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const start = await startWebOAuthFlow({
+      agent: startAgent,
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+    });
+
+    await assert.rejects(
+      () =>
+        completeWebOAuthFlow({
+          state: start.state,
+          expectedState: start.state,
+          code: 'replacement-code',
+          pendingFlowStore,
+          agentStorage: {
+            loadAgent: async () => storedAgent,
+            saveAgent: async () => assert.fail('changed configuration must not be saved'),
+          },
+        }),
+      AgentChangedDuringFlowError
+    );
+  });
+
+  test('legacy pending rows without a resource snapshot preserve current operator configuration', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    let pendingFlow;
+    const legacyStore = {
+      put: async flow => {
+        pendingFlow = { ...flow };
+        delete pendingFlow.resourceOverrideSnapshot;
+        delete pendingFlow.resourceOverrideAction;
+        delete pendingFlow.resourceOverride;
+      },
+      consume: async stateValue => {
+        if (pendingFlow?.state !== stateValue) return null;
+        const flow = pendingFlow;
+        pendingFlow = null;
+        return flow;
+      },
+    };
+    const start = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore: legacyStore,
+    });
+    const storedAgent = makeAgent({ oauth_resource: 'https://current.example.com/' });
+
+    await completeWebOAuthFlow({
+      state: start.state,
+      expectedState: start.state,
+      code: 'legacy-row-code',
+      pendingFlowStore: legacyStore,
+      agentStorage: {
+        loadAgent: async () => storedAgent,
+        saveAgent: async () => {},
+      },
+    });
+    assert.strictEqual(storedAgent.oauth_resource, 'https://current.example.com/');
+  });
+
+  test('explicit null clears an unchanged persisted override', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const agent = makeAgent({ oauth_resource: 'https://old.example.com/' });
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const start = await startWebOAuthFlow({
+      agent,
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+      resourceOverride: null,
+    });
+    assert.strictEqual(new URL(start.authorizationUrl).searchParams.get('resource'), agentUrl());
+
+    await completeWebOAuthFlow({
+      state: start.state,
+      expectedState: start.state,
+      code: 'clear-code',
+      pendingFlowStore,
+      agentStorage: {
+        loadAgent: async () => agent,
+        saveAgent: async () => {},
+      },
+    });
+    assert.strictEqual(agent.oauth_resource, undefined);
+  });
+
+  test('rejects persistence when agent identity changes while the flow is pending', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const start = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+    });
+
+    await assert.rejects(
+      () =>
+        completeWebOAuthFlow({
+          state: start.state,
+          expectedState: start.state,
+          code: 'changed-agent-code',
+          pendingFlowStore,
+          agentStorage: {
+            loadAgent: async () => makeAgent({ agent_uri: `${origin()}/replacement` }),
+            saveAgent: async () => assert.fail('changed agent must not be saved'),
+          },
+        }),
+      AgentChangedDuringFlowError
+    );
+  });
+
+  test('rejects an explicit override when operator configuration changed while pending', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const startAgent = makeAgent({ oauth_resource: 'https://old.example.com/' });
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const start = await startWebOAuthFlow({
+      agent: startAgent,
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+      resourceOverride: 'https://requested.example.com/',
+    });
+
+    await assert.rejects(
+      () =>
+        completeWebOAuthFlow({
+          state: start.state,
+          expectedState: start.state,
+          code: 'concurrent-change-code',
+          pendingFlowStore,
+          agentStorage: {
+            loadAgent: async () => makeAgent({ oauth_resource: 'https://newer.example.com/' }),
+            saveAgent: async () => assert.fail('concurrently changed agent must not be saved'),
+          },
+        }),
+      AgentChangedDuringFlowError
+    );
+  });
+
+  test('returns persisted=false when no agentStorage is provided', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const start = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+    });
+    const completion = await completeWebOAuthFlow({
+      state: start.state,
+      code: 'c',
+      pendingFlowStore,
+    });
+    assert.strictEqual(completion.persisted, false);
+  });
+
+  test('throws AgentVanishedDuringFlowError when agentStorage.loadAgent returns undefined', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const agent = makeAgent();
+    const start = await startWebOAuthFlow({
+      agent,
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+    });
+
+    const agentStorage = {
+      loadAgent: async () => undefined,
+      saveAgent: async () => {
+        throw new Error('should never be called');
+      },
+    };
+
+    await assert.rejects(
+      () =>
+        completeWebOAuthFlow({
+          state: start.state,
+          code: 'c',
+          pendingFlowStore,
+          agentStorage,
+        }),
+      err => err instanceof AgentVanishedDuringFlowError && err.agentId === 'test-agent'
+    );
+  });
+
+  test('throws StateMismatchError when expectedState differs', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const start = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+    });
+
+    await assert.rejects(
+      () =>
+        completeWebOAuthFlow({
+          state: start.state,
+          code: 'c',
+          pendingFlowStore,
+          expectedState: 'different-cookie-value',
+        }),
+      err => err instanceof StateMismatchError
+    );
+  });
+
+  test('expectedState matching the supplied state succeeds', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const start = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+    });
+
+    const completion = await completeWebOAuthFlow({
+      state: start.state,
+      code: 'c',
+      pendingFlowStore,
+      expectedState: start.state,
+    });
+    assert.strictEqual(completion.tokens.access_token, 'issued-access-token');
+  });
+
+  test('fails closed when expectedState is omitted', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const start = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+    });
+
+    await assert.rejects(
+      () => rawCompleteWebOAuthFlow({ state: start.state, code: 'c', pendingFlowStore, allowHttp: true }),
+      err => err instanceof BrowserBindingRequiredError
+    );
+  });
+
+  test('allows an explicit non-browser compatibility escape hatch', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const start = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+    });
+
+    const result = await rawCompleteWebOAuthFlow({
+      state: start.state,
+      code: 'c',
+      pendingFlowStore,
+      allowHttp: true,
+      allowUnboundState: true,
+    });
+    assert.strictEqual(result.tokens.access_token, 'issued-access-token');
+  });
+
+  test('throws BrowserBindingRequiredError when requireBrowserBinding:true and expectedState omitted', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const start = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+    });
+
+    await assert.rejects(
+      () =>
+        completeWebOAuthFlow({
+          state: start.state,
+          code: 'c',
+          pendingFlowStore,
+          requireBrowserBinding: true,
+        }),
+      err => err instanceof BrowserBindingRequiredError
+    );
+  });
+
+  test('requireBrowserBinding:true with expectedState provided succeeds', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    installStandardASHandlers();
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const start = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+    });
+
+    const completion = await completeWebOAuthFlow({
+      state: start.state,
+      code: 'c',
+      pendingFlowStore,
+      expectedState: start.state,
+      requireBrowserBinding: true,
+    });
+    assert.strictEqual(completion.tokens.access_token, 'issued-access-token');
+  });
+
+  test('throws TokenExchangeError carrying status + body on AS rejection (with token redaction)', async () => {
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+    state.handlers['/.well-known/oauth-authorization-server'] = (req, res) =>
+      jsonRes(res, 200, {
+        issuer: origin(),
+        authorization_endpoint: `${origin()}/oauth/authorize`,
+        token_endpoint: `${origin()}/oauth/token`,
+        response_types_supported: ['code'],
+        code_challenge_methods_supported: ['S256'],
+        grant_types_supported: ['authorization_code'],
+        token_endpoint_auth_methods_supported: ['none'],
+        scopes_supported: ['mcp.read'],
+      });
+    state.handlers['/oauth/token'] = (req, res) => {
+      // AS error response that *also* echoes a refresh token in the body
+      // — we want to confirm redaction does its job.
+      jsonRes(res, 400, {
+        error: 'invalid_grant',
+        error_description: 'authorization code expired',
+        refresh_token: 'leaked-refresh-token',
+      });
+    };
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const start = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+    });
+
+    await assert.rejects(
+      () =>
+        completeWebOAuthFlow({
+          state: start.state,
+          code: 'expired-code',
+          pendingFlowStore,
+        }),
+      err => {
+        if (!(err instanceof TokenExchangeError)) return false;
+        assert.strictEqual(err.oauthErrorCode, 'invalid_grant');
+        assert.match(err.message, /invalid_grant/);
+        assert.doesNotMatch(err.body, /leaked-refresh-token/);
+        assert.doesNotMatch(err.message, /leaked-refresh-token/);
+        return true;
+      }
+    );
+  });
+
+  test('throws InvalidOrExpiredFlowError on unknown state', async () => {
+    await assert.rejects(
+      () =>
+        completeWebOAuthFlow({
+          state: 'never-existed',
+          code: 'x',
+          pendingFlowStore: new InMemoryPendingFlowStore(),
+        }),
+      err => err instanceof InvalidOrExpiredFlowError
+    );
+  });
+
+  test('throws InvalidOrExpiredFlowError on expired flow', async () => {
+    installStandardASHandlers();
+    state.handlers['/.well-known/oauth-protected-resource/mcp'] = (req, res) =>
+      jsonRes(res, 200, { resource: agentUrl(), authorization_servers: [origin()] });
+
+    const pendingFlowStore = new InMemoryPendingFlowStore();
+    const start = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost:9999/callback',
+      pendingFlowStore,
+      ttlMs: 1,
+    });
+
+    await new Promise(r => setTimeout(r, 10));
+
+    await assert.rejects(
+      () =>
+        completeWebOAuthFlow({
+          state: start.state,
+          code: 'auth-code',
+          pendingFlowStore,
+        }),
+      err => err instanceof InvalidOrExpiredFlowError
+    );
+  });
+});
+
+// Test adapter for the same JSON boundary a Redis/Postgres implementation uses.
+class JsonStringPendingFlowStore {
+  rows = new Map();
+
+  async put(flow) {
+    if (this.rows.has(flow.state)) throw new Error('Duplicate state');
+    this.rows.set(flow.state, serializePendingWebFlow(flow));
+  }
+
+  async consume(stateValue) {
+    const json = this.rows.get(stateValue);
+    this.rows.delete(stateValue);
+    if (json === undefined) return null;
+    const flow = parsePendingWebFlow(json);
+    return flow && flow.state === stateValue && flow.expiresAt.getTime() > Date.now() ? flow : null;
+  }
+}
+
+// Obtain the complete fixture from the published helper, keeping SDK field
+// coverage in one place rather than maintaining a second full fixture here.
+async function capturePendingFlowFixture() {
+  const store = new InMemoryPendingFlowStore();
+  let fixture;
+  await assertPendingWebFlowStoreRoundTrip({
+    put: async flow => {
+      fixture ??= structuredClone(flow);
+      await store.put(flow);
+    },
+    consume: stateValue => store.consume(stateValue),
+  });
+  return fixture;
+}
+
+describe('pending web-flow serialization', () => {
+  let fixture;
+  before(async () => {
+    fixture = await capturePendingFlowFixture();
+  });
+
+  test('round-trips all SDK fields, client information, nested carry, and Dates', () => {
+    const json = serializePendingWebFlow(fixture);
+    const wire = JSON.parse(json);
+    assert.strictEqual(wire.createdAt, fixture.createdAt.toISOString());
+    assert.strictEqual(wire.expiresAt, fixture.expiresAt.toISOString());
+    assert.deepStrictEqual(parsePendingWebFlow(json), fixture);
+    assert.deepStrictEqual(parsePendingWebFlow(wire), fixture, 'decoded Postgres jsonb payload');
+    assert.strictEqual(typeof require('@adcp/sdk/auth').serializePendingWebFlow, 'function');
+    assert.strictEqual(typeof require('@adcp/sdk/auth').parsePendingWebFlow, 'function');
+  });
+
+  test('preserves unknown top-level fields, client metadata, and nested extensions', () => {
+    const extended = structuredClone(fixture);
+    extended.futureField = { nested: [1, false, null, { issuer: 'opaque' }] };
+    extended.clientInformation.redirect_uris = ['https://buyer.example/oauth/callback'];
+    extended.clientInformation.token_endpoint_auth_method = 'client_secret_post';
+    extended.clientInformation.futureMetadata = { retained: true };
+    assert.deepStrictEqual(parsePendingWebFlow(serializePendingWebFlow(extended)), extended);
+  });
+
+  test('permits absent optional fields, a null snapshot, and the clear action', () => {
+    const flow = structuredClone(fixture);
+    for (const key of [
+      'resource',
+      'resourceOverride',
+      'resourceOverrideAction',
+      'resourceOverrideSnapshot',
+      'scope',
+      'authorizationServerIssuer',
+      'carry',
+    ])
+      delete flow[key];
+    flow.clientInformation = { client_id: 'public-client' };
+    assert.deepStrictEqual(parsePendingWebFlow(serializePendingWebFlow(flow)), flow);
+    flow.resourceOverrideAction = 'clear';
+    flow.resourceOverrideSnapshot = null;
+    assert.deepStrictEqual(parsePendingWebFlow(serializePendingWebFlow(flow)), flow);
+  });
+
+  test('does not filter expired flows during parsing', () => {
+    const expired = structuredClone(fixture);
+    expired.expiresAt = new Date(0);
+    assert.deepStrictEqual(parsePendingWebFlow(serializePendingWebFlow(expired)), expired);
+  });
+
+  test('returns null on invalid JSON and non-object payloads', () => {
+    for (const json of ['', '{', 'null', '[]', '42', '"string"', '{}', null, undefined]) {
+      assert.strictEqual(parsePendingWebFlow(json), null);
+    }
+  });
+
+  test('rejects each missing required field and every malformed SDK field', () => {
+    const wire = JSON.parse(serializePendingWebFlow(fixture));
+    for (const key of [
+      'state',
+      'agentId',
+      'agentUrl',
+      'codeVerifier',
+      'redirectUri',
+      'authorizationServerUrl',
+      'clientInformation',
+      'createdAt',
+      'expiresAt',
+    ]) {
+      const missing = { ...wire };
+      delete missing[key];
+      assert.strictEqual(parsePendingWebFlow(JSON.stringify(missing)), null, key);
+    }
+    for (const key of Object.keys(wire)) {
+      if (key === 'conformanceExtension') continue; // Deliberately unknown future field.
+      assert.strictEqual(parsePendingWebFlow(JSON.stringify({ ...wire, [key]: 123 })), null, key);
+    }
+    for (const value of [null, [], 'not-a-date', '2026-02-30T00:00:00.000Z', '2026-10-09']) {
+      for (const key of ['createdAt', 'expiresAt']) {
+        assert.strictEqual(parsePendingWebFlow(JSON.stringify({ ...wire, [key]: value })), null, key);
+      }
+    }
+    for (const value of [null, [], 'invalid']) {
+      assert.strictEqual(parsePendingWebFlow(JSON.stringify({ ...wire, carry: value })), null);
+    }
+    for (const value of [null, [], {}, { client_id: 1 }, { client_id: 'c', issuer: 7 }]) {
+      assert.strictEqual(parsePendingWebFlow(JSON.stringify({ ...wire, clientInformation: value })), null);
+    }
+    for (const key of ['client_secret', 'client_id_issued_at', 'client_secret_expires_at']) {
+      const invalidValue = key === 'client_secret' ? 123 : 'not-a-number';
+      assert.strictEqual(
+        parsePendingWebFlow(JSON.stringify({ ...wire, clientInformation: { client_id: 'c', [key]: invalidValue } })),
+        null,
+        key
+      );
+    }
+    assert.strictEqual(parsePendingWebFlow(JSON.stringify({ ...wire, resourceOverrideAction: 'invalid' })), null);
+  });
+
+  test('serializer rejects invalid Dates and non-JSON-serializable carry', () => {
+    assert.throws(() => serializePendingWebFlow({ ...fixture, expiresAt: new Date(NaN) }), TypeError);
+    assert.throws(() => serializePendingWebFlow({ ...fixture, carry: { value: 1n } }), TypeError);
+    const carry = {};
+    carry.circular = carry;
+    assert.throws(() => serializePendingWebFlow({ ...fixture, carry }), TypeError);
+  });
+});
+
+describe('published pending-flow store conformance helper', () => {
+  test('passes against the in-memory reference', async () => {
+    await assertPendingWebFlowStoreRoundTrip(new InMemoryPendingFlowStore());
+  });
+
+  test('passes across JSON serialization and Date revival', async () => {
+    await assertPendingWebFlowStoreRoundTrip(new JsonStringPendingFlowStore());
+  });
+
+  test('supports adopter-owned fixture values and real SDK state lengths', async () => {
+    const store = new JsonStringPendingFlowStore();
+    const carry = { tenant: 'test-tenant', nested: { retained: [1, null] } };
+    await assertPendingWebFlowStoreRoundTrip(
+      {
+        put: async flow => {
+          assert.strictEqual(flow.agentId, 'existing-test-agent');
+          assert.deepStrictEqual(flow.carry, carry);
+          assert.match(flow.state, /^[A-Za-z0-9_-]{43}$/);
+          await store.put(flow);
+        },
+        consume: stateValue => store.consume(stateValue),
+      },
+      { agentId: 'existing-test-agent', carry }
+    );
+    assert.strictEqual(store.rows.size, 0);
+  });
+
+  test('accepts synchronous rejection of duplicate and already-expired inserts', async () => {
+    const store = new JsonStringPendingFlowStore();
+    await assertPendingWebFlowStoreRoundTrip({
+      put: flow => {
+        if (flow.expiresAt.getTime() < Date.now()) throw new Error('Non-positive TTL');
+        if (store.rows.has(flow.state)) throw new Error('Duplicate state');
+        return store.put(flow);
+      },
+      consume: stateValue => store.consume(stateValue),
+    });
+  });
+
+  test('isolates adopter carry from stores that mutate their input after saving', async () => {
+    const store = new JsonStringPendingFlowStore();
+    const carry = { user_id: 'owner', nested: { values: [1, null] } };
+    const expected = structuredClone(carry);
+    await assertPendingWebFlowStoreRoundTrip(
+      {
+        put: async flow => {
+          assert.deepStrictEqual(flow.carry, expected);
+          await store.put(flow);
+          flow.carry.nested.values.push('mutated');
+        },
+        consume: stateValue => store.consume(stateValue),
+      },
+      { carry }
+    );
+    assert.deepStrictEqual(carry, expected);
+  });
+
+  test('expiry at the exact deadline is absent in the reference store and callback', async t => {
+    const fixture = await capturePendingFlowFixture();
+    const deadline = fixture.expiresAt.getTime();
+    t.mock.method(Date, 'now', () => deadline);
+    const store = new InMemoryPendingFlowStore();
+    await store.put(structuredClone(fixture));
+    assert.strictEqual(await store.consume(fixture.state), null);
+    await store.put(structuredClone(fixture));
+    assert.strictEqual(await store.cleanupExpired(), 1);
+    await assert.rejects(
+      () =>
+        completeWebOAuthFlow({
+          state: fixture.state,
+          code: 'auth-code',
+          pendingFlowStore: {
+            put: async () => {},
+            consume: async () => structuredClone(fixture),
+          },
+        }),
+      error => error instanceof InvalidOrExpiredFlowError
+    );
+    assert.strictEqual(state.lastTokenRequest, null);
+  });
+
+  test('detects losing any fixture field, including optional issuer and override fields', async () => {
+    const fixture = await capturePendingFlowFixture();
+    for (const key of Object.keys(fixture)) {
+      const store = new InMemoryPendingFlowStore();
+      await assert.rejects(
+        () =>
+          assertPendingWebFlowStoreRoundTrip({
+            put: flow => store.put(flow),
+            consume: async stateValue => {
+              const flow = await store.consume(stateValue);
+              if (flow) delete flow[key];
+              return flow;
+            },
+          }),
+        /round-trip every field and Date/,
+        key
+      );
+    }
+  });
+
+  test('detects Date strings, lost client secrets/issuer, and flattened carry', async () => {
+    for (const corrupt of [
+      flow => ({ ...flow, createdAt: flow.createdAt.toISOString() }),
+      flow => ({ ...flow, clientInformation: { client_id: flow.clientInformation.client_id } }),
+      flow => ({ ...flow, carry: { user_id: flow.carry.user_id } }),
+    ]) {
+      const store = new InMemoryPendingFlowStore();
+      await assert.rejects(
+        () =>
+          assertPendingWebFlowStoreRoundTrip({
+            put: flow => store.put(flow),
+            consume: async stateValue => {
+              const flow = await store.consume(stateValue);
+              return flow ? corrupt(flow) : null;
+            },
+          }),
+        /round-trip every field and Date/
+      );
+    }
+  });
+
+  test('snapshots the fixture before a store mutates its input', async () => {
+    const store = new InMemoryPendingFlowStore();
+    await assert.rejects(
+      () =>
+        assertPendingWebFlowStoreRoundTrip({
+          put: async flow => {
+            delete flow.authorizationServerIssuer;
+            await store.put(flow);
+          },
+          consume: stateValue => store.consume(stateValue),
+        }),
+      /round-trip every field and Date/
+    );
+  });
+
+  test('detects null/absent snapshot loss and overwrites before duplicate rejection', async () => {
+    for (const violation of ['null-snapshot', 'snapshot-hydration', 'duplicate-overwrite']) {
+      const rows = new Map();
+      await assert.rejects(
+        () =>
+          assertPendingWebFlowStoreRoundTrip({
+            put: async flow => {
+              const duplicate = rows.has(flow.state);
+              if (duplicate && violation !== 'duplicate-overwrite') throw new Error('Duplicate');
+              const saved = structuredClone(flow);
+              if (saved.resourceOverrideSnapshot === null && violation === 'null-snapshot') {
+                delete saved.resourceOverrideSnapshot;
+              }
+              if (!Object.hasOwn(saved, 'resourceOverrideSnapshot') && violation === 'snapshot-hydration') {
+                saved.resourceOverrideSnapshot = undefined;
+              }
+              rows.set(flow.state, saved);
+              if (duplicate) throw new Error('Duplicate');
+            },
+            consume: async stateValue => {
+              const flow = rows.get(stateValue);
+              rows.delete(stateValue);
+              return flow && flow.expiresAt.getTime() > Date.now() ? flow : null;
+            },
+          }),
+        { name: 'AssertionError' },
+        violation
+      );
+    }
+  });
+
+  test('JSON store refuses malformed payloads and payloads under the wrong state key', async () => {
+    const store = new JsonStringPendingFlowStore();
+    const fixture = await capturePendingFlowFixture();
+    store.rows.set('wrong-state', serializePendingWebFlow(fixture));
+    store.rows.set('malformed', '{');
+    assert.strictEqual(await store.consume('wrong-state'), null);
+    assert.strictEqual(await store.consume('malformed'), null);
+    assert.strictEqual(store.rows.size, 0);
+  });
+
+  test('detects missing-state, replay, expiry, duplicate, and concurrent-consume violations', async () => {
+    for (const violation of ['missing-state', 'replay', 'expiry', 'duplicate', 'concurrent']) {
+      const rows = new Map();
+      let current;
+      const store = {
+        put: async flow => {
+          if (rows.has(flow.state) && violation !== 'duplicate') throw new Error('Duplicate');
+          current = flow;
+          rows.set(flow.state, structuredClone(flow));
+        },
+        consume: async stateValue => {
+          const flow = rows.get(stateValue);
+          if (!flow) return violation === 'missing-state' ? current : null;
+          if (violation === 'concurrent') {
+            // Models SELECT followed by an asynchronous DELETE, so both readers win.
+            await Promise.resolve();
+          }
+          if (violation !== 'replay') rows.delete(stateValue);
+          if (flow.expiresAt.getTime() < Date.now() && violation !== 'expiry') return null;
+          return flow;
+        },
+      };
+      await assert.rejects(() => assertPendingWebFlowStoreRoundTrip(store), { name: 'AssertionError' }, violation);
+    }
+  });
+});
+
+describe('PendingWebFlowStore contract (run against any implementation)', () => {
+  /**
+   * Reusable contract test. Adopters implementing a Postgres or Redis
+   * `PendingWebFlowStore` SHOULD run this against their store to prove
+   * the atomic-consume contract. The in-memory reference passes by
+   * construction; a `SELECT then DELETE` Postgres impl will fail it.
+   */
+  function runContract(name, factory) {
+    describe(name, () => {
+      test('consume returns null for absent state', async () => {
+        const store = await factory();
+        assert.strictEqual(await store.consume('does-not-exist'), null);
+      });
+
+      test('consume returns the row exactly once', async () => {
+        const store = await factory();
+        const flow = makePendingFlow('one-shot', 60_000);
+        await store.put(flow);
+
+        const first = await store.consume('one-shot');
+        assert.ok(first);
+        assert.strictEqual(first.agentId, 'test-agent');
+
+        const second = await store.consume('one-shot');
+        assert.strictEqual(second, null);
+      });
+
+      test('consume returns null for expired rows', async () => {
+        const store = await factory();
+        await store.put(makePendingFlow('expired', -1));
+        assert.strictEqual(await store.consume('expired'), null);
+      });
+
+      test('put rejects duplicate state', async () => {
+        const store = await factory();
+        await store.put(makePendingFlow('dup', 60_000));
+        await assert.rejects(() => store.put(makePendingFlow('dup', 60_000)));
+      });
+
+      test('parallel consume of the same state yields exactly one non-null', async () => {
+        const store = await factory();
+        await store.put(makePendingFlow('race', 60_000));
+        const results = await Promise.all([store.consume('race'), store.consume('race')]);
+        const wins = results.filter(r => r !== null);
+        assert.strictEqual(wins.length, 1, 'two consumers won the race');
+      });
+    });
+  }
+
+  function makePendingFlow(stateValue, ttlMs) {
+    const now = new Date();
+    return {
+      state: stateValue,
+      agentId: 'test-agent',
+      agentUrl: 'https://agent.example/mcp',
+      codeVerifier: 'pkce-verifier',
+      redirectUri: 'https://callback.example/cb',
+      resource: 'https://agent.example/mcp',
+      scope: 'mcp.read',
+      authorizationServerUrl: 'https://as.example/',
+      clientInformation: { client_id: 'c' },
+      createdAt: now,
+      expiresAt: new Date(now.getTime() + ttlMs),
+      carry: undefined,
+    };
+  }
+
+  runContract('InMemoryPendingFlowStore', async () => new InMemoryPendingFlowStore());
+  runContract('JsonStringPendingFlowStore', async () => new JsonStringPendingFlowStore());
+});
+
+describe('web OAuth issuer isolation', () => {
+  test('completes a web flow across the shared JSON persistence boundary', async () => {
+    installStandardASHandlers();
+    const store = new JsonStringPendingFlowStore();
+    const carry = { user_id: 'owner', nested: { values: ['one', { two: 2 }] } };
+    const started = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost/callback',
+      resourceOverride: `${origin()}/resource`,
+      carry,
+      pendingFlowStore: store,
+    });
+    const persisted = JSON.parse(store.rows.get(started.state));
+    assert.strictEqual(persisted.authorizationServerIssuer, `${origin()}/`);
+    assert.strictEqual(persisted.resourceOverrideAction, 'set');
+    const completed = await completeWebOAuthFlow({
+      state: started.state,
+      code: 'auth-code',
+      pendingFlowStore: store,
+    });
+    assert.deepStrictEqual(completed.carry, carry);
+    assert.strictEqual(completed.tokens.issuer, `${origin()}/`);
+    assert.strictEqual(state.lastTokenRequest.params.resource, `${origin()}/resource`);
+    assert.strictEqual(await store.consume(started.state), null);
+  });
+
+  test('parseable legacy rows without a frozen issuer refuse callback before token exchange', async () => {
+    installStandardASHandlers();
+    const store = new JsonStringPendingFlowStore();
+    const started = await startWebOAuthFlow({
+      agent: makeAgent(),
+      redirectUri: 'http://localhost/callback',
+      pendingFlowStore: store,
+    });
+    const flow = parsePendingWebFlow(store.rows.get(started.state));
+    delete flow.authorizationServerIssuer;
+    store.rows.set(started.state, serializePendingWebFlow(flow));
+    await assert.rejects(
+      () => completeWebOAuthFlow({ state: started.state, code: 'auth-code', pendingFlowStore: store }),
+      error => error.code === 'oauth_issuer_required'
+    );
+    assert.strictEqual(state.lastTokenRequest, null);
+    assert.strictEqual(await store.consume(started.state), null);
+  });
+
+  test('rejects unbound or differently bound confidential clients before starting a flow', async () => {
+    installStandardASHandlers();
+    for (const issuer of [undefined, 'https://different-as.example']) {
+      await assert.rejects(
+        () =>
+          startWebOAuthFlow({
+            agent: makeAgent({ oauth_client: { client_id: 'cid', client_secret: 'saved-secret', issuer } }),
+            redirectUri: 'http://localhost/callback',
+            pendingFlowStore: new InMemoryPendingFlowStore(),
+          }),
+        error => error.code === (issuer ? 'oauth_issuer_mismatch' : 'oauth_issuer_required')
+      );
+    }
+    assert.strictEqual(state.lastTokenRequest, null);
+    assert.strictEqual(state.lastRegisterRequest, null);
+  });
+
+  test('rejects metadata claiming another issuer before using saved secrets', async () => {
+    installStandardASHandlers();
+    state.handlers['/.well-known/oauth-authorization-server'] = (req, res) =>
+      jsonRes(res, 200, {
+        issuer: 'https://legitimate-as.example',
+        authorization_endpoint: `${origin()}/oauth/authorize`,
+        token_endpoint: `${origin()}/oauth/token`,
+        response_types_supported: ['code'],
+      });
+    await assert.rejects(
+      () =>
+        startWebOAuthFlow({
+          agent: makeAgent({
+            oauth_client: { client_id: 'cid', client_secret: 'saved-secret', issuer: 'https://legitimate-as.example' },
+          }),
+          redirectUri: 'http://localhost/callback',
+          pendingFlowStore: new InMemoryPendingFlowStore(),
+        }),
+      error => error.code === 'oauth_issuer_mismatch'
+    );
+    assert.strictEqual(state.lastTokenRequest, null);
+  });
+
+  test('rejects unbound or differently bound pending clients before direct token exchange', async () => {
+    installStandardASHandlers();
+    for (const issuer of [undefined, 'https://different-as.example']) {
+      const store = new InMemoryPendingFlowStore();
+      const started = await startWebOAuthFlow({
+        agent: makeAgent(),
+        redirectUri: 'http://localhost/callback',
+        pendingFlowStore: store,
+      });
+      const flow = await store.consume(started.state);
+      flow.clientInformation = { client_id: 'cid', client_secret: 'saved-secret', issuer };
+      await store.put(flow);
+      await assert.rejects(
+        () => completeWebOAuthFlow({ state: started.state, code: 'auth-code', pendingFlowStore: store }),
+        error => error.code === (issuer ? 'oauth_issuer_mismatch' : 'oauth_issuer_required')
+      );
+    }
+    assert.strictEqual(state.lastTokenRequest, null);
+  });
+
+  test('binds registered clients and returned tokens to the discovered server', async () => {
+    installStandardASHandlers({
+      registrationEndpoint: true,
+      registrationResponse: { issuer: 'https://wrong-as.example' },
+    });
+    state.handlers['/oauth/token'] = (req, res) =>
+      jsonRes(res, 200, {
+        access_token: 'issued-access',
+        refresh_token: 'issued-refresh',
+        token_type: 'Bearer',
+        issuer: 'https://wrong-as.example',
+      });
+    const agent = makeAgent({ oauth_client: undefined });
+    const storage = { loadAgent: async () => agent, saveAgent: async () => {} };
+    const store = new InMemoryPendingFlowStore();
+    const started = await startWebOAuthFlow({
+      agent,
+      agentStorage: storage,
+      redirectUri: 'http://localhost/callback',
+      pendingFlowStore: store,
+    });
+    assert.strictEqual(agent.oauth_client.issuer, `${origin()}/`);
+    const completed = await completeWebOAuthFlow({ state: started.state, code: 'auth-code', pendingFlowStore: store });
+    assert.strictEqual(completed.tokens.issuer, `${origin()}/`);
+    assert.strictEqual(completed.tokens.refresh_token, 'issued-refresh');
+  });
+});
+
+describe('safeReturnTo', () => {
+  test('accepts simple absolute paths', () => {
+    assert.strictEqual(safeReturnTo('/dashboard'), '/dashboard');
+    assert.strictEqual(safeReturnTo('/foo?bar=1'), '/foo?bar=1');
+  });
+
+  test('rejects protocol-relative URLs (//evil.example)', () => {
+    assert.strictEqual(safeReturnTo('//evil.example/'), undefined);
+  });
+
+  test('rejects path-traversal protocol smuggling (/\\\\evil)', () => {
+    assert.strictEqual(safeReturnTo('/\\evil.example'), undefined);
+  });
+
+  test('rejects absolute URLs by default', () => {
+    assert.strictEqual(safeReturnTo('https://evil.example/dashboard'), undefined);
+  });
+
+  test('rejects non-string and empty values', () => {
+    assert.strictEqual(safeReturnTo(undefined), undefined);
+    assert.strictEqual(safeReturnTo(null), undefined);
+    assert.strictEqual(safeReturnTo(''), undefined);
+    assert.strictEqual(safeReturnTo({ foo: 'bar' }), undefined);
+  });
+
+  test('honors allowedReturnHosts allowlist for absolute URLs', () => {
+    assert.strictEqual(
+      safeReturnTo('https://app.example.com/dashboard', { allowedReturnHosts: ['app.example.com'] }),
+      'https://app.example.com/dashboard'
+    );
+    assert.strictEqual(safeReturnTo('https://evil.example/', { allowedReturnHosts: ['app.example.com'] }), undefined);
+  });
+
+  test('rejects non-http(s) schemes even if host appears in allowlist', () => {
+    assert.strictEqual(safeReturnTo('javascript:alert(1)', { allowedReturnHosts: ['app.example.com'] }), undefined);
+  });
+});

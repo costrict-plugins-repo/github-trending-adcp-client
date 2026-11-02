@@ -1,0 +1,325 @@
+const { test, describe } = require('node:test');
+const assert = require('node:assert');
+const { createHash } = require('node:crypto');
+const { readFileSync, readdirSync } = require('node:fs');
+const path = require('node:path');
+
+const {
+  InMemoryReplayStore,
+  InMemoryRevocationStore,
+  RequestSignatureError,
+  StaticJwksResolver,
+  verifyRequestSignature,
+  signRequest,
+  buildSignatureBase,
+  canonicalAuthority,
+  canonicalTargetUri,
+  canonicalAgentOrigin,
+  parseSignatureInput,
+} = require('../dist/lib/signing/index.js');
+
+const ROOT = path.join(__dirname, '..', 'compliance', 'cache', 'latest', 'test-vectors', 'request-signing');
+
+const keysData = JSON.parse(readFileSync(path.join(ROOT, 'keys.json'), 'utf8'));
+const keysByKid = new Map(keysData.keys.map(k => [k.kid, k]));
+const canonicalizationVectors = JSON.parse(readFileSync(path.join(ROOT, 'canonicalization.json'), 'utf8'));
+
+describe('AdCP 3.2 request-target canonicalization', () => {
+  for (const vector of canonicalizationVectors.cases) {
+    test(vector.name, () => {
+      if (vector.reject) {
+        for (const canonicalize of [canonicalTargetUri, canonicalAuthority]) {
+          assert.throws(
+            () => canonicalize(vector.input_url, '3.2'),
+            error =>
+              error instanceof RequestSignatureError &&
+              error.code === vector.expected_error_code &&
+              error.failedStep === 10
+          );
+        }
+        return;
+      }
+      assert.strictEqual(canonicalTargetUri(vector.input_url, '3.2'), vector.expected_target_uri);
+      assert.strictEqual(canonicalAuthority(vector.input_url, '3.2'), vector.expected_authority);
+    });
+  }
+});
+
+describe('AdCP 3.3 canonical agent origins', () => {
+  for (const vector of canonicalizationVectors.cases) {
+    test(vector.name, () => {
+      if (vector.reject) {
+        assert.throws(() => canonicalAgentOrigin(vector.input_url));
+        return;
+      }
+      const scheme = new URL(vector.input_url).protocol;
+      assert.strictEqual(canonicalAgentOrigin(vector.input_url), `${scheme}//${vector.expected_authority}`);
+    });
+  }
+
+  test('shares origins across paths while preserving scheme, host, and port boundaries', () => {
+    const origin = canonicalAgentOrigin('HTTPS://User@Seller.Example.COM.:443/mcp?x=1#fragment');
+    assert.strictEqual(origin, 'https://seller.example.com');
+    assert.strictEqual(canonicalAgentOrigin('https://seller.example.com/a2a'), origin);
+    for (const url of [
+      'http://seller.example.com/mcp',
+      'https://seller.example.com:8443',
+      'https://other.example.com',
+    ]) {
+      assert.notStrictEqual(canonicalAgentOrigin(url), origin);
+    }
+  });
+
+  test('normalizes IDN inputs and rejects malformed identity locators', () => {
+    assert.strictEqual(canonicalAgentOrigin('https://XN--BCHER-KVA.example.:443/mcp'), 'https://xn--bcher-kva.example');
+    for (const url of ['https://seller.example.com../mcp', 'ftp://seller.example.com', '']) {
+      assert.throws(() => canonicalAgentOrigin(url));
+    }
+  });
+
+  test('is available from the client and server signing entry points in CJS and ESM', async () => {
+    for (const entry of ['client', 'server']) {
+      assert.strictEqual(
+        require(`../dist/lib/signing/${entry}.js`).canonicalAgentOrigin('https://EXAMPLE.com/mcp'),
+        'https://example.com'
+      );
+      const esm = await import(`../dist/lib/signing/${entry}.mjs`);
+      assert.strictEqual(esm.canonicalAgentOrigin('https://EXAMPLE.com/mcp'), 'https://example.com');
+      for (const api of [require(`../dist/lib/signing/${entry}.js`), esm]) {
+        assert.throws(
+          () => api.canonicalAgentOrigin(String.raw`https://example.com\@other.example`),
+          api.CanonicalizeError
+        );
+      }
+    }
+  });
+});
+
+test('default profile preserves the published trailing-empty-query vector', () => {
+  const vector = canonicalizationVectors.cases.find(entry => entry.name === 'trailing-empty-query-preserved');
+  assert.ok(vector);
+  assert.strictEqual(canonicalTargetUri(vector.input_url), vector.expected_target_uri);
+  assert.strictEqual(canonicalTargetUri(`${vector.input_url}#fragment`), vector.expected_target_uri);
+  assert.strictEqual(canonicalTargetUri(`${vector.input_url} \t`), vector.expected_target_uri);
+  assert.strictEqual(canonicalTargetUri('https://seller.example.com/p#?'), 'https://seller.example.com/p');
+  assert.notStrictEqual(canonicalTargetUri(vector.input_url), canonicalTargetUri('https://seller.example.com/p'));
+});
+
+function parseSigInput(headerValue) {
+  const parsed = parseSignatureInput(headerValue);
+  return { components: parsed.components, params: parsed.params };
+}
+
+function buildJwksForVector(vector) {
+  if (vector.jwks_override) return new StaticJwksResolver(vector.jwks_override.keys);
+  const entries = (vector.jwks_ref ?? []).map(kid => keysByKid.get(kid)).filter(k => k !== undefined);
+  return new StaticJwksResolver(entries);
+}
+
+function operationFromUrl(url) {
+  const p = new URL(url).pathname;
+  return p.split('/').filter(Boolean).pop();
+}
+
+async function runVector(vector, { pinned = true, now = vector.reference_now } = {}) {
+  const replayStore = new InMemoryReplayStore();
+  const revocationStore = new InMemoryRevocationStore();
+  // Replay entries are scoped by `(keyid, @target-uri)` (adcp#2460). Vector
+  // harness-state preloads inherit the scope from the vector's request URL
+  // — that's the endpoint the verifier will canonicalize when committing.
+  // Deferred until a preload is actually needed so URL-authority rejection
+  // vectors (e.g. 026) exercise the verifier's own canonicalization path
+  // rather than throwing in harness setup.
+  const state = vector.test_harness_state ?? {};
+  if (state.replay_cache_entries) {
+    const scope = canonicalTargetUri(vector.request.url);
+    for (const entry of state.replay_cache_entries) {
+      replayStore.preload(entry.keyid, scope, entry.nonce, entry.ttl_seconds, now);
+    }
+  }
+  if (state.revocation_list) revocationStore.load(state.revocation_list);
+  if (state.replay_cache_per_keyid_cap_hit) {
+    replayStore.setCapHitForTesting(state.replay_cache_per_keyid_cap_hit.keyid);
+  }
+  try {
+    await verifyRequestSignature(vector.request, {
+      capability: vector.verifier_capability,
+      jwks: buildJwksForVector(vector),
+      replayStore,
+      revocationStore,
+      now: () => now,
+      operation: operationFromUrl(vector.request.url),
+      ...(pinned ? { adcpVersion: vector.signing_profile_version ?? '3.1' } : {}),
+    });
+    return { success: true };
+  } catch (err) {
+    if (err instanceof RequestSignatureError) {
+      return { success: false, error_code: err.code, failed_step: err.failedStep };
+    }
+    throw err;
+  }
+}
+
+describe('RFC 9421 canonicalization: positive expected_signature_base (adcp#2323)', () => {
+  const dir = path.join(ROOT, 'positive');
+  for (const file of readdirSync(dir).sort()) {
+    const vector = JSON.parse(readFileSync(path.join(dir, file), 'utf8'));
+    if (!vector.expected_signature_base) continue;
+    test(`${file}: signature base matches spec byte-for-byte`, () => {
+      const { components, params } = parseSigInput(vector.request.headers['Signature-Input']);
+      const base = buildSignatureBase(components, vector.request, params);
+      assert.strictEqual(base, vector.expected_signature_base);
+    });
+  }
+});
+
+describe('RFC 9421 verifier: positive conformance vectors (adcp#2323)', () => {
+  const dir = path.join(ROOT, 'positive');
+  for (const file of readdirSync(dir).sort()) {
+    const vector = JSON.parse(readFileSync(path.join(dir, file), 'utf8'));
+    test(file, async () => {
+      const actual = await runVector(vector);
+      assert.strictEqual(actual.success, true, JSON.stringify(actual));
+    });
+  }
+});
+
+describe('RFC 9421 verifier: negative conformance vectors (adcp#2323)', () => {
+  const dir = path.join(ROOT, 'negative');
+  for (const file of readdirSync(dir).sort()) {
+    const originalBytes = readFileSync(path.join(dir, file));
+    const vector = JSON.parse(originalBytes.toString('utf8'));
+    const historical026 =
+      file === '026-non-ascii-host.json' && vector.expected_outcome.error_code === 'request_signature_header_malformed';
+    const expectedCode = historical026 ? 'request_target_uri_malformed' : vector.expected_outcome.error_code;
+    test(`${file} → ${expectedCode}${historical026 ? ' (published 026 metadata erratum)' : ''}`, async () => {
+      if (historical026) {
+        // Immutable AdCP 3.2.1 publication: /compliance/3.2.1/test-vectors/
+        // request-signing/negative/026-non-ascii-host.json. Its metadata
+        // conflicts with security.mdx#transport-error-taxonomy's raw-host
+        // target-URI classification. Preserve and check every original byte;
+        // correct this one assertion rather than editing the cached artifact
+        // or accepting either code for unrelated vectors.
+        assert.strictEqual(
+          createHash('sha256').update(originalBytes).digest('hex'),
+          '11e66b2442ace26d81ce7c78b636a3dc4813b670a34eea4e75bc77acfb03219a'
+        );
+        assert.strictEqual(vector.expected_outcome.failed_step, 1);
+      }
+      const actual = await runVector(vector);
+      assert.strictEqual(actual.success, false);
+      assert.strictEqual(actual.error_code, expectedCode);
+      if (file === '026-non-ascii-host.json') {
+        assert.strictEqual(expectedCode, 'request_target_uri_malformed');
+        // Informational SDK-local raw-authority parsing diagnostics; the
+        // normative checklist's step 1 parses signature headers themselves.
+        assert.strictEqual(actual.failed_step, 1);
+      }
+    });
+  }
+});
+
+describe('AdCP 3.2 signing-profile vectors', () => {
+  const profileRoot = path.join(ROOT, 'profile-3.2');
+
+  for (const file of readdirSync(path.join(profileRoot, 'positive')).sort()) {
+    const vector = JSON.parse(readFileSync(path.join(profileRoot, 'positive', file), 'utf8'));
+    test(`positive/${file}`, async () => {
+      const actual = await runVector(vector);
+      assert.strictEqual(actual.success, true, JSON.stringify(actual));
+    });
+  }
+
+  for (const file of readdirSync(path.join(profileRoot, 'negative')).sort()) {
+    const vector = JSON.parse(readFileSync(path.join(profileRoot, 'negative', file), 'utf8'));
+    test(`negative/${file}`, async () => {
+      const actual = await runVector(vector);
+      assert.strictEqual(actual.success, false);
+      assert.strictEqual(actual.error_code, vector.expected_outcome.error_code);
+      // Sub-steps such as "9a" are strings; numbered steps must match exactly.
+      // The raw U-label rejection is the one informational exception (see the
+      // root 026 assertion above): the SDK parses the received authority at
+      // step 1, while the corpus names step 10 where @authority is derived.
+      if (file === '026-non-ascii-host.json') {
+        assert.strictEqual(actual.failed_step, 1);
+      } else if (typeof vector.expected_outcome.failed_step === 'number') {
+        assert.strictEqual(actual.failed_step, vector.expected_outcome.failed_step);
+      }
+    });
+  }
+
+  // adcp-client#3073: a live grader sends this vector with its fixed, long-
+  // expired timestamps. The Base64URL Signature must be rejected at parse time
+  // (step 1), before the window check can report window_invalid.
+  test('negative/001-base64url-sf-binary fails at step 1 at a live clock', async () => {
+    const vector = JSON.parse(readFileSync(path.join(profileRoot, 'negative', '001-base64url-sf-binary.json'), 'utf8'));
+    for (const covers_content_digest of ['required', 'either']) {
+      const actual = await runVector(
+        { ...vector, verifier_capability: { ...vector.verifier_capability, covers_content_digest } },
+        { now: vector.reference_now + 30 * 24 * 60 * 60 }
+      );
+      assert.deepStrictEqual(
+        actual,
+        { success: false, error_code: 'request_signature_header_malformed', failed_step: 1 },
+        `covers_content_digest=${covers_content_digest}`
+      );
+    }
+  });
+
+  test('unpinned verifier derives 3.2 URI rules from RFC 8941 signature encoding', async () => {
+    const vector = JSON.parse(
+      readFileSync(path.join(profileRoot, 'negative', '002-multiple-trailing-dots.json'), 'utf8')
+    );
+    const actual = await runVector(vector, { pinned: false });
+    assert.deepStrictEqual(actual, {
+      success: false,
+      error_code: 'request_target_uri_malformed',
+      failed_step: 10,
+    });
+  });
+});
+
+test('AdCP 3.2 preserves query bytes without percent normalization', () => {
+  for (const query of ['x=%7e', 'x=%2f', 'x=%2F&y=%aB']) {
+    assert.strictEqual(
+      canonicalTargetUri(`https://seller.example.com/p?${query}#ignored`, '3.2'),
+      `https://seller.example.com/p?${query}`
+    );
+  }
+});
+
+describe('RFC 9421 signer: reference signature reproduction (adcp#2323)', () => {
+  test('positive/001 reproduces spec Ed25519 signature byte-for-byte', () => {
+    const vectorPath = path.join(ROOT, 'positive', '001-basic-post.json');
+    const vector = JSON.parse(readFileSync(vectorPath, 'utf8'));
+    const sigInput = vector.request.headers['Signature-Input'];
+    const created = Number(sigInput.match(/created=(\d+)/)[1]);
+    const expires = Number(sigInput.match(/expires=(\d+)/)[1]);
+    const nonce = sigInput.match(/nonce="([^"]+)"/)[1];
+
+    const jwk = { ...keysByKid.get('test-ed25519-2026') };
+    jwk.d = jwk._private_d_for_test_only;
+    delete jwk._private_d_for_test_only;
+    delete jwk.key_ops;
+    delete jwk.use;
+
+    const signed = signRequest(
+      {
+        method: vector.request.method,
+        url: vector.request.url,
+        headers: { 'Content-Type': vector.request.headers['Content-Type'] },
+        body: vector.request.body,
+      },
+      { keyid: 'test-ed25519-2026', alg: 'ed25519', privateKey: jwk },
+      {
+        now: () => created,
+        windowSeconds: expires - created,
+        nonce,
+      }
+    );
+
+    const mySig = signed.headers.Signature.match(/sig1=:([^:]+):/)[1];
+    const expectedSig = vector.request.headers.Signature.match(/sig1=:([^:]+):/)[1];
+    assert.strictEqual(mySig, expectedSig);
+  });
+});

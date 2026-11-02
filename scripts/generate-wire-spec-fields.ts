@@ -1,0 +1,258 @@
+#!/usr/bin/env tsx
+/**
+ * Codegen — emits `src/lib/server/wire-spec-fields.generated.ts`.
+ *
+ * Walks `schemas/cache/{ADCP_VERSION}/**\/*-request.json` and extracts
+ * the top-level `properties` keys for every request schema. The
+ * resulting constant maps each request's PascalCase TS name to its
+ * wire-spec field allowlist — used by `pickWireSpecFields(req,
+ * schemaName)` to strip buyer-controlled args to schema-spec fields
+ * only at the operational fan-out boundary.
+ *
+ * Replaces the hand-rolled allowlist that adopters built in
+ * scope3data/agentic-adapters#248 (`scrubRequestForFanout`,
+ * `synthesizeArgsForFanout`). The codegen-derived list is the schema —
+ * drift is structurally impossible.
+ */
+
+import { readFileSync, readdirSync, statSync, writeFileSync, existsSync } from 'fs';
+import path from 'path';
+import { collectTopLevelFields, type RequestSchemaDocument } from './wire-spec-field-collector';
+
+const REPO_ROOT = path.resolve(__dirname, '..');
+const ADCP_VERSION_FILE = path.join(REPO_ROOT, 'ADCP_VERSION');
+const SCHEMA_CACHE_DIR = path.join(REPO_ROOT, 'schemas/cache');
+const OUTPUT_FILE = path.join(REPO_ROOT, 'src/lib/server/wire-spec-fields.generated.ts');
+
+function getAdcpVersion(): string {
+  return readFileSync(ADCP_VERSION_FILE, 'utf8').trim();
+}
+
+// Subdirectories under `schemas/cache/{version}/` to skip:
+// - `bundled/` is a compose layer that re-shapes schemas for cross-protocol
+//   convenience. Field sets diverge from the canonical schemas, which
+//   would produce false-positive collisions.
+// - `mcp/` contains model-facing projections. Security-sensitive fields can
+//   intentionally be omitted from those prompt schemas, so they are not wire
+//   contracts and must not participate in the request allowlist.
+// - underscore-prefixed dirs are codegen scratch.
+const SKIP_DIRS = new Set(['bundled', 'mcp']);
+
+/**
+ * Allowlist of fan-out-relevant request basenames. Restricts codegen to
+ * the request shapes that actually flow through operational fan-out
+ * paths (mutating tools + delivery polling). Read-only tools like
+ * `list_creative_formats` are excluded — they aren't fan-out targets,
+ * and some have cross-protocol shape divergence in the schema cache
+ * that would block codegen if included.
+ *
+ * Source: derived from `MUTATING_TASKS` (see `src/lib/utils/idempotency.ts`)
+ * plus `get_media_buy_delivery` (the canonical poller read).
+ */
+const FAN_OUT_REQUEST_BASENAMES = new Set([
+  // Media-buy mutating
+  'create-media-buy-request',
+  'update-media-buy-request',
+  'sync-accounts-request',
+  'sync-creatives-request',
+  'sync-audiences-request',
+  'sync-catalogs-request',
+  'sync-event-sources-request',
+  'sync-plans-request',
+  'sync-governance-request',
+  'provide-performance-feedback-request',
+  'log-event-request',
+  'report-usage-request',
+  'report-plan-outcome-request',
+  'sync-reporting-status-request',
+  'sync-reporting-receipts-request',
+  // Brand rights mutating
+  'acquire-rights-request',
+  'update-rights-request',
+  // Signals mutating
+  'activate-signal-request',
+  // Creative mutating
+  'build-creative-request',
+  // Property / collection / content-standards mutating
+  'create-property-list-request',
+  'update-property-list-request',
+  'delete-property-list-request',
+  'create-collection-list-request',
+  'update-collection-list-request',
+  'delete-collection-list-request',
+  'create-content-standards-request',
+  'update-content-standards-request',
+  'calibrate-content-request',
+  // Sponsored intelligence mutating
+  'si-initiate-session-request',
+  'si-send-message-request',
+  // Read paths fan-out callers also need
+  'get-media-buy-delivery-request',
+  'get-reporting-status-request',
+]);
+
+function walk(dir: string, suffix: string): string[] {
+  if (!existsSync(dir)) return [];
+  const out: string[] = [];
+  for (const entry of readdirSync(dir)) {
+    if (SKIP_DIRS.has(entry) || entry.startsWith('_')) continue;
+    const full = path.join(dir, entry);
+    const st = statSync(full);
+    if (st.isDirectory()) {
+      out.push(...walk(full, suffix));
+    } else if (entry.endsWith(suffix)) {
+      const basename = path.basename(entry, '.json');
+      if (FAN_OUT_REQUEST_BASENAMES.has(basename)) {
+        out.push(full);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Convert a kebab-case file basename like `update-media-buy-request` to
+ * the PascalCase TypeScript type name `UpdateMediaBuyRequest`. Matches
+ * the convention `json-schema-to-typescript` uses in
+ * `core.generated.ts`.
+ */
+function toTypeName(basename: string): string {
+  // PascalCase, with one special-case: `si-*` files map to `SI*`
+  // (uppercase SI) because the codegen for sponsored-intelligence
+  // request types in core/tools.generated.ts emits `SIInitiateSessionRequest`
+  // etc. This matches `json-schema-to-typescript`'s acronym handling
+  // for the SI prefix used throughout the spec.
+  const pascal = basename
+    .split('-')
+    .map(s => s.charAt(0).toUpperCase() + s.slice(1))
+    .join('');
+  return pascal.replace(/^Si([A-Z])/, 'SI$1');
+}
+
+interface SchemaEntry {
+  typeName: string;
+  fields: string[];
+  source: string;
+}
+
+function loadSchema(file: string, schemaDir: string): SchemaEntry | null {
+  const json = JSON.parse(readFileSync(file, 'utf8')) as RequestSchemaDocument;
+  const fields = [...collectTopLevelFields(json, schemaDir, new Set([file]))].sort();
+  if (fields.length === 0) return null;
+  const basename = path.basename(file, '.json');
+  const typeName = toTypeName(basename);
+  return { typeName, fields, source: path.relative(REPO_ROOT, file) };
+}
+
+function main(): void {
+  const version = getAdcpVersion();
+  const schemaDir = path.join(SCHEMA_CACHE_DIR, version);
+  if (!existsSync(schemaDir)) {
+    throw new Error(`generate-wire-spec-fields: schema cache not found at ${schemaDir}`);
+  }
+  const requestFiles = walk(schemaDir, '-request.json').sort();
+  const entries: SchemaEntry[] = [];
+  for (const file of requestFiles) {
+    const entry = loadSchema(file, schemaDir);
+    if (entry) entries.push(entry);
+  }
+
+  // Dedupe by typeName — schemas may appear in multiple subdirectories
+  // for cross-cutting tools (rare but possible). Keep the first
+  // occurrence; flag duplicates to surface drift.
+  const seen = new Map<string, SchemaEntry>();
+  for (const entry of entries) {
+    const existing = seen.get(entry.typeName);
+    if (existing) {
+      const sameFields =
+        existing.fields.length === entry.fields.length && existing.fields.every((f, i) => f === entry.fields[i]);
+      if (!sameFields) {
+        throw new Error(
+          `generate-wire-spec-fields: schema ${entry.typeName} appears in multiple files with DIFFERENT field sets:\n` +
+            `  ${existing.source}: ${existing.fields.join(', ')}\n` +
+            `  ${entry.source}: ${entry.fields.join(', ')}`
+        );
+      }
+      continue;
+    }
+    seen.set(entry.typeName, entry);
+  }
+
+  const sorted = [...seen.values()].sort((a, b) => a.typeName.localeCompare(b.typeName));
+
+  // Type imports: every PascalCase request type referenced via `__type`
+  // phantom is imported from the generated tools file so adopters get
+  // strong narrowing through `pickWireSpecFields`. The phantom is
+  // type-only (`null as unknown as T`) — runtime cost is one null
+  // property per entry.
+  const lines: string[] = [
+    '// AUTO-GENERATED by scripts/generate-wire-spec-fields.ts. DO NOT EDIT.',
+    `// Source: schemas/cache/${version}/**/*-request.json`,
+    `// Generated at: ${new Date().toISOString()}`,
+    '',
+    `import type {`,
+    ...sorted.map(e => `  ${e.typeName},`),
+    `} from '../types';`,
+    '',
+    '/**',
+    ' * Wire-spec field allowlists per request type. The `fields` values',
+    ' * are exact top-level property names from the AdCP request JSON',
+    ' * schemas; `pickWireSpecFields(req, schemaName)` uses them to strip',
+    ' * buyer-controlled args to schema-spec fields at the operational',
+    ' * fan-out boundary. Drift between this map and the schemas is',
+    ' * impossible by construction — both are emitted from the same',
+    ' * codegen pass.',
+    ' *',
+    ' * The `__type` phantom is type-only (`null as unknown as T`) — it',
+    " * carries the wire-spec request shape so `pickWireSpecFields`'s",
+    ' * return type narrows per `schemaName`. Runtime cost: one null',
+    ' * property per entry.',
+    ' *',
+    ' * Arrays and entry objects are runtime-frozen via `Object.freeze`',
+    ' * so a misbehaving dependency cannot widen the scrub via prototype',
+    ' * pollution or shared-state mutation of the allowlist.',
+    ' */',
+    'export const WIRE_SPEC_FIELDS = Object.freeze({',
+  ];
+  for (const entry of sorted) {
+    lines.push(`  /** ${entry.source} */`);
+    lines.push(`  ${entry.typeName}: Object.freeze({`);
+    lines.push(`    fields: Object.freeze(${JSON.stringify(entry.fields)}) as readonly string[],`);
+    lines.push(`    __type: null as unknown as ${entry.typeName},`);
+    lines.push(`  }),`);
+  }
+  lines.push('} as const);');
+  lines.push('');
+  lines.push('export type WireSpecRequestName = keyof typeof WIRE_SPEC_FIELDS;');
+  lines.push('');
+
+  const content = lines.join('\n');
+  // Guard: if the schema cache is empty (e.g. gitignored dirs not yet
+  // downloaded in a fresh clone), don't overwrite a pre-existing
+  // non-empty generated file with an empty stub — that would break tsc
+  // for all consuming modules until the dev runs `sync-schemas`.
+  if (sorted.length === 0 && existsSync(OUTPUT_FILE)) {
+    const existing = readFileSync(OUTPUT_FILE, 'utf8');
+    if (existing.includes('WIRE_SPEC_FIELDS') && existing.includes('fields:')) {
+      console.log(
+        `[generate-wire-spec-fields] schema cache empty; keeping existing generated file unchanged: ${path.relative(REPO_ROOT, OUTPUT_FILE)}`
+      );
+      return;
+    }
+  }
+  // Idempotent write — skip if unchanged sans timestamp.
+  if (existsSync(OUTPUT_FILE)) {
+    const existing = readFileSync(OUTPUT_FILE, 'utf8');
+    const stripTs = (s: string) => s.replace(/\/\/ Generated at: .*?\n/, '');
+    if (stripTs(existing) === stripTs(content)) {
+      console.log(`[generate-wire-spec-fields] up to date: ${path.relative(REPO_ROOT, OUTPUT_FILE)}`);
+      return;
+    }
+  }
+  writeFileSync(OUTPUT_FILE, content);
+  console.log(
+    `[generate-wire-spec-fields] wrote ${sorted.length} request schemas to ${path.relative(REPO_ROOT, OUTPUT_FILE)}`
+  );
+}
+
+main();

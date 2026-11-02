@@ -1,0 +1,107 @@
+[
+  {
+    "source": "skills/build-decisioning-creative-template/SKILL.md",
+    "errorCode": "TS2322",
+    "messagePrefix": "Type '(ref: AccountReference) => Promise<{ id: string; name: string; status: \"ac"
+  },
+  {
+    "source": "skills/build-decisioning-platform/advanced/MULTI-TENANT.md",
+    "errorCode": "TS2304",
+    "messagePrefix": "Cannot find name 'loadTenant'."
+  },
+  {
+    "source": "skills/build-decisioning-platform/advanced/MULTI-TENANT.md",
+    "errorCode": "TS2304",
+    "messagePrefix": "Cannot find name 'MyPlatform'."
+  },
+  {
+    "source": "skills/build-decisioning-platform/advanced/MULTI-TENANT.md",
+    "errorCode": "TS2322",
+    "messagePrefix": "Type 'string | undefined' is not assignable to type 'number | undefined'."
+  },
+  {
+    "source": "skills/build-decisioning-platform/advanced/OAUTH.md",
+    "errorCode": "TS18004",
+    "messagePrefix": "No value exists in scope for the shorthand property 'port'. Either declare one o"
+  },
+  {
+    "source": "skills/build-decisioning-platform/advanced/OAUTH.md",
+    "errorCode": "TS2322",
+    "messagePrefix": "Type 'string | undefined' is not assignable to type 'string'."
+  },
+  {
+    "source": "skills/build-decisioning-platform/advanced/OAUTH.md",
+    "errorCode": "TS2322",
+    "messagePrefix": "Type 'string | undefined' is not assignable to type 'string'."
+  },
+  {
+    "source": "skills/build-decisioning-platform/advanced/OAUTH.md",
+    "errorCode": "TS2322",
+    "messagePrefix": "Type 'string | undefined' is not assignable to type 'string'."
+  },
+  {
+    "source": "skills/build-decisioning-platform/advanced/OAUTH.md",
+    "errorCode": "TS2552",
+    "messagePrefix": "Cannot find name 'server'. Did you mean 'serve'?"
+  },
+  {
+    "source": "skills/build-decisioning-platform/SKILL.md",
+    "errorCode": "TS1309",
+    "messagePrefix": "The current file is a CommonJS module and cannot use 'await' at the top level."
+  },
+  {
+    "source": "skills/build-decisioning-platform/SKILL.md",
+    "errorCode": "TS2304",
+    "messagePrefix": "Cannot find name 'myAdServer'."
+  },
+  {
+    "source": "skills/build-decisioning-platform/SKILL.md",
+    "errorCode": "TS2322",
+    "messagePrefix": "Type 'string | undefined' is not assignable to type 'number | undefined'."
+  },
+  {
+    "source": "skills/build-decisioning-platform/SKILL.md",
+    "errorCode": "TS2552",
+    "messagePrefix": "Cannot find name 'MyPlatform'. Did you mean 'platform'?"
+  },
+  {
+    "source": "skills/build-decisioning-signal-marketplace/SKILL.md",
+    "errorCode": "TS2322",
+    "messagePrefix": "Type '(ref: AccountReference) => Promise<{ id: string; name: string; status: \"ac"
+  },
+  {
+    "source": "skills/build-seller-agent/deployment.md",
+    "errorCode": "LINT-as-any",
+    "messagePrefix": "`as any` hides API drift; use a typed factory or // @ts-expect-error instead"
+  },
+  {
+    "source": "skills/build-seller-agent/deployment.md",
+    "errorCode": "TS2304",
+    "messagePrefix": "Cannot find name 'AdapterConfig'."
+  },
+  {
+    "source": "skills/build-seller-agent/deployment.md",
+    "errorCode": "TS2304",
+    "messagePrefix": "Cannot find name 'metaConfig'."
+  },
+  {
+    "source": "skills/build-seller-agent/deployment.md",
+    "errorCode": "TS2304",
+    "messagePrefix": "Cannot find name 'snapConfig'."
+  },
+  {
+    "source": "skills/build-seller-agent/deployment.md",
+    "errorCode": "TS2322",
+    "messagePrefix": "Type 'string | undefined' is not assignable to type 'string'."
+  },
+  {
+    "source": "skills/build-seller-agent/deployment.md",
+    "errorCode": "TS2322",
+    "messagePrefix": "Type 'string | undefined' is not assignable to type 'string'."
+  },
+  {
+    "source": "skills/build-seller-agent/deployment.md",
+    "errorCode": "TS2769",
+    "messagePrefix": "No overload matches this call."
+  }
+]

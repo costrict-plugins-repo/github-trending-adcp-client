@@ -1,0 +1,146 @@
+# Serving reporting subscriptions (seller)
+
+AdCP 3.3 reporting subscriptions (`media_buy.reporting_subscriptions`, experimental) let a buyer register reporting once on its principal through `sync_principal`, instead of once per account through `sync_accounts`. A subscription follows the buyer's grants: when you grant an account, it is covered; when you revoke it, coverage stops.
+
+This guide covers the managed path, where the SDK derives everything from surfaces you already serve. The [Reliable Reporting ledger guide](REPORTING-LEDGER.md#principal-level-reporting-subscriptions-experimental-adcp-33) documents the building blocks underneath. The Python SDK's guide has the same title and sections.
+
+```ts
+import { Pool } from 'pg';
+import { postgresStorage } from '@adcp/reporting-storage';
+import { createReliableReportingService } from '@adcp/sdk/reporting/service';
+import { createAdcpServerFromPlatform } from '@adcp/sdk/server';
+
+const storage = postgresStorage({ pool: new Pool(), acknowledgeIsolatedDatabase: true }); // memoryStorage() in development
+const reporting = createReliableReportingService({
+  storage,
+  adapters: { gam: gamAdapter },
+  resolveSource,
+  resolveCurrency,
+  resolveCoverage,
+  contact: { name: 'Reporting ops', email: 'reporting@seller.example' },
+  automatedRecoveryWindowSeconds: 86_400,
+  statusRetentionDays: 400,
+  subscriptions: {
+    principal: { agentUrl: 'https://seller.example/mcp', notifications, resolvePrincipal },
+    maxAccounts: 500,
+  },
+});
+const server = createAdcpServerFromPlatform(reporting.install(platform), {
+  name: 'acme-seller',
+  version: '1.0.0',
+  protocol: reporting.principals!.protocol, // get_principal / sync_principal
+});
+```
+
+## Prerequisites
+
+The SDK reads these surfaces under each principal's identity, so a principal sees exactly what it could see through `get_media_buys`.
+
+| Input | Read from | Must be present | Override |
+|---|---|---|---|
+| Authorized accounts | the platform's `accounts.list` | `account_id`, `timezone` (IANA), `operator`, `authorization.allowed_tasks` | `subscriptions.accounts` |
+| Visible buys | `sales.getMediaBuys` | `confirmed_at`, `start_time`, `end_time`, `cancellation.canceled_at`, `completed_at`, `packages[].package_id` | `subscriptions.buys` |
+| Package offerings | every registered offering | | `subscriptions.buyOfferings` |
+| Offerings | each adapter's `deliveryOffering` | `standard_dimensions` on every offering | none |
+| Report content | the resolved source offering | exact metrics and dimensions, attribution settings | `subscriptions.configure(generation)`; required for billing feeds |
+
+Set `timezone` on the framework `Account` your `accounts.list` returns; `list_accounts` serves it. An account without a timezone fails `account_timezone` offerings with `COVERAGE_INPUT_INCOMPLETE`, and is never read as UTC.
+
+### Local-day offerings
+
+Local days follow `core/reporting-schedule.json` `period_generation`. A day starts at local midnight. Where a DST gap swallows midnight (America/Santiago, America/Havana, Africa/Cairo), it starts at the instant midnight advances to, so that day is 23 hours long. The source is asked for whole local dates (`start_date`, `end_date`), so such a day is served like any other.
+
+- **`source_timezone` `P1D`.** Served in any IANA zone, on the subscription path and for account-level configurations.
+- **`account_timezone`.** Served only on the subscription path, where each account owes the periods of its own `timezone`, as the buyer's `reconcile` computes them. Creating the service without a `subscriptions` block refuses the offering, and `installConfiguration` refuses an account-level configuration for it.
+  - The source offering must not pin `sourceTimezone.ianaTimezone`.
+  - `resolveSource` must return the account's timezone as `sourceTimezone`, because the source reports each account's days in that account's zone. When an owed period is not whole local days in the returned zone, planning fails for that subscription and names the period.
+  - A generation keeps the zone it was installed with. The managed path does not yet follow an account timezone change (a `timezone_cutovers` entry) or a `selector.period_timezone` override the source does not report in. Planning reports both as failures.
+
+Without `configure`, each generation requests every metric and dimension its source offering supports exactly, with the offering's first attribution model and window, and an `official` feed gets a contractual cutoff at the offering's `delivery_sla`. Billing feeds need a canonicalization, so they fail to plan until you supply `configure`.
+
+## What the SDK derives
+
+- **The principal runtime.** With `storage` and `subscriptions.principal`, the service builds it over `storage.principals` (`reporting.principals`), pairs `notification_configs` with `sync_principal`, and advertises `capability_changes` unless you do. `principal.notifications` is optional with `memoryStorage()` (nothing is sent) and required with durable storage. Otherwise pass yours as `subscriptions.principals`. Either way the service installs the `reporting_subscriptions` section and fills in `capabilities.principal`.
+- **Capabilities.** `configuration_tasks` and the `subscriptions` block (`max_accounts`, `backfill_on_regrant`).
+- **Scheduling.**
+  - A `sync_principal` write that submits `reporting_subscriptions` reconciles that principal (`reconcileOnWrite`, default on). A failed reconcile never fails the write.
+  - Each `runCycle` sweeps the subscribed principals that are due, then plans obligations. A principal is due when a period of one of its schedules ended since its last reconcile, its last reconcile failed, a grant change was pushed, or `maxSweepIntervalMilliseconds` (one hour by default) elapsed.
+- **Grants.** The grant journal (see [Grants and wind-down](#grants-and-wind-down)).
+- **Failures.** Reconcile and planning failures are returned in `runCycle().subscriptionPlanningFailures` and passed to `planningErrorHandler`. They never reject a cycle.
+
+## Overrides
+
+Each `subscriptions` field replaces one derivation:
+- `accounts(principal, { cursor })` and `buys(principal, accountId)` replace the roster and the buys;
+- `buyOfferings(mediaBuy)` replaces package offerings;
+- `accountDeliveryConfigs(principal, accountId)` and `endAccountConfigs(...)` enable precedence and `replace_account_configs`;
+- `isPeriodDelivered(principal, period)` decides whether a withheld period was delivered (by default the service's ledger answers: the period's obligation has a revision);
+- `configure(generation)` replaces the report content derived from the source offering;
+- `resolvePrincipal(ctx)` replaces principal resolution for the reporting tasks.
+
+If your account access depends on a live upstream token, supply `accounts`. A listing that fails under the service context is recorded as `SUBSCRIPTION_ROSTER_UNAVAILABLE`, and is never read as an empty roster.
+
+## Bring your own producer and ledger
+
+Not yet on the managed path. Use the advanced composition from `@adcp/sdk/reporting/advanced`: build the engine with `createReportingSubscriptionEngineV1` and pass `subscriptions: { engine, resolvePrincipal, listSubscriptionPrincipals, resolveSubscriptionConfiguration }`. See the [ledger guide](REPORTING-LEDGER.md#principal-level-reporting-subscriptions-experimental-adcp-33). The bring-your-own-producer option (`producer: 'external'`) arrives in a later beta.
+
+## Grants and wind-down
+
+The SDK is the only source of `authorization.authorized_at` and `authorization.regranted_at`.
+- **Chain rule.** A re-grant before `unauthorized_at + status_retention_days` continues the chain, so `authorized_at` does not move, and the re-grant is the chain's `regranted_at` (AdCP 3.3.0-beta.3). A later re-grant starts a new chain with no `regranted_at`.
+- **Projection.** Served `list_accounts` and `sync_accounts` carry the journal's values, which are the values coverage uses. A host value that moves backwards is refused (`authorized_at_regressed`).
+- **Partial grants.** Coverage depends only on `get_reporting_status`. A grant without `sync_reporting_receipts` or `sync_reporting_status` keeps the account covered, and the SDK refuses the missing task with `SCOPE_INSUFFICIENT` when your resolver returns the account with its `authorization`. Don't refuse it as an unknown account.
+- **Push.** `await reporting.grants!.changed({ principal, accountId, at, authorized, allowedTasks })` records a change at the moment your entitlement service knows it.
+
+`authorized_at` is when the *current authorization chain* began, not when access was last granted. Never set it to "now" on a re-grant, and never move it earlier.
+
+**Wind down, don't revoke.** Revocation means no access at all, receipts and statuses included. To end a relationship while the buyer finishes reconciling:
+
+```ts
+import { windDownGrant } from '@adcp/sdk/server';
+
+// Keeps get_reporting_status, sync_reporting_receipts and sync_reporting_status, and authorized_at.
+account.authorization = windDownGrant(account.authorization);
+```
+
+## What beta.3 asks of your platform
+
+- **Buys.** `get_media_buys` should carry each package's `reporting_delivery_offering_ids` (its offering set, fixed at confirmation), `cancellation_effective_at` when a cancellation stops delivery later than it was recorded, and `flight_history` for retroactive flight edits. The managed path reads all three. Resolution is sticky per (buy, version): an offering you add later never re-resolves a package, and withdrawing one (`withdrawn_at`) is a cutover.
+- **Offerings.** Every managed-delivery offering (one with `method`) declares `account_id` in `reporting_profile.primary_keys`, so rows of several accounts can share a destination. Creating the service refuses one that doesn't.
+- **Billing.** A cutover onto a billing feed owes the stretch to its first boundary as one stub period (`stub: true` on the obligation).
+
+## Storage and migrations
+
+Pass one storage object: `memoryStorage()` from `@adcp/sdk/storage` in development, `postgresStorage({ pool })` from `@adcp/reporting-storage` in production. It holds the ledger, principal records, engine state and grant journal. Process-local storage is refused outside `NODE_ENV=test|development` (`REPORTING_STORAGE_NOT_DURABLE`). Durability is a property of the store, never a flag.
+
+Apply schema changes with `npx adcp-reporting-storage migrate [--status | --dry-run]` before starting a release. The service refuses a schema that is behind before its first cycle (`REPORTING_SCHEMA_BEHIND`, naming the pending versions); call `await storage.checkSchema()` at boot to fail before serving requests. Version `0003` is a stopped-worker upgrade: stop every older reporting worker first. See the [storage package README](https://github.com/adcontextprotocol/adcp-client/blob/main/packages/reporting-storage/README.md#apply-migrations-npx-adcp-reporting-storage-migrate).
+
+## Workers and scaling
+
+Run `reporting.start({ intervalMilliseconds, deploymentWide: true })`, or call `runCycle` from your own scheduler. Workers share the storage; engine state is written by compare-and-set, so several workers agree. Each platform read is bounded by `subscriptions.readTimeoutMilliseconds` (30 seconds by default).
+
+## Telemetry
+
+Today: `planningErrorHandler`, `runCycle().subscriptionPlanningFailures`, the `authorized_at_regressed` log line and `reporting.subscriptionWiring.engine.inspect(principal)` ("what the engine believes"). OpenTelemetry metrics and `reporting.health()` arrive in a later beta.
+
+## Troubleshooting with explain
+
+`reporting.explainCoverage(...)` answers "why is (or isn't) this period owed?" from the engine's own state: the stored version history, the grant journal, the coverage the caller is served, and the buys read under the principal's identity.
+
+```ts
+const traces = await reporting.explainCoverage!({
+  principal: { tenantId: 't1', principalId: 'agency-x' },
+  accountId: 'acc_renault_fr',
+  subscriptionId: 'analytics-daily', // optional: every subscription when omitted
+  mediaBuyId: 'mb_123', // optional
+  period: '2026-11-03', // a date read in each offering's zone, an instant, or { start, end }
+});
+for (const trace of traces) console.log(trace.verdict, trace.reason, trace.explanation);
+```
+
+```
+npx adcp reporting explain --app ./dist/reporting.js#reporting --tenant t1 --principal agency-x \
+    --account acc_renault_fr --period 2026-11-03 [--json]
+```
+
+Each `CoverageTrace` is the JSON a buyer's `client.reporting.explain` returns, plus `seller_only` (`buy_visible`, and the `reporting_obligation_id` of an owed, planned period). Send `coverageTraceForBuyer(trace)` if it leaves the seller. When a buyer disputes a period, compare the two traces with `npx adcp reporting diff buyer.json seller.json`: equal `inputs_digest` with different verdicts is an SDK bug, different digests mean one side read different state. See [Coverage, explained](REPORTING-SUBSCRIPTIONS-COVERAGE.md#explaining-a-period) for the reason codes.

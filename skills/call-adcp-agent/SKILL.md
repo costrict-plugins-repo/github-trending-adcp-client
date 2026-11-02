@@ -1,0 +1,291 @@
+---
+name: call-adcp-agent
+description: Wire-level invariants for any AdCP buyer call — idempotency_key replay semantics, account `oneOf` variants, async `status:'submitted'`+`task_id` polling, error recovery from `adcp_error.issues[]`. Load before any per-protocol task skill (adcp-media-buy, adcp-creative, adcp-signals, adcp-governance, adcp-si, adcp-brand) when calling an AdCP agent as a buyer.
+adcp_version: '3.x'
+type: cross-cutting
+---
+
+# Call an AdCP agent
+
+## Overview
+
+AdCP (Ad Context Protocol) agents expose a fixed tool surface over MCP or A2A.
+For media buying, prefer the AdCP 3.2 lifecycle:
+`list_products` → `buy_products` → `control_media_buy`, or
+`request_proposals` → `refine_proposals` → `accept_proposal`. The established
+`get_products` / `create_media_buy` / `update_media_buy` surface remains for
+3.0/3.1 compatibility. Tool names come from `get_adcp_capabilities`; exact
+request/response shapes come from `get_schema(tool_name)` when available or
+from the bundled JSON Schemas. This skill teaches the invariants that don't
+live cleanly in any schema: cross-tool patterns, async flow, error recovery.
+
+## When to Use
+
+- User wants to call a publisher / SSP / retail media network over AdCP
+- Tool names like `list_products`, `buy_products`, `request_proposals`, `sync_creatives`, or `get_signals` appear in the available-tools list
+- Agent card advertises `protocolVersion: '0.3.0'` with `skills` listing AdCP tool names
+- **Not this skill:** building an AdCP seller agent (see `@adcp/client/skills/build-seller-agent/` and analogous SDK skills)
+
+## Discovery chain
+
+Walk these in order on first contact:
+
+1. **Agent card** (A2A) or **`tools/list`** (MCP): returns tool NAMES. Most AdCP MCP servers publish passthrough schemas in `tools/list` by default — everything shows `{type: 'object', properties: {}}`. Some servers opt into `exposeToolSchemas: true` and publish shallow top-level key hints there; treat those as call hints, not as the canonical schema.
+2. **`get_adcp_capabilities`**: returns supported protocols (`media_buy`, `signals`, `creative`, …), AdCP major versions, feature flags. Tells you WHICH tools this agent supports, not how to call them.
+3. **`get_schema(tool_name)`** _(when the agent exposes it — pending standardization in [#3057](https://github.com/adcontextprotocol/adcp/issues/3057), not yet universal)_: returns the JSON Schema for a tool's request/response. Preferred over reading bundled schemas when available.
+4. **Bundled schemas** (offline, authoritative): every SDK ships the AdCP JSON Schemas locally. Path differs by SDK — spec repo source uses `dist/schemas/<version>/bundled/`, `@adcp/client` puts them at `schemas/cache/<version>/bundled/` after `npm run sync-schemas`, Python and Go SDKs use their own conventions. **Don't hardcode a path** — let the SDK's loader find them, or ask the developer. Each schema is `<protocol>/<tool>-{request,response}.json` once you locate the bundle. The canonical source for every SDK is `https://adcontextprotocol.org/protocol/<version>.tgz`.
+
+## Non-obvious rules every buyer must follow
+
+### `idempotency_key` is required on every mutating tool
+
+UUID format. The key is your retry-safety guarantee — and the most common way naive callers create duplicate media buys is by misunderstanding it:
+
+- **Same key on retry → replay.** The server returns the SAME response — same `task_id`, same `media_buy_id`, same shape, byte-for-byte. Use this for transport-level retries (timeout, 5xx, dropped connection).
+- **Fresh key on retry → NEW operation.** Generating a new UUID because the previous attempt failed is how you double-book. Reuse the key until you've seen a terminal response (success, error, or non-retryable error).
+- **Same key, different body → server-defined.** Most agents return the original cached response and ignore the body change. Don't rely on it — pick a fresh key only when you genuinely want a new operation.
+- For async flows, the replayed response carries the **same `task_id`**, so polling continues against the same task instead of forking a duplicate.
+
+Required on: `buy_products`, `request_proposals`, `refine_proposals`,
+`decline_proposals`, `accept_proposal`, `control_media_buy`,
+`create_media_buy`, `update_media_buy`, `sync_creatives`, `sync_audiences`,
+`sync_accounts`, `sync_catalogs`, `sync_event_sources`, `sync_plans`,
+`sync_governance`, `activate_signal`, `acquire_rights`, `log_event`,
+`report_usage`, `provide_performance_feedback`, `report_plan_outcome`, and the
+other mutating tools declared by the current schema.
+
+Missing the key → `adcp_error.code: 'VALIDATION_ERROR'` with `/idempotency_key` in `issues`.
+
+### `account` is a `oneOf` — pick ONE variant, send ONLY its fields
+
+Probably the single most common stumble for naive LLMs. `account` is a discriminated union. Per AdCP 3.0, two variants on `create_media_buy` / `update_media_buy`:
+
+```json
+// variant 0: by seller-assigned id (from sync_accounts or list_accounts)
+"account": { "account_id": "seller_assigned_id" }
+
+// variant 1: by natural key (brand + operator, optional sandbox)
+"account": { "brand": { "domain": "acme.com" }, "operator": "sales.example" }
+```
+
+**Do NOT merge required fields across variants** — `additionalProperties: false` on each variant means `{account_id, brand}` fails BOTH. Pick one variant and send only its fields. Always check the specific tool's schema because other tools (e.g. `sync_creatives`) may accept a superset.
+
+### `brand` takes `{domain}` — not `{brand_id}`
+
+```json
+"brand": { "domain": "acme.example" }
+```
+
+### Async responses: `status: 'submitted'` means "queued, poll later"
+
+A mutating tool can return one of three shapes:
+
+```json
+// Success (sync): the work is done
+{ "media_buy_id": "mb_123", "packages": [...], "confirmed_at": "..." }
+
+// Submitted (async): the work is queued
+{ "status": "submitted", "task_id": "tk_abc", "message": "Awaiting IO signature" }
+
+// Error: don't retry without fixing
+{ "errors": [{ "code": "PRODUCT_NOT_FOUND", "message": "..." }] }
+```
+
+When you see `status: 'submitted'`, the work is NOT complete. Poll via `tasks/get` (A2A) or the MCP async task extension, using the `task_id`. Over A2A the AdCP `task_id` also rides on `artifact.metadata.adcp_task_id` — both work.
+
+### `packages[*]` on media buys
+
+```json
+"packages": [
+  { "buyer_ref": "pkg_1", "product_id": "p_from_catalog", "budget": 10000, "pricing_option_id": "po_xyz" }
+]
+```
+
+`budget` is a **number** (not `{amount, currency}` — currency is implied by the pricing option). Required per package: `product_id`, `budget`, `pricing_option_id`. `buyer_ref` is optional but strongly recommended as a buyer-side correlation id across retries and reporting.
+
+## Error envelope — read `issues[]` to recover
+
+Every validation failure produces:
+
+```json
+{
+  "adcp_error": {
+    "code": "VALIDATION_ERROR",
+    "recovery": "correctable",
+    "field": "account",
+    "issues": [
+      {
+        "pointer": "/account",
+        "keyword": "oneOf",
+        "message": "must match exactly one schema in oneOf",
+        "variants": [
+          { "index": 0, "required": ["account_id"], "properties": ["account_id"] },
+          { "index": 1, "required": ["brand", "operator"], "properties": ["brand", "operator", "sandbox"] }
+        ]
+      },
+      { "pointer": "/brand/domain", "keyword": "required", "message": "must have required property 'domain'" }
+    ]
+  }
+}
+```
+
+- `issues[].pointer` — RFC 6901 JSON Pointer to the field.
+- `field` — the first issue's pointer translated to JSONPath-lite (for example, `packages[0].targeting`). Parse `issues[].pointer` when you need JSON Pointer notation.
+- `issues[].keyword` — AJV keyword (`required`, `type`, `oneOf`, `anyOf`, `additionalProperties`, `format`, `enum`).
+- `not` presence guards name individually forbidden fields (for example, `product_id cannot be set here`). Compound guards retain their original diagnostic.
+- `adcp_error.details.issues_truncated` — when true, the diagnostic list reached its count or byte limit. Fix the displayed failures and retry to see any remaining failures.
+- `issues[].variants` — when the keyword is `oneOf` or `anyOf`, each entry lists one variant's `required` + declared `properties`. **Pick ONE variant**, send only its `required` fields. This is the fastest recovery path when you didn't know the field was a union.
+- `issues[].discriminator` — when an SDK ≥6.7 picks a "best surviving variant" of a const-discriminated union, this is the `[{field, value}, …]` pairs that variant requires. Reads as the validator's verdict on which branch you were inferred to be targeting. Example: `discriminator: [{field: 'type', value: 'key_value'}]` plus `pointer: '/deployments/0/activation_key/key'` and `keyword: 'required'` means "you picked the `key_value` activation_key variant and it requires top-level `key` and `value`." Compound discriminators like `audience-selector`'s `(type, value_type)` produce two-entry arrays.
+- `issues[].schemaId` — `$id` of the rejecting schema. For tools served from the bundled tree this is usually the response root; for flat-tree tools it can land on the deeper sub-schema. Diagnostic only; the actionable lever is `discriminator` + `variants` + `pointer`.
+- `issues[].allowedValues` — closed enum lists for `keyword: 'enum'` issues. Picking from this list closes the case in one round.
+- `issues[].hint` — SDK ≥6.8 only. One-sentence curated recipe for known shape gotchas: discriminator nesting (`activation_key`, VAST `delivery_type`), shape mismatches (`format_id` object, `budget` number, `signal_ids` provenance objects), and discriminator merging (`account`). When present, the hint is the most-direct fix path; read it before walking variants. Absent on the long tail — no hint just means there's no curated rule for the pattern.
+
+**Recovery order**: read `hint` first (when present, it's the validated fix path); then `discriminator` (names which branch to fix); then `variants` (lists every option if you're not in a branch); then `pointer` + `keyword` + `message` for the leaf fix. Patch and resend. Three attempts should cover every field.
+
+## Minimal working examples
+
+### list_products (AdCP 3.2)
+
+```json
+{
+  "account": { "account_id": "seller_assigned_id" },
+  "brand": { "domain": "acme.example" }
+}
+```
+
+Returns `{ outcome: "listed", products: [...], feed_version, cache_scope }`.
+Keep `feed_version` and select `product_id` plus `pricing_option_id` from the
+same snapshot.
+
+### buy_products (AdCP 3.2)
+
+```json
+{
+  "idempotency_key": "<uuid>",
+  "account": { "account_id": "seller_assigned_id" },
+  "brand": { "domain": "acme.example" },
+  "feed_version": "<feed_version from list_products>",
+  "start_time": "2026-05-01T00:00:00Z",
+  "end_time": "2026-05-31T23:59:59Z",
+  "purchases": [
+    {
+      "product_id": "<product_id from list_products>",
+      "budget": 10000,
+      "pricing_option_id": "<pricing_option_id from product.pricing_options>"
+    }
+  ]
+}
+```
+
+If you don't have a `seller_assigned_id`, use the natural-key variant instead:
+`"account": { "brand": { "domain": "acme.example" }, "operator": "sales.example" }`.
+
+Returns either a completed commitment with `media_buy_id` and `revision`, or a
+submitted task. Use `control_media_buy` with the latest revision for pause,
+resume, cancel, or other changes inside accepted commercial terms.
+
+For a negotiated buy, call `request_proposals`, refine/finalize with
+`refine_proposals`, then pass the committed proposal's exact `proposal_id` and
+`terms_digest` to `accept_proposal`.
+
+For AdCP 3.0/3.1 sellers, use the established
+`get_products` → `create_media_buy` → `update_media_buy` lifecycle instead.
+
+### sync_creatives
+
+```json
+{
+  "idempotency_key": "<uuid>",
+  "account": { "account_id": "seller_assigned_id" },
+  "creatives": [
+    {
+      "creative_id": "cr_1",
+      "name": "My Creative",
+      "format_id": { "agent_url": "https://creatives.adcontextprotocol.org", "id": "video_1920x1080" },
+      "assets": {}
+    }
+  ]
+}
+```
+
+Per-creative required: `creative_id`, `name`, `format_id: { agent_url, id }`, `assets` (shape depends on `format_id`; start with `{}` then fill required asset keys per format spec). Returns `{ creatives: [{ creative_id, action, status }] }` — items may fail individually without failing the batch.
+
+### get_signals
+
+```json
+{
+  "signal_spec": "female professionals 25-54 in major US metros"
+}
+```
+
+Returns `{ signals: [{ signal_agent_segment_id, match_rate, pricing, ... }] }`. Note: the identifier field is `signal_agent_segment_id` (not `signal_id`) — used as input to `activate_signal` below.
+
+### activate_signal
+
+```json
+{
+  "idempotency_key": "<uuid>",
+  "signal_agent_segment_id": "sig_premium_ctv_sports",
+  "destinations": [{ "type": "platform", "platform": "the-trade-desk" }]
+}
+```
+
+`destinations[]` is a `oneOf`: either `{type: 'platform', platform, account?}` OR `{type, agent_url, account?}`. Pick one shape per destination.
+
+## Transport notes
+
+- **MCP**: `tools/call` with `{ name: 'tool_name', arguments: {...} }`. Returns `{ content, structuredContent, isError? }`. Read `structuredContent` for the typed response.
+- **A2A**: `message/send` with a `DataPart` of shape `{ skill: 'tool_name', input: {...} }` (the legacy key `parameters` is also accepted). Returns an A2A `Task`; the typed response is at `task.artifacts[0].parts[0].data`.
+
+Both transports share: idempotency, error shape, schema enforcement, and handler semantics. If a call works on one, the equivalent call works on the other.
+
+## Gotchas I keep seeing
+
+1. **Merging `oneOf` variants**: see the account section above. If you see three `additionalProperties` errors under one pointer, you merged. Drop to one variant.
+2. **`budget` as an object**: it's a number. Currency comes from the `pricing_option`.
+3. **`brand.brand_id` instead of `brand.domain`**: spec uses `domain`.
+4. **Forgetting `idempotency_key`**: required on every mutating tool; see the list above.
+5. **Treating A2A `Task.state: 'completed'` as AdCP completion**: A2A task state = transport call lifecycle. AdCP-level completion is in the artifact's payload (`structuredContent.status` or `data.status`). A `completed` A2A task can still carry a `submitted` AdCP response.
+6. **`format_id` as a string**: `format_id` is always an object `{ agent_url, id }` (and sometimes `{ width, height, duration_ms }` for dimensions). Sending `"format_id": "video_1920x1080"` fails with an `additionalProperties` / `type` error — pass the object.
+
+## Symptom → fix
+
+Quick lookup before reading the full envelope. Match what you see in `adcp_error.issues[*]`, apply the fix:
+
+| Symptom                                                                    | What it means                                                                                                             | Fix                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `keyword: 'oneOf'` with `variants[]`                                       | Discriminated union — you sent fields from multiple variants, or none                                                     | Pick ONE variant from `variants[]`. Send only its `required` fields.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `discriminator: [{field, value}]` on a `required` issue                    | Validator inferred which branch you targeted; you missed required fields IN that branch                                   | Read the `discriminator` pair, fill the missing required fields at the same level (don't nest under the discriminator field name).                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `hint:` field present on the issue                                         | SDK matched a curated shape-gotcha rule                                                                                   | Apply the hint directly — it's the validated fix path.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| 2-3 `additionalProperties` errors at the same pointer                      | You merged `oneOf` variants ({account_id, brand, operator, …})                                                            | Drop to one variant. Don't keep "extra" fields "for completeness".                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `keyword: 'required'`, `pointer: '/idempotency_key'`                       | Mutating tool, no UUID                                                                                                    | Generate fresh UUID per logical operation. Reuse it on retries.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `keyword: 'type'` or `additionalProperties` at `/budget`                   | Sent `{amount, currency}`                                                                                                 | `budget` is a number. Currency is implied by `pricing_option_id`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `additionalProperties` at `/format_id` (string passed)                     | Sent `"format_id": "video_..."`                                                                                           | `format_id` is `{agent_url, id}` — always an object.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `keyword: 'enum'` at `/destinations/*/type`                                | Made-up destination type                                                                                                  | Use `'platform'` (with `platform`) or `'agent'` (with `agent_url`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Response carries `status: 'submitted'` and `task_id`                       | Async — work is queued, NOT done                                                                                          | Poll via `tasks/get` (A2A) or the MCP async task extension using `task_id`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `recovery: 'transient'` (rate limit, 5xx, timeout)                         | Server-side, retry-safe                                                                                                   | Retry with the **same** `idempotency_key`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `recovery: 'correctable'`                                                  | Buyer-side fix                                                                                                            | Read `issues[]`, patch the pointers, resend. Most cases close in one attempt.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `recovery: 'terminal'` (account suspended, payment required, …)            | Requires human action                                                                                                     | Don't retry. Surface to the user.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `VersionUnsupportedError` / `code: 'VERSION_UNSUPPORTED'` from `@adcp/sdk` | Seller cannot meet the configured AdCP 3 version or required capability guarantees; read the error's `reason` and message | Stop and report the incompatibility before business-tool dispatch. For end-of-life AdCP 2 or missing discovery, upgrade the seller to AdCP 3 with `get_adcp_capabilities`; if the application must retain AdCP 2 temporarily, use the exact older SDK pins in the [AdCP 2 migration guide](https://github.com/adcontextprotocol/adcp-client/blob/main/docs/migration-drop-adcp-2.md). Retrying or changing idempotency keys cannot fix protocol incompatibility.                                                                                                                                             |
+| `adcp_error.code: 'AUTH_MISSING'`                                          | No credential was presented                                                                                               | Escalate by default. Retry only if you own a credential supply or refresh path; otherwise surface re-auth to a human.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `adcp_error.code: 'AUTH_INVALID'`                                          | Credential was presented but rejected or revoked                                                                          | Do not retry blindly. Refresh once only if you own a valid refresh grant and the rejection is token-expiry-shaped; otherwise surface to a human to rotate credentials.                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `adcp_error.code: 'AUTH_REQUIRED'`                                         | Legacy compatibility code; older sellers and some SDK helper paths still use it for missing or rejected credentials       | Treat as auth escalation by default. Retry only if your agent owns a credential-refresh path; otherwise surface to a human.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| HTTP 401 with `WWW-Authenticate` header                                    | Transport auth challenge; may be missing credentials, wrong scheme, rejected credentials, or required request signing     | Follow the challenge scheme. `Bearer` means send/refresh an OAuth-style `Authorization: Bearer ...` token. `Basic` means configure basic auth (`auth: { type: 'basic', username, password }` or `--auth user:pass --auth-scheme basic`) — `Bearer` will never succeed against that gateway. `Signature` means enable RFC 9421 request signing with an AdCP signing key, not an `Authorization` retry. **Saved aliases**: if registered with `--auth-scheme basic`, the scheme persists in `~/.adcp/config.json` and auto-applies on every later invocation — don't redundantly repeat the flag on each call. |
+
+If your symptom isn't here, fall through to the next section.
+
+## If you get stuck
+
+Priority order:
+
+1. Re-read the failure's `issues[]`. The pointer list plus this skill covers 80% of cases.
+2. Call `get_schema(tool_name)` if the agent exposes it (see [#3057](https://github.com/adcontextprotocol/adcp/issues/3057) for the pending standard).
+3. Read the bundled JSON Schema for `<protocol>/<tool>-request.json` — see Discovery chain step 4 for path resolution. If you can't locate the SDK's schema cache, ask the developer or fall back to `get_schema()`.
+4. Consult the per-protocol skill (`adcp-media-buy`, `adcp-creative`, …) for specialism-specific patterns.
+
+## Related
+
+- [Calling an agent (docs)](https://adcontextprotocol.org/docs/protocol/calling-an-agent) — human-readable narrative form of this skill
+- `skills/adcp-media-buy/`, `skills/adcp-creative/`, `skills/adcp-signals/`, `skills/adcp-governance/`, `skills/adcp-si/`, `skills/adcp-brand/` — per-protocol task skills (layered on top of this one)
+- `@adcp/client/skills/build-seller-agent/SKILL.md` — building agents on the other side of the call
+- Bundled JSON Schemas — canonical for every tool, version-pinned. Path differs by SDK (see Discovery chain step 4). Pulled from the protocol tarball at `/protocol/<version>.tgz`.

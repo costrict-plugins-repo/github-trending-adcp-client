@@ -1,0 +1,74 @@
+/**
+ * AdCP conformance fuzzer.
+ *
+ * Property-based testing against an agent's published JSON schemas.
+ * Import from `@adcp/sdk/conformance` — kept off the runtime-client
+ * path so `fast-check` and the schema bundle only load when fuzzing.
+ *
+ * ```ts
+ * import { runConformance } from '@adcp/sdk/conformance';
+ *
+ * const report = await runConformance('https://agent.example.com', {
+ *   seed: 42,
+ *   tools: ['get_products', 'get_signals'],
+ * });
+ * if (report.totalFailures > 0) {
+ *   console.error(JSON.stringify(report.failures, null, 2));
+ *   process.exit(1);
+ * }
+ * ```
+ */
+
+export { runConformance } from './runConformance';
+export { runPropertyListConformance } from './property-lists';
+export type { PropertyListConformanceReport } from './property-lists';
+export { runWebhookConformance } from './webhook';
+export { seedFixtures } from './seeder';
+export {
+  TARGETING_GEOGRAPHY_CONFORMANCE_VECTORS,
+  buildTargetingInputConformanceVectors,
+  runTargetingInputConformance,
+} from './targeting';
+export type {
+  TargetingConformanceOutcome,
+  TargetingConformanceOperation,
+  TargetingDimensionSample,
+  TargetingDimensionSamples,
+  TargetingInputConformanceAdapter,
+  TargetingInputConformanceCaseResult,
+  TargetingInputConformanceObservation,
+  TargetingInputConformanceOptions,
+  TargetingInputConformanceReport,
+  TargetingInputConformanceVector,
+} from './targeting';
+export type { SeedOptions, SeedResult, SeederName, SeedWarning } from './seeder';
+export type { ConformanceSchemaOptions } from './schemaLoader';
+export {
+  STATELESS_TIER_TOOLS,
+  REFERENTIAL_STATELESS_TOOLS,
+  UPDATE_TIER_TOOLS,
+  COMPACT_STATELESS_TIER_TOOLS,
+  COMPACT_UPDATE_TIER_TOOLS,
+  COMPACT_LIFECYCLE_TOOLS,
+  DEFAULT_TOOLS,
+  DEFAULT_TOOLS_WITH_UPDATES,
+} from './types';
+export type {
+  ConformanceFailure,
+  ConformanceAccountFixture,
+  ConformanceFixtures,
+  ConformanceMediaBuyFixture,
+  ConformanceProductFixture,
+  ConformanceProposalFixture,
+  ConformanceReport,
+  ConformanceToolName,
+  ConformanceToolStats,
+  OracleVerdict,
+  RunConformanceOptions,
+  RunWebhookConformanceOptions,
+  SkipReason,
+  WebhookConformanceCase,
+  WebhookConformanceReport,
+  WebhookConformanceSigningOptions,
+  WebhookConformanceVerdict,
+} from './types';

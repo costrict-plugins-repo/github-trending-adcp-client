@@ -1,0 +1,647 @@
+/**
+ * RFC 9421 webhook-signing verifier (AdCP 3.0 webhook profile).
+ *
+ * Companion to `verifier.ts`, which verifies outbound request signatures.
+ * This verifier runs on the receiving side of a publisher webhook: the
+ * storyboard runner's receiver captures a POST and hands the request (headers
+ * + raw body) here for signature validation.
+ *
+ * Distinct from request-signing:
+ *   - Tag: `adcp/webhook-signing/v1` (vs `adcp/request-signing/v1`).
+ *   - Key purpose: `adcp_use: "webhook-signing"` OR `"request-signing"` — a
+ *     signer may reuse its request-signing key for webhooks (see step 8).
+ *   - Covered components MUST include `@method`, `@target-uri`, `@authority`,
+ *     `content-type`, and `content-digest` — `content-digest` is unconditional
+ *     for webhooks (vs policy-driven on requests) because every webhook
+ *     carries a JSON body.
+ *   - JWKS resolved via the capabilities-selected operator brand.json;
+ *     publisher pins narrow its keys for applicable inventory.
+ *
+ * Checklist steps below mirror the 14-step shape in
+ * `docs/building/implementation/security.mdx#verifier-checklist-for-webhooks`
+ * so failures can point at a specific spec clause. Numbers are 1-based to
+ * match the security doc.
+ */
+
+import { buildSignatureBase, canonicalTargetUri, getHeaderValue } from './canonicalize';
+import { contentDigestMatches, type SfBinaryEncoding } from './content-digest';
+import { RequestSignatureError, WebhookSignatureError } from './errors';
+import { AgentResolverError } from './agent-resolver/errors';
+import { StrictJsonError } from './agent-resolver/strict-json';
+import { assertSignedBodyWellFormed } from './body-validation';
+import { BrandJsonResolverError } from './brand-jwks';
+import { parseSignature, parseSignatureInput, type ParsedSignatureInput } from './parser';
+import { isValidSigningNonce } from './nonce';
+import { jwkToPublicKey, verifySignatureAsync } from './crypto';
+import type { JwksResolution, JwksResolver } from './jwks';
+import { assertPublisherPins, type PublisherSigningKeyPin } from './publisher-pins';
+import { InMemoryReplayStore, type ReplayStore } from './replay';
+import { InMemoryRevocationStore, type RevocationStore } from './revocation';
+import { ALLOWED_ALGS, CLOCK_SKEW_TOLERANCE_SECONDS, MAX_SIGNATURE_WINDOW_SECONDS } from './types';
+
+function keyDiscoveryRetryable(error: unknown): boolean {
+  if (error instanceof AgentResolverError) return error.recovery === 'transient';
+  if (error instanceof BrandJsonResolverError) return error.recovery === 'transient';
+  return true;
+}
+
+export const WEBHOOK_SIGNING_TAG = 'adcp/webhook-signing/v1';
+
+/** Receiver-side request shape; body may be the exact undecoded wire bytes. */
+export interface WebhookRequestLike {
+  method: string;
+  url: string;
+  headers: Record<string, string | string[] | undefined>;
+  body?: string | Uint8Array;
+}
+
+/**
+ * Covered-component minimum for webhooks. Unlike request-signing, every
+ * webhook carries a body so `content-type` and `content-digest` are
+ * unconditional — a webhook without `content-digest` coverage can't be
+ * verified because the body has no anchor.
+ */
+export const WEBHOOK_MANDATORY_COMPONENTS: ReadonlyArray<string> = [
+  '@method',
+  '@target-uri',
+  '@authority',
+  'content-type',
+  'content-digest',
+];
+
+export interface VerifyWebhookOptions {
+  jwks: JwksResolver;
+  /**
+   * Trusted receiver configuration for the Signature byte sequence.
+   * Defaults to `legacy-base64url`, as the AdCP webhook-v1 profile requires
+   * throughout 3.x. Set `rfc8941-base64` only for an explicitly configured
+   * peer emitting standard padded Base64 (for example, a generic RFC 9421
+   * request signer with the webhook tag). There is no encoding fallback.
+   * URL canonicalization remains AdCP 3.2 in either mode; Signature encoding
+   * does not identify a webhook's AdCP version.
+   */
+  signatureEncoding?: SfBinaryEncoding;
+  /** Applicable publishers from the verifier's own media-buy record. */
+  publisherPins?: readonly PublisherSigningKeyPin[];
+  /** Log the underlying request_signature_* discovery cause locally. */
+  onKeyResolutionError?: (error: unknown) => void;
+  replayStore: ReplayStore;
+  revocationStore: RevocationStore;
+  /** Now in seconds since epoch. Defaults to `Date.now() / 1000`. */
+  now?: () => number;
+  /**
+   * Optional tag override — spec currently defines exactly
+   * `adcp/webhook-signing/v1`; the override lets test vectors pin a version.
+   */
+  requiredTag?: string;
+  /** Optional reverse-lookup (kid → publisher URL) for result attribution. */
+  agentUrlForKeyid?: (keyid: string) => string | undefined;
+  /**
+   * Trusted local discriminator appended to replay accounting. Receivers use
+   * this to isolate registrations authorized under different delegated-
+   * operator tuples even when they share a callback URL and signing key.
+   */
+  replayScopeBinding?: string;
+}
+
+export interface VerifyWebhookResult {
+  status: 'verified';
+  keyid: string;
+  agent_url?: string;
+  verified_at: number;
+}
+
+/**
+ * Verify an inbound webhook's RFC 9421 signature.
+ *
+ * Checklist steps 1–14 plus sub-step 9a, matching the canonical numbering
+ * in `security.mdx#verifier-checklist-for-webhooks` (and the `failed_step`
+ * values on the conformance vectors at
+ * `test-vectors/webhook-signing/negative/`). Throws
+ * `WebhookSignatureError` on the first failed step.
+ *
+ * Ordering invariant: cheap invariant checks (tag, alg, window, components)
+ * run before JWKS resolution (step 7); revocation (9) and rate-abuse (9a)
+ * run before cryptographic verify (10) so an attacker can't amplify
+ * Ed25519/ECDSA work. Replay insert (13) commits only after every earlier
+ * step has passed — any signature failing at step 10 never consumes a cap
+ * entry, so external traffic can't grow the per-keyid cache.
+ */
+export async function verifyWebhookSignature(
+  request: WebhookRequestLike,
+  options: VerifyWebhookOptions
+): Promise<VerifyWebhookResult> {
+  const signatureEncoding = resolveSignatureEncoding(options.signatureEncoding);
+  const currentTime = options.now ?? (() => Date.now() / 1000);
+  const now = currentTime();
+  const requiredTag = options.requiredTag ?? WEBHOOK_SIGNING_TAG;
+
+  // Step 1: both signature headers present AND parseable. The bound-pair
+  // rule (`Signature` without `Signature-Input` or vice versa) rejects here.
+  const sigInputHeader = getHeaderValue(request.headers, 'Signature-Input');
+  const sigHeader = getHeaderValue(request.headers, 'Signature');
+  if (!sigInputHeader || !sigHeader) {
+    throw new WebhookSignatureError(
+      'webhook_signature_header_malformed',
+      1,
+      'Webhook is missing Signature or Signature-Input headers.'
+    );
+  }
+  let parsedInput: ParsedSignatureInput;
+  let parsedSig: ReturnType<typeof parseSignature>;
+  try {
+    parsedInput = parseSignatureInput(sigInputHeader);
+    parsedSig = parseSignature(sigHeader, parsedInput.label, signatureEncoding);
+  } catch (err) {
+    throw new WebhookSignatureError(
+      'webhook_signature_header_malformed',
+      1,
+      `${err instanceof Error ? err.message : String(err)} (webhook signatureEncoding="${signatureEncoding}").`
+    );
+  }
+
+  // Step 2: required params present.
+  requireParams(parsedInput);
+
+  // Step 3: tag match.
+  if (parsedInput.params.tag !== requiredTag) {
+    throw new WebhookSignatureError(
+      'webhook_signature_tag_invalid',
+      3,
+      `Signature tag must be "${requiredTag}"; got "${parsedInput.params.tag}".`
+    );
+  }
+
+  // Step 4: alg allowlist.
+  if (!ALLOWED_ALGS.has(parsedInput.params.alg)) {
+    throw new WebhookSignatureError(
+      'webhook_signature_alg_not_allowed',
+      4,
+      `Signature alg "${parsedInput.params.alg}" is not in the AdCP allowlist.`
+    );
+  }
+
+  // Step 5: window valid.
+  validateWindow(parsedInput.params.created, parsedInput.params.expires, now);
+
+  // Step 6: covered components.
+  validateCoveredComponents(parsedInput.components);
+
+  // Step 6a: `@target-uri` syntactic validation. Runs before JWKS resolution
+  // and crypto verify so a malformed URI short-circuits without JWKS
+  // side-effects. Distinct from `header_malformed` (the Signature /
+  // Signature-Input headers themselves) — this flags the covered URI value
+  // that will be fed into the signature base. Non-parseable URLs, non-https
+  // schemes, embedded userinfo, and fragments are all rejected.
+  const canonicalWebhookTarget = validateTargetUri(request.url);
+
+  // Step 7: resolve keyid.
+  let keyResolution: JwksResolution;
+  try {
+    keyResolution = options.jwks.resolveWithMetadata
+      ? await options.jwks.resolveWithMetadata(parsedInput.params.keyid)
+      : { jwk: await options.jwks.resolve(parsedInput.params.keyid) };
+  } catch (error) {
+    try {
+      options.onKeyResolutionError?.(error);
+    } catch {
+      /* Logging cannot change verification. */
+    }
+    throw new WebhookSignatureError(
+      'webhook_signature_key_unknown',
+      7,
+      'Signing key discovery or publisher pin check failed.',
+      undefined,
+      keyDiscoveryRetryable(error)
+    );
+  }
+  const jwk = keyResolution.jwk;
+  if (!jwk) {
+    throw new WebhookSignatureError(
+      'webhook_signature_key_unknown',
+      7,
+      `No JWK found for keyid "${parsedInput.params.keyid}".`
+    );
+  }
+  if (jwk.kid !== parsedInput.params.keyid) {
+    throw new WebhookSignatureError(
+      'webhook_signature_key_unknown',
+      7,
+      `JWKS resolver returned a JWK whose kid "${jwk.kid}" does not match requested keyid "${parsedInput.params.keyid}".`
+    );
+  }
+  if (keyResolution.operatorAuthorizationValidUntil !== undefined) {
+    assertDelegatedOperatorAuthorizationActive(keyResolution.operatorAuthorizationValidUntil, currentTime());
+  }
+
+  // Step 8: key purpose — webhooks are signed with a `request-signing` key.
+  //
+  // Webhooks carry no separate key purpose: the signer uses its
+  // `adcp_use: "request-signing"` key (the deprecated `"webhook-signing"`
+  // value is still accepted here for backward compatibility, pending removal — adcontextprotocol/adcp#5555).
+  // This is safe because cross-protocol confusion is prevented by the
+  // signature `tag` (step 3, `adcp/webhook-signing/v1`, part of the signed
+  // base) and mandatory `content-digest` coverage (step 6) — not by the
+  // key-purpose discriminator. A captured request signature
+  // (`tag=adcp/request-signing/v1`) can never be replayed against this
+  // verifier because step 3 rejects it. Webhook key isolation, when wanted, is
+  // a second `request-signing` key under a distinct `kid` — not a distinct
+  // `adcp_use`.
+  //
+  // All key-purpose failures use `webhook_signature_key_purpose_invalid`:
+  // absent `adcp_use`, a missing `verify` key_op, or an `adcp_use` outside the
+  // accepted set (e.g. `response-signing`, `governance-signing`). We do NOT
+  // reuse `webhook_mode_mismatch` here — that code is reserved for the
+  // HMAC-vs-9421 auth-mode selector mismatch, and overloading it would collapse
+  // two distinct failure classes onto one stable code receivers branch on.
+  if (
+    jwk.adcp_use === undefined ||
+    !jwk.key_ops?.includes('verify') ||
+    (jwk.adcp_use !== 'request-signing' && jwk.adcp_use !== 'webhook-signing')
+  ) {
+    throw new WebhookSignatureError(
+      'webhook_signature_key_purpose_invalid',
+      8,
+      `JWK "${jwk.kid}" is not scoped for webhook delivery: adcp_use must be "request-signing" (or the deprecated "webhook-signing") with a "verify" key_op (got adcp_use="${jwk.adcp_use}").`
+    );
+  }
+
+  // Step 9: revocation. Shared store throws `request_signature_revocation_stale`
+  // when its cached snapshot is past grace — re-map to the webhook taxonomy
+  // so callers see a consistent error surface.
+  try {
+    if (await options.revocationStore.isRevoked(jwk.kid)) {
+      throw new WebhookSignatureError('webhook_signature_key_revoked', 9, `JWK "${jwk.kid}" is revoked.`);
+    }
+  } catch (err) {
+    if (err instanceof RequestSignatureError && err.code === 'request_signature_revocation_stale') {
+      throw new WebhookSignatureError('webhook_signature_revocation_stale', 9, err.message);
+    }
+    throw err;
+  }
+
+  // Replay cache is scoped by `(keyid, @target-uri, trusted binding)` — a
+  // webhook captured on one receiver path or authorized tuple MUST NOT count
+  // against another budget under the same keyid. The binding is absent on the
+  // generic low-level path, preserving adcp#2460 URL-only behavior there.
+  const replayScope = replayScopeForWebhook(canonicalWebhookTarget, options.replayScopeBinding);
+
+  // Pre-check step 12's replay before crypto so a replayed nonce short-
+  // circuits an expensive Ed25519/ECDSA verify. Replay precedes the cap
+  // check to match every replay store's atomic insert result precedence.
+  if (await options.replayStore.has(jwk.kid, replayScope, parsedInput.params.nonce, now)) {
+    throw new WebhookSignatureError(
+      'webhook_signature_replayed',
+      12,
+      `Replay of (keyid=${jwk.kid}, nonce=${parsedInput.params.nonce}) within signature window.`
+    );
+  }
+
+  // Step 9a: per-keyid rate abuse. Distinct code from step 12's replay —
+  // cap exhaustion is a compromised-key / misconfig signal that SHOULD
+  // alert operators for new nonces.
+  if (await options.replayStore.isCapHit(jwk.kid, replayScope, now)) {
+    // A concurrent request may have committed this nonce after the first
+    // replay probe and filled the cap. Preserve replay-over-cap precedence.
+    if (await options.replayStore.has(jwk.kid, replayScope, parsedInput.params.nonce, now)) {
+      throw new WebhookSignatureError(
+        'webhook_signature_replayed',
+        12,
+        `Replay of (keyid=${jwk.kid}, nonce=${parsedInput.params.nonce}) within signature window.`
+      );
+    }
+    throw new WebhookSignatureError(
+      'webhook_signature_rate_abuse',
+      9,
+      `Per-keyid replay cache cap exceeded for keyid=${jwk.kid}.`
+    );
+  }
+
+  // Step 10: cryptographic verify.
+  const base = buildSignatureBase(
+    parsedInput.components,
+    { method: request.method, url: request.url, headers: request.headers },
+    parsedInput.params,
+    parsedInput.signatureParamsValue,
+    '3.2'
+  );
+  // Validates the JWK (malformed keys are rejected before verification).
+  jwkToPublicKey(jwk);
+  const valid = await verifySignatureAsync(parsedInput.params.alg, jwk, Buffer.from(base, 'utf8'), parsedSig.bytes);
+  if (!valid) {
+    throw new WebhookSignatureError(
+      'webhook_signature_invalid',
+      10,
+      'Cryptographic verification of webhook signature base failed.'
+    );
+  }
+
+  // Step 11: content-digest match.
+  const digestHeader = getHeaderValue(request.headers, 'Content-Digest');
+  if (!digestHeader || !contentDigestMatches(digestHeader, request.body ?? '')) {
+    throw new WebhookSignatureError(
+      'webhook_signature_digest_mismatch',
+      11,
+      'Content-Digest header does not match recomputed body hash.'
+    );
+  }
+
+  // Refresh publisher pins only after authenticating the signature and body,
+  // so a forged signature cannot trigger forced adagents.json fetches.
+  if (options.publisherPins) {
+    try {
+      await assertPublisherPins(jwk, options.publisherPins, currentTime);
+    } catch (error) {
+      try {
+        options.onKeyResolutionError?.(error);
+      } catch {
+        /* Logging cannot change verification. */
+      }
+      throw new WebhookSignatureError(
+        'webhook_signature_key_unknown',
+        7,
+        'Signing key is outside the applicable publisher pins.',
+        undefined,
+        keyDiscoveryRetryable(error)
+      );
+    }
+  }
+
+  // Resolution can be valid at step 7 and expire while cryptographic and
+  // digest verification are in flight. Recheck immediately before accepting
+  // the delivery or consuming replay capacity.
+  if (keyResolution.operatorAuthorizationValidUntil !== undefined) {
+    assertDelegatedOperatorAuthorizationActive(keyResolution.operatorAuthorizationValidUntil, currentTime());
+  }
+
+  // Step 13: commit nonce. Insert AFTER every prior check passes — this is
+  // the load-bearing invariant that keeps external traffic from growing the
+  // cap (any signature failing at step 10 never consumes an entry).
+  // Acceptance is inclusive of `expires + skew`; the nonce must outlive it.
+  const remaining = parsedInput.params.expires - now + CLOCK_SKEW_TOLERANCE_SECONDS + 1;
+  const ttl = Math.max(remaining, MAX_SIGNATURE_WINDOW_SECONDS + CLOCK_SKEW_TOLERANCE_SECONDS);
+  const insertResult = await options.replayStore.insert(jwk.kid, replayScope, parsedInput.params.nonce, ttl, now);
+  if (insertResult === 'replayed') {
+    throw new WebhookSignatureError(
+      'webhook_signature_replayed',
+      13,
+      `Replay of (keyid=${jwk.kid}, nonce=${parsedInput.params.nonce}) within signature window.`
+    );
+  }
+  if (insertResult === 'rate_abuse') {
+    throw new WebhookSignatureError(
+      'webhook_signature_rate_abuse',
+      13,
+      `Per-keyid replay cache cap exceeded on commit for keyid=${jwk.kid}.`
+    );
+  }
+
+  // Step 14: authenticate and burn the nonce before rejecting malformed JSON.
+  // A replay of this validly signed frame then stops before crypto verification.
+  try {
+    assertSignedBodyWellFormed(request.body);
+  } catch (err) {
+    if (err instanceof StrictJsonError) {
+      throw new WebhookSignatureError('webhook_body_malformed', 14, 'Signed webhook body is not strict JSON', {
+        reason: err.code,
+      });
+    }
+    throw err;
+  }
+
+  // A durable replay backend can block across the delegation boundary. The
+  // delivery is not accepted until that atomic insert has completed, so check
+  // the authorization one final time at the actual acceptance boundary.
+  if (keyResolution.operatorAuthorizationValidUntil !== undefined) {
+    assertDelegatedOperatorAuthorizationActive(keyResolution.operatorAuthorizationValidUntil, currentTime());
+  }
+
+  const agent_url = keyResolution.agentUrl ?? options.agentUrlForKeyid?.(jwk.kid);
+  return {
+    status: 'verified',
+    keyid: jwk.kid,
+    ...(agent_url !== undefined && { agent_url }),
+    // Keep the established whole-second credential timestamp while using the
+    // fractional clock above for exact authorization-expiry enforcement.
+    verified_at: Math.floor(now),
+  };
+}
+
+function resolveSignatureEncoding(encoding: SfBinaryEncoding = 'legacy-base64url'): SfBinaryEncoding {
+  if (encoding !== 'legacy-base64url' && encoding !== 'rfc8941-base64') {
+    throw new TypeError('signatureEncoding must be "legacy-base64url" or "rfc8941-base64".');
+  }
+  return encoding;
+}
+
+function assertDelegatedOperatorAuthorizationActive(validUntil: number | undefined, now: number): void {
+  if (validUntil !== undefined && (!Number.isFinite(validUntil) || now >= validUntil)) {
+    throw new WebhookSignatureError(
+      'webhook_signature_key_unknown',
+      7,
+      'The signing key is no longer authorized for this webhook registration.'
+    );
+  }
+}
+
+function replayScopeForWebhook(canonicalTarget: string, binding: string | undefined): string {
+  if (binding === undefined) return canonicalTarget;
+  if (binding.length === 0 || binding.length > 1_024 || binding.includes('\0')) {
+    throw new TypeError('replayScopeBinding must be a non-empty string of at most 1024 characters without NUL.');
+  }
+  return JSON.stringify([canonicalTarget, binding]);
+}
+
+function requireParams(parsed: ParsedSignatureInput): void {
+  const required: Array<keyof ParsedSignatureInput['params']> = ['created', 'expires', 'nonce', 'keyid', 'alg', 'tag'];
+  const missing = required.filter(k => parsed.params[k] === undefined);
+  if (missing.length) {
+    throw new WebhookSignatureError(
+      'webhook_signature_params_incomplete',
+      2,
+      `Signature-Input missing required parameter(s): ${missing.join(', ')}.`
+    );
+  }
+  if (!isValidSigningNonce(parsed.params.nonce)) {
+    throw new WebhookSignatureError(
+      'webhook_signature_params_incomplete',
+      2,
+      'Signature nonce must be unpadded Base64URL containing at least 16 bytes'
+    );
+  }
+}
+
+function validateWindow(created: number, expires: number, now: number): void {
+  // Spec folds every window-level failure — expired, negative window,
+  // over-long window, created-in-future — into webhook_signature_window_invalid.
+  // The error message carries the specific subtype for diagnostics.
+  if (expires <= created) {
+    throw new WebhookSignatureError(
+      'webhook_signature_window_invalid',
+      5,
+      'Signature expires must be strictly greater than created.'
+    );
+  }
+  if (expires - created > MAX_SIGNATURE_WINDOW_SECONDS) {
+    throw new WebhookSignatureError(
+      'webhook_signature_window_invalid',
+      5,
+      `Signature window exceeds ${MAX_SIGNATURE_WINDOW_SECONDS}s maximum.`
+    );
+  }
+  if (now < created - CLOCK_SKEW_TOLERANCE_SECONDS) {
+    throw new WebhookSignatureError(
+      'webhook_signature_window_invalid',
+      5,
+      'Signature created is in the future beyond skew tolerance.'
+    );
+  }
+  if (now > expires + CLOCK_SKEW_TOLERANCE_SECONDS) {
+    throw new WebhookSignatureError('webhook_signature_window_invalid', 5, 'Signature is expired.');
+  }
+}
+
+function validateCoveredComponents(components: string[]): void {
+  for (const mandatory of WEBHOOK_MANDATORY_COMPONENTS) {
+    if (!components.includes(mandatory)) {
+      throw new WebhookSignatureError(
+        'webhook_signature_components_incomplete',
+        6,
+        `Covered components must include "${mandatory}".`
+      );
+    }
+  }
+}
+
+/**
+ * Syntactic validation of the `@target-uri` value before signature
+ * computation. Four failure modes:
+ *   - URL doesn't parse at all.
+ *   - Scheme is not https (webhooks MUST be TLS-terminated; loopback
+ *     addresses are exempt so `loopback_mock` test receivers — the
+ *     storyboard runner's default — can operate over plain http).
+ *   - Authority contains userinfo — credentials don't belong in a signed URI.
+ *   - URL carries a fragment — fragments are client-side and never transmitted.
+ *
+ * Each throws `webhook_target_uri_malformed` with the failure reason in the
+ * message. Distinct from `webhook_signature_header_malformed`, which flags
+ * the Signature / Signature-Input headers themselves.
+ */
+function validateTargetUri(rawUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new WebhookSignatureError(
+      'webhook_target_uri_malformed',
+      6,
+      `@target-uri "${rawUrl}" is not a parseable URL.`
+    );
+  }
+  if (url.protocol !== 'https:' && !isWebhookLoopbackHost(url.hostname)) {
+    throw new WebhookSignatureError(
+      'webhook_target_uri_malformed',
+      6,
+      `@target-uri must use https; got "${url.protocol}" in "${rawUrl}".`
+    );
+  }
+  if (url.username || url.password) {
+    throw new WebhookSignatureError('webhook_target_uri_malformed', 6, '@target-uri must not embed userinfo.');
+  }
+  if (url.hash) {
+    throw new WebhookSignatureError('webhook_target_uri_malformed', 6, '@target-uri must not carry a fragment.');
+  }
+  try {
+    return canonicalTargetUri(rawUrl, '3.2');
+  } catch (err) {
+    throw new WebhookSignatureError(
+      'webhook_target_uri_malformed',
+      6,
+      err instanceof Error ? err.message : String(err)
+    );
+  }
+}
+
+/**
+ * Loopback host exemption for the https-only rule. The storyboard runner's
+ * `loopback_mock` webhook receiver binds to 127.0.0.1 (or the IPv6 [::1])
+ * and publishers emit `http://127.0.0.1:<port>/…` URLs for delivery; the
+ * signature covers `@target-uri` byte-for-byte, so the verifier sees the
+ * http scheme.
+ *
+ * The exemption is restricted to IPv4 literals in 127.0.0.0/8, the IPv6
+ * loopback, and the literal name `localhost`. A prefix test would also match
+ * registered names like `127.example.com`, which resolve to arbitrary public
+ * addresses and would let a real webhook drop TLS.
+ */
+// Only reached with an already-parsed `URL.hostname`, so WHATWG has normalized
+// `127.1` / `0x7f000001` to dotted-quad form and rejected out-of-range octets
+// before this sees them. No octet-range check is needed (or reachable).
+const LOOPBACK_IPV4 = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+
+export function isWebhookLoopbackHost(hostname: string): boolean {
+  if (!hostname) return false;
+  // Node's `URL.hostname` keeps IPv6 literals bracketed; a FQDN keeps its dot.
+  const normalized = hostname.toLowerCase().replace(/\.$/, '');
+  if (normalized === 'localhost' || normalized === '::1' || normalized === '[::1]') return true;
+  return LOOPBACK_IPV4.test(normalized);
+}
+
+/**
+ * Options for {@link createWebhookVerifier}. Identical to
+ * {@link VerifyWebhookOptions} except `replayStore` and `revocationStore` are
+ * optional — the factory defaults them once at creation time so replay state
+ * is shared across every request the returned verifier handles.
+ */
+export interface CreateWebhookVerifierOptions extends Omit<VerifyWebhookOptions, 'replayStore' | 'revocationStore'> {
+  /**
+   * Stores `(keyid, scope, nonce)` tuples for replay detection.
+   * Defaults to a fresh {@link InMemoryReplayStore} — suitable for single-process
+   * deployments only. **Multi-replica deployments MUST pass an explicit shared
+   * store** (Redis, Postgres, etc.) — the default in-memory store does not
+   * survive process boundaries, so a signature accepted on replica A is
+   * invisible to replica B and can be replayed there within the signature window.
+   */
+  replayStore?: ReplayStore;
+  /**
+   * Consulted for revoked `kid` before accepting a signature.
+   * Defaults to a fresh {@link InMemoryRevocationStore}, which starts empty
+   * and does not poll for updates. The default is sufficient when you don't
+   * revoke keys at runtime; when you do, pass a store backed by your secrets
+   * manager or admin tooling so revocations take effect without redeployment.
+   */
+  revocationStore?: RevocationStore;
+}
+
+/**
+ * Create a bound webhook-signature verifier with shared replay and revocation
+ * stores. Mirrors {@link createExpressVerifier} for the webhook profile.
+ *
+ * The returned function is the per-request entry point: call it with each
+ * inbound webhook's {@link RequestLike} representation.
+ *
+ * **Why a factory?** Replay detection requires the same store instance to be
+ * consulted across every request. Constructing stores inside a per-request
+ * call would silently defeat replay dedup — each call would start with an
+ * empty store and always accept the nonce. The factory pattern captures the
+ * store instances in closure scope at wire-up time, guaranteeing they are
+ * shared across calls for the lifetime of the verifier.
+ *
+ * **Multi-replica deployments MUST pass an explicit `replayStore`** backed by
+ * a shared persistence layer (Redis, Postgres, etc.) — the default
+ * `InMemoryReplayStore` does not survive process boundaries. A nonce accepted
+ * on replica A is invisible to replica B; replaying the webhook to B succeeds
+ * silently within the signature window.
+ */
+export function createWebhookVerifier(
+  options: CreateWebhookVerifierOptions
+): (request: WebhookRequestLike) => Promise<VerifyWebhookResult> {
+  const signatureEncoding = resolveSignatureEncoding(options.signatureEncoding);
+  // Instantiate defaults once at creation time so every request handled by
+  // this verifier shares the same replay / revocation state. Per-request
+  // construction would defeat replay detection entirely.
+  const replayStore = options.replayStore ?? new InMemoryReplayStore();
+  const revocationStore = options.revocationStore ?? new InMemoryRevocationStore();
+  return (request: WebhookRequestLike) =>
+    verifyWebhookSignature(request, { ...options, signatureEncoding, replayStore, revocationStore });
+}

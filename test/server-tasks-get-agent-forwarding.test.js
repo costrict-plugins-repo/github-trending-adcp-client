@@ -1,0 +1,512 @@
+'use strict';
+
+// Symmetric follow-up: `tasks_get` calls `platform.accounts.resolve` from
+// the custom-tool path, which historically bypassed `BuyerAgentRegistry`
+// resolution and threaded `ctx.agent: undefined` through to adopters'
+// resolve impls. PR #1315 + #1321 documented the contract that `ctx.agent`
+// reaches every account-store method when an `agentRegistry` is configured;
+// this test file pins the same contract on the tasks_get polling surface.
+//
+// Two policies the tests anchor:
+//   1. Agent IS resolved and threaded through to `accounts.resolve`.
+//   2. Agent-status enforcement (suspended/blocked → 403) is DELIBERATELY
+//      skipped on tasks_get polls so a buyer suspended after kicking off
+//      an HITL task can still learn the terminal state. Hard cutoff is the
+//      adopter's choice via `ctx.agent.status` checks inside their resolver.
+
+const { describe, it } = require('node:test');
+const assert = require('node:assert/strict');
+
+const { createAdcpServerFromPlatform } = require('../dist/lib/server/decisioning/runtime/from-platform');
+
+const sampleAgent = (overrides = {}) => ({
+  agent_url: 'https://agent.scope3.com',
+  display_name: 'Scope3',
+  status: 'active',
+  billing_capabilities: new Set(['operator']),
+  ...overrides,
+});
+
+function buildHitlPlatform(captures, overrides = {}) {
+  const taskFn = overrides.taskFn ?? (async () => ({ media_buy_id: 'mb_42', status: 'active' }));
+  return {
+    capabilities: {
+      specialisms: ['sales-non-guaranteed'],
+      creative_agents: [],
+      channels: ['display'],
+      pricingModels: ['cpm'],
+      config: {},
+    },
+    accounts: {
+      resolve: async (ref, ctx) => {
+        captures.lastResolveCtx = ctx;
+        return {
+          id: ref?.account_id ?? 'acc_1',
+          name: 'Acme',
+          status: 'active',
+          metadata: {},
+          authInfo: { kind: 'api_key' },
+        };
+      },
+    },
+    sales: {
+      getProducts: async () => ({ products: [] }),
+      createMediaBuy: (_req, ctx) => ctx.handoffToTask(async () => taskFn()),
+      updateMediaBuy: async () => ({ media_buy_id: 'mb_42' }),
+      syncCreatives: async () => [],
+      getMediaBuyDelivery: async () => ({ media_buys: [] }),
+    },
+    ...(overrides.agentRegistry !== undefined && { agentRegistry: overrides.agentRegistry }),
+  };
+}
+
+async function createCompletedTask(server, accountId) {
+  const result = await server.dispatchTestRequest({
+    method: 'tools/call',
+    params: {
+      name: 'create_media_buy',
+      arguments: {
+        buyer_ref: 'b1',
+        idempotency_key: '11111111-1111-1111-1111-111111111111',
+        packages: [],
+        start_time: '2026-05-01T00:00:00Z',
+        end_time: '2026-06-01T00:00:00Z',
+        account: { account_id: accountId },
+      },
+    },
+  });
+  await server.awaitTaskUnsafe(result.structuredContent.task_id);
+  return result.structuredContent.task_id;
+}
+
+async function createTaskWithPushConfig(server, accountId, withPushConfig = true) {
+  const result = await server.dispatchTestRequest({
+    method: 'tools/call',
+    params: {
+      name: 'create_media_buy',
+      arguments: {
+        buyer_ref: 'b1',
+        idempotency_key: '11111111-1111-1111-1111-111111111111',
+        packages: [],
+        start_time: '2026-05-01T00:00:00Z',
+        end_time: '2026-06-01T00:00:00Z',
+        account: { account_id: accountId },
+        ...(withPushConfig && {
+          push_notification_config: {
+            url: 'https://buyer.example.com/webhook',
+            operation_id: 'op_has_webhook',
+          },
+        }),
+      },
+    },
+  });
+  assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+  return result.structuredContent.task_id;
+}
+
+const dispatchTasksGet = (server, taskId, accountId) =>
+  server.dispatchTestRequest({
+    method: 'tools/call',
+    params: {
+      name: 'tasks_get',
+      arguments: { task_id: taskId, account: { account_id: accountId } },
+    },
+  });
+
+const dispatchTasksGetWithExtra = (server, taskId, accountId, extra) =>
+  server.dispatchTestRequest(
+    {
+      method: 'tools/call',
+      params: {
+        name: 'tasks_get',
+        arguments: { task_id: taskId, account: { account_id: accountId } },
+      },
+    },
+    extra
+  );
+
+const dispatchGetTaskStatus = (server, taskId, accountId) =>
+  server.dispatchTestRequest({
+    method: 'tools/call',
+    params: {
+      name: 'get_task_status',
+      arguments: { task_id: taskId, include_result: true, account: { account_id: accountId } },
+    },
+  });
+
+const dispatchGetTaskStatusWithExtra = (server, taskId, accountId, extra) =>
+  server.dispatchTestRequest(
+    {
+      method: 'tools/call',
+      params: {
+        name: 'get_task_status',
+        arguments: { task_id: taskId, include_result: true, account: { account_id: accountId } },
+      },
+    },
+    extra
+  );
+
+const dispatchListTasks = (server, taskId, accountId) =>
+  server.dispatchTestRequest({
+    method: 'tools/call',
+    params: {
+      name: 'list_tasks',
+      arguments: { account: { account_id: accountId }, filters: { task_ids: [taskId] } },
+    },
+  });
+
+describe('tasks_get — agent forwarding to accounts.resolve', () => {
+  it('forwards resolved BuyerAgent to accounts.resolve when agentRegistry is configured', async () => {
+    const captures = {};
+    const agent = sampleAgent();
+    const server = createAdcpServerFromPlatform(
+      buildHitlPlatform(captures, {
+        agentRegistry: {
+          async resolve() {
+            return agent;
+          },
+        },
+      }),
+      { name: 'p', version: '0.0.1', validation: { requests: 'off', responses: 'off' } }
+    );
+    const taskId = await createCompletedTask(server, 'acc_owner');
+    // Reset captures so the assertion targets the tasks_get call, not
+    // create_media_buy's earlier resolve.
+    captures.lastResolveCtx = undefined;
+    const result = await dispatchTasksGet(server, taskId, 'acc_owner');
+    assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.ok(captures.lastResolveCtx, 'tasks_get must call accounts.resolve');
+    assert.ok(captures.lastResolveCtx.agent, 'accounts.resolve MUST receive ctx.agent from tasks_get');
+    assert.strictEqual(captures.lastResolveCtx.agent.agent_url, 'https://agent.scope3.com');
+    assert.strictEqual(captures.lastResolveCtx.toolName, 'tasks_get');
+  });
+
+  it('omits ctx.agent when no agentRegistry is configured (no regression)', async () => {
+    const captures = {};
+    const server = createAdcpServerFromPlatform(buildHitlPlatform(captures), {
+      name: 'p',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+    });
+    const taskId = await createCompletedTask(server, 'acc_owner');
+    captures.lastResolveCtx = undefined;
+    const result = await dispatchTasksGet(server, taskId, 'acc_owner');
+    assert.notStrictEqual(result.isError, true);
+    assert.ok(captures.lastResolveCtx, 'tasks_get must call accounts.resolve');
+    assert.strictEqual(captures.lastResolveCtx.agent, undefined);
+    assert.strictEqual(captures.lastResolveCtx.toolName, 'tasks_get');
+  });
+
+  it('freezes the resolved BuyerAgent before threading to resolve', async () => {
+    const captures = {};
+    const agent = sampleAgent();
+    const server = createAdcpServerFromPlatform(
+      buildHitlPlatform(captures, {
+        agentRegistry: {
+          async resolve() {
+            return agent;
+          },
+        },
+      }),
+      { name: 'p', version: '0.0.1', validation: { requests: 'off', responses: 'off' } }
+    );
+    const taskId = await createCompletedTask(server, 'acc_owner');
+    await dispatchTasksGet(server, taskId, 'acc_owner');
+    assert.equal(Object.isFrozen(agent), true, 'resolved BuyerAgent must be frozen by tasks_get path');
+    assert.equal(Object.isFrozen(agent.billing_capabilities), true);
+  });
+
+  it('returns SERVICE_UNAVAILABLE when registry resolution fails during the poll', async () => {
+    const captures = {};
+    const registry = {
+      async resolve() {
+        return sampleAgent();
+      },
+    };
+    const server = createAdcpServerFromPlatform(buildHitlPlatform(captures, { agentRegistry: registry }), {
+      name: 'p',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+    });
+    const taskId = await createCompletedTask(server, 'acc_owner');
+    // Flip the registry to throw AFTER the task is created (registry must
+    // succeed during create_media_buy for the dispatcher's main path).
+    registry.resolve = async () => {
+      throw new Error('upstream-id-provider-down');
+    };
+    captures.lastResolveCtx = undefined;
+    const result = await dispatchTasksGet(server, taskId, 'acc_owner');
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'SERVICE_UNAVAILABLE');
+    assert.strictEqual(captures.lastResolveCtx, undefined);
+  });
+
+  it('applies credentialPolicy.scanAuthInfo to tasks_get', async () => {
+    const captures = {};
+    const server = createAdcpServerFromPlatform(buildHitlPlatform(captures), {
+      name: 'p',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+      credentialPolicy: { policy: 'authInfo-only', scanAuthInfo: true },
+    });
+    const taskId = await createCompletedTask(server, 'acc_owner');
+
+    const result = await dispatchTasksGetWithExtra(server, taskId, 'acc_owner', {
+      authInfo: {
+        credential: { kind: 'api_key', key_id: 'buyer-1' },
+        extra: { upstream_access_token: 'sekret' },
+      },
+    });
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'PERMISSION_DENIED');
+  });
+
+  it('applies tasks_get credentialPolicy overrides to get_task_status/list_tasks aliases', async () => {
+    const captures = {};
+    const server = createAdcpServerFromPlatform(buildHitlPlatform(captures), {
+      name: 'p',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+      credentialPolicy: { policy: 'lax', tools: { tasks_get: 'authInfo-only' }, scanAuthInfo: true },
+    });
+    const taskId = await createCompletedTask(server, 'acc_owner');
+    const extra = {
+      authInfo: {
+        credential: { kind: 'api_key', key_id: 'buyer-1' },
+        extra: { upstream_access_token: 'sekret' },
+      },
+    };
+
+    const status = await dispatchGetTaskStatusWithExtra(server, taskId, 'acc_owner', extra);
+    assert.strictEqual(status.isError, true);
+    assert.strictEqual(status.structuredContent.adcp_error.code, 'PERMISSION_DENIED');
+
+    const listed = await server.dispatchTestRequest(
+      {
+        method: 'tools/call',
+        params: {
+          name: 'list_tasks',
+          arguments: { account: { account_id: 'acc_owner' }, filters: { task_ids: [taskId] } },
+        },
+      },
+      extra
+    );
+    assert.strictEqual(listed.isError, true);
+    assert.strictEqual(listed.structuredContent.adcp_error.code, 'PERMISSION_DENIED');
+  });
+
+  it('keeps credentialPolicy.scanAuthInfo rejection stable when logger.warn throws', async () => {
+    const captures = {};
+    const server = createAdcpServerFromPlatform(buildHitlPlatform(captures), {
+      name: 'p',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+      credentialPolicy: { policy: 'authInfo-only', scanAuthInfo: true },
+      logger: {
+        debug() {},
+        info() {},
+        warn(message) {
+          if (String(message).includes('credentialPolicy')) {
+            throw new Error('logger-down');
+          }
+        },
+        error() {},
+      },
+    });
+    const taskId = await createCompletedTask(server, 'acc_owner');
+
+    const result = await dispatchTasksGetWithExtra(server, taskId, 'acc_owner', {
+      authInfo: {
+        credential: { kind: 'api_key', key_id: 'buyer-1' },
+        extra: { upstream_access_token: 'sekret' },
+      },
+    });
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'PERMISSION_DENIED');
+  });
+});
+
+describe('tasks_get — webhook availability', () => {
+  it('reports has_webhook false for polling-only external settlement (#2836)', async () => {
+    let sdkWebhookEmits = 0;
+    const platform = buildHitlPlatform(
+      {},
+      {
+        taskFn: async () => {},
+      }
+    );
+    platform.sales.createMediaBuy = (_req, ctx) => ctx.handoffToTask(async () => {}, { settlement: 'external' });
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'p',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+      taskRegistry: {
+        ...require('../dist/lib/server/decisioning/runtime/task-registry').createInMemoryTaskRegistry(),
+        durability: 'durable',
+      },
+      observability: { onWebhookEmit: () => (sdkWebhookEmits += 1) },
+    });
+    const taskId = await createTaskWithPushConfig(server, 'acc_owner', false);
+
+    const result = await dispatchTasksGet(server, taskId, 'acc_owner');
+    assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.strictEqual(result.structuredContent.has_webhook, false);
+    assert.strictEqual(sdkWebhookEmits, 0);
+  });
+
+  it('reports has_webhook false for polling-only handoffs (#2836)', async () => {
+    const server = createAdcpServerFromPlatform(buildHitlPlatform({}), {
+      name: 'p',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+    });
+    const taskId = await createCompletedTask(server, 'acc_owner');
+    const result = await dispatchTasksGet(server, taskId, 'acc_owner');
+    assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.strictEqual(result.structuredContent.has_webhook, false);
+  });
+
+  it('reports has_webhook true when a push URL and emitter are configured (#2836)', async () => {
+    const server = createAdcpServerFromPlatform(buildHitlPlatform({}), {
+      name: 'p',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+      taskWebhookEmitter: {
+        emit: async params => ({
+          delivery_id: params.delivery_id,
+          idempotency_key: 'k',
+          attempts: 1,
+          delivered: true,
+          errors: [],
+        }),
+      },
+    });
+    const taskId = await createTaskWithPushConfig(server, 'acc_owner');
+
+    const result = await dispatchTasksGet(server, taskId, 'acc_owner');
+    assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.strictEqual(result.structuredContent.has_webhook, true);
+  });
+});
+
+describe('tasks_get — agent status policy (suspended/blocked agents can still poll)', () => {
+  // Pinned policy: the dispatcher's status-enforcement seam at
+  // `create-adcp-server.ts:2796-2802` deliberately skips status checks on
+  // tasks_get polls. A buyer agent suspended/blocked AFTER kicking off an
+  // HITL task must still be able to retrieve the terminal state — refusing
+  // the poll would strand work with no visibility. This anchor catches a
+  // future refactor that would tighten status enforcement onto the polling
+  // path and break that contract.
+
+  it('suspended agent can still poll tasks_get', async () => {
+    const captures = {};
+    const agent = sampleAgent();
+    const registry = {
+      async resolve() {
+        return agent;
+      },
+    };
+    const server = createAdcpServerFromPlatform(buildHitlPlatform(captures, { agentRegistry: registry }), {
+      name: 'p',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+    });
+    const taskId = await createCompletedTask(server, 'acc_owner');
+    // Status flip happens AFTER the task is created. Ordering matters: the
+    // create_media_buy flow runs through the dispatcher's status seam (which
+    // would 403 if the agent were suspended at that moment) and freezes the
+    // agent record. We mutate `status` via a fresh object reference returned
+    // from the registry for subsequent calls — Object.freeze locks the
+    // previously-resolved record, but new resolve() calls return a new value.
+    registry.resolve = async () => sampleAgent({ status: 'suspended' });
+    const result = await dispatchTasksGet(server, taskId, 'acc_owner');
+    assert.notStrictEqual(
+      result.isError,
+      true,
+      `suspended agents must still be able to poll tasks_get, got ${JSON.stringify(result.structuredContent)}`
+    );
+    assert.strictEqual(result.structuredContent.task_id, taskId);
+    assert.strictEqual(result.structuredContent.status, 'completed');
+  });
+
+  it('suspended agent can still poll get_task_status/list_tasks aliases', async () => {
+    const captures = {};
+    const agent = sampleAgent();
+    const registry = {
+      async resolve() {
+        return agent;
+      },
+    };
+    const server = createAdcpServerFromPlatform(buildHitlPlatform(captures, { agentRegistry: registry }), {
+      name: 'p',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+    });
+    const taskId = await createCompletedTask(server, 'acc_owner');
+
+    registry.resolve = async () => sampleAgent({ status: 'suspended' });
+
+    const status = await dispatchGetTaskStatus(server, taskId, 'acc_owner');
+    assert.notStrictEqual(
+      status.isError,
+      true,
+      `suspended agents must still be able to poll get_task_status, got ${JSON.stringify(status.structuredContent)}`
+    );
+    assert.strictEqual(status.structuredContent.task_id, taskId);
+
+    const listed = await dispatchListTasks(server, taskId, 'acc_owner');
+    assert.notStrictEqual(
+      listed.isError,
+      true,
+      `suspended agents must still be able to poll list_tasks, got ${JSON.stringify(listed.structuredContent)}`
+    );
+    assert.strictEqual(listed.structuredContent.tasks.length, 1);
+    assert.strictEqual(listed.structuredContent.tasks[0].task_id, taskId);
+  });
+
+  it('blocked agent can still poll tasks_get', async () => {
+    const captures = {};
+    const registry = {
+      async resolve() {
+        return sampleAgent();
+      },
+    };
+    const server = createAdcpServerFromPlatform(buildHitlPlatform(captures, { agentRegistry: registry }), {
+      name: 'p',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+    });
+    const taskId = await createCompletedTask(server, 'acc_owner');
+    registry.resolve = async () => sampleAgent({ status: 'blocked' });
+    const result = await dispatchTasksGet(server, taskId, 'acc_owner');
+    assert.notStrictEqual(
+      result.isError,
+      true,
+      `blocked agents must still be able to poll tasks_get, got ${JSON.stringify(result.structuredContent)}`
+    );
+    assert.strictEqual(result.structuredContent.task_id, taskId);
+  });
+
+  it('blocked agent can still poll get_task_status alias', async () => {
+    const captures = {};
+    const registry = {
+      async resolve() {
+        return sampleAgent();
+      },
+    };
+    const server = createAdcpServerFromPlatform(buildHitlPlatform(captures, { agentRegistry: registry }), {
+      name: 'p',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+    });
+    const taskId = await createCompletedTask(server, 'acc_owner');
+    registry.resolve = async () => sampleAgent({ status: 'blocked' });
+    const result = await dispatchGetTaskStatus(server, taskId, 'acc_owner');
+    assert.notStrictEqual(
+      result.isError,
+      true,
+      `blocked agents must still be able to poll get_task_status, got ${JSON.stringify(result.structuredContent)}`
+    );
+    assert.strictEqual(result.structuredContent.task_id, taskId);
+  });
+});

@@ -1,0 +1,1375 @@
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  AD_UNITS,
+  DEFAULT_API_KEY,
+  NETWORKS,
+  PRODUCTS,
+  type MockAdUnit,
+  type MockNetwork,
+  type MockProduct,
+} from './seed-data';
+import {
+  createMockScenarioController,
+  idempotencyKeyFromBody,
+  stableFingerprint,
+  writeCachedResponse,
+  type MockScenarioHandle,
+} from '../scenario';
+
+export interface BootOptions {
+  port: number;
+  apiKey?: string;
+  networks?: MockNetwork[];
+  adUnits?: MockAdUnit[];
+  products?: MockProduct[];
+}
+
+export interface BootResult {
+  url: string;
+  close: () => Promise<void>;
+  scenario: MockScenarioHandle;
+}
+
+type OrderStatus = 'draft' | 'pending_approval' | 'approved' | 'delivering' | 'completed' | 'canceled' | 'rejected';
+type LineItemStatus = 'pending_creatives' | 'ready' | 'paused' | 'delivering' | 'completed';
+type TaskStatus = 'submitted' | 'working' | 'completed' | 'rejected';
+
+interface OrderState {
+  order_id: string;
+  network_code: string;
+  name: string;
+  status: OrderStatus;
+  advertiser_id: string;
+  currency: string;
+  budget?: number;
+  approval_task_id?: string;
+  rejection_reason?: string;
+  /** Line-item children, keyed by line_item_id. */
+  line_items: Map<string, LineItemState>;
+  /** Conversions ingested via /conversions/ — count + dedup-key set. */
+  conversions: { count: number; dedup_keys: Set<string>; total_value: number };
+  body_fingerprint: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface LineItemState {
+  line_item_id: string;
+  order_id: string;
+  product_id: string;
+  status: LineItemStatus;
+  budget: number;
+  ad_unit_targeting: string[];
+  creative_ids: string[];
+  body_fingerprint: string;
+  created_at: string;
+}
+
+interface CreativeState {
+  creative_id: string;
+  network_code: string;
+  name: string;
+  format_id: string;
+  advertiser_id: string;
+  snippet?: string;
+  status: 'active' | 'paused' | 'archived';
+  body_fingerprint: string;
+  created_at: string;
+}
+
+interface TaskState {
+  task_id: string;
+  order_id: string;
+  status: TaskStatus;
+  /** Number of times the task has been polled. Used to auto-promote
+   * `submitted → working → completed` so adapters exercise the polling
+   * pattern without the matrix run dragging. */
+  poll_count: number;
+  result?: { outcome: 'approved' | 'rejected'; reviewer_note: string };
+  created_at: string;
+  updated_at: string;
+}
+
+type ProposalStatus = 'draft' | 'committed' | 'expired' | 'rejected';
+
+/**
+ * Upstream proposal record. Proposals are the lifecycle-aware shape on
+ * top of products: `draft` (indicative pricing, no inventory hold) →
+ * `committed` (locked pricing + reserved inventory until `expires_at`).
+ *
+ * Mirrors GAM's `Proposal` shape: a sellable plan that an adopter
+ * curates from the product catalog, refines with the buyer, and then
+ * finalizes (locking pricing + reserving inventory before the buyer
+ * commits with `create_media_buy`).
+ */
+interface ProposalState {
+  proposal_id: string;
+  network_code: string;
+  status: ProposalStatus;
+  brief?: string;
+  /** Product allocations the proposal recommends. Indicative pricing
+   * pre-finalize; locked + line-item-template-allocated post-finalize. */
+  allocations: Array<{
+    product_id: string;
+    allocation_percentage: number;
+    indicative_cpm: number;
+    locked_cpm?: number;
+    upstream_line_item_template_id?: string;
+  }>;
+  total_budget?: { amount: number; currency: string };
+  /** Set on finalize; inventory hold deadline. */
+  expires_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function bootSalesGuaranteed(options: BootOptions): Promise<BootResult> {
+  const apiKey = options.apiKey ?? DEFAULT_API_KEY;
+  const networks = options.networks ?? NETWORKS;
+  const adUnits = options.adUnits ?? AD_UNITS;
+  const products = options.products ?? PRODUCTS;
+
+  const orders = new Map<string, OrderState>();
+  const creatives = new Map<string, CreativeState>();
+  const tasks = new Map<string, TaskState>();
+  const proposals = new Map<string, ProposalState>();
+  // Idempotency table — keyed `<network_code>::<resource_kind>::<client_request_id>`.
+  const idempotency = new Map<string, string>();
+
+  // Traffic counters keyed by `<METHOD> <route-template>`. Harness queries
+  // `GET /_debug/traffic` after the storyboard run and asserts headline
+  // routes were hit ≥1. Façade adapters that skip the upstream produce zero
+  // counters and fail the assertion. adcontextprotocol/adcp-client#1225.
+  const traffic = new Map<string, number>();
+  const bump = (routeTemplate: string): void => {
+    traffic.set(routeTemplate, (traffic.get(routeTemplate) ?? 0) + 1);
+  };
+  const scenario = createMockScenarioController({
+    specialism: 'sales-guaranteed',
+    snapshot: () => ({
+      orders: orders.size,
+      creatives: creatives.size,
+      tasks: tasks.size,
+      proposals: proposals.size,
+      idempotency: idempotency.size,
+      traffic: Object.fromEntries(traffic),
+    }),
+    reset: () => {
+      orders.clear();
+      creatives.clear();
+      tasks.clear();
+      proposals.clear();
+      idempotency.clear();
+      traffic.clear();
+    },
+  });
+
+  const server = createServer((req, res) => {
+    handleRequest(req, res).catch(err => {
+      writeJson(res, 500, { code: 'internal_error', message: err?.message ?? 'unexpected error' });
+    });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(options.port, '127.0.0.1', () => {
+      server.removeListener('error', reject);
+      resolve();
+    });
+  });
+
+  const addr = server.address();
+  const boundPort = typeof addr === 'object' && addr ? addr.port : options.port;
+  const url = `http://127.0.0.1:${boundPort}`;
+  return {
+    url,
+    scenario: scenario.handle,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close(err => (err ? reject(err) : resolve()));
+      }),
+  };
+
+  async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    const path = url.pathname;
+    const method = req.method ?? 'GET';
+
+    if (await scenario.handleControlRequest(req, res, method, path)) return;
+
+    // Façade-detection traffic dump — harness-only, no auth required.
+    if (method === 'GET' && path === '/_debug/traffic') {
+      writeJson(res, 200, { traffic: Object.fromEntries(traffic) });
+      return;
+    }
+
+    // Discovery endpoint — replaces the hardcoded principal-mapping table the
+    // harness used to inline. Adapters resolve at runtime by querying with
+    // the AdCP-side identifier they receive from buyers (`account.publisher`,
+    // `account.brand.domain`). No auth required — discovery happens before
+    // the agent has any network context. Issue #1225.
+    if (method === 'GET' && path === '/_lookup/network') {
+      bump('GET /_lookup/network');
+      const adcpPublisher = url.searchParams.get('adcp_publisher');
+      if (!adcpPublisher) {
+        writeJson(res, 400, {
+          code: 'invalid_request',
+          message: 'adcp_publisher query parameter is required.',
+        });
+        return;
+      }
+      const match = networks.find(n => n.adcp_publisher === adcpPublisher);
+      if (!match) {
+        writeJson(res, 404, {
+          code: 'network_not_found',
+          message: `No upstream network registered for adcp_publisher=${adcpPublisher}.`,
+        });
+        return;
+      }
+      writeJson(res, 200, {
+        adcp_publisher: match.adcp_publisher,
+        network_code: match.network_code,
+        display_name: match.display_name,
+      });
+      return;
+    }
+
+    const auth = req.headers['authorization'];
+    if (!auth || !auth.startsWith('Bearer ') || auth.slice(7) !== apiKey) {
+      writeJson(res, 401, { code: 'unauthorized', message: 'Missing or invalid bearer credential.' });
+      return;
+    }
+    const networkHeader = req.headers['x-network-code'];
+    const networkCode = Array.isArray(networkHeader) ? networkHeader[0] : networkHeader;
+    if (!networkCode) {
+      writeJson(res, 403, {
+        code: 'network_required',
+        message: 'X-Network-Code header is required on every request.',
+      });
+      return;
+    }
+    const network = networks.find(n => n.network_code === networkCode);
+    if (!network) {
+      writeJson(res, 403, { code: 'unknown_network', message: `Unknown network: ${networkCode}` });
+      return;
+    }
+
+    if (await scenario.handleScriptedResponse(res, method, path, (m, p) => bump(`${m} ${p}`))) return;
+
+    if (method === 'GET' && path === '/v1/inventory') {
+      bump('GET /v1/inventory');
+      return handleListInventory(network, res);
+    }
+    if (method === 'GET' && path === '/v1/products') {
+      bump('GET /v1/products');
+      return handleListProducts(url, network, res);
+    }
+    if (method === 'POST' && path === '/v1/forecast') {
+      bump('POST /v1/forecast');
+      return handleForecast(req, network, res);
+    }
+    if (method === 'POST' && path === '/v1/availability') {
+      bump('POST /v1/availability');
+      return handleAvailability(req, network, res);
+    }
+    if (method === 'GET' && path === '/v1/creatives') {
+      bump('GET /v1/creatives');
+      return handleListCreatives(network, res);
+    }
+    if (method === 'POST' && path === '/v1/creatives') {
+      bump('POST /v1/creatives');
+      return handleCreateCreative(req, network, res);
+    }
+
+    if (method === 'POST' && path === '/v1/proposals') {
+      bump('POST /v1/proposals');
+      return handleCreateProposal(req, network, res);
+    }
+    const proposalMatch = path.match(/^\/v1\/proposals\/([^/]+)(\/.*)?$/);
+    if (proposalMatch && proposalMatch[1]) {
+      const proposalId = decodeURIComponent(proposalMatch[1]);
+      const subPath = proposalMatch[2] ?? '/';
+      const proposal = proposals.get(proposalId);
+      if (!proposal || proposal.network_code !== network.network_code) {
+        writeJson(res, 404, { code: 'proposal_not_found', message: `Proposal ${proposalId} not found.` });
+        return;
+      }
+      if (method === 'GET' && subPath === '/') {
+        bump('GET /v1/proposals/{id}');
+        return handleGetProposal(proposal, res);
+      }
+      if (method === 'POST' && subPath === '/refine') {
+        bump('POST /v1/proposals/{id}/refine');
+        return handleRefineProposal(req, proposal, res);
+      }
+      if (method === 'POST' && subPath === '/finalize') {
+        bump('POST /v1/proposals/{id}/finalize');
+        return handleFinalizeProposal(proposal, res);
+      }
+    }
+
+    if (method === 'GET' && path === '/v1/orders') {
+      bump('GET /v1/orders');
+      return handleListOrders(network, res);
+    }
+    if (method === 'POST' && path === '/v1/orders') {
+      bump('POST /v1/orders');
+      return handleCreateOrder(req, network, res);
+    }
+
+    const orderMatch = path.match(/^\/v1\/orders\/([^/]+)(\/.*)?$/);
+    if (orderMatch && orderMatch[1]) {
+      const orderId = decodeURIComponent(orderMatch[1]);
+      const subPath = orderMatch[2] ?? '/';
+      const order = orders.get(orderId);
+      if (!order || order.network_code !== network.network_code) {
+        writeJson(res, 404, { code: 'order_not_found', message: `Order ${orderId} not found.` });
+        return;
+      }
+      if (method === 'GET' && subPath === '/') {
+        bump('GET /v1/orders/{id}');
+        return handleGetOrder(order, res);
+      }
+      if (method === 'GET' && subPath === '/lineitems') {
+        bump('GET /v1/orders/{id}/lineitems');
+        return handleListLineItems(order, res);
+      }
+      if (method === 'POST' && subPath === '/lineitems') {
+        bump('POST /v1/orders/{id}/lineitems');
+        return handleCreateLineItem(req, order, res);
+      }
+      const liAttachMatch = subPath.match(/^\/lineitems\/([^/]+)\/creative-attach$/);
+      if (method === 'POST' && liAttachMatch && liAttachMatch[1]) {
+        bump('POST /v1/orders/{id}/lineitems/{li}/creative-attach');
+        return handleAttachCreative(req, order, decodeURIComponent(liAttachMatch[1]), res);
+      }
+      if (method === 'GET' && subPath === '/delivery') {
+        bump('GET /v1/orders/{id}/delivery');
+        return handleGetDelivery(order, res);
+      }
+      if (method === 'POST' && subPath === '/conversions') {
+        bump('POST /v1/orders/{id}/conversions');
+        return handleIngestConversions(req, order, res);
+      }
+    }
+
+    const taskMatch = path.match(/^\/v1\/tasks\/([^/]+)$/);
+    if (method === 'GET' && taskMatch && taskMatch[1]) {
+      bump('GET /v1/tasks/{id}');
+      return handleGetTask(decodeURIComponent(taskMatch[1]), network, res);
+    }
+
+    writeJson(res, 404, { code: 'not_found', message: `No route for ${method} ${path}` });
+  }
+
+  // ────────────────────────────────────────────────────────────
+  // Inventory + Products + Creatives
+  // ────────────────────────────────────────────────────────────
+  function handleListInventory(network: MockNetwork, res: ServerResponse): void {
+    const visible = adUnits.filter(au => au.network_code === network.network_code);
+    writeJson(res, 200, { ad_units: visible });
+  }
+
+  function handleListProducts(url: URL, network: MockNetwork, res: ServerResponse): void {
+    let visible = products.filter(p => p.network_code === network.network_code);
+    const deliveryType = url.searchParams.get('delivery_type');
+    const channel = url.searchParams.get('channel');
+    if (deliveryType) visible = visible.filter(p => p.delivery_type === deliveryType);
+    if (channel) visible = visible.filter(p => p.channel === channel);
+
+    // Per-query forecast embedding. When the caller passes any of
+    // `targeting`, `flight_start`, `flight_end`, or `budget`, attach a
+    // deterministic-seeded forecast keyed on those inputs so a single
+    // get_products call surfaces both the catalog and the forecast curve
+    // without a follow-up POST /v1/forecast. Mirrors GAM's
+    // `forecastService.getAvailabilityForecast` returning availability inline
+    // with product metadata when a brief is supplied.
+    const targeting = url.searchParams.get('targeting');
+    const flightStart = parseDateParam(url.searchParams.get('flight_start'));
+    const flightEnd = parseDateParam(url.searchParams.get('flight_end'));
+    const budget = parsePositiveNumber(url.searchParams.get('budget'));
+    const hasQuery = Boolean(targeting || flightStart || flightEnd || budget !== undefined);
+    if (hasQuery) {
+      const dates = { start: flightStart, end: flightEnd };
+      const decorated = visible.map(p => ({
+        ...p,
+        forecast: synthForecast(p, { targeting, dates, budget }),
+      }));
+      writeJson(res, 200, { products: decorated });
+      return;
+    }
+    writeJson(res, 200, { products: visible });
+  }
+
+  // ────────────────────────────────────────────────────────────
+  // Forecast + availability (GAM-style getDeliveryForecast)
+  // ────────────────────────────────────────────────────────────
+  async function handleForecast(req: IncomingMessage, network: MockNetwork, res: ServerResponse): Promise<void> {
+    const body = await readJsonObject(req, res);
+    if (!body) return;
+    const { product_id, targeting, flight_dates, budget } = body as Record<string, unknown>;
+    if (typeof product_id !== 'string') {
+      writeJson(res, 400, { code: 'invalid_request', message: 'product_id is required.' });
+      return;
+    }
+    const product = products.find(p => p.product_id === product_id && p.network_code === network.network_code);
+    if (!product) {
+      writeJson(res, 404, { code: 'product_not_found', message: `Product ${product_id} not found.` });
+      return;
+    }
+    const dates = isObject(flight_dates) ? flight_dates : {};
+    const targetingKey = serializeTargeting(targeting);
+    const forecast = synthForecast(product, {
+      targeting: targetingKey,
+      dates: {
+        start: typeof dates.start === 'string' ? dates.start : undefined,
+        end: typeof dates.end === 'string' ? dates.end : undefined,
+      },
+      budget: typeof budget === 'number' ? budget : undefined,
+    });
+    writeJson(res, 200, forecast);
+  }
+
+  async function handleAvailability(req: IncomingMessage, network: MockNetwork, res: ServerResponse): Promise<void> {
+    const body = await readJsonObject(req, res);
+    if (!body) return;
+    const { items, dry_run } = body as Record<string, unknown>;
+    if (!Array.isArray(items) || items.length === 0) {
+      writeJson(res, 400, {
+        code: 'invalid_request',
+        message: 'items must be a non-empty array of { product_id, budget?, flight_dates? }.',
+      });
+      return;
+    }
+    if (dry_run === false) {
+      writeJson(res, 400, {
+        code: 'invalid_request',
+        message: 'availability is dry-run only; reservations happen via POST /v1/orders.',
+      });
+      return;
+    }
+
+    // Track cumulative reservations across overlapping line items so the
+    // second LI sees reduced inventory when its targeting overlaps the first.
+    // Mirrors GAM's getCompetitiveForecast semantics.
+    const reservedByProduct = new Map<string, number>();
+    const conflicts: Array<{ product_id: string; reason: string }> = [];
+    const results: Array<Record<string, unknown>> = [];
+
+    for (const raw of items) {
+      if (!isObject(raw)) {
+        writeJson(res, 400, { code: 'invalid_request', message: 'each item must be an object.' });
+        return;
+      }
+      const itemProductId = typeof raw.product_id === 'string' ? raw.product_id : null;
+      if (!itemProductId) {
+        writeJson(res, 400, { code: 'invalid_request', message: 'each item requires product_id.' });
+        return;
+      }
+      const product = products.find(p => p.product_id === itemProductId && p.network_code === network.network_code);
+      if (!product) {
+        results.push({ product_id: itemProductId, available: false, reason: 'product_not_found' });
+        conflicts.push({ product_id: itemProductId, reason: 'product_not_found' });
+        continue;
+      }
+      const itemDates = isObject(raw.flight_dates) ? raw.flight_dates : {};
+      const itemBudget = typeof raw.budget === 'number' ? raw.budget : undefined;
+      const itemTargeting = serializeTargeting(raw.targeting);
+
+      const forecast = synthForecast(product, {
+        targeting: itemTargeting,
+        dates: {
+          start: typeof itemDates.start === 'string' ? itemDates.start : undefined,
+          end: typeof itemDates.end === 'string' ? itemDates.end : undefined,
+        },
+        budget: itemBudget,
+      });
+
+      const availabilityPoint = forecast.points.find((pt: ForecastPoint) => pt.budget === undefined);
+      const availableImpressions = availabilityPoint?.metrics.impressions?.mid ?? 0;
+      const alreadyReserved = reservedByProduct.get(itemProductId) ?? 0;
+      const remaining = Math.max(0, availableImpressions - alreadyReserved);
+      const cpmForCalc = product.pricing.cpm > 0 ? product.pricing.cpm : 1;
+      const requiredImpressions = itemBudget ? Math.floor((itemBudget / cpmForCalc) * 1000) : 0;
+      const fits = requiredImpressions === 0 || remaining >= requiredImpressions;
+
+      if (!fits) {
+        conflicts.push({
+          product_id: itemProductId,
+          reason: `Requested ${requiredImpressions.toLocaleString()} impressions but only ${remaining.toLocaleString()} remain after prior items in this proposal.`,
+        });
+      }
+      reservedByProduct.set(itemProductId, alreadyReserved + requiredImpressions);
+
+      results.push({
+        product_id: itemProductId,
+        available: fits,
+        forecast,
+        tier_pricing: tierPricing(product),
+        ...(itemBudget !== undefined && {
+          required_impressions: requiredImpressions,
+          remaining_after_prior_items: remaining,
+        }),
+      });
+    }
+
+    writeJson(res, 200, {
+      available: conflicts.length === 0,
+      items: results,
+      ...(conflicts.length > 0 && { conflicts }),
+    });
+  }
+
+  function handleListCreatives(network: MockNetwork, res: ServerResponse): void {
+    const list = Array.from(creatives.values()).filter(c => c.network_code === network.network_code);
+    writeJson(res, 200, { creatives: list.map(stripBodyFingerprint) });
+  }
+
+  async function handleCreateCreative(req: IncomingMessage, network: MockNetwork, res: ServerResponse): Promise<void> {
+    const body = await readJsonObject(req, res);
+    if (!body) return;
+    const exactReplay = scenario.idempotency.check(
+      `${network.network_code}::creative`,
+      idempotencyKeyFromBody(body),
+      stableFingerprint(body)
+    );
+    if (exactReplay.kind === 'replay' || exactReplay.kind === 'conflict') {
+      writeCachedResponse(res, exactReplay.response);
+      return;
+    }
+    const { name, format_id, advertiser_id, snippet, client_request_id } = body as Record<string, unknown>;
+    if (typeof name !== 'string' || typeof format_id !== 'string' || typeof advertiser_id !== 'string') {
+      writeJson(res, 400, { code: 'invalid_request', message: 'name, format_id, advertiser_id are required.' });
+      return;
+    }
+    const fingerprint = JSON.stringify({ name, format_id, advertiser_id, snippet });
+    const replay = checkIdempotentReplay(network.network_code, 'creative', client_request_id, fingerprint);
+    if (replay.kind === 'conflict') {
+      writeJson(res, 409, { code: 'idempotency_conflict', message: replay.message });
+      return;
+    }
+    if (replay.kind === 'replay') {
+      const existing = creatives.get(replay.id);
+      if (existing) {
+        writeJson(res, 200, stripBodyFingerprint(existing));
+        return;
+      }
+    }
+    const id = `cr_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+    const cr: CreativeState = {
+      creative_id: id,
+      network_code: network.network_code,
+      name,
+      format_id,
+      advertiser_id,
+      snippet: typeof snippet === 'string' ? snippet : undefined,
+      status: 'active',
+      body_fingerprint: fingerprint,
+      created_at: new Date().toISOString(),
+    };
+    creatives.set(id, cr);
+    if (typeof client_request_id === 'string' && client_request_id.length > 0) {
+      idempotency.set(`${network.network_code}::creative::${client_request_id}`, id);
+    }
+    const responseBody = stripBodyFingerprint(cr);
+    if (exactReplay.kind === 'fresh') exactReplay.record({ status: 201, body: responseBody });
+    writeJson(res, 201, responseBody);
+  }
+
+  // ────────────────────────────────────────────────────────────
+  // Orders + state machine
+  // ────────────────────────────────────────────────────────────
+  // ────────────────────────────────────────────────────────────
+  // Proposals (lifecycle-aware: draft → committed)
+  // ────────────────────────────────────────────────────────────
+
+  async function handleCreateProposal(req: IncomingMessage, network: MockNetwork, res: ServerResponse): Promise<void> {
+    const body = await readJsonObject(req, res);
+    if (!body) return;
+    const exactReplay = scenario.idempotency.check(
+      `${network.network_code}::proposal`,
+      idempotencyKeyFromBody(body),
+      stableFingerprint(body)
+    );
+    if (exactReplay.kind === 'replay' || exactReplay.kind === 'conflict') {
+      writeCachedResponse(res, exactReplay.response);
+      return;
+    }
+    const { brief, total_budget, product_ids } = body as Record<string, unknown>;
+    const briefStr = typeof brief === 'string' ? brief : undefined;
+    const budget = isObject(total_budget)
+      ? {
+          amount: typeof total_budget.amount === 'number' ? total_budget.amount : 0,
+          currency: typeof total_budget.currency === 'string' ? total_budget.currency : 'USD',
+        }
+      : undefined;
+    // Pick referenced products OR fall back to all guaranteed products
+    // for this network. Mirrors a real planner's behaviour: caller
+    // either steers the seller toward specific inventory or lets the
+    // seller curate.
+    const eligible = products.filter(p => p.network_code === network.network_code && p.delivery_type === 'guaranteed');
+    let pickList: MockProduct[];
+    if (Array.isArray(product_ids) && product_ids.length > 0) {
+      const ids = new Set(product_ids.filter((p): p is string => typeof p === 'string'));
+      pickList = eligible.filter(p => ids.has(p.product_id));
+      if (pickList.length === 0) {
+        writeJson(res, 400, {
+          code: 'invalid_request',
+          message: 'No matching guaranteed products for the supplied product_ids.',
+        });
+        return;
+      }
+    } else {
+      pickList = eligible.slice(0, 3); // default curated set
+    }
+    if (pickList.length === 0) {
+      writeJson(res, 400, {
+        code: 'no_inventory',
+        message: 'No guaranteed products available for this network.',
+      });
+      return;
+    }
+    // Even allocation across the picked products. Real planners weight
+    // by forecast / brief alignment; the mock keeps it simple.
+    const evenSplit = Math.floor(100 / pickList.length);
+    const remainder = 100 - evenSplit * pickList.length;
+    const allocations = pickList.map((p, i) => ({
+      product_id: p.product_id,
+      allocation_percentage: evenSplit + (i === 0 ? remainder : 0),
+      indicative_cpm: p.pricing.cpm,
+    }));
+    const proposalId = `prop_${randomUUID()}`;
+    const now = new Date().toISOString();
+    const proposal: ProposalState = {
+      proposal_id: proposalId,
+      network_code: network.network_code,
+      status: 'draft',
+      ...(briefStr !== undefined && { brief: briefStr }),
+      allocations,
+      ...(budget && { total_budget: budget }),
+      created_at: now,
+      updated_at: now,
+    };
+    proposals.set(proposalId, proposal);
+    const responseBody = serializeProposal(proposal);
+    if (exactReplay.kind === 'fresh') exactReplay.record({ status: 201, body: responseBody });
+    writeJson(res, 201, responseBody);
+  }
+
+  function handleGetProposal(proposal: ProposalState, res: ServerResponse): void {
+    writeJson(res, 200, serializeProposal(proposal));
+  }
+
+  async function handleRefineProposal(
+    req: IncomingMessage,
+    proposal: ProposalState,
+    res: ServerResponse
+  ): Promise<void> {
+    if (proposal.status !== 'draft') {
+      writeJson(res, 409, {
+        code: 'invalid_state',
+        message: `Cannot refine proposal in state ${proposal.status}; only draft proposals are mutable.`,
+      });
+      return;
+    }
+    const body = await readJsonObject(req, res);
+    if (!body) return;
+    const { ask, allocation_overrides } = body as Record<string, unknown>;
+    const askStr = typeof ask === 'string' ? ask.toLowerCase() : '';
+    // Apply targeted overrides first (typed steering).
+    if (Array.isArray(allocation_overrides)) {
+      for (const raw of allocation_overrides) {
+        if (!isObject(raw)) continue;
+        const productId = raw.product_id;
+        const pct = raw.allocation_percentage;
+        if (typeof productId !== 'string' || typeof pct !== 'number') continue;
+        const target = proposal.allocations.find(a => a.product_id === productId);
+        if (target) target.allocation_percentage = pct;
+      }
+    }
+    // Free-text hints: simple keyword steering. Real planners run an LLM
+    // here; the mock is deterministic so storyboards don't flake.
+    if (askStr.includes('shift') && askStr.includes('ctv')) {
+      // Bias toward CTV products.
+      bias(proposal, p => p.channel === 'ctv', 1.5);
+    } else if (askStr.includes('shift') && (askStr.includes('video') || askStr.includes('preroll'))) {
+      bias(proposal, p => p.channel === 'video', 1.5);
+    }
+    // Renormalise to 100.
+    renormalize(proposal);
+    proposal.updated_at = new Date().toISOString();
+    writeJson(res, 200, serializeProposal(proposal));
+  }
+
+  function handleFinalizeProposal(proposal: ProposalState, res: ServerResponse): void {
+    if (proposal.status === 'committed') {
+      // Idempotent: re-finalize on a committed proposal returns the
+      // same record. Real upstreams either reject or no-op.
+      writeJson(res, 200, serializeProposal(proposal));
+      return;
+    }
+    if (proposal.status !== 'draft') {
+      writeJson(res, 409, {
+        code: 'invalid_state',
+        message: `Cannot finalize proposal in state ${proposal.status}.`,
+      });
+      return;
+    }
+    // Lock pricing — copy indicative_cpm to locked_cpm and allocate
+    // upstream line-item template ids the adapter will pass on
+    // create_media_buy.
+    for (const allocation of proposal.allocations) {
+      allocation.locked_cpm = allocation.indicative_cpm;
+      allocation.upstream_line_item_template_id = `lit_${randomUUID().slice(0, 8)}`;
+    }
+    proposal.status = 'committed';
+    // 24h inventory hold — the adopter's `expiresAtGraceSeconds`
+    // capability extends this on the AdCP side.
+    proposal.expires_at = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    proposal.updated_at = new Date().toISOString();
+    writeJson(res, 200, serializeProposal(proposal));
+  }
+
+  function bias(proposal: ProposalState, predicate: (p: MockProduct) => boolean, factor: number): void {
+    for (const allocation of proposal.allocations) {
+      const product = products.find(p => p.product_id === allocation.product_id);
+      if (product && predicate(product)) {
+        allocation.allocation_percentage = Math.round(allocation.allocation_percentage * factor);
+      }
+    }
+  }
+
+  function renormalize(proposal: ProposalState): void {
+    const total = proposal.allocations.reduce((s, a) => s + a.allocation_percentage, 0);
+    if (total === 0 || total === 100) return;
+    const scale = 100 / total;
+    for (const allocation of proposal.allocations) {
+      allocation.allocation_percentage = Math.round(allocation.allocation_percentage * scale);
+    }
+    // Round-trip drift: assign remainder to the largest allocation.
+    const drift = 100 - proposal.allocations.reduce((s, a) => s + a.allocation_percentage, 0);
+    if (drift !== 0 && proposal.allocations.length > 0) {
+      proposal.allocations.sort((a, b) => b.allocation_percentage - a.allocation_percentage);
+      proposal.allocations[0]!.allocation_percentage += drift;
+    }
+  }
+
+  function serializeProposal(proposal: ProposalState): Record<string, unknown> {
+    return {
+      proposal_id: proposal.proposal_id,
+      network_code: proposal.network_code,
+      status: proposal.status,
+      ...(proposal.brief !== undefined && { brief: proposal.brief }),
+      allocations: proposal.allocations.map(a => ({
+        product_id: a.product_id,
+        allocation_percentage: a.allocation_percentage,
+        indicative_cpm: a.indicative_cpm,
+        ...(a.locked_cpm !== undefined && { locked_cpm: a.locked_cpm }),
+        ...(a.upstream_line_item_template_id !== undefined && {
+          upstream_line_item_template_id: a.upstream_line_item_template_id,
+        }),
+      })),
+      ...(proposal.total_budget && { total_budget: proposal.total_budget }),
+      ...(proposal.expires_at !== undefined && { expires_at: proposal.expires_at }),
+      created_at: proposal.created_at,
+      updated_at: proposal.updated_at,
+    };
+  }
+
+  // ────────────────────────────────────────────────────────────
+  // Orders
+  // ────────────────────────────────────────────────────────────
+
+  function handleListOrders(network: MockNetwork, res: ServerResponse): void {
+    const list = Array.from(orders.values()).filter(o => o.network_code === network.network_code);
+    writeJson(res, 200, { orders: list.map(serializeOrder) });
+  }
+
+  async function handleCreateOrder(req: IncomingMessage, network: MockNetwork, res: ServerResponse): Promise<void> {
+    const body = await readJsonObject(req, res);
+    if (!body) return;
+    const exactReplay = scenario.idempotency.check(
+      `${network.network_code}::order`,
+      idempotencyKeyFromBody(body),
+      stableFingerprint(body)
+    );
+    if (exactReplay.kind === 'replay' || exactReplay.kind === 'conflict') {
+      writeCachedResponse(res, exactReplay.response);
+      return;
+    }
+    const { name, advertiser_id, currency, budget, client_request_id } = body as Record<string, unknown>;
+    if (
+      typeof name !== 'string' ||
+      typeof advertiser_id !== 'string' ||
+      typeof currency !== 'string' ||
+      typeof budget !== 'number'
+    ) {
+      writeJson(res, 400, {
+        code: 'invalid_request',
+        message: 'name, advertiser_id, currency, budget are all required.',
+      });
+      return;
+    }
+    const fingerprint = JSON.stringify({ name, advertiser_id, currency, budget });
+    const replay = checkIdempotentReplay(network.network_code, 'order', client_request_id, fingerprint);
+    if (replay.kind === 'conflict') {
+      writeJson(res, 409, { code: 'idempotency_conflict', message: replay.message });
+      return;
+    }
+    if (replay.kind === 'replay') {
+      const existing = orders.get(replay.id);
+      if (existing) {
+        writeJson(res, 200, serializeOrder(existing));
+        return;
+      }
+    }
+    const id = `ord_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+    const taskId = `task_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+    const now = new Date().toISOString();
+    const order: OrderState = {
+      order_id: id,
+      network_code: network.network_code,
+      name,
+      status: 'pending_approval',
+      advertiser_id,
+      currency,
+      budget,
+      approval_task_id: taskId,
+      line_items: new Map(),
+      conversions: { count: 0, dedup_keys: new Set(), total_value: 0 },
+      body_fingerprint: fingerprint,
+      created_at: now,
+      updated_at: now,
+    };
+    orders.set(id, order);
+    tasks.set(taskId, {
+      task_id: taskId,
+      order_id: id,
+      status: 'submitted',
+      poll_count: 0,
+      created_at: now,
+      updated_at: now,
+    });
+    if (typeof client_request_id === 'string' && client_request_id.length > 0) {
+      idempotency.set(`${network.network_code}::order::${client_request_id}`, id);
+    }
+    const responseBody = serializeOrder(order);
+    if (exactReplay.kind === 'fresh') exactReplay.record({ status: 201, body: responseBody });
+    writeJson(res, 201, responseBody);
+  }
+
+  function handleGetOrder(order: OrderState, res: ServerResponse): void {
+    // Auto-promote pending_approval orders by checking the task. Real
+    // platforms rely on a human review workflow; the mock advances on
+    // poll counts so adapters exercise the polling pattern without the
+    // matrix run dragging.
+    if (order.status === 'pending_approval' && order.approval_task_id) {
+      const task = tasks.get(order.approval_task_id);
+      if (task && task.status === 'completed' && task.result?.outcome === 'approved') {
+        order.status = 'approved';
+        order.updated_at = new Date().toISOString();
+        order.approval_task_id = undefined;
+        // Promote any pending line items that have creatives → delivering.
+        for (const li of order.line_items.values()) {
+          if (li.creative_ids.length > 0 && li.status === 'pending_creatives') {
+            li.status = 'delivering';
+          }
+        }
+      } else if (task && task.status === 'rejected') {
+        order.status = 'rejected';
+        order.rejection_reason = task.result?.reviewer_note ?? 'Order rejected by IO review.';
+        order.updated_at = new Date().toISOString();
+        order.approval_task_id = undefined;
+      }
+    }
+    if (order.status === 'approved') {
+      // After approval, naturally transition to delivering on first GET.
+      // Mirrors GAM's auto-activation once IO is signed.
+      order.status = 'delivering';
+      order.updated_at = new Date().toISOString();
+    }
+    writeJson(res, 200, serializeOrder(order));
+  }
+
+  function handleListLineItems(order: OrderState, res: ServerResponse): void {
+    writeJson(res, 200, {
+      line_items: Array.from(order.line_items.values()).map(stripBodyFingerprint),
+    });
+  }
+
+  async function handleCreateLineItem(req: IncomingMessage, order: OrderState, res: ServerResponse): Promise<void> {
+    const body = await readJsonObject(req, res);
+    if (!body) return;
+    const exactReplay = scenario.idempotency.check(
+      `${order.network_code}::${order.order_id}::lineitem`,
+      idempotencyKeyFromBody(body),
+      stableFingerprint({ order_id: order.order_id, body })
+    );
+    if (exactReplay.kind === 'replay' || exactReplay.kind === 'conflict') {
+      writeCachedResponse(res, exactReplay.response);
+      return;
+    }
+    if (order.status === 'completed' || order.status === 'canceled' || order.status === 'rejected') {
+      writeJson(res, 422, {
+        code: 'invalid_state_transition',
+        message: `Cannot add line items to an order in terminal status: ${order.status}.`,
+      });
+      return;
+    }
+    const { product_id, budget, ad_unit_targeting, client_request_id } = body as Record<string, unknown>;
+    if (typeof product_id !== 'string' || typeof budget !== 'number') {
+      writeJson(res, 400, { code: 'invalid_request', message: 'product_id and budget are required.' });
+      return;
+    }
+    const targeting = Array.isArray(ad_unit_targeting)
+      ? (ad_unit_targeting.filter(x => typeof x === 'string') as string[])
+      : [];
+    const fingerprint = JSON.stringify({ order_id: order.order_id, product_id, budget, ad_unit_targeting: targeting });
+    const replay = checkIdempotentReplay(order.network_code, 'lineitem', client_request_id, fingerprint);
+    if (replay.kind === 'conflict') {
+      writeJson(res, 409, { code: 'idempotency_conflict', message: replay.message });
+      return;
+    }
+    if (replay.kind === 'replay') {
+      const existing = order.line_items.get(replay.id);
+      if (existing) {
+        writeJson(res, 200, stripBodyFingerprint(existing));
+        return;
+      }
+    }
+    const id = `li_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+    const li: LineItemState = {
+      line_item_id: id,
+      order_id: order.order_id,
+      product_id,
+      status: 'pending_creatives',
+      budget,
+      ad_unit_targeting: targeting,
+      creative_ids: [],
+      body_fingerprint: fingerprint,
+      created_at: new Date().toISOString(),
+    };
+    order.line_items.set(id, li);
+    if (typeof client_request_id === 'string' && client_request_id.length > 0) {
+      idempotency.set(`${order.network_code}::lineitem::${client_request_id}`, id);
+    }
+    const responseBody = stripBodyFingerprint(li);
+    if (exactReplay.kind === 'fresh') exactReplay.record({ status: 201, body: responseBody });
+    writeJson(res, 201, responseBody);
+  }
+
+  function handleAttachCreative(
+    req: IncomingMessage,
+    order: OrderState,
+    lineItemId: string,
+    res: ServerResponse
+  ): void {
+    void readJsonObject(req, res).then(body => {
+      if (!body) return;
+      const li = order.line_items.get(lineItemId);
+      if (!li) {
+        writeJson(res, 404, { code: 'line_item_not_found', message: `Line item ${lineItemId} not found.` });
+        return;
+      }
+      const { creative_id } = body as Record<string, unknown>;
+      if (typeof creative_id !== 'string') {
+        writeJson(res, 400, { code: 'invalid_request', message: 'creative_id is required.' });
+        return;
+      }
+      if (!li.creative_ids.includes(creative_id)) li.creative_ids.push(creative_id);
+      // Promote the line item to delivering if the order is already approved.
+      if (order.status === 'delivering' || order.status === 'approved') {
+        li.status = 'delivering';
+      } else {
+        li.status = 'ready';
+      }
+      writeJson(res, 200, stripBodyFingerprint(li));
+    });
+  }
+
+  // ────────────────────────────────────────────────────────────
+  // Approval task polling — auto-progress submitted → working → completed
+  // ────────────────────────────────────────────────────────────
+  function handleGetTask(taskId: string, network: MockNetwork, res: ServerResponse): void {
+    const task = tasks.get(taskId);
+    if (!task) {
+      writeJson(res, 404, { code: 'task_not_found', message: `Task ${taskId} not found.` });
+      return;
+    }
+    const order = orders.get(task.order_id);
+    if (!order || order.network_code !== network.network_code) {
+      writeJson(res, 404, { code: 'task_not_found', message: `Task ${taskId} not found.` });
+      return;
+    }
+    task.poll_count++;
+    if (task.status === 'submitted' && task.poll_count >= 1) {
+      task.status = 'working';
+      task.updated_at = new Date().toISOString();
+    } else if (task.status === 'working' && task.poll_count >= 2) {
+      task.status = 'completed';
+      task.result = { outcome: 'approved', reviewer_note: 'IO signed; approved for delivery.' };
+      task.updated_at = new Date().toISOString();
+    }
+    writeJson(res, 200, {
+      task_id: task.task_id,
+      order_id: task.order_id,
+      status: task.status,
+      result: task.result,
+      created_at: task.created_at,
+      updated_at: task.updated_at,
+    });
+  }
+
+  // ────────────────────────────────────────────────────────────
+  // Delivery reporting + CAPI conversion ingestion
+  // ────────────────────────────────────────────────────────────
+  function handleGetDelivery(order: OrderState, res: ServerResponse): void {
+    // Synthesize plausible delivery numbers based on order budget and
+    // status. Real platforms compute from impression logs; the mock
+    // produces stable, deterministic-feeling numbers for storyboard graders.
+    const isLive = order.status === 'delivering' || order.status === 'completed';
+    const budget = order.budget ?? 50_000;
+    const totalSpend = isLive ? Math.min(budget * 0.4, budget) : 0;
+    const cpm = 35;
+    const impressions = isLive ? Math.floor((totalSpend / cpm) * 1000) : 0;
+    const clicks = Math.floor(impressions * 0.0042);
+    const viewable = Math.floor(impressions * 0.71);
+    const completions = Math.floor(impressions * 0.78);
+    writeJson(res, 200, {
+      order_id: order.order_id,
+      currency: order.currency,
+      reporting_period: {
+        start: order.created_at,
+        end: new Date().toISOString(),
+      },
+      totals: {
+        impressions,
+        clicks,
+        spend: totalSpend,
+        viewable_impressions: viewable,
+        video_completions: completions,
+        conversions: order.conversions.count,
+      },
+      line_item_breakdown: Array.from(order.line_items.values()).map(li => ({
+        line_item_id: li.line_item_id,
+        impressions: Math.floor(impressions / Math.max(1, order.line_items.size)),
+        spend: totalSpend / Math.max(1, order.line_items.size),
+      })),
+    });
+  }
+
+  async function handleIngestConversions(req: IncomingMessage, order: OrderState, res: ServerResponse): Promise<void> {
+    const body = await readJsonObject(req, res);
+    if (!body) return;
+    const { conversions } = body as Record<string, unknown>;
+    if (!Array.isArray(conversions) || conversions.length === 0) {
+      writeJson(res, 400, { code: 'empty_conversions', message: 'conversions must be a non-empty array.' });
+      return;
+    }
+    let received = 0;
+    let dedup = 0;
+    for (const c of conversions) {
+      if (!c || typeof c !== 'object') continue;
+      const conv = c as Record<string, unknown>;
+      if (typeof conv.event_name !== 'string' || typeof conv.event_time !== 'number') continue;
+      const value = typeof conv.value === 'number' ? conv.value : 0;
+      const dedupKey = typeof conv.dedup_key === 'string' ? conv.dedup_key : null;
+      if (dedupKey && order.conversions.dedup_keys.has(dedupKey)) {
+        dedup++;
+        continue;
+      }
+      if (dedupKey) order.conversions.dedup_keys.add(dedupKey);
+      order.conversions.count++;
+      order.conversions.total_value += value;
+      received++;
+    }
+    writeJson(res, 200, {
+      order_id: order.order_id,
+      events_received: received,
+      events_deduplicated: dedup,
+    });
+  }
+
+  // ────────────────────────────────────────────────────────────
+  // Helpers
+  // ────────────────────────────────────────────────────────────
+  function checkIdempotentReplay(
+    networkCode: string,
+    resourceKind: string,
+    clientRequestId: unknown,
+    fingerprint: string
+  ): { kind: 'replay'; id: string } | { kind: 'conflict'; message: string } | { kind: 'fresh' } {
+    if (typeof clientRequestId !== 'string' || clientRequestId.length === 0) return { kind: 'fresh' };
+    const key = `${networkCode}::${resourceKind}::${clientRequestId}`;
+    const existingId = idempotency.get(key);
+    if (!existingId) return { kind: 'fresh' };
+    const stored = lookupResource(resourceKind, existingId);
+    if (!stored) return { kind: 'fresh' };
+    if (stored.body_fingerprint !== fingerprint) {
+      return {
+        kind: 'conflict',
+        message: `client_request_id ${clientRequestId} was previously used with a different body. Use a fresh idempotency key for distinct requests.`,
+      };
+    }
+    return { kind: 'replay', id: existingId };
+  }
+
+  function lookupResource(kind: string, id: string): { body_fingerprint: string } | undefined {
+    if (kind === 'order') return orders.get(id);
+    if (kind === 'creative') return creatives.get(id);
+    if (kind === 'lineitem') {
+      for (const order of orders.values()) {
+        const li = order.line_items.get(id);
+        if (li) return li;
+      }
+      return undefined;
+    }
+    return undefined;
+  }
+
+  function serializeOrder(order: OrderState): Record<string, unknown> {
+    const { body_fingerprint, line_items, conversions, ...rest } = order;
+    return rest;
+  }
+}
+
+function stripBodyFingerprint<T extends { body_fingerprint?: string }>(record: T): Omit<T, 'body_fingerprint'> {
+  const { body_fingerprint, ...rest } = record;
+  return rest;
+}
+
+async function readJsonObject(req: IncomingMessage, res: ServerResponse): Promise<Record<string, unknown> | null> {
+  let body: unknown;
+  try {
+    body = await readJson(req);
+  } catch {
+    writeJson(res, 400, { code: 'invalid_json', message: 'Request body must be valid JSON.' });
+    return null;
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    writeJson(res, 400, { code: 'invalid_request', message: 'Body must be a JSON object.' });
+    return null;
+  }
+  return body as Record<string, unknown>;
+}
+
+function readJson(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', c => chunks.push(c));
+    req.on('error', reject);
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (!raw) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw));
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+}
+
+function writeJson(res: ServerResponse, status: number, body: unknown): void {
+  const json = JSON.stringify(body);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(json),
+  });
+  res.end(json);
+}
+
+interface ForecastRange {
+  low: number;
+  mid: number;
+  high: number;
+}
+interface ForecastPoint {
+  label?: string;
+  budget?: number;
+  metrics: {
+    impressions?: ForecastRange;
+    reach?: ForecastRange;
+    frequency?: ForecastRange;
+    spend?: ForecastRange;
+  };
+}
+interface SyntheticForecast {
+  points: ForecastPoint[];
+  forecast_range_unit: 'spend' | 'availability';
+  /** `guaranteed` for availability checks (the GAM-style commit-to-deliver),
+   * `modeled` for spend curves where a budget is supplied. Matches the AdCP
+   * `forecast-method` enum semantics: guaranteed = "Contractually committed
+   * delivery levels backed by reserved inventory". */
+  method: 'modeled' | 'guaranteed';
+  currency: string;
+  generated_at: string;
+}
+
+/**
+ * Deterministic forecast generator. Same (product, targeting, dates, budget)
+ * inputs always yield the same numbers — storyboard graders can assert exact
+ * values without flake. Different targeting hashes produce different
+ * availability levels so adapters can demonstrate that targeting actually
+ * affects the forecast.
+ */
+function synthForecast(
+  product: MockProduct,
+  query: {
+    targeting?: string | null;
+    dates: { start?: string; end?: string };
+    budget?: number;
+  }
+): SyntheticForecast {
+  const seedKey = stableStringify({
+    product_id: product.product_id,
+    targeting: query.targeting ?? null,
+    dates: query.dates,
+  });
+  const seed = seedFromString(seedKey);
+  const baseImpressions = product.availability?.available_impressions ?? 10_000_000;
+  // Targeting tightens supply: hash → fraction in [0.35, 0.95].
+  const supplyFraction = 0.35 + (seed.next() % 6001) / 10_000;
+  const availability = Math.floor(baseImpressions * supplyFraction);
+
+  // Guard against zero-CPM seed entries — would NaN out availabilityCost
+  // and the spend-curve tiers below. Real seeds never hit zero, but a
+  // misconfigured override would.
+  const cpm = product.pricing.cpm > 0 ? product.pricing.cpm : 1;
+  const availabilityCost = (availability / 1000) * cpm;
+  const reachAvail = Math.floor(availability * 0.42);
+
+  const availabilityPoint: ForecastPoint = {
+    label: 'available inventory',
+    metrics: {
+      impressions: range(availability, 0.85, 1.1),
+      reach: range(reachAvail, 0.85, 1.1),
+      frequency: range(availability / Math.max(1, reachAvail), 0.95, 1.05),
+      spend: range(availabilityCost, 0.95, 1.05),
+    },
+  };
+
+  // Spend-curve points. If the caller passed a budget we anchor at it; else
+  // we generate three plausible budget tiers under the availability ceiling.
+  const anchorBudget = query.budget ?? availabilityCost * 0.5;
+  const tiers = [anchorBudget * 0.5, anchorBudget, anchorBudget * 1.5];
+  const spendPoints: ForecastPoint[] = tiers.map(b => {
+    const impressions = Math.min(availability, Math.floor((b / cpm) * 1000));
+    const reach = Math.floor(impressions * 0.42);
+    return {
+      budget: Math.round(b),
+      metrics: {
+        impressions: range(impressions, 0.9, 1.05),
+        reach: range(reach, 0.9, 1.05),
+        frequency: range(impressions / Math.max(1, reach), 0.97, 1.03),
+      },
+    };
+  });
+
+  return {
+    points: [availabilityPoint, ...spendPoints],
+    forecast_range_unit: query.budget !== undefined ? 'spend' : 'availability',
+    method: query.budget !== undefined ? 'modeled' : 'guaranteed',
+    currency: product.pricing.currency,
+    generated_at: '2026-04-01T00:00:00.000Z',
+  };
+}
+
+function tierPricing(product: MockProduct): Array<{ tier: string; cpm: number; currency: string }> {
+  // Plausible-feeling, deterministic per-product tiers so the adapter has
+  // something concrete to project onto a rate card. Real platforms vary
+  // tier composition (daypart, geo, audience); we expose three tiers so the
+  // adapter can demonstrate that pricing is not a single scalar.
+  const base = product.pricing.cpm;
+  return [
+    { tier: 'open', cpm: base, currency: product.pricing.currency },
+    { tier: 'preferred', cpm: roundCpm(base * 1.15), currency: product.pricing.currency },
+    { tier: 'premium', cpm: roundCpm(base * 1.4), currency: product.pricing.currency },
+  ];
+}
+
+function roundCpm(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+function range(mid: number, lowFactor: number, highFactor: number): ForecastRange {
+  return {
+    low: Math.max(0, Math.floor(mid * lowFactor)),
+    mid: Math.max(0, Math.floor(mid)),
+    high: Math.max(0, Math.floor(mid * highFactor)),
+  };
+}
+
+function isObject(v: unknown): v is Record<string, unknown> {
+  return Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+}
+
+function parsePositiveNumber(raw: string | null | undefined): number | undefined {
+  if (raw === null || raw === undefined || raw === '') return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+function parseDateParam(raw: string | null | undefined): string | undefined {
+  if (!raw) return undefined;
+  // OpenAPI declares `format: date` (YYYY-MM-DD). Tighten beyond `Date.parse`
+  // so `?flight_start=2026` (which Date.parse accepts as Jan 1) doesn't hash
+  // to a different seed than `?flight_start=2026-01-01`. Storyboards that
+  // mix abbreviated and full dates would otherwise produce unstable forecasts.
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return undefined;
+  return Number.isFinite(Date.parse(raw)) ? raw : undefined;
+}
+
+function serializeTargeting(t: unknown): string | null {
+  if (t === null || t === undefined) return null;
+  if (typeof t === 'string') return t;
+  try {
+    return stableStringify(t);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Recursive deterministic JSON stringifier — sorts object keys at every
+ * depth so two equivalent payloads with different key insertion orders
+ * hash identically. Plain `JSON.stringify(t, keys.sort())` only sorts the
+ * top level AND treats the array as a key allowlist (silently dropping
+ * nested fields).
+ */
+function stableStringify(v: unknown): string {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(stableStringify).join(',')}]`;
+  const obj = v as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  const parts = keys.map(k => `${JSON.stringify(k)}:${stableStringify(obj[k])}`);
+  return `{${parts.join(',')}}`;
+}
+
+interface DeterministicSeed {
+  next: () => number;
+}
+
+function seedFromString(key: string): DeterministicSeed {
+  // SHA-256 → consume 4-byte windows as uint32 stream. Stable across Node
+  // versions; storyboards assert exact forecast numbers.
+  const digest = createHash('sha256').update(key).digest();
+  let offset = 0;
+  return {
+    next: () => {
+      if (offset + 4 > digest.length) {
+        // Re-hash to extend the stream if a caller exhausts it.
+        const extended = createHash('sha256').update(digest).digest();
+        digest.set(extended);
+        offset = 0;
+      }
+      const v = digest.readUInt32BE(offset);
+      offset += 4;
+      return v;
+    },
+  };
+}

@@ -1,0 +1,898 @@
+// Official A2A client implementation - NO FALLBACKS
+import {
+  ClientFactory,
+  DefaultAgentCardResolver,
+  JsonRpcTransportFactory,
+  ServiceParameters,
+  withA2AExtensions,
+  type Client,
+} from '@a2a-js/sdk/client';
+import { Role, TaskState, type SendMessageRequest, type TaskPushNotificationConfig } from '@a2a-js/sdk';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { PushNotificationConfig } from '../types/tools.generated';
+import type { DebugLogEntry } from '../types/adcp';
+import { AuthenticationRequiredError, is401Error } from '../errors';
+import { discoverOAuthMetadata } from '../auth/oauth/discovery';
+import { probeAuthChallenge } from '../auth/oauth/authorization-required';
+import { withSpan, injectTraceHeaders } from '../observability/tracing';
+import { isAgentCardPath, buildCardUrls } from '../utils/a2a-discovery';
+import {
+  buildAgentSigningContext,
+  buildAgentSigningFetch,
+  signingContextStorage,
+  type AgentSigningContext,
+} from '../signing/client';
+import type { FetchLike } from '../signing/fetch';
+import type { AgentConfig } from '../types/adcp';
+import { redactArgsForLog } from '../utils/redact-args';
+import { wrapFetchWithCapture } from './rawResponseCapture';
+import { getSignedRequestRejection, wrapFetchWithSignedRequestRejection } from './signedRequestRejection';
+import { wrapFetchWithSizeLimit } from './responseSizeLimit';
+import { wrapFetchWithTransportDiagnostics } from './transportDiagnostics';
+import { DEFAULT_REQUEST_TIMEOUT_MS, resolveRequestTimeoutMs, withAbortSignal } from './abort';
+import { getLatestA2ADataPartFromResponse } from '../utils/a2a-artifacts';
+import { createAgentTransportFetch } from '../net/agent-transport-fetch';
+import { isLikelyPrivateUrl } from '../net/address-guards';
+
+const ADCP_A2A_EXTENSION = 'https://adcontextprotocol.org/extensions/adcp/v3';
+const defaultTestFromCardUrl = (
+  cardUrl: string,
+  options: { fetchImpl: typeof fetch; legacyCompat?: A2ALegacyCompatOptions }
+) => createNativeA2AClientFromCardUrl(cardUrl, options.fetchImpl, options.legacyCompat);
+export const legacyA2AClientTestShim = { fromCardUrl: defaultTestFromCardUrl };
+
+/**
+ * Per-call state flowed through AsyncLocalStorage so concurrent callers
+ * that share a cached A2AClient don't clobber each other's debugLogs,
+ * customHeaders, or 401 flag.
+ */
+interface A2ACallContext {
+  customHeaders?: Record<string, string>;
+  debugLogs: DebugLogEntry[];
+  got401Ref: { value: boolean };
+  signal?: AbortSignal;
+  requestTimeoutMs?: number;
+  fetchFn?: typeof fetch;
+  allowPrivateIp?: boolean;
+  legacyCompat?: A2ALegacyCompatOptions;
+}
+
+/**
+ * Controls the official A2A SDK's opt-in v0.3 compatibility layer.
+ *
+ * The AdCP SDK defaults this to enabled for backwards compatibility. Set
+ * `enabled: false` to require the native A2A 1.0 card and JSON-RPC path.
+ */
+export interface A2ALegacyCompatOptions {
+  enabled: boolean;
+}
+
+const DEFAULT_A2A_LEGACY_COMPAT: Readonly<A2ALegacyCompatOptions> = Object.freeze({ enabled: true });
+
+const callContextStorage = new AsyncLocalStorage<A2ACallContext>();
+
+/**
+ * Cached A2AClient keyed by connection identity and transport policy. Avoids re-fetching
+ * /.well-known/agent.json on every tool call. The cached client's fetchImpl
+ * reads per-call state from callContextStorage, so concurrent calls to the
+ * same cache entry are safe.
+ *
+ * Process-global singleton — not suitable for multi-tenant servers that
+ * want per-tenant isolation (use separate processes or explicit cache keys).
+ */
+const a2aClientCache = new Map<string, Client>();
+const pendingA2AClients = new Map<string, Promise<Client>>();
+const MAX_CACHED_A2A_CLIENTS = 20;
+let a2aClientGeneration = 0;
+
+function getCachedA2AClient(cacheKey: string): Client | undefined {
+  const client = a2aClientCache.get(cacheKey);
+  if (!client) return undefined;
+  a2aClientCache.delete(cacheKey);
+  a2aClientCache.set(cacheKey, client);
+  return client;
+}
+
+function evictLeastRecentlyUsedA2AClients(): void {
+  while (a2aClientCache.size > MAX_CACHED_A2A_CLIENTS) {
+    const oldestKey = a2aClientCache.keys().next().value as string | undefined;
+    if (oldestKey === undefined) return;
+    a2aClientCache.delete(oldestKey);
+  }
+}
+
+/**
+ * Build the A2A connection-cache key. Mirrors the rationale in
+ * `src/lib/protocols/mcp.ts:connectionCacheKey`: when the caller is using a
+ * non-bearer scheme (RFC 7617 Basic from the CLI's `--auth-scheme basic`
+ * shape, or any future caller-injected `Authorization` header), `authToken`
+ * is undefined and the credential rides on the customHeaders bag. Hashing
+ * only `authToken` would let two callers with different `user:pass`
+ * credentials share a single cached A2AClient — single-CLI-process safe,
+ * multi-tenant SDK consumer not safe.
+ *
+ * `customHeaders` also feed the key so tenant/routing headers cannot reuse a
+ * card/client discovered for another caller. Scoped fetch calls bypass this
+ * cache entirely (see `getOrCreateA2AClient`).
+ */
+function a2aCacheKey(
+  agentUrl: string,
+  authToken?: string,
+  signingCacheKey?: string,
+  customHeaders?: Record<string, string>,
+  allowPrivateIp = false,
+  legacyCompatEnabled = true
+): string {
+  // Use the exact credential/header material in this private, in-memory key.
+  // The cached client already retains the same credential, so hashing would
+  // not reduce secret lifetime and would introduce a collision boundary.
+  // This key is never logged or persisted.
+  const fingerprint = authToken ?? extractA2AAuthHeader(customHeaders);
+  const headersKey = headersCacheMaterial(customHeaders);
+  // A serialized tuple avoids delimiter ambiguity between attacker-controlled
+  // URLs and the policy/auth suffixes (for example, a URL ending in a suffix).
+  return JSON.stringify([
+    agentUrl,
+    fingerprint ?? null,
+    headersKey ?? null,
+    signingCacheKey ?? null,
+    allowPrivateIp,
+    legacyCompatEnabled,
+  ]);
+}
+
+/**
+ * Case-insensitive lookup of `Authorization` on a header bag. Mirrors the
+ * MCP-side helper; A2A keeps its own copy because the two protocol modules
+ * intentionally don't share runtime imports.
+ */
+function extractA2AAuthHeader(headers: Record<string, string> | undefined): string | undefined {
+  if (!headers) return undefined;
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === 'authorization' && value) return value;
+  }
+  return undefined;
+}
+
+function headersCacheMaterial(headers?: Record<string, string>): string | undefined {
+  const entries = Object.entries(headers ?? {})
+    .filter(([key]) => {
+      const lower = key.toLowerCase();
+      return lower !== 'traceparent' && lower !== 'tracestate' && lower !== 'baggage';
+    })
+    .map(([key, value]) => [key.toLowerCase(), value] as const)
+    .sort(([a], [b]) => a.localeCompare(b));
+  return entries.length > 0 ? JSON.stringify(entries) : undefined;
+}
+
+function redactHeadersForDebug(headers: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.keys(headers).map(key => [key, '***']));
+}
+
+function redactPushNotificationConfigForDebug(
+  config: PushNotificationConfig | undefined
+): PushNotificationConfig | undefined {
+  if (!config) return undefined;
+  return {
+    ...config,
+    ...(config.token && { token: '***' }),
+    ...(config.authentication && {
+      authentication: {
+        ...config.authentication,
+        ...(config.authentication.credentials && { credentials: '***' }),
+      },
+    }),
+  };
+}
+
+/**
+ * Clear all cached A2A clients. Called by closeConnections('a2a').
+ * A2A clients hold no persistent network resources (unlike MCP), so this
+ * is just cache eviction.
+ */
+export function closeA2AConnections(): void {
+  a2aClientGeneration++;
+  a2aClientCache.clear();
+  pendingA2AClients.clear();
+}
+
+/**
+ * Wall-clock cap on a fire-and-forget cancel. A2A sellers that accept the
+ * TCP connect but never respond would otherwise pin the event loop past the
+ * buyer's abort, which defeats the whole point of fire-and-forget.
+ */
+const CANCEL_TIMEOUT_MS = 5000;
+
+/**
+ * Fire-and-forget A2A CancelTask for an in-flight task.
+ *
+ * Uses the official A2A 1.0 client with the same auth header shape as
+ * `callA2AToolImpl` (Bearer + x-adcp-auth). Does NOT
+ * enter `callContextStorage` — debug-log capture and 401-cache-eviction are
+ * intentionally skipped for best-effort cancellation.
+ *
+ * **Auth-code OAuth gap:** `authToken` is resolved by `getAuthToken(agent)`,
+ * which returns `undefined` for authorization-code-flow sellers (those tokens
+ * are managed by the OAuth provider path in `ProtocolClient.callTool`, not
+ * accessible here). Cancel calls to those sellers go out unauthenticated and
+ * will likely 401 non-fatally.
+ *
+ * **Phase 2 (adcp-client#1617 follow-up):** when `agent.request_signing` is
+ * configured, the cancel POST is signed with the agent's signer key. The
+ * `signingContextStorage` ALS scope around `callA2AToolImpl` does NOT extend
+ * into `pollTaskCompletion` (sibling promise trees), so we can't replay the
+ * captured ALS context — instead we rebuild a one-shot signer fetch from
+ * `agent.request_signing` directly and use it for this single POST. Inline
+ * and provider-backed configs use the shared protocol-method signing policy
+ * with the active AdCP wire-version pin. A seller that requires
+ * signing on `tasks/cancel` (or applies a uniform "all mutating POSTs must
+ * be signed" policy) now accepts the cancel; one without signing config on
+ * the agent gets the Phase 1 unsigned path.
+ *
+ * The caller is responsible for swallowing errors: cancel failure
+ * (TaskNotCancelable, network error, auth rejection, network timeout) is
+ * non-fatal because the buyer is already abandoning the task.
+ *
+ * @param agent     The agent config (used for URL, auth token, signing).
+ * @param taskId    The server-assigned A2A Task.id to cancel.
+ */
+export async function cancelA2ATask(
+  agent: AgentConfig,
+  taskId: string,
+  fetchFn?: typeof fetch,
+  allowPrivateIp?: boolean,
+  legacyCompat?: A2ALegacyCompatOptions,
+  adcpVersion?: string
+): Promise<void> {
+  // Defense-in-depth (ad-tech-protocol-expert review of #1640): the cancel
+  // request targets the discovered A2A endpoint. Calling this on an MCP agent
+  // would attempt A2A discovery against an MCP endpoint. The
+  // single call site (`pollTaskCompletion`) already gates on
+  // `agent.protocol === 'a2a'`; this assertion catches future call sites
+  // that forget the gate.
+  if (agent.protocol !== 'a2a') {
+    return;
+  }
+  const agentUrl = agent.agent_uri;
+  const transportFetch = createAgentTransportFetch(agentUrl, { trustedFetchFn: fetchFn, allowPrivateIp });
+  const authToken = agent.auth_token;
+
+  // Preserve the established best-effort cancel signing policy, using the
+  // same wire encoding, provider snapshot and WBA advertisement guard as all
+  // other protocol-method dispatches. No extra discovery is performed here.
+  let requestFetch: FetchLike = (input, init) => transportFetch(input as RequestInfo | URL, init);
+  const signingContext = buildAgentSigningContext(agent, { adcpVersion });
+  if (signingContext) {
+    requestFetch = buildAgentSigningFetch({
+      upstream: requestFetch,
+      getCapability: signingContext.getCapability,
+      adcpVersion: signingContext.adcpVersion,
+      signing: {
+        ...signingContext.signing,
+        always_sign_protocol_methods: [
+          ...new Set([...(signingContext.signing.always_sign_protocol_methods ?? []), 'tasks/cancel', 'CancelTask']),
+        ],
+      },
+    });
+  }
+
+  const timeoutSignal = AbortSignal.timeout(CANCEL_TIMEOUT_MS);
+  const fetchImpl: typeof fetch = (input, init = {}) => {
+    const headers = new Headers(init.headers);
+    if (authToken) {
+      headers.set('authorization', `Bearer ${authToken}`);
+      headers.set('x-adcp-auth', authToken);
+    }
+    const signal = init.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
+    return requestFetch(input, { ...init, headers, signal }) as Promise<Response>;
+  };
+
+  let client: Client | undefined;
+  let lastError: unknown;
+  for (const cardUrl of buildCardUrls(agentUrl)) {
+    try {
+      client = await createA2AClientFromCardUrl(cardUrl, fetchImpl, legacyCompat);
+      break;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  if (!client) throw lastError instanceof Error ? lastError : new Error('A2A agent card discovery failed');
+  await client.cancelTask({ tenant: '', id: taskId, metadata: undefined });
+}
+
+async function getOrCreateA2AClient(
+  agentUrl: string,
+  authToken: string | undefined,
+  customHeaders?: Record<string, string>,
+  bypassCache = false
+): Promise<Client> {
+  const signingContext = signingContextStorage.getStore();
+  const callContext = callContextStorage.getStore();
+  const fetchFn = callContext?.fetchFn;
+  const cacheKey = a2aCacheKey(
+    agentUrl,
+    authToken,
+    signingContext?.cacheKey,
+    customHeaders,
+    callContext?.allowPrivateIp === true,
+    callContext?.legacyCompat?.enabled ?? DEFAULT_A2A_LEGACY_COMPAT.enabled
+  );
+  // Scoped fetchers often carry request/tenant-specific egress policy. Keep
+  // those calls one-shot so neither agent-card discovery nor a client created
+  // under one policy can be reused by another caller, and so short-lived
+  // closure identities do not grow the global cache without bound.
+  if (bypassCache || fetchFn) {
+    return createA2AClient(agentUrl, authToken);
+  }
+  const cached = getCachedA2AClient(cacheKey);
+  if (cached) return cached;
+
+  const pending = pendingA2AClients.get(cacheKey);
+  if (pending) return pending;
+
+  const generation = a2aClientGeneration;
+  const promise = createA2AClient(agentUrl, authToken)
+    .then(client => {
+      if (generation !== a2aClientGeneration) {
+        throw new Error('A2A agent-card discovery completed after connection teardown');
+      }
+      a2aClientCache.set(cacheKey, client);
+      evictLeastRecentlyUsedA2AClients();
+      return client;
+    })
+    .finally(() => {
+      if (pendingA2AClients.get(cacheKey) === promise) pendingA2AClients.delete(cacheKey);
+    });
+
+  pendingA2AClients.set(cacheKey, promise);
+  return promise;
+}
+
+async function createA2AClient(agentUrl: string, authToken: string | undefined): Promise<Client> {
+  const fetchImpl = buildFetchImpl(authToken, agentUrl);
+  const cardUrls = buildCardUrls(agentUrl);
+
+  const context = callContextStorage.getStore();
+  context?.debugLogs.push({
+    type: 'info',
+    message: `A2A: Discovering agent card at ${cardUrls.join(', ')}`,
+    timestamp: new Date().toISOString(),
+  });
+
+  let client: Client | undefined;
+  let lastError: Error = new Error(`A2A agent card not found at ${cardUrls.join(', ')}`);
+  for (const cardUrl of cardUrls) {
+    try {
+      client = await createA2AClientFromCardUrl(cardUrl, fetchImpl, context?.legacyCompat);
+      break;
+    } catch (err: unknown) {
+      lastError = err as Error;
+      if (context?.got401Ref.value) break;
+    }
+  }
+  if (!client) throw lastError;
+
+  return client;
+}
+
+/**
+ * Create an official A2A client from an agent-card URL.
+ *
+ * v0.3 compatibility remains enabled by default. Pass
+ * `{ enabled: false }` as the third argument to require native A2A 1.0 card
+ * resolution and JSON-RPC transport behavior.
+ */
+export async function createA2AClientFromCardUrl(
+  cardUrl: string,
+  fetchImpl: typeof fetch,
+  legacyCompat: A2ALegacyCompatOptions = DEFAULT_A2A_LEGACY_COMPAT
+): Promise<Client> {
+  // Snapshot the policy so mutating a caller-owned options object cannot
+  // change the dialect of an already-created official SDK client.
+  const resolvedLegacyCompat = { enabled: legacyCompat.enabled !== false };
+  // Keep the long-standing unit-test seam while production uses the v1
+  // factory. Existing tests replace this shim with deterministic stubs;
+  // never consult it outside tests.
+  if (process.env.NODE_ENV === 'test' && legacyA2AClientTestShim.fromCardUrl !== defaultTestFromCardUrl) {
+    return legacyA2AClientTestShim.fromCardUrl(cardUrl, {
+      fetchImpl,
+      legacyCompat: resolvedLegacyCompat,
+    }) as unknown as Client;
+  }
+  return createNativeA2AClientFromCardUrl(cardUrl, fetchImpl, resolvedLegacyCompat);
+}
+
+async function createNativeA2AClientFromCardUrl(
+  cardUrl: string,
+  fetchImpl: typeof fetch,
+  legacyCompat: A2ALegacyCompatOptions = DEFAULT_A2A_LEGACY_COMPAT
+): Promise<Client> {
+  const factory = new ClientFactory({
+    transports: [new JsonRpcTransportFactory({ fetchImpl, legacyCompat })],
+    cardResolver: new DefaultAgentCardResolver({ fetchImpl, legacyCompat }),
+  });
+  return factory.createFromUrl(cardUrl, '');
+}
+
+function toA2APushNotificationConfig(config: PushNotificationConfig): TaskPushNotificationConfig {
+  const authentication = config.authentication as { schemes?: string[]; credentials?: string } | undefined;
+  return {
+    tenant: '',
+    id: '',
+    taskId: '',
+    url: config.url,
+    token: config.token ?? '',
+    authentication: authentication
+      ? {
+          scheme: authentication.schemes?.[0] ?? '',
+          credentials: authentication.credentials ?? '',
+        }
+      : undefined,
+  };
+}
+
+function normalizeA2APart(part: any): Record<string, unknown> {
+  switch (part?.content?.$case) {
+    case 'data':
+      return { kind: 'data', data: part.content.value, metadata: part.metadata };
+    case 'text':
+      return { kind: 'text', text: part.content.value, metadata: part.metadata };
+    case 'url':
+      return {
+        kind: 'file',
+        file: { uri: part.content.value, name: part.filename, mimeType: part.mediaType },
+        metadata: part.metadata,
+      };
+    case 'raw':
+      return {
+        kind: 'file',
+        file: { bytes: part.content.value, name: part.filename, mimeType: part.mediaType },
+        metadata: part.metadata,
+      };
+    default:
+      return part;
+  }
+}
+
+function taskStateName(state: TaskState | undefined): string | undefined {
+  switch (state) {
+    case TaskState.TASK_STATE_SUBMITTED:
+      return 'submitted';
+    case TaskState.TASK_STATE_WORKING:
+      return 'working';
+    case TaskState.TASK_STATE_COMPLETED:
+      return 'completed';
+    case TaskState.TASK_STATE_FAILED:
+      return 'failed';
+    case TaskState.TASK_STATE_CANCELED:
+      return 'canceled';
+    case TaskState.TASK_STATE_INPUT_REQUIRED:
+      return 'input-required';
+    case TaskState.TASK_STATE_REJECTED:
+      return 'rejected';
+    case TaskState.TASK_STATE_AUTH_REQUIRED:
+      return 'auth-required';
+    default:
+      return undefined;
+  }
+}
+
+function normalizeA2AResult(result: any): { result: unknown } {
+  if (result && typeof result === 'object' && ('result' in result || 'error' in result)) {
+    return result;
+  }
+  if (result && Array.isArray(result.artifacts)) {
+    return {
+      result: {
+        ...result,
+        kind: 'task',
+        status: result.status
+          ? {
+              ...result.status,
+              state: taskStateName(result.status.state),
+              message: result.status.message
+                ? {
+                    ...result.status.message,
+                    kind: 'message',
+                    parts: result.status.message.parts.map(normalizeA2APart),
+                  }
+                : undefined,
+            }
+          : undefined,
+        artifacts: result.artifacts.map((artifact: any) => ({
+          ...artifact,
+          parts: artifact.parts?.map(normalizeA2APart) ?? [],
+        })),
+      },
+    };
+  }
+  if (result && Array.isArray(result.parts)) {
+    return { result: { ...result, kind: 'message', parts: result.parts.map(normalizeA2APart) } };
+  }
+  return { result };
+}
+
+function buildFetchImpl(authToken: string | undefined, agentUrl: string) {
+  // The A2A client is cached per (url, authToken, signingCacheKey). We capture
+  // the signing context at client-creation time so all subsequent calls that
+  // share this cached client use the same signing identity — changing identity
+  // requires a different cache entry, built on a separate call that enters ALS
+  // with a different context.
+  const signingContext = signingContextStorage.getStore();
+  const pinnedFetch = createAgentTransportFetch(agentUrl, {
+    trustedFetchFn: callContextStorage.getStore()?.fetchFn,
+    allowPrivateIp: callContextStorage.getStore()?.allowPrivateIp,
+  });
+
+  // Innermost wrapper: enforce response body size cap from the active
+  // `responseSizeLimitStorage` slot. Pass-through when no slot is set.
+  const networkFetch = wrapFetchWithTransportDiagnostics(
+    wrapFetchWithSizeLimit((input, init) => pinnedFetch(input, init))
+  );
+  const rejectionFetch = signingContext ? wrapFetchWithSignedRequestRejection(networkFetch, agentUrl) : networkFetch;
+
+  // Inner fetch handles auth/header injection and 401 detection. If the
+  // agent has request-signing configured, we wrap it with the AdCP signing
+  // fetch so the signature covers the exact bytes we're about to send (auth
+  // headers included, since the signer re-reads the final header record).
+  const baseFetch = async (url: string | URL | Request, options?: RequestInit): Promise<Response> => {
+    const context = callContextStorage.getStore();
+    const urlString = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url;
+    const credentialOrigin = new URL(agentUrl).origin;
+    const sameOrigin = new URL(urlString).origin === credentialOrigin;
+
+    const existingHeaders: Record<string, string> = {};
+    if (options?.headers) {
+      if (options.headers instanceof Headers) {
+        options.headers.forEach((value, key) => {
+          existingHeaders[key] = value;
+        });
+      } else if (Array.isArray(options.headers)) {
+        for (const [key, value] of options.headers) {
+          existingHeaders[key] = value;
+        }
+      } else {
+        Object.assign(existingHeaders, options.headers);
+      }
+    }
+
+    // Agent Cards are untrusted and may advertise an RPC or extended-card URL
+    // on another origin. The transport fetch still applies DNS/IP validation
+    // there, but credentials, tenant routing, traces, and request signatures
+    // are scoped to the explicitly configured agent origin.
+    if (!sameOrigin) {
+      for (const key of Object.keys(existingHeaders)) {
+        if (!['accept', 'content-type', 'a2a-version', 'a2a-extensions'].includes(key.toLowerCase())) {
+          delete existingHeaders[key];
+        }
+      }
+    }
+
+    // Only inject trace context headers for actual tool requests, not discovery.
+    // The agent card endpoint is external/untrusted — don't leak trace IDs to it.
+    const isDiscoveryRequest = isAgentCardPath(urlString);
+    const traceHeaders = isDiscoveryRequest || !sameOrigin ? {} : injectTraceHeaders();
+    const requestTimeoutMs = isDiscoveryRequest
+      ? resolveRequestTimeoutMs(context?.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS)
+      : resolveRequestTimeoutMs(context?.requestTimeoutMs);
+
+    // Merge: existing < trace < custom < auth (auth always wins)
+    const headers: Record<string, string> = {
+      ...existingHeaders,
+      ...traceHeaders,
+      ...(sameOrigin ? context?.customHeaders : undefined),
+      ...(sameOrigin &&
+        authToken && {
+          Authorization: `Bearer ${authToken}`,
+          'x-adcp-auth': authToken,
+        }),
+    };
+
+    context?.debugLogs.push({
+      type: 'info',
+      message: `A2A: Fetch to ${urlString}`,
+      timestamp: new Date().toISOString(),
+      hasAuth: !!authToken,
+      headers: redactHeadersForDebug(headers),
+    });
+
+    const response = await withAbortSignal<Response>([context?.signal, options?.signal], requestTimeoutMs, signal =>
+      rejectionFetch(url as any, {
+        ...options,
+        headers,
+        signal,
+      })
+    );
+
+    if (response.status === 401 && context) {
+      context.got401Ref.value = true;
+    }
+
+    return response;
+  };
+
+  if (!signingContext) return wrapFetchWithCapture(baseFetch);
+
+  // The signing wrapper assembles headers into the signature base. We invoke
+  // it first so the signer sees the caller-supplied headers; baseFetch then
+  // overlays auth/trace headers afterwards — A2A's auth scheme (bearer) is
+  // not among the MANDATORY_COMPONENTS and is injected by the counterparty's
+  // transport layer, not signed.
+  const signingFetch = buildAgentSigningFetch({
+    upstream: (input, init) => baseFetch(input as any, init),
+    signing: signingContext.signing,
+    getCapability: signingContext.getCapability,
+    adcpVersion: signingContext.adcpVersion,
+  });
+  return wrapFetchWithCapture(signingFetch as typeof fetch);
+}
+
+/**
+ * Terminal A2A task states. Only these can carry the
+ * AdCP-mandated artifact + DataPart envelope (per transport-errors §A2A
+ * Binding); intermediate states (`working`, `submitted`, `input-required`,
+ * `auth-required`) carry no completion artifact.
+ */
+const TERMINAL_A2A_STATES = new Set(['completed', 'failed', 'rejected', 'canceled']);
+
+/**
+ * Detect whether a JSON-RPC response carries a spec-compliant terminal-state
+ * Task with at least one artifact containing a structured DataPart payload.
+ * Per AdCP transport-errors §A2A Binding, the artifact's DataPart is the
+ * canonical envelope for both the success arm (`completed`) and the error
+ * arms (`failed` / `rejected` / `canceled`). The criterion intentionally
+ * matches the unwrapper's terminal-state extraction in
+ * `unwrapA2AResponse` — keeping protocol layer and unwrapper in lockstep
+ * across all terminal states, not just the error arms.
+ *
+ * Used to short-circuit the generic "A2A agent returned error" throw when
+ * a non-conformant seller surfaces both a transport-level `result.error`
+ * hint and the canonical artifact envelope side-by-side. The DataPart is
+ * authoritative; the throw would otherwise swallow it.
+ */
+function hasTerminalTaskWithDataArtifact(response: unknown): boolean {
+  if (!response || typeof response !== 'object') return false;
+  const result = (response as { result?: unknown }).result;
+  if (!result || typeof result !== 'object') return false;
+  const r = result as { kind?: unknown; status?: unknown; artifacts?: unknown };
+  if (r.kind !== 'task') return false;
+  const status = r.status as { state?: unknown } | undefined;
+  if (typeof status?.state !== 'string' || !TERMINAL_A2A_STATES.has(status.state)) return false;
+  return getLatestA2ADataPartFromResponse(response) !== undefined;
+}
+
+/**
+ * Protocol-level session identifiers that ride on the A2A Message envelope
+ * (not in the skill parameters). `contextId` binds sends to a server-side
+ * conversation; `taskId` resumes an existing non-terminal task.
+ *
+ * Callers (buyers) typically retain these across calls on a per-conversation
+ * AgentClient. `getPendingTaskId()` returns this transport Task.id, not the
+ * AdCP work handle used by `tasks/get`; see `TaskResult.metadata.serverTaskId`.
+ */
+export interface A2ASessionIds {
+  contextId?: string;
+  taskId?: string;
+}
+
+export async function callA2ATool(
+  agentUrl: string,
+  toolName: string,
+  parameters: Record<string, unknown>,
+  authToken?: string,
+  debugLogs: DebugLogEntry[] = [],
+  pushNotificationConfig?: PushNotificationConfig,
+  customHeaders?: Record<string, string>,
+  signingContext?: AgentSigningContext,
+  session?: A2ASessionIds,
+  signal?: AbortSignal,
+  requestTimeoutMs?: number,
+  fetchFn?: typeof fetch,
+  allowPrivateIp?: boolean,
+  legacyCompat?: A2ALegacyCompatOptions
+): Promise<unknown> {
+  return withSpan(
+    'adcp.a2a.call_tool',
+    {
+      'adcp.tool': toolName,
+      'http.url': agentUrl,
+    },
+    async () => {
+      const context: A2ACallContext = {
+        customHeaders,
+        debugLogs,
+        got401Ref: { value: false },
+        signal,
+        requestTimeoutMs,
+        fetchFn,
+        allowPrivateIp,
+        legacyCompat,
+      };
+      return signingContextStorage.run(signingContext, () =>
+        callContextStorage.run(context, () =>
+          callA2AToolImpl(
+            agentUrl,
+            toolName,
+            parameters,
+            authToken,
+            debugLogs,
+            pushNotificationConfig,
+            context,
+            session
+          )
+        )
+      );
+    }
+  );
+}
+
+async function callA2AToolImpl(
+  agentUrl: string,
+  toolName: string,
+  parameters: Record<string, unknown>,
+  authToken: string | undefined,
+  debugLogs: DebugLogEntry[],
+  pushNotificationConfig: PushNotificationConfig | undefined,
+  context: A2ACallContext,
+  session: A2ASessionIds | undefined
+): Promise<unknown> {
+  try {
+    const client = await getOrCreateA2AClient(
+      agentUrl,
+      authToken,
+      context.customHeaders,
+      !!context.signal || context.requestTimeoutMs !== undefined
+    );
+    const legacyWire = client.protocolVersion?.startsWith('0.') ?? false;
+    const invocation = legacyWire ? { skill: toolName, parameters } : { skill: toolName, input: parameters };
+
+    const requestPayload: SendMessageRequest = {
+      tenant: '',
+      message: {
+        messageId: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        role: Role.ROLE_USER,
+        parts: [
+          {
+            content: {
+              $case: 'data',
+              value: invocation,
+            },
+            metadata: undefined,
+            filename: '',
+            mediaType: 'application/json',
+          },
+        ],
+        contextId: session?.contextId ?? '',
+        taskId: session?.taskId ?? '',
+        metadata: undefined,
+        extensions: legacyWire ? [] : [ADCP_A2A_EXTENSION],
+        referenceTaskIds: [],
+      },
+      configuration: pushNotificationConfig
+        ? {
+            acceptedOutputModes: ['application/json'],
+            taskPushNotificationConfig: toA2APushNotificationConfig(pushNotificationConfig),
+            returnImmediately: false,
+          }
+        : undefined,
+      metadata: undefined,
+    };
+
+    const payloadSize = JSON.stringify(requestPayload).length;
+    const redactedParameters = redactArgsForLog(parameters);
+    const redactedInvocation = legacyWire
+      ? { skill: toolName, parameters: redactedParameters }
+      : { skill: toolName, input: redactedParameters };
+    const redactedPayload = {
+      ...requestPayload,
+      message: {
+        ...requestPayload.message,
+        parts: [
+          {
+            content: { $case: 'data', value: redactedInvocation },
+            metadata: undefined,
+            filename: '',
+            mediaType: 'application/json',
+          },
+        ],
+      },
+      ...(requestPayload.configuration && {
+        configuration: {
+          taskPushNotificationConfig: redactPushNotificationConfigForDebug(pushNotificationConfig),
+        },
+      }),
+    };
+    debugLogs.push({
+      type: 'info',
+      message: `A2A: Calling skill ${toolName} with parameters: ${JSON.stringify(
+        redactedParameters
+      )}. Payload size: ${payloadSize} bytes`,
+      timestamp: new Date().toISOString(),
+      payloadSize,
+      actualPayload: redactedPayload,
+    });
+
+    debugLogs.push({
+      type: 'info',
+      message: `A2A: Sending message via sendMessage()`,
+      timestamp: new Date().toISOString(),
+      skill: toolName,
+    });
+
+    const result = await client.sendMessage(requestPayload, {
+      ...(legacyWire ? {} : { serviceParameters: ServiceParameters.create(withA2AExtensions(ADCP_A2A_EXTENSION)) }),
+      signal: context.signal,
+    });
+    const messageResponse: any = normalizeA2AResult(result);
+
+    debugLogs.push({
+      type: messageResponse?.error ? 'error' : 'success',
+      message: `A2A: Response received (${messageResponse?.error ? 'error' : 'success'})`,
+      timestamp: new Date().toISOString(),
+      response: messageResponse,
+      skill: toolName,
+    });
+
+    if (messageResponse?.error || messageResponse?.result?.error) {
+      // adcp-client#1575: when the seller emits a spec-compliant terminal-state
+      // Task carrying an `adcp_error` DataPart (per AdCP transport-errors §A2A
+      // Binding), the structured artifact is canonical — even if the seller
+      // also surfaced a transport-level error string. Pass the response
+      // through so the upstream unwrapper extracts `adcp_error.code` instead
+      // of throwing a generic message that loses the AdCP error envelope.
+      if (!hasTerminalTaskWithDataArtifact(messageResponse)) {
+        const errorObj = messageResponse.error || messageResponse.result?.error;
+        const errorMessage = errorObj.message || JSON.stringify(errorObj);
+        throw new Error(`A2A agent returned error: ${errorMessage}`);
+      }
+    }
+
+    return messageResponse;
+  } catch (error: unknown) {
+    if (is401Error(error, context.got401Ref.value)) {
+      // Evict this cache entry — credential may have expired or been
+      // revoked. Same disambiguator as the original `getOrCreateA2AClient`
+      // call: when the credential rode on customHeaders.Authorization (Basic
+      // case) rather than authToken, the cache key must reflect that or we
+      // evict the wrong entry.
+      const signingContext = signingContextStorage.getStore();
+      a2aClientCache.delete(
+        a2aCacheKey(
+          agentUrl,
+          authToken,
+          signingContext?.cacheKey,
+          context.customHeaders,
+          context.allowPrivateIp === true,
+          context.legacyCompat?.enabled ?? DEFAULT_A2A_LEGACY_COMPAT.enabled
+        )
+      );
+
+      debugLogs.push({
+        type: 'error',
+        message: `A2A: Authentication required for ${agentUrl}`,
+        timestamp: new Date().toISOString(),
+      });
+
+      const signedRejection = getSignedRequestRejection(error);
+      if (signedRejection) throw signedRejection;
+
+      // Re-probe to surface the WWW-Authenticate scheme on the error envelope.
+      // Basic-fronted agents (Apigee/Kong/AWS API GW with a BasicAuthentication
+      // policy) would otherwise leave consumers chasing OAuth metadata that
+      // doesn't exist. Matches the MCP discovery throw site in
+      // `SingleAgentClient.discoverMCPEndpoint`.
+      const challenge = await probeAuthChallenge(agentUrl, {
+        fetchFn: context.fetchFn,
+        allowPrivateIp: context.allowPrivateIp ?? isLikelyPrivateUrl(agentUrl),
+      });
+      const oauthMetadata = await discoverOAuthMetadata(agentUrl, {
+        trustedFetchFn: context.fetchFn,
+        allowPrivateIp: context.allowPrivateIp ?? isLikelyPrivateUrl(agentUrl),
+      });
+      throw new AuthenticationRequiredError(agentUrl, oauthMetadata || undefined, undefined, challenge ?? undefined);
+    }
+
+    throw error;
+  }
+}

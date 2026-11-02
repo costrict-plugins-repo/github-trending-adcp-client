@@ -1,0 +1,202 @@
+# Add AdCP to an existing application
+
+This is the thin integration path for an application that already owns authentication, transactions, and durable storage. It adds one public SDK client and one task without replacing those boundaries. The compiling source is [`examples/existing-platform-thin.ts`](../../examples/existing-platform-thin.ts).
+
+## Ownership boundaries
+
+| Concern | Owner | Production note |
+| --- | --- | --- |
+| MCP/A2A transport, version adaptation, request validation, task status normalization | SDK | Uses the official protocol clients. |
+| User authentication, tenant selection, seller-account authorization | Application | Derive these before calling the SDK; never put credentials in `ctx_metadata`. |
+| Business transaction and task-handle storage | Application contract | Persist serializable `metadata.taskId`, `metadata.serverTaskId`, status, and any idempotency key before leaving the request. Never serialize continuation closures. |
+| Conversation and webhook registration defaults | SDK process memory | Install the documented durable adapters before horizontal scaling or restart-sensitive use. |
+| Submitted-task polling and callback verification | Shared | The SDK performs protocol work; the application supplies cancellation, durable recovery, and current authorization before replay. |
+
+The example accepts an already authenticated request context, rechecks tenant/account authorization before starting a submitted-task poll, calls `list_products`, records the initial mixed-status result in the application's transaction, and records terminal settlement after polling. Its store also implements `WebhookRegistrationStore` and idempotent `recordWebhookSettlement`, so verified callbacks can resolve the persisted operation to its tenant, re-authorize, and save completion after a restart. It imports only from `@adcp/sdk`, uses no private `dist/` path, and does not enable the optional schema subpath.
+
+## Migrate targeting adapters without casts
+
+AdCP 3.2 mutation targeting is a command shape, while accepted provider state
+and response readback are strict state shapes. The packed, compile-gated
+[`targeting-input-existing-platform.ts`](../../examples/targeting-input-existing-platform.ts)
+example derives its input types from the public `BuyProductsRequest` and
+`ControlMediaBuyRequest` exports and uses only public projection helpers.
+
+| Request state | Adapter action | Accepted/readback state |
+| --- | --- | --- |
+| Dimension omitted | Create: preserve the product/provider default. Update: make no provider call and retain stored state. | Existing strict value remains; no command is stored. |
+| Dimension `null` | Verify that the product and provider support clearing, then send the provider's explicit clear/replacement operation. | The dimension is absent. Never echo `null`. |
+| Dimension has a value | Translate and replace the complete provider dimension. | Persist and return the validated value. |
+
+Translate the original request into provider set/clear operations first; do not
+drop `null` before the provider executes the clear. On create, start from the
+selected product's strict configured/default targeting and call
+`applyTargetingInput()` so omitted dimensions are materialized, cleared defaults
+are removed, and supplied dimensions replace them. On update, load the prior
+strict state and apply the same helper. Commit only that complete strict result.
+`resolveTargetingInput()` removes request commands but cannot materialize create
+defaults on its own. If the provider succeeds but the local commit fails,
+reconcile through the application's existing transaction or outbox boundary.
+The outer `control_media_buy` handler must also serialize or CAS the whole
+read-provider-save block using the request revision so concurrent patches cannot
+lose an accepted dimension. The example's provider seam assumes exact, atomic
+application: an adapter whose provider normalizes values should return its
+canonical post-mutation readback and persist that instead of the request value.
+
+The example deliberately throws `UnsupportedTargetingClearError` before any
+provider call or durable write. Do not cast the request to a strict overlay,
+drop `null` keys before the provider has executed the clear, or persist the
+request object unchanged. Provider adapters should also reject targeting
+dimensions they do not translate instead of silently discarding them.
+
+Configure the callback as an absolute template containing both trusted route macros, for example `https://buyer.example/adcp/webhook/{task_type}/{operation_id}`. Supply a framework adapter that derives the public URL only from server-owned configuration, and mount raw-body parsing on the matching route:
+
+```ts
+app.post(
+  '/adcp/webhook/:task_type/:operation_id',
+  express.raw({ type: 'application/json' }),
+  integration.createWebhookHandler({
+    getRequestUrl: req => `https://buyer.example${req.originalUrl}`,
+  })
+);
+```
+
+Do not derive the external URL from untrusted `Host` or forwarding headers. The durable registration store proves which callback was registered; the status handler is what commits the verified settlement into application storage.
+
+The submitted continuation's `waitForCompletion` function is deliberately process-local. Persist its identifiers for reconciliation, and use the durable callback registration path for completion after a restart. PostgreSQL and Redis adapters are available when the application store does not implement `WebhookRegistrationStore` directly; see [Push notification configuration](./PUSH-NOTIFICATION-CONFIG.md).
+
+## Cancellation and errors
+
+| Path | Bound | Cancellation outcome | Remote/protocol failure |
+| --- | --- | --- | --- |
+| Client task | `TaskOptions.timeout` is one absolute task deadline; `signal` is caller cancellation | Throws the abort/timeout error | Returns `TaskResult` with `success: false` and structured `adcpError` |
+| `validateAdAgents` | `signal` spans the whole discovery; `timeoutMs` bounds each fetch | Throws the signal's abort reason and starts no later fallback | Returns `valid: false` with discovery errors |
+| Submitted wait | `waitForCompletion(interval, signal)` | Stops polling; A2A cancellation is a best-effort protocol courtesy | Returns the latest/terminal `TaskResult` |
+| Transport observer | Operational responses return immediately. Diagnostic text bodies are cloned and captured asynchronously up to 64 KiB with a 1 s capture ceiling; explicitly over-limit, SSE, and non-text bodies are skipped with `responseBodyTruncated: true` | Never consumes or delays the operational response stream | Observer rejection is isolated from protocol behavior |
+
+Do not catch every outcome into a string. Switch on `result.status`; use `result.adcpError` for failed results, and catch thrown cancellation/configuration errors separately. Internal transport retries reuse an idempotency key. A new application intent must receive a new key; after an ambiguous timeout, reconcile by the persisted natural key before deciding to retry.
+
+Transport diagnostics never delay delivery of the operational `Response`.
+Each request emits `request_started`, then `response_received`, then (for
+streamed replies) `response_completed`. `response_received` means **response
+headers arrived**: its `durationMs` is time to headers. For an MCP server that
+answers over `text/event-stream`, that is not the end of the reply, so do not
+record it as a finished call.
+
+Bodies are captured only when they are text-like and declare a finite
+`Content-Length` of at most 64 KiB. Those are cloned synchronously and read in
+the background for at most `BODY_SNIPPET_TIMEOUT_MS` (currently 1 second), and
+their single `response_received` event is emitted when capture completes,
+truncates, or expires. The enclosing task then waits within
+`OBSERVER_FLUSH_TIMEOUT_MS` for that event's asynchronous observer, so
+short-lived processes do not lose the final audit record.
+
+Every other body is never cloned or buffered: SSE, non-text content, chunked
+responses or responses with a missing or invalid `Content-Length`, and bodies
+declared over the limit. Their `response_received` event is emitted
+immediately with `responseBodyTruncated: true` and, when the body can be observed, `streaming: true`; `streaming` is the signal that a `response_completed` event will follow. The body
+is passed through an observing stream with the same bytes, status, headers,
+`url`, `redirected`, and `type`, and with pull-driven backpressure. When the
+caller finishes with it, exactly one `response_completed` event reports
+`outcome`, total `bytes`, and `durationMs` measured from `startedAt`:
+
+| `outcome`   | Meaning                                                                    |
+| ----------- | -------------------------------------------------------------------------- |
+| `ended`     | The caller read the stream to EOF.                                         |
+| `errored`   | The stream failed (`errorName` / sanitized `errorMessage` are set).        |
+| `aborted`   | The request's `AbortSignal` fired (also when the body is cancelled after it fired), or the stream failed with an abort error. |
+| `cancelled` | The consumer cancelled the body, including SDK cleanup after delivering a successful MCP result. |
+
+A streamed call that never answers therefore shows `response_received` with no
+matching `response_completed` until the caller aborts it (for example, when its
+deadline fires an `AbortSignal` on the request), then an `aborted` completion. `response_completed` is fire-and-forget: it can arrive
+after the diagnostics scope exits, the scope never waits for it, and a body
+that is never read or aborted never emits one. It carries the request correlation
+fields, `httpStatus`, and `statusText`, but no request or response bodies and no
+response headers. The SDK does not parse SSE messages, so it cannot say whether
+a stream carried a final result.
+
+Observer failures remain isolated. Applications should synchronously enqueue
+each event into their own bounded in-memory or durable queue and return
+promptly; flushing that queue is an application lifecycle concern.
+
+## Reuse scoped capability evidence
+
+For evidence shared across separate client instances, use the opt-in [discovery cache](./DISCOVERY-CACHE-AND-SESSION-REUSE.md). That guide also covers MCP connection scopes and per-call session reuse.
+
+An application factory that already performs a bounded seller preflight can
+construct and prime the specific client instance before exposing it for task
+dispatch:
+
+```ts
+let agent: AgentClient;
+try {
+  agent = await AgentClient.createWithCapabilityPreflight(
+    agentConfig,
+    async ({ client, scope }) => ({
+      ...(await tenantScopedCapabilityPreflight(client, scope, signal)),
+      scope,
+    }),
+    clientOptions,
+  );
+} catch (error) {
+  if (!(error instanceof CapabilityPreflightError)) throw error;
+  agent = new AgentClient(agentConfig, clientOptions);
+  await agent.getCapabilities({ signal }); // safe cold-discovery fallback
+}
+```
+
+The callback receives the exact instance the factory returns. The factory
+primes it before any caller can dispatch a task. Refusal throws a typed
+`CapabilityPreflightError`: `scoped_transport`, `scope_rotated`, or
+`invalid_evidence`. The compiling
+`examples/existing-platform-thin.ts` factory demonstrates a cold-discovery
+fallback without removing a scoped transport. The scope binds evidence to the normalized
+endpoint, configured AdCP release, and this immutable client's
+authorization/transport instance; preserve the seller's normalized
+`capabilities.servedVersion` when the preflight supplies it. Use one client per
+authorization context. Include `toolSchemas` when the preflight observed MCP
+`tools/list`; compatibility projection augments and uses the same tool
+evidence. A constructor-level scoped fetch refuses priming with
+`code: 'scoped_transport'`; keep that fetch and construct normally so
+discovery runs within its narrower transport scope. A per-call
+`trustedFetchFn` likewise bypasses primed state.
+
+For an already-constructed client, the lower-level
+`getCapabilityEvidenceScope()` plus `primeCapabilities()` pair remains
+available. Expired, malformed, endpoint-mismatched, release-mismatched, or
+differently scoped evidence is refused, clears older cached state, and leaves
+discovery cold; `refreshCapabilities()` rotates the scope so older snapshots
+cannot be reinstalled.
+
+This is same-instance preflight reuse, not a durable cache identity. The opaque
+`scopeKey` is created per client instance and is intentionally not reconstructable
+from endpoint, credentials, or version. After a process restart, a snapshot
+persisted by the old client is refused by the new client even when its timestamps
+are still fresh. Do not attach the new scope to that old observation. Construct
+the replacement client first, obtain its scope, and either perform a fresh
+tenant-scoped preflight for that scope or let `getCapabilities()` discover cold:
+
+```ts
+const replacement = await AgentClient.createWithCapabilityPreflight(
+  {
+    id: 'seller',
+    name: 'Seller',
+    agent_uri: sellerUrl,
+    protocol: 'mcp',
+    auth_token: requestScopedAuthToken,
+  },
+  async ({ client, scope }) => ({
+    ...(await tenantScopedCapabilityPreflight(client, scope, signal)),
+    scope,
+  }),
+  clientOptions,
+);
+```
+
+An application-owned persisted discovery cache may still accelerate the
+application's own preflight logic, but it cannot currently be installed across
+SDK client instances. Retain a process-local client when same-instance reuse is
+required; otherwise budget for fresh discovery after reconstruction.
+
+For durable webhook and reporting flows, continue with [Push notification configuration](./PUSH-NOTIFICATION-CONFIG.md) and the [Reporting ledger](./REPORTING-LEDGER.md).

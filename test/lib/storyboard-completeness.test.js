@@ -1,0 +1,287 @@
+/**
+ * Structural completeness tests for every storyboard in the compliance cache.
+ *
+ * Validates that every YAML in `compliance/cache/{version}/` has the
+ * infrastructure needed to run:
+ * - Required fields (id, version, title, phases)
+ * - Every task has a response schema registered (for field validation)
+ * - Every step has either a request builder or sample_request fallback
+ * - Phase and step IDs are unique within their parent
+ */
+
+const { describe, it } = require('node:test');
+const assert = require('node:assert/strict');
+
+const { listAllComplianceStoryboards } = require('../../dist/lib/testing/storyboard/index.js');
+const { VALIDATION_ONLY_TASK, normalizeValidationOnlyTasks } = require('../../dist/lib/testing/index.js');
+const { runStoryboard, runStoryboardStep } = require('../../dist/lib/testing/storyboard/runner.js');
+const { hasRequestBuilder } = require('../../dist/lib/testing/storyboard/request-builder.js');
+const { TASK_TO_METHOD } = require('../../dist/lib/testing/storyboard/task-map.js');
+const { TOOL_REQUEST_SCHEMAS } = require('../../dist/lib/utils/tool-request-schemas.js');
+const { TOOL_RESPONSE_SCHEMAS } = require('../../dist/lib/utils/response-schemas.js');
+
+const allStoryboards = listAllComplianceStoryboards();
+
+// Upstream ships placeholder storyboards with empty phases for protocols/specialisms
+// whose conformance tests haven't been written yet. Skip structural assertions on those.
+const storyboards = allStoryboards.filter(sb => Array.isArray(sb.phases) && sb.phases.length > 0);
+
+// Tasks that are part of the test harness — not protocol tools
+const HARNESS_TASKS = new Set([
+  VALIDATION_ONLY_TASK,
+  'comply_test_controller',
+  // Synthetic tasks dispatched by the storyboard runner — no corresponding
+  // AdCP tool or response schema. Raw HTTP probes and flag-accumulator steps.
+  'protected_resource_metadata',
+  'oauth_auth_server_metadata',
+  'assert_contribution',
+  // Synthesized request-signing steps — the runner builds each request from
+  // a test-vector fixture; no `sample_request` shape applies.
+  'request_signing_probe',
+  // Runner-native probes added by webhook/key-publishing and idempotency
+  // compliance storyboards. They inspect metadata or runner-observed traffic
+  // rather than dispatching protocol tools.
+  'fetch_brand_jwks',
+  'assert_jwks_purpose',
+  'expect_rate_limit_not_replayed',
+  // Webhook-assertion pseudo-tasks (adcontextprotocol/adcp#2431). The runner
+  // observes the shared receiver rather than driving the agent, so these
+  // steps have no request shape.
+  'expect_webhook',
+  'expect_no_webhook',
+  'expect_webhook_retry_keys_stable',
+  'expect_webhook_signature_valid',
+  // Inbound webhook receiver conformance replays a fixture into the local
+  // receiver instead of invoking a seller protocol tool.
+  'replay_webhook_vector',
+  'replay_trusted_match_context_vector',
+  'trusted_match_missing_auth_context_probe',
+  'trusted_match_invalid_auth_context_probe',
+  'trusted_match_missing_auth_identity_probe',
+  'trusted_match_invalid_auth_identity_probe',
+  'fetch_brand_jwks',
+  'assert_jwks_purpose',
+  'expect_rate_limit_not_replayed',
+  // Substitution-safety observer for catalog-driven sellers. The runner
+  // inspects the previous step's preview artifact rather than issuing a
+  // tool call — no request or response schema applies.
+  'expect_substitution_safe',
+  // Rate-limit replay observer (universal/idempotency.yaml). The runner
+  // drives the `rate_limit_trip_runner` contract — fresh-key burst until a
+  // `RATE_LIMITED` arrives, then replays the captured key after
+  // `retry_after` and asserts the response is not the cached rate-limit.
+  // No standalone request shape; the runner builds requests itself.
+  'expect_rate_limit_not_replayed',
+  // Brand.json/JWKS probes (universal/webhook-emission.yaml). The runner
+  // fetches brand.json + walks `agents[].jwks_uri`, then inspects the JWKS
+  // for keys with `adcp_use: "webhook-signing"`. Both are raw HTTP probes
+  // against `brand_json_url` / `jwks_uri`, not AdCP tool calls.
+  'fetch_brand_jwks',
+  // `assert_jwks_purpose` is the runner-side check the spec uses to assert
+  // a JWKS key advertises a specific `adcp_use` purpose (e.g.
+  // `webhook-signing`). No AdCP tool call; the runner inspects the JWKS
+  // fetched in the prior `fetch_brand_jwks` step.
+  'assert_jwks_purpose',
+]);
+
+// Tasks that reference test-kit data (e.g. "$test_kit.auth.probe_task"). The
+// runner resolves these at execution time; they aren't MCP tool names.
+function isTestKitReference(task) {
+  return typeof task === 'string' && task.startsWith('$test_kit.');
+}
+
+describe('storyboard structural completeness', () => {
+  it('loads at least 25 compliance storyboards from the cache', () => {
+    assert.ok(storyboards.length >= 25, `Expected ≥25 storyboards, got ${storyboards.length}`);
+  });
+
+  for (const sb of storyboards) {
+    describe(`storyboard: ${sb.id}`, () => {
+      it('has required top-level fields', () => {
+        assert.ok(sb.id, 'missing id');
+        assert.ok(sb.version, 'missing version');
+        assert.ok(sb.title, 'missing title');
+        // 3.2 storyboards may use the concise top-level `summary` in place
+        // of the older long-form `narrative` field.
+        assert.ok(sb.narrative || sb.summary, 'missing narrative or summary');
+        assert.ok(Array.isArray(sb.phases), 'phases must be an array');
+      });
+
+      it('has unique phase IDs', () => {
+        const ids = sb.phases.map(p => p.id);
+        const unique = new Set(ids);
+        assert.equal(unique.size, ids.length, `Duplicate phase IDs: ${ids.filter((id, i) => ids.indexOf(id) !== i)}`);
+      });
+
+      for (const phase of sb.phases) {
+        describe(`phase: ${phase.id}`, () => {
+          it('has required fields', () => {
+            assert.ok(phase.id, 'missing phase id');
+            assert.ok(phase.title, 'missing phase title');
+            assert.ok(Array.isArray(phase.steps), 'steps must be an array');
+            assert.ok(phase.steps.length > 0, 'must have at least one step');
+          });
+
+          it('has unique step IDs', () => {
+            const ids = phase.steps.map(s => s.id);
+            const unique = new Set(ids);
+            assert.equal(
+              unique.size,
+              ids.length,
+              `Duplicate step IDs in phase ${phase.id}: ${ids.filter((id, i) => ids.indexOf(id) !== i)}`
+            );
+          });
+
+          for (const step of phase.steps) {
+            describe(`step: ${step.id}`, () => {
+              it('has required fields', () => {
+                assert.ok(step.id, 'missing step id');
+                assert.ok(step.title, 'missing step title');
+                if (step.task === '__validation_only__') {
+                  assert.ok(
+                    Array.isArray(step.validations) && step.validations.length > 0,
+                    'a validation-only step must have validations'
+                  );
+                } else {
+                  assert.ok(step.task, 'missing task');
+                }
+              });
+
+              it('has a request builder or sample_request', () => {
+                if (step.task === undefined) return;
+                // Synthetic runner tasks (HTTP probes, flag accumulators) build their
+                // own request; they don't need a builder or sample_request.
+                if (HARNESS_TASKS.has(step.task) || isTestKitReference(step.task)) return;
+                const hasBuilder = hasRequestBuilder(step.task);
+                const hasSample = step.sample_request !== undefined && step.sample_request !== null;
+                assert.ok(
+                  hasBuilder || hasSample,
+                  `Step ${sb.id}/${step.id} (task: ${step.task}) has no request builder and no sample_request`
+                );
+              });
+            });
+          }
+        });
+      }
+    });
+  }
+});
+
+describe('response schema coverage', () => {
+  const allTasks = new Set();
+  for (const sb of storyboards) {
+    for (const phase of sb.phases) {
+      for (const step of phase.steps) {
+        if (typeof step.task === 'string') allTasks.add(step.task);
+      }
+    }
+  }
+
+  for (const task of [...allTasks].sort()) {
+    if (HARNESS_TASKS.has(task) || isTestKitReference(task)) continue;
+
+    it(`${task} has a registered response schema`, () => {
+      assert.ok(
+        TOOL_RESPONSE_SCHEMAS[task],
+        `Task "${task}" is used in storyboards but has no response schema in TOOL_RESPONSE_SCHEMAS`
+      );
+    });
+  }
+});
+
+describe('AdCP 3.2 request schema coverage', () => {
+  for (const task of [
+    'get_principal',
+    'sync_principal',
+    'get_reporting_status',
+    'sync_reporting_status',
+    'sync_reporting_receipts',
+  ]) {
+    it(`${task} has a registered request schema`, () => {
+      assert.ok(TOOL_REQUEST_SCHEMAS[task], `Task "${task}" has no request schema in TOOL_REQUEST_SCHEMAS`);
+    });
+  }
+});
+
+describe('task execution coverage', () => {
+  const allTasks = new Set();
+  for (const sb of storyboards) {
+    for (const phase of sb.phases) {
+      for (const step of phase.steps) {
+        if (typeof step.task === 'string') allTasks.add(step.task);
+      }
+    }
+  }
+
+  it('all tasks are either mapped or handled by executeTask fallback', () => {
+    const mapped = [...allTasks].filter(t => t in TASK_TO_METHOD);
+    const fallback = [...allTasks].filter(t => !(t in TASK_TO_METHOD));
+    assert.ok(mapped.length > 0, 'should have at least some mapped tasks');
+    assert.ok(mapped.length + fallback.length === allTasks.size);
+  });
+});
+
+describe('validation-only storyboard steps', () => {
+  it('exports the normalization contract from the public testing entrypoint', () => {
+    assert.equal(VALIDATION_ONLY_TASK, '__validation_only__');
+    assert.equal(typeof normalizeValidationOnlyTasks, 'function');
+  });
+
+  it('reports a validation-only step as an unsupported runner coverage gap without dispatching', async () => {
+    let dispatches = 0;
+    const profile = { name: 'Test', tools: [] };
+    const storyboard = {
+      id: 'validation_only_test',
+      version: '1.0.0',
+      title: 'Validation-only test',
+      category: 'test',
+      phases: [
+        {
+          id: 'interpretation',
+          title: 'Interpretation',
+          steps: [
+            {
+              id: 'interpret',
+              title: 'Interpret',
+              validations: [{ check: 'output_contains', field: 'candidates' }],
+            },
+          ],
+        },
+      ],
+    };
+    Object.freeze(storyboard.phases[0].steps[0]);
+    Object.freeze(storyboard.phases[0].steps);
+    Object.freeze(storyboard.phases[0]);
+    Object.freeze(storyboard.phases);
+    Object.freeze(storyboard);
+    const result = await runStoryboardStep('https://seller.example/mcp', storyboard, 'interpret', {
+      protocol: 'mcp',
+      _profile: profile,
+      _client: {
+        getAgentInfo: async () => profile,
+        callTool: async () => {
+          dispatches += 1;
+        },
+      },
+    });
+    assert.equal(result.task, '__validation_only__');
+    assert.equal(storyboard.phases[0].steps[0].task, undefined);
+    assert.equal(result.skipped, true);
+    assert.equal(result.skip_reason, 'fixture_unavailable');
+    assert.equal(dispatches, 0);
+
+    const fullResult = await runStoryboard('https://seller.example/mcp', storyboard, {
+      protocol: 'mcp',
+      _profile: profile,
+      _client: {
+        getAgentInfo: async () => profile,
+        callTool: async () => {
+          dispatches += 1;
+        },
+      },
+    });
+    assert.equal(fullResult.overall_passed, false);
+    assert.equal(fullResult.phases[0].steps[0].skip_reason, 'fixture_unavailable');
+    assert.equal(dispatches, 0);
+  });
+});

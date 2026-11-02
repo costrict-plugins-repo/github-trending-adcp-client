@@ -1,0 +1,1492 @@
+import { randomBytes } from 'crypto';
+import { buildNegativeRequest, buildPositiveRequest, type BuildOptions, type SignedHttpRequest } from './builder';
+import { initializeMcpSession, probeSignedRequest, type ProbeOptions, type ProbeResult } from './probe';
+import { loadRequestSigningVectors, selectRequestSigningVectors, type LoadVectorsOptions } from './vector-loader';
+import { captureA2aRequest, operationFromVectorUrl, type CapturedA2aRequest } from './a2a-dispatch';
+import { loadSignedRequestsRunnerContract, type SignedRequestsRunnerContract } from './test-kit';
+import { gradeA2aOperationResolution, type A2aOperationResolutionSummary } from './a2a-operation-resolution';
+import {
+  InMemoryReplayStore,
+  InMemoryRevocationStore,
+  MANDATORY_COMPONENTS,
+  RequestSignatureError,
+  StaticJwksResolver,
+  verifyRequestSignature,
+  type AdcpJsonWebKey,
+} from '../../../signing';
+import { parseSignatureInput } from '../../../signing/parser';
+import type { A2aVectorTier, NegativeVector, PositiveVector, VerifierCapabilityFixture } from './types';
+
+export interface GradeOptions extends LoadVectorsOptions {
+  /** Grade only authored 3.2 profile vectors. Omit for the legacy root corpus. */
+  signingProfileVersion?: '3.2';
+  /** Allow http:// and private-IP destinations. Off by default (match fetchProbe). */
+  allowPrivateIp?: boolean;
+  /** Skip the rate-abuse vector (it sends 100+ requests; slow). Defaults to false. */
+  skipRateAbuse?: boolean;
+  /**
+   * Override the rate-abuse cap the grader targets. Defaults to the contract's
+   * `grading_target_per_keyid_cap_requests`. Agents that advertise a smaller
+   * per-keyid cap for the test counterparty MAY lower this so grading finishes
+   * in a reasonable time — see test-kits/signed-requests-runner.yaml.
+   */
+  rateAbuseCap?: number;
+  /**
+   * Vector IDs to skip for operator-driven reasons (SDK-internal vectors,
+   * environment-specific quirks, etc.). Capability-profile mismatches
+   * don't belong here — pass {@link agentCapability} and the grader auto-
+   * skips vectors whose `verifier_capability` can't match the agent.
+   */
+  skipVectors?: string[];
+  /**
+   * Agent's declared `request_signing` capability block — exactly the shape
+   * in `get_adcp_capabilities.response.request_signing`. When provided, the
+   * grader pre-flights every vector's `verifier_capability` against this
+   * profile and auto-skips any vector that asserts a policy the agent
+   * didn't advertise (e.g., vector 007 requires `covers_content_digest:
+   * 'required'`; agent declares `'either'` — auto-skipped with
+   * `skip_reason: 'capability_profile_mismatch'`). The grader also parses
+   * each vector's `Signature-Input` and auto-skips vectors whose actual
+   * signed components are structurally incompatible with the agent's
+   * policy (uncovered `content-digest` against a `'required'` verifier,
+   * or covered `content-digest` against a `'forbidden'` verifier). A vector
+   * expecting that exact policy refusal remains gradable.
+   *
+   * Without this option, every vector runs and cap-profile mismatches
+   * produce failed vectors that the operator has to manually translate
+   * into `skipVectors` entries — fragile and easy to get wrong per
+   * profile. Set `agentCapability` and `skipVectors` collapses to just
+   * the handful of operator-specific overrides (like vector 025, which
+   * exercises the SDK library rather than the agent).
+   */
+  agentCapability?: VerifierCapabilityFixture;
+  /**
+   * When set, run only the named vector ids (all others auto-skip). Takes
+   * precedence over `skipVectors`. Useful for isolated regression tests
+   * against a single vector without hand-maintaining an inverted skip list.
+   */
+  onlyVectors?: string[];
+  /**
+   * Opt in to running vectors that produce live agent-side effects — vector
+   * 016 (replay_window) sends a valid `create_media_buy`-shaped request the
+   * agent will accept, and vector 020 (rate_abuse) floods cap+1 requests.
+   * Required unless the test-kit contract declares `endpoint_scope: sandbox`
+   * (in which case the agent asserts the operation is side-effect-free).
+   * Default: false — side-effectful vectors auto-skip against non-sandbox
+   * endpoints.
+   */
+  allowLiveSideEffects?: boolean;
+  /**
+   * Agent's declared `covers_content_digest` policy from
+   * `get_adcp_capabilities.request_signing.covers_content_digest`. When set
+   * without `agentCapability`, the grader auto-skips both positive and
+   * negative vectors whose signature shape is structurally incompatible
+   * with the agent's policy:
+   *
+   *   - Vectors whose `verifier_capability.covers_content_digest` asserts
+   *     a strict policy the agent didn't advertise (e.g. `'either'` →
+   *     skips neg/007 (`'required'`) and neg/018 (`'forbidden'`)).
+   *   - Vectors whose actual `Signature-Input` covers `content-digest`
+   *     against a `'forbidden'` agent (rejected with
+   *     `request_signature_components_unexpected` before the intended
+   *     error path, unless that is the vector's expected error).
+   *   - Vectors whose actual `Signature-Input` does not cover
+   *     `content-digest` against a `'required'` agent (rejected with
+   *     `request_signature_components_incomplete` before the intended
+   *     error path, unless that is the vector's expected error).
+   *
+   * Skipped vectors use `skip_reason: 'capability_profile_mismatch'`.
+   *
+   * Has no effect when `agentCapability` is provided — the full
+   * capability fixture's `covers_content_digest` field governs via
+   * `capabilityMismatch()`, which performs the same shape check. Use
+   * `agentCapability` when you also need `required_for` skip behavior.
+   */
+  agentContentDigestPolicy?: 'required' | 'forbidden' | 'either';
+  /**
+   * The agent's advertised `request_signing.required_for`, read off its own
+   * capability block. Narrow like {@link agentContentDigestPolicy}: it may
+   * exclude only negative vectors whose `verifier_capability.required_for`
+   * names an operation the agent does not declare (vector 001 for a 3.x
+   * shadow-posture agent). Has no effect when `agentCapability` is provided.
+   */
+  agentRequiredFor?: readonly string[];
+  /**
+   * The agent's advertised `request_signing.protocol_methods_required_for`
+   * (JSON-RPC method names such as `SendMessage` or `tasks/cancel`). Only the
+   * A2A operation-resolution vectors consult it: negative/007 (an unsigned
+   * `SendMessage` rejected because the method itself is required) skips when
+   * the agent does not declare `SendMessage`, and unsigned positives skip when
+   * the agent requires their method. Has no effect when `agentCapability` is
+   * provided (its own `protocol_methods_required_for` governs).
+   */
+  agentProtocolMethodsRequiredFor?: readonly string[];
+  /**
+   * Transport shape the agent speaks. `'mcp'` (default) wraps each
+   * vector body in a JSON-RPC `tools/call` envelope and POSTs to the MCP
+   * mount path (`agentUrl`) — use when grading an MCP agent whose verifier
+   * sits as transport-layer middleware ahead of MCP dispatch.
+   *
+   * See adcontextprotocol/adcp-client#612 for the MCP-mode rationale.
+   *
+   * `'a2a'` additionally grades the A2A operation-resolution vectors
+   * (adcp#7945): `required_for` must be enforced against the operation named
+   * by the invocation DataPart's `skill`, not the JSON-RPC method. See
+   * `a2a-operation-resolution.ts`. Vector ids are prefixed `a2a/`.
+   */
+  transport?: 'raw' | 'mcp' | 'a2a';
+  /** Trusted Agent Card fetch seam for A2A tests and custom runtimes. */
+  cardFetch?: typeof fetch;
+  /**
+   * MCP session ID to attach as `Mcp-Session-Id` on every probe after
+   * signing. When `transport` is `'mcp'` and this field is `undefined`,
+   * `gradeRequestSigning` / `gradeOneVector` automatically performs an
+   * `initialize` handshake to acquire a session ID before grading starts.
+   *
+   * Pass a pre-acquired ID (from `initializeMcpSession`) to reuse one
+   * session across multiple calls and avoid repeated handshakes — useful
+   * when the storyboard runner initializes the session once at storyboard
+   * start and threads it through each per-vector call.
+   *
+   * Pass `''` (empty string) to opt out of auto-initialization and send
+   * requests session-less — for stateless streamable-HTTP agents that do
+   * not issue a session ID.
+   */
+  mcpSessionId?: string;
+  /**
+   * MCP protocol version to attach after signing. Auto-initialization replaces
+   * this with the server-negotiated version. Supply it alongside a
+   * pre-acquired `mcpSessionId`. Omit it only when the server does not require
+   * a protocol-version header.
+   */
+  mcpProtocolVersion?: string;
+  /**
+   * Headers for the auto-`initialize` handshake only (typically the agent's
+   * `authorization`) — agents that require auth on `initialize` would
+   * otherwise 401 the handshake, read as "stateless server", and every
+   * vector would then be sent session-less. Never applied to the signed
+   * vector requests themselves.
+   */
+  initializeHeaders?: Record<string, string>;
+  /**
+   * Override the agent's base URL used for the grader's HTTP targets. When set,
+   * each vector's `request.url` is rewritten by swapping origin+path under this
+   * base — useful when the vectors point at `seller.example.com` but the agent
+   * is reachable at a sandbox URL.
+   */
+  agentUrl?: string;
+  /** Per-probe timeout. Default 10s. */
+  timeoutMs?: number;
+  /**
+   * Number of (probe1, probe2) pairs to run for vector neg/016
+   * (replayed-nonce). Each pair uses a fresh nonce and a new TCP
+   * connection, so on a multi-instance deployment the two probes
+   * may land on different instances. K pairs make the failure
+   * deterministic: if any second probe is accepted the count and
+   * the cross-instance hypothesis surface in the diagnostic.
+   * Must be ≥ 2. Default 10.
+   */
+  replayProbePairs?: number;
+}
+
+export interface VectorGradeResult {
+  vector_id: string;
+  kind: 'positive' | 'negative';
+  passed: boolean;
+  skipped?: boolean;
+  skip_reason?: string;
+  /** For negatives: the error code the agent returned (from WWW-Authenticate). */
+  actual_error_code?: string;
+  /** For negatives: the error code the spec says we should see. */
+  expected_error_code?: string;
+  http_status: number;
+  /**
+   * A2A operation-resolution vectors only: `contradiction-resolution` is MUST
+   * for a 3.2 verifier; `hardening` is SHOULD in 3.2.x and MUST from 3.3.
+   * Hardening failures still count as failures; the tier tells you which kind.
+   */
+  tier?: A2aVectorTier;
+  /** Actual endpoint probed when it differs from the configured agent URL (notably A2A card routing). */
+  probe_url?: string;
+  diagnostic?: string;
+  /**
+   * The request never completed: `ProbeResult.error` was set (DNS, connect,
+   * TLS, SSRF guard). Structured rather than left to the `probe error:`
+   * prefix on `diagnostic`, because callers have to tell a transport fault
+   * from a verdict — both report `http_status: 0` with text attached, and
+   * the storyboard's coverage classifier would otherwise report an
+   * unreachable agent as "only the SDK self-check ran".
+   */
+  transport_error?: boolean;
+  probe_duration_ms: number;
+  /**
+   * For neg/016 (replayed-nonce) only: total number of (probe1, probe2)
+   * pairs attempted by the K-pair grader.
+   */
+  replay_pairs_tried?: number;
+  /**
+   * For neg/016 (replayed-nonce) only: number of pairs where the second
+   * probe was correctly rejected with `request_signature_replayed`.
+   * Equal to `replay_pairs_tried` on a passing run.
+   */
+  replay_pairs_rejected?: number;
+}
+
+export interface GradeReport {
+  agent_url: string;
+  harness_mode: 'black_box';
+  /**
+   * `true` when the test-kit contract declares an endpoint_scope other than
+   * `sandbox` — vectors 016 and 020 produce live side effects (a real
+   * `create_media_buy` for 016, cap+1 flooding for 020). Treat as a warning
+   * to the operator.
+   */
+  live_endpoint_warning: boolean;
+  contract_loaded: boolean;
+  positive: VectorGradeResult[];
+  negative: VectorGradeResult[];
+  /**
+   * Present only on `transport: 'a2a'` runs. Per-tier tally of the A2A
+   * operation-resolution vectors, or `vectors_available: false` (with the
+   * reason) when the compliance bundle carries none, so an absent corpus is
+   * never mistaken for a clean pass. The vector rows themselves are in
+   * `positive` / `negative` under `a2a/` ids.
+   */
+  a2a_operation_resolution?: A2aOperationResolutionSummary;
+  passed: boolean;
+  passed_count: number;
+  failed_count: number;
+  skipped_count: number;
+  total_duration_ms: number;
+}
+
+/**
+ * Grade an agent's RFC 9421 verifier against the selected conformance vectors.
+ *
+ * Preconditions the caller owns:
+ *   - Agent advertises `request_signing.supported: true` in `get_adcp_capabilities`.
+ *   - Agent has pre-configured its verifier per `test-kits/signed-requests-runner.yaml`:
+ *     - Runner's signing keyids (`test-ed25519-2026`, `test-es256-2026`) accepted.
+ *     - `test-revoked-2026` pre-revoked.
+ *     - Per-keyid rate cap within grading_target_per_keyid_cap_requests.
+ *   - `agentUrl` targets a sandbox endpoint — the replay-window contract sends
+ *     a live valid request that will be accepted before the second (rejected)
+ *     copy fires.
+ */
+export async function gradeRequestSigning(agentUrl: string, options: GradeOptions = {}): Promise<GradeReport> {
+  const start = Date.now();
+  const loaded = loadRequestSigningVectors(options);
+  const selected = selectRequestSigningVectors(loaded, options.signingProfileVersion);
+  const contract = loadSignedRequestsRunnerContract(options);
+  const transport = options.transport ?? 'mcp';
+
+  // Avoid allocating an MCP session (or making authenticated egress) when
+  // every vector is skipped or handled entirely by the local verifier.
+  const hasRunnableNetworkVector =
+    selected.positive.some(vector => !preflightSkip(vector, 'positive', contract, options, agentUrl)) ||
+    selected.negative.some(
+      vector => !vector.jwks_override && !preflightSkip(vector, 'negative', contract, options, agentUrl)
+    );
+
+  // Auto-initialize MCP session once before all vectors. A single session
+  // covers the full batch — the session ID is injected post-signing so
+  // Mcp-Session-Id is never a covered component, and negative vectors reach
+  // the verifier before MCP session dispatch (the signature check fires at
+  // the HTTP middleware layer, ahead of session routing).
+  let mcpSessionId: string | undefined = options.mcpSessionId;
+  let mcpProtocolVersion = options.mcpProtocolVersion;
+  if (transport === 'mcp' && hasRunnableNetworkVector && mcpSessionId === undefined) {
+    const init = await initializeMcpSession(
+      agentUrl,
+      {
+        allowPrivateIp: options.allowPrivateIp === true,
+        timeoutMs: options.timeoutMs,
+      },
+      options.initializeHeaders ?? {}
+    );
+    if (init.error) {
+      throw new Error(`MCP initialize precondition failed: ${init.error}`);
+    }
+    mcpSessionId = init.sessionId; // undefined without an error = stateless server
+    mcpProtocolVersion = init.protocolVersion ?? mcpProtocolVersion;
+  }
+
+  const probeOpts: ProbeOptions = {
+    allowPrivateIp: options.allowPrivateIp === true,
+    timeoutMs: options.timeoutMs,
+    mcpSessionId,
+    mcpProtocolVersion: transport === 'mcp' ? mcpProtocolVersion : undefined,
+  };
+
+  const positive: VectorGradeResult[] = [];
+  for (const vector of selected.positive) {
+    const skip = preflightSkip(vector, 'positive', contract, options, agentUrl);
+    if (skip) {
+      positive.push(skip);
+      continue;
+    }
+    const buildOpts = await buildOptionsForVector(vector, agentUrl, transport, options);
+    const signed = buildPositiveRequest(vector, loaded.keys, buildOpts);
+    const probed = await probeSignedRequest(signed, probeOpts);
+    positive.push(withA2aProbeUrl(gradePositive(vector, probed), buildOpts));
+  }
+
+  const negative: VectorGradeResult[] = [];
+  for (const vector of selected.negative) {
+    const skip = preflightSkip(vector, 'negative', contract, options, agentUrl);
+    if (skip) {
+      negative.push(skip);
+      continue;
+    }
+    const buildOpts = vector.jwks_override
+      ? { baseUrl: agentUrl, transport }
+      : await buildOptionsForVector(vector, agentUrl, transport, options);
+    negative.push(
+      withA2aProbeUrl(await gradeNegative(vector, loaded, contract, probeOpts, buildOpts, options), buildOpts)
+    );
+  }
+
+  // A2A runs also grade the operation-resolution corpus (adcp#7945). Rows join
+  // `positive` / `negative` so counts, `passed`, and every report consumer treat
+  // them like any other vector; the summary carries the tier split.
+  let a2aSummary: A2aOperationResolutionSummary | undefined;
+  if (transport === 'a2a') {
+    const a2a = await gradeA2aOperationResolution(agentUrl, loaded.keys, contract, options);
+    if (a2a) {
+      positive.push(...a2a.positive);
+      negative.push(...a2a.negative);
+      a2aSummary = a2a.summary;
+    }
+  }
+
+  const all = [...positive, ...negative];
+  const passed_count = all.filter(r => r.passed && !r.skipped).length;
+  const skipped_count = all.filter(r => r.skipped).length;
+  const failed_count = all.filter(r => !r.passed && !r.skipped).length;
+  const passed = failed_count === 0;
+
+  return {
+    agent_url: agentUrl,
+    harness_mode: 'black_box',
+    // Default to TRUE when no contract is loaded — we can't prove the endpoint
+    // is sandbox, so warn the operator that 016/020 could produce live side
+    // effects. Only FALSE when a contract is loaded AND declares sandbox.
+    live_endpoint_warning: !contract || contract.endpoint_scope !== 'sandbox',
+    contract_loaded: Boolean(contract),
+    positive,
+    negative,
+    ...(a2aSummary ? { a2a_operation_resolution: a2aSummary } : {}),
+    passed,
+    passed_count,
+    failed_count,
+    skipped_count,
+    total_duration_ms: Date.now() - start,
+  };
+}
+
+// Positive vectors whose edge-case coverage survives only under raw transport
+// (per-operation endpoint URLs). Listed explicitly rather than heuristically
+// so a spec author adding a new canonicalization-edge vector has to opt into
+// the skip.
+const MCP_FLATTENED_VECTORS = new Set([
+  '005-default-port-stripped',
+  '006-dot-segment-path',
+  '007-query-byte-preserved',
+  '008-percent-encoded-path',
+  '009-percent-encoded-unreserved-decoded',
+  '010-percent-encoded-slash-preserved',
+  '011-ipv6-authority',
+  '012-ipv6-authority-default-port-stripped',
+  'profile-3.2/positive/005-default-port-stripped',
+  'profile-3.2/positive/006-dot-segment-path',
+  'profile-3.2/positive/007-query-byte-preserved',
+  'profile-3.2/positive/008-percent-encoded-path',
+  'profile-3.2/positive/009-percent-encoded-unreserved-decoded',
+  'profile-3.2/positive/010-percent-encoded-slash-preserved',
+  'profile-3.2/positive/011-ipv6-authority',
+  'profile-3.2/positive/012-ipv6-authority-default-port-stripped',
+  '015-bracketed-ipv6-host-with-port',
+  'profile-3.2/positive/015-bracketed-ipv6-host-with-port',
+]);
+
+// Positive vectors whose subject is a bracketed IPv6 literal with a non-default
+// port in the request authority. Under raw transport they are only a live
+// witness when the agent's own URL has that shape.
+const RAW_AUTHORITY_SHAPE_VECTORS = new Set([
+  '015-bracketed-ipv6-host-with-port',
+  'profile-3.2/positive/015-bracketed-ipv6-host-with-port',
+]);
+
+function targetCarriesBracketedIpv6WithPort(agentUrl: string): boolean {
+  try {
+    const target = new URL(agentUrl);
+    // `URL.port` is empty for the scheme's default port.
+    return target.hostname.startsWith('[') && target.port !== '';
+  } catch {
+    return false;
+  }
+}
+
+// Vectors whose failure mode can't reach a live agent through HTTP. Document
+// why each entry can't be graded via probe so adding a new entry isn't a
+// silent coverage loss.
+const TRANSPORT_UNGRADABLE: Record<string, string> = {
+  // fetch() and the Node URL parser normalize U-labels to A-labels before
+  // the request leaves the client. A raw non-ASCII Host header reaches the
+  // agent as Punycode, defeating the parse-time check. Direct verifier
+  // tests exercise this edge.
+  '026-non-ascii-host':
+    'HTTP transport punycodes U-labels before the request leaves the client; verified at the library level.',
+  'profile-3.2/negative/026-non-ascii-host':
+    'HTTP transport punycodes U-labels before the request leaves the client; verified at the library level.',
+  'profile-3.2/negative/002-multiple-trailing-dots':
+    'HTTP transport cannot route to an intentionally malformed DNS authority; verified at the library level.',
+  // The fault is a Host header the URL does not carry. fetch() derives Host
+  // from the request URL and ignores a caller-supplied value, so the agent would
+  // receive a well-formed Host and a valid signature, and a conformant verifier
+  // would correctly accept it.
+  '031-malformed-host-authority':
+    'HTTP transport derives the Host header from the request URL, so the malformed Host cannot reach the agent; verified at the library level.',
+  'profile-3.2/negative/031-malformed-host-authority':
+    'HTTP transport derives the Host header from the request URL, so the malformed Host cannot reach the agent; verified at the library level.',
+};
+
+/** A vector excluded on its own terms, independent of the run's transport. */
+export interface SemanticVectorExclusion {
+  skip_reason: 'capability_profile_mismatch' | 'transport_ungradable';
+  diagnostic: string;
+}
+
+/**
+ * Exclusions that depend on the vector and the agent's declared profile, not
+ * on how this run reaches the agent: a capability-profile mismatch, and the
+ * `TRANSPORT_UNGRADABLE` carve-outs above (which no HTTP binding can grade on
+ * any protocol). Returns `undefined` when the vector is gradable in principle.
+ *
+ * Shared with the storyboard probe so both entry points apply the same rules
+ * in the same order, and so the probe can apply them *before* its own
+ * protocol-transport gate. Gating on protocol first would relabel a vector the
+ * agent's profile never opted into — or one no transport can carry — as this
+ * protocol's missing coverage (adcp-client#2954).
+ */
+export function semanticVectorExclusion(
+  vector: PositiveVector | NegativeVector,
+  declaredCapability?: Pick<VerifierCapabilityFixture, 'protocol_methods_required_for'>
+): SemanticVectorExclusion | undefined {
+  if (declaredCapability) {
+    // Only the protocol-method dimension — see
+    // `protocolMethodCoverageMismatch` for why the rest of
+    // `capabilityMismatch` needs an operator-selected profile rather than an
+    // advertised one. The skip stays auditable either way: it surfaces as a
+    // `profile_excluded` selection result on the step, and an agent that
+    // under-declares to dodge a vector shows up in the skip count.
+    const mismatch = protocolMethodCoverageMismatch(vector, declaredCapability);
+    if (mismatch) return { skip_reason: 'capability_profile_mismatch', diagnostic: mismatch };
+  }
+  const transportReason = TRANSPORT_UNGRADABLE[vector.id];
+  if (transportReason) return { skip_reason: 'transport_ungradable', diagnostic: transportReason };
+  return undefined;
+}
+
+/**
+ * Centralized skip decisions. Checks (in order): onlyVectors filter,
+ * operator skipVectors, agent-capability-profile mismatch
+ * (`agentCapability` wired), transport-ungradable, MCP-mode URL-edge
+ * flattening, rate-abuse opt-out, stateful-contract missing, and the
+ * live-side-effect gate.
+ */
+function preflightSkip(
+  vector: PositiveVector | NegativeVector,
+  kind: 'positive' | 'negative',
+  contract: SignedRequestsRunnerContract | undefined,
+  options: GradeOptions,
+  agentUrl: string
+): VectorGradeResult | undefined {
+  const expected_error_code = kind === 'negative' ? (vector as NegativeVector).expected_error_code : undefined;
+  const base = {
+    vector_id: vector.id,
+    kind,
+    passed: true, // skipped ≠ failed; overall pass/fail excludes skipped
+    http_status: 0,
+    probe_duration_ms: 0,
+    ...(expected_error_code ? { expected_error_code } : {}),
+  } as const;
+
+  if (options.onlyVectors && !options.onlyVectors.includes(vector.id)) {
+    return { ...base, skipped: true, skip_reason: 'not_in_only_vectors' };
+  }
+  if (options.skipVectors?.includes(vector.id)) {
+    return { ...base, skipped: true, skip_reason: 'operator_skip' };
+  }
+  if (options.agentCapability) {
+    // Full profile comparison: `agentCapability` here is an operator-selected
+    // profile, not an advertisement, so every dimension is meaningful.
+    // Surface the mismatch in the diagnostic so operators can audit which
+    // vectors were dodged. An agent that under-declares its capability
+    // (claims `required_for: []` while it actually enforces on multiple ops)
+    // would hide negative-vector failures here — the operator needs to see
+    // the skip count to catch that pattern. The caller inspects
+    // `report.skipped_count` plus the individual `skip_reason`/`diagnostic`
+    // pairs.
+    const mismatch = capabilityMismatch(vector, kind, options.agentCapability);
+    if (mismatch) {
+      return { ...base, skipped: true, skip_reason: 'capability_profile_mismatch', diagnostic: mismatch };
+    }
+  }
+  if (!options.agentCapability && options.agentContentDigestPolicy) {
+    const policyMismatch = contentDigestPolicyMismatch(vector, kind, options.agentContentDigestPolicy);
+    if (policyMismatch) {
+      return {
+        ...base,
+        skipped: true,
+        skip_reason: 'capability_profile_mismatch',
+        diagnostic: policyMismatch,
+      };
+    }
+  }
+  if (!options.agentCapability && options.agentRequiredFor) {
+    const requiredForMismatch = advertisedRequiredForExclusion(vector, kind, options.agentRequiredFor);
+    if (requiredForMismatch) {
+      return {
+        ...base,
+        skipped: true,
+        skip_reason: requiredForMismatch.skip_reason,
+        diagnostic: requiredForMismatch.diagnostic,
+      };
+    }
+  }
+  // Transport-ungradable comes from the shared helper so the grader and the
+  // storyboard probe can't drift on which vectors no HTTP binding can carry.
+  const semantic = semanticVectorExclusion(vector);
+  if (semantic) {
+    return { ...base, skipped: true, skip_reason: semantic.skip_reason, diagnostic: semantic.diagnostic };
+  }
+  // Canonicalization-edge positive vectors (005–008) bake their edge case
+  // into the vector URL path, query, or port. A single-endpoint transport
+  // flattens every vector to the same target, so these vectors become
+  // indistinguishable from vector 001 — passing is not evidence the edge was
+  // tested. Skip with a distinct reason so the report doesn't claim coverage it
+  // didn't deliver.
+  //
+  // BOTH single-endpoint transports, not just MCP. A2A routes every vector to
+  // the one RPC endpoint the agent card names, for exactly the reason MCP routes
+  // every vector to the one JSON-RPC mount, so the URL edge never reaches the
+  // wire on either. Gating this on MCP alone let an A2A run report these as
+  // PASSES — coverage claimed and not delivered, and the two cards stopped
+  // grading the same vector set, which is the one property that makes comparing
+  // them worth anything.
+  const flattensUrlEdges = ((options.transport ?? 'mcp') as string) !== 'raw';
+  if (kind === 'positive' && flattensUrlEdges && MCP_FLATTENED_VECTORS.has(vector.id)) {
+    return {
+      ...base,
+      skipped: true,
+      skip_reason: 'mcp_mode_flattens_url_edges',
+      diagnostic:
+        `Vector ${vector.id} tests a URL-canonicalization edge (port/path/query/encoding) ` +
+        `that ${options.transport ?? 'mcp'} mode neutralizes by routing every vector to the one ` +
+        `endpoint the agent exposes. Grade this edge with \`--transport raw\` against a ` +
+        `per-operation AdCP agent.`,
+    };
+  }
+  // Raw mode retargets the vector onto the agent's own authority and the HTTP
+  // client derives `Host` from that URL, so a vector whose subject is the
+  // authority itself reaches the agent only when the agent's authority already
+  // has that shape. Anything else would grade an ordinary request and report
+  // the edge as covered.
+  if (
+    kind === 'positive' &&
+    !flattensUrlEdges &&
+    RAW_AUTHORITY_SHAPE_VECTORS.has(vector.id) &&
+    !targetCarriesBracketedIpv6WithPort(agentUrl)
+  ) {
+    return {
+      ...base,
+      skipped: true,
+      skip_reason: 'transport_ungradable',
+      diagnostic:
+        `Vector ${vector.id} presents a bracketed IPv6 literal with a non-default port as the request ` +
+        `authority. Raw mode sends the request to the agent's own authority, which is not a bracketed ` +
+        `IPv6 literal with an explicit non-default port, so that authority never reaches the agent; ` +
+        `verified at the library level. Point the grader at such an endpoint (for example ` +
+        `http://[::1]:3001) to grade it live.`,
+    };
+  }
+  if (kind === 'negative') {
+    const neg = vector as NegativeVector;
+    if (neg.requires_contract === 'rate_abuse' && options.skipRateAbuse) {
+      return { ...base, skipped: true, skip_reason: 'rate_abuse_opt_out' };
+    }
+    if (neg.requires_contract && !contract) {
+      return {
+        ...base,
+        skipped: true,
+        skip_reason: 'missing_test_kit_contract',
+        diagnostic:
+          'Stateful vector requires `test-kits/signed-requests-runner.yaml` in the compliance cache. Run `npm run sync-schemas`.',
+      };
+    }
+    // Sandbox opt-in: vectors 016 (replay_window) and 020 (rate_abuse) produce
+    // live side effects on the agent. Refuse to run unless the contract says
+    // sandbox OR the operator explicitly accepts the side effects.
+    if (
+      (neg.requires_contract === 'replay_window' || neg.requires_contract === 'rate_abuse') &&
+      !options.allowLiveSideEffects &&
+      contract?.endpoint_scope !== 'sandbox'
+    ) {
+      return {
+        ...base,
+        skipped: true,
+        skip_reason: 'live_side_effect_opt_in_required',
+        diagnostic:
+          `Vector ${vector.id} produces live agent-side effects. Pass allowLiveSideEffects: true ` +
+          `(or point the grader at an endpoint whose signed-requests-runner contract declares ` +
+          `endpoint_scope: sandbox) to run it.`,
+      };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Grade a single vector. Loads the vectors+keys+contract on every call; for
+ * the storyboard-runner dispatch path where the caller runs many vectors in
+ * sequence, prefer `gradeRequestSigning` which loads once.
+ */
+/**
+ * The request the OFFICIAL A2A client emits for *vector*.
+ *
+ * Two vector shapes, distinguished by what the fixture body already is:
+ *
+ * - a JSON-RPC envelope naming a task-lifecycle method (vector 028 and the
+ *   `protocol_methods_*` namespace generally). The method is NOT re-framed
+ *   from the fixture — the corresponding client call is made instead, so the
+ *   SDK emits whichever spelling the agent's declared protocol version uses
+ *   (`tasks/cancel` on 0.3, `CancelTask` on 1.0). That distinction is the one
+ *   a seller's `protocol_methods_required_for` is declared against.
+ * - an AdCP operation body, sent as the invocation inside a `SendMessage`.
+ *
+ * Either way the bytes come back from the SDK and are signed as captured.
+ */
+async function captureA2aRequestForVector(
+  vector: PositiveVector | NegativeVector,
+  agentUrl: string,
+  options: Pick<GradeOptions, 'allowPrivateIp' | 'timeoutMs' | 'cardFetch'>
+): Promise<CapturedA2aRequest> {
+  const raw = vector.request.body;
+  const body = parseA2aVectorBody(vector.id, raw);
+  const envelope = parseJsonRpcEnvelope(body);
+  if (envelope) {
+    if (envelope.method === 'tasks/cancel' || envelope.method === 'CancelTask') {
+      const params = (envelope.params ?? {}) as Record<string, unknown>;
+      const taskId = typeof params.taskId === 'string' ? params.taskId : String(params.id ?? '');
+      return captureA2aRequest(agentUrl, { kind: 'cancelTask', taskId }, options);
+    }
+    throw new Error(
+      `vector "${vector.id}" carries JSON-RPC method "${envelope.method}", which this transport does not ` +
+        `map to an official-client call. Add the mapping rather than framing the envelope by hand.`
+    );
+  }
+  return captureA2aRequest(
+    agentUrl,
+    {
+      kind: 'sendMessage',
+      operation: operationFromVectorUrl(vector.request.url),
+      args: body,
+    },
+    options
+  );
+}
+
+async function buildOptionsForVector(
+  vector: PositiveVector | NegativeVector,
+  agentUrl: string,
+  transport: NonNullable<GradeOptions['transport']>,
+  options: GradeOptions
+): Promise<BuildOptions> {
+  if (transport !== 'a2a') return { baseUrl: agentUrl, transport };
+  const a2aRequest = await captureA2aRequestForVector(vector, agentUrl, a2aDispatchOptions(options));
+  return { baseUrl: agentUrl, transport, a2aRequest };
+}
+
+function a2aDispatchOptions(options: GradeOptions): Pick<GradeOptions, 'allowPrivateIp' | 'timeoutMs' | 'cardFetch'> {
+  return {
+    allowPrivateIp: options.allowPrivateIp === true,
+    ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+    ...(options.cardFetch ? { cardFetch: options.cardFetch } : {}),
+  };
+}
+
+/** Parse once so malformed fixtures fail closed with a vector-specific error. */
+function parseA2aVectorBody(vectorId: string, body: string | undefined): Record<string, unknown> {
+  if (!body) return {};
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new TypeError('body must be a JSON object');
+    }
+    return parsed as Record<string, unknown>;
+  } catch (cause) {
+    throw new Error(`vector "${vectorId}" has a body the official A2A client cannot frame: expected a JSON object`, {
+      cause,
+    });
+  }
+}
+
+/** The parsed fixture body as a JSON-RPC envelope, or `undefined`. */
+function parseJsonRpcEnvelope(body: Record<string, unknown>): { method: string; params?: unknown } | undefined {
+  if (body.jsonrpc === '2.0' && typeof body.method === 'string') {
+    return { method: body.method, params: body.params };
+  }
+  return undefined;
+}
+
+export async function gradeOneVector(
+  vectorId: string,
+  kind: 'positive' | 'negative',
+  agentUrl: string,
+  options: GradeOptions = {}
+): Promise<VectorGradeResult> {
+  const loaded = loadRequestSigningVectors(options);
+  const selected = selectRequestSigningVectors(loaded, options.signingProfileVersion);
+  const contract = loadSignedRequestsRunnerContract(options);
+  const transport = options.transport ?? 'mcp';
+
+  const vector =
+    kind === 'positive'
+      ? selected.positive.find(v => v.id === vectorId)
+      : selected.negative.find(v => v.id === vectorId);
+  if (!vector) throw new Error(`Unknown ${kind} vector "${vectorId}"`);
+
+  const skip = preflightSkip(vector, kind, contract, options, agentUrl);
+  if (skip) return skip;
+
+  // Per-vector session initialization for the storyboard-runner path.
+  // Callers that dispatch many vectors in sequence (e.g., storyboard runner)
+  // should pre-initialize once with initializeMcpSession() and pass the ID
+  // via options.mcpSessionId to avoid per-call round-trips.
+  let mcpSessionId: string | undefined = options.mcpSessionId;
+  let mcpProtocolVersion = options.mcpProtocolVersion;
+  const requiresNetworkProbe = kind === 'positive' || !(vector as NegativeVector).jwks_override;
+  if (transport === 'mcp' && requiresNetworkProbe && mcpSessionId === undefined) {
+    const init = await initializeMcpSession(
+      agentUrl,
+      {
+        allowPrivateIp: options.allowPrivateIp === true,
+        timeoutMs: options.timeoutMs,
+      },
+      options.initializeHeaders ?? {}
+    );
+    if (init.error) {
+      throw new Error(`MCP initialize precondition failed: ${init.error}`);
+    }
+    mcpSessionId = init.sessionId;
+    mcpProtocolVersion = init.protocolVersion ?? mcpProtocolVersion;
+  }
+
+  // A2A precondition: ask the official client for this vector's request. It
+  // resolves the agent card on the way, so a card that does not resolve fails
+  // here — visibly — instead of producing a framed guess.
+  let a2aRequest: CapturedA2aRequest | undefined;
+  if (transport === 'a2a' && requiresNetworkProbe) {
+    a2aRequest = await captureA2aRequestForVector(vector, agentUrl, a2aDispatchOptions(options));
+  }
+
+  const probeOpts: ProbeOptions = {
+    allowPrivateIp: options.allowPrivateIp === true,
+    timeoutMs: options.timeoutMs,
+    mcpSessionId,
+    mcpProtocolVersion: transport === 'mcp' ? mcpProtocolVersion : undefined,
+  };
+  const buildOpts: BuildOptions = { baseUrl: agentUrl, transport, ...(a2aRequest ? { a2aRequest } : {}) };
+
+  if (kind === 'positive') {
+    const signed = buildPositiveRequest(vector as PositiveVector, loaded.keys, buildOpts);
+    const probe = await probeSignedRequest(signed, probeOpts);
+    return withA2aProbeUrl(gradePositive(vector as PositiveVector, probe), buildOpts);
+  }
+  return withA2aProbeUrl(
+    await gradeNegative(vector as NegativeVector, loaded, contract, probeOpts, buildOpts, options),
+    buildOpts
+  );
+}
+
+function withA2aProbeUrl(result: VectorGradeResult, buildOpts: BuildOptions): VectorGradeResult {
+  return buildOpts.transport === 'a2a' && buildOpts.a2aRequest
+    ? { ...result, probe_url: buildOpts.a2aRequest.url }
+    : result;
+}
+
+// ── Phase helpers ─────────────────────────────────────────────
+
+function gradePositive(vector: PositiveVector, probe: ProbeResult): VectorGradeResult {
+  const accepted = probe.status >= 200 && probe.status < 300;
+  return {
+    vector_id: vector.id,
+    kind: 'positive',
+    passed: accepted && !probe.error,
+    http_status: probe.status,
+    diagnostic: accepted ? undefined : buildPositiveDiagnostic(vector, probe),
+    ...(probe.error !== undefined && { transport_error: true }),
+    probe_duration_ms: probe.duration_ms,
+  };
+}
+
+function buildPositiveDiagnostic(vector: PositiveVector, probe: ProbeResult): string {
+  if (probe.error) return `probe error: ${probe.error}`;
+  const expected = 'a 2xx status';
+  const sigError = probe.wwwAuthenticateErrorCode;
+  if (sigError) {
+    return `expected ${expected}, got ${probe.status} with WWW-Authenticate error="${sigError}" — signer or agent-side JWKS likely mismatched. Vector: ${vector.name}`;
+  }
+  return `expected ${expected}, got ${probe.status}. Vector: ${vector.name}`;
+}
+
+async function gradeNegative(
+  vector: NegativeVector,
+  loaded: ReturnType<typeof loadRequestSigningVectors>,
+  contract: SignedRequestsRunnerContract | undefined,
+  probeOpts: ProbeOptions,
+  buildOpts: BuildOptions,
+  options: GradeOptions
+): Promise<VectorGradeResult> {
+  if (vector.jwks_override) {
+    return gradeJwksOverrideNegative(vector);
+  }
+  switch (vector.requires_contract) {
+    case 'replay_window':
+      return gradeReplayWindow(vector, loaded, probeOpts, buildOpts, options.replayProbePairs ?? 10);
+    case 'rate_abuse':
+      return gradeRateAbuse(vector, loaded, contract!, probeOpts, buildOpts, options);
+    case 'revocation':
+    default:
+      return gradeStaticNegative(vector, loaded, probeOpts, buildOpts);
+  }
+}
+
+/**
+ * Grade vectors that ship an inline `jwks_override` against the library
+ * verifier directly. The agent's JWKS can't be mutated per-vector at probe
+ * time, so a black-box HTTP grade can't surface these failure modes.
+ * Grading the library verifier is the only path that exercises what the
+ * vector is testing — the inline JWK's kty/crv/alg consistency rules.
+ */
+async function gradeJwksOverrideNegative(vector: NegativeVector): Promise<VectorGradeResult> {
+  const override = vector.jwks_override!;
+  const start = Date.now();
+  const jwks = new StaticJwksResolver(override.keys as unknown as AdcpJsonWebKey[]);
+  const replayStore = new InMemoryReplayStore();
+  const revocationStore = new InMemoryRevocationStore();
+  const operation = new URL(vector.request.url).pathname.split('/').filter(Boolean).pop() ?? '';
+  try {
+    await verifyRequestSignature(vector.request, {
+      capability: vector.verifier_capability,
+      jwks,
+      replayStore,
+      revocationStore,
+      now: () => vector.reference_now,
+      operation,
+      adcpVersion: vector.signing_profile_version,
+    });
+    return {
+      vector_id: vector.id,
+      kind: 'negative',
+      passed: false,
+      http_status: 0,
+      expected_error_code: vector.expected_error_code,
+      diagnostic: `library verifier accepted a request expected to fail with error="${vector.expected_error_code}"`,
+      probe_duration_ms: Date.now() - start,
+    };
+  } catch (err) {
+    if (err instanceof RequestSignatureError) {
+      const passed = err.code === vector.expected_error_code;
+      return {
+        vector_id: vector.id,
+        kind: 'negative',
+        passed,
+        http_status: 0,
+        expected_error_code: vector.expected_error_code,
+        actual_error_code: err.code,
+        diagnostic: passed
+          ? undefined
+          : `library verifier rejected with error="${err.code}" but vector expects "${vector.expected_error_code}"`,
+        probe_duration_ms: Date.now() - start,
+      };
+    }
+    throw err;
+  }
+}
+
+function gradeStaticNegative(
+  vector: NegativeVector,
+  loaded: ReturnType<typeof loadRequestSigningVectors>,
+  probeOpts: ProbeOptions,
+  buildOpts: BuildOptions
+): Promise<VectorGradeResult> {
+  const signed = buildNegativeRequest(vector, loaded.keys, buildOpts);
+  return probeSignedRequest(signed, probeOpts).then(probe => ({
+    vector_id: vector.id,
+    kind: 'negative',
+    passed: negativeAcceptedErrorCode(vector, probe),
+    http_status: probe.status,
+    expected_error_code: vector.expected_error_code,
+    actual_error_code: probe.wwwAuthenticateErrorCode,
+    diagnostic: buildNegativeDiagnostic(vector, probe),
+    ...(probe.error !== undefined && { transport_error: true }),
+    probe_duration_ms: probe.duration_ms,
+  }));
+}
+
+async function gradeReplayWindow(
+  vector: NegativeVector,
+  loaded: ReturnType<typeof loadRequestSigningVectors>,
+  probeOpts: ProbeOptions,
+  buildOpts: BuildOptions,
+  pairCount: number
+): Promise<VectorGradeResult> {
+  // Run pairCount independent (probe1, probe2) pairs. Each pair uses a fresh
+  // nonce so pair N's probe1 doesn't consume pair N+1's replay-window slot.
+  // probeSignedRequest already closes its undici Agent on completion, so each
+  // call gets a new TCP connection — no keep-alive pinning to the same upstream.
+  let totalDurationMs = 0;
+  let rejectedCount = 0;
+  let lastSecondStatus = 0;
+  let lastSecondErrorCode: string | undefined;
+  // A second probe that never completed is a transport fault, not evidence
+  // that the agent accepted a replay. Tracked across pairs because either
+  // terminal return below can be reached after one: without it the caller
+  // sees `http_status: 0` with a diagnostic and cannot tell an unreachable
+  // agent from a verdict.
+  let sawSecondTransportError = false;
+
+  for (let i = 0; i < pairCount; i++) {
+    const nonce = randomBytes(16).toString('base64url');
+    const signed = buildPositiveRequestFromNegative(vector, loaded, { ...buildOpts, nonce });
+
+    const first = await probeSignedRequest(signed, probeOpts);
+    totalDurationMs += first.duration_ms;
+
+    if (first.status < 200 || first.status >= 300) {
+      return {
+        vector_id: vector.id,
+        kind: 'negative',
+        passed: false,
+        http_status: first.status,
+        expected_error_code: vector.expected_error_code,
+        actual_error_code: first.wwwAuthenticateErrorCode,
+        diagnostic:
+          `replay_window contract: first submission MUST be accepted but agent returned ${first.status}` +
+          (first.wwwAuthenticateErrorCode ? ` (error="${first.wwwAuthenticateErrorCode}")` : '') +
+          '. Check runner JWKS registration with the agent.',
+        ...(first.error !== undefined && { transport_error: true }),
+        probe_duration_ms: totalDurationMs,
+        replay_pairs_tried: i + 1,
+        replay_pairs_rejected: rejectedCount,
+      };
+    }
+
+    const second = await probeSignedRequest(signed, probeOpts);
+    totalDurationMs += second.duration_ms;
+    lastSecondStatus = second.status;
+    lastSecondErrorCode = second.wwwAuthenticateErrorCode;
+    if (second.error !== undefined) sawSecondTransportError = true;
+
+    if (negativeAcceptedErrorCode(vector, second)) {
+      rejectedCount++;
+    }
+  }
+
+  if (rejectedCount === pairCount) {
+    return {
+      vector_id: vector.id,
+      kind: 'negative',
+      passed: true,
+      http_status: lastSecondStatus,
+      expected_error_code: vector.expected_error_code,
+      actual_error_code: lastSecondErrorCode,
+      // Unreachable today — an errored probe cannot satisfy
+      // `negativeAcceptedErrorCode`, so every pair rejecting implies none
+      // faulted — but carried on both terminal paths so the provenance
+      // cannot be lost if that counting changes.
+      ...(sawSecondTransportError && { transport_error: true }),
+      probe_duration_ms: totalDurationMs,
+      replay_pairs_tried: pairCount,
+      replay_pairs_rejected: pairCount,
+    };
+  }
+
+  return {
+    vector_id: vector.id,
+    kind: 'negative',
+    passed: false,
+    http_status: lastSecondStatus,
+    expected_error_code: vector.expected_error_code,
+    actual_error_code: lastSecondErrorCode,
+    diagnostic: buildReplayWindowFailDiagnostic(vector, rejectedCount, pairCount),
+    ...(sawSecondTransportError && { transport_error: true }),
+    probe_duration_ms: totalDurationMs,
+    replay_pairs_tried: pairCount,
+    replay_pairs_rejected: rejectedCount,
+  };
+}
+
+function buildReplayWindowFailDiagnostic(vector: NegativeVector, rejectedCount: number, pairCount: number): string {
+  if (rejectedCount === 0) {
+    return (
+      `expected 401 with error="${vector.expected_error_code}" on replayed nonce, but all ${pairCount} probe ` +
+      `pairs were accepted (got 200 on second submission every time). Verifier has no replay protection for this nonce. ` +
+      `If your verifier runs more than one process or machine instance, confirm the replay store is shared across ` +
+      `the pool — the default \`InMemoryReplayStore\` is per-process. For distributed deployments use ` +
+      `\`PostgresReplayStore\` from \`@adcp/sdk/signing/server\` or a Redis-backed \`ReplayStore\` ` +
+      `implementation. See https://github.com/adcontextprotocol/adcp-client/pull/1018`
+    );
+  }
+  return (
+    `${rejectedCount} of ${pairCount} probe pairs were correctly rejected; ` +
+    `${pairCount - rejectedCount} pair(s) had the second submission accepted. ` +
+    `This is the classic multi-instance \`InMemoryReplayStore\` pattern — the two probes in an ` +
+    `accepted pair landed on different load-balanced instances, each with its own per-process replay store. ` +
+    `For distributed deployments use \`PostgresReplayStore\` from \`@adcp/sdk/signing/server\` ` +
+    `or a Redis-backed \`ReplayStore\` implementation so all instances share one replay cache. ` +
+    `See https://github.com/adcontextprotocol/adcp-client/pull/1018`
+  );
+}
+
+async function gradeRateAbuse(
+  vector: NegativeVector,
+  loaded: ReturnType<typeof loadRequestSigningVectors>,
+  contract: SignedRequestsRunnerContract,
+  probeOpts: ProbeOptions,
+  buildOpts: BuildOptions,
+  options: GradeOptions
+): Promise<VectorGradeResult> {
+  const cap =
+    options.rateAbuseCap ?? contract.stateful_vector_contract.rate_abuse.grading_target_per_keyid_cap_requests;
+  // Fill the cap with cap distinct-nonce requests, then probe one more — that
+  // (cap+1)th request is what the vector expects to be rejected.
+  let durationMs = 0;
+  // A fill request that never completed means the cap was not actually
+  // reached, so the (cap+1) response proves nothing about the limiter. Keep
+  // the first failure's text, not just a flag: "the cap was never
+  // established" is only actionable if it says which request died and how.
+  let fillTransportError: string | undefined;
+  for (let i = 0; i < cap; i++) {
+    const nonce = randomBytes(16).toString('base64url');
+    const signed = buildNegativeRequest(vector, loaded.keys, { nonce, ...buildOpts });
+    const probe = await probeSignedRequest(signed, probeOpts);
+    durationMs += probe.duration_ms;
+    if (probe.error !== undefined && fillTransportError === undefined) {
+      fillTransportError = `cap-fill request ${i + 1} of ${cap} never completed: ${probe.error}`;
+    }
+  }
+  const finalNonce = randomBytes(16).toString('base64url');
+  const capPlusOne = buildNegativeRequest(vector, loaded.keys, { nonce: finalNonce, ...buildOpts });
+  const probe = await probeSignedRequest(capPlusOne, probeOpts);
+  durationMs += probe.duration_ms;
+  // A correct (cap+1) rejection is only evidence when the cap was actually
+  // reached. Without this the vector passes on a limiter that was never
+  // exercised — the agent may simply reject every request with that code.
+  const capEstablished = fillTransportError === undefined;
+  return {
+    vector_id: vector.id,
+    kind: 'negative',
+    passed: capEstablished && negativeAcceptedErrorCode(vector, probe),
+    http_status: probe.status,
+    expected_error_code: vector.expected_error_code,
+    actual_error_code: probe.wwwAuthenticateErrorCode,
+    diagnostic: capEstablished
+      ? buildNegativeDiagnostic(vector, probe)
+      : `rate_abuse contract: the per-keyid cap was never established — ${fillTransportError}. ` +
+        `The (cap+1) response (status ${probe.status}` +
+        (probe.wwwAuthenticateErrorCode ? `, error="${probe.wwwAuthenticateErrorCode}"` : '') +
+        ') says nothing about the limiter, so this vector is ungraded rather than passing.',
+    ...((probe.error !== undefined || !capEstablished) && { transport_error: true }),
+    probe_duration_ms: durationMs,
+  };
+}
+
+function buildPositiveRequestFromNegative(
+  vector: NegativeVector,
+  loaded: ReturnType<typeof loadRequestSigningVectors>,
+  options: BuildOptions & { nonce: string }
+): SignedHttpRequest {
+  // Vector 016 is structurally identical to positive/001 — sign it as a positive.
+  const pseudoPositive: PositiveVector = {
+    kind: 'positive',
+    id: vector.id,
+    name: vector.name,
+    signing_profile_version: vector.signing_profile_version,
+    reference_now: vector.reference_now,
+    request: vector.request,
+    verifier_capability: vector.verifier_capability,
+    jwks_ref: vector.jwks_ref,
+    jwks_override: vector.jwks_override,
+  };
+  return buildPositiveRequest(pseudoPositive, loaded.keys, options);
+}
+
+function negativeAcceptedErrorCode(vector: NegativeVector, probe: ProbeResult): boolean {
+  return probe.status === 401 && probe.wwwAuthenticateErrorCode === vector.expected_error_code;
+}
+
+/**
+ * Inspect the vector's `Signature-Input` header to determine whether the
+ * signed components cover `content-digest`. Returns `undefined` when the
+ * header is absent or unparseable — the vector exercises a no-signature or
+ * malformed-header failure path, so the digest shape check doesn't apply
+ * (the verifier short-circuits before the components check).
+ *
+ * Header lookup is canonical-PascalCase + lowercase only. Test fixtures
+ * use canonical PascalCase headers; this isn't a general-purpose
+ * header-name normalizer.
+ */
+function vectorCoveredComponents(vector: PositiveVector | NegativeVector): string[] | undefined {
+  const headers = vector.request.headers;
+  const sigInput = headers['Signature-Input'] ?? headers['signature-input'];
+  if (!sigInput) return undefined;
+  try {
+    const parsed = parseSignatureInput(sigInput);
+    return parsed.components;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Return a diagnostic when the vector's actual signed shape is
+ * structurally incompatible with `agentCoversContentDigest` — i.e. the
+ * verifier rejects the request shape before the vector's intended error
+ * path can fire. Returns `undefined` when the shapes can coexist (or the
+ * vector exercises a header-absent/malformed path where this check
+ * doesn't apply).
+ */
+function contentDigestStructuralMismatch(
+  vector: PositiveVector | NegativeVector,
+  agentCoversContentDigest: 'required' | 'forbidden' | 'either'
+): string | undefined {
+  const components = vectorCoveredComponents(vector);
+  if (components === undefined) return undefined;
+  const signsCd = components.includes('content-digest');
+  const coversOtherRequiredComponents =
+    MANDATORY_COMPONENTS.every(component => components.includes(component)) &&
+    (!(vector.request.body && vector.request.body.length > 0) || components.includes('content-type'));
+  const expectsOnlyDigestUnexpected =
+    'expected_error_code' in vector &&
+    vector.expected_error_code === 'request_signature_components_unexpected' &&
+    coversOtherRequiredComponents &&
+    components.every(
+      component =>
+        MANDATORY_COMPONENTS.some(required => required === component) ||
+        component === 'content-type' ||
+        component === 'content-digest'
+    );
+  if (signsCd && agentCoversContentDigest === 'forbidden' && !expectsOnlyDigestUnexpected) {
+    return (
+      `Vector's Signature-Input covers content-digest but agent declares ` +
+      `covers_content_digest='forbidden'. The verifier rejects with ` +
+      `request_signature_components_unexpected before the vector's intended ` +
+      `error path can fire.`
+    );
+  }
+  const expectsOnlyDigestRefusal =
+    'expected_error_code' in vector &&
+    vector.expected_error_code === 'request_signature_components_incomplete' &&
+    coversOtherRequiredComponents;
+  if (!signsCd && agentCoversContentDigest === 'required' && !expectsOnlyDigestRefusal) {
+    return (
+      `Vector's Signature-Input does not cover content-digest but agent declares ` +
+      `covers_content_digest='required'. The verifier rejects with ` +
+      `request_signature_components_incomplete before the vector's intended ` +
+      `error path can fire.`
+    );
+  }
+  return undefined;
+}
+
+/**
+ * The two refusals that exist ONLY under a narrowed content-digest policy:
+ * one for a signature that omits the digest (`'required'` verifiers), one for
+ * a signature that covers it (`'forbidden'` verifiers). A vector expecting
+ * either outcome is asserting the narrowing itself, so it cannot grade an
+ * agent that declares `'either'`.
+ *
+ * Everything else a content-digest vector can assert — a 2xx acceptance, a
+ * digest MISMATCH, a malformed digest header — is a property of the verifier
+ * rather than of the policy, and an `'either'` agent must get it right too.
+ */
+const CONTENT_DIGEST_POLICY_REFUSALS: ReadonlySet<string> = new Set([
+  'request_signature_components_incomplete',
+  'request_signature_components_unexpected',
+]);
+
+/**
+ * Declared-policy check: the vector's `verifier_capability.covers_content_digest`
+ * against the agent's declared policy.
+ *
+ * A strict vector (`'required'` / `'forbidden'`) does not grade an agent that
+ * declared the other strict value — the agent never rejects the shape the
+ * vector exercises.
+ *
+ * Against an agent declaring `'either'` the answer depends on what the vector
+ * EXPECTS, not on what it declares. Per AdCP `security.mdx`
+ * (`covers_content_digest`), `'either'` means "signer chooses; verifier
+ * accepts both" — it is the widest policy, not a third incompatible one. So
+ * an `'either'` agent can grade every content-digest vector except the two
+ * whose expected outcome IS the narrowing (`components_incomplete`,
+ * `components_unexpected`).
+ *
+ * Keying the skip on the DECLARED field alone excluded every vector that so
+ * much as mentions content-digest, because the shipped fixtures declare
+ * `covers_content_digest: 'required'` on vectors whose assertion has nothing
+ * to do with the policy: `positive/002` (a covered digest that must be
+ * ACCEPTED), `negative/010` (a FALSIFIED digest that must be rejected with
+ * `request_signature_digest_mismatch`) and `negative/023` (a malformed
+ * `Content-Digest` header, `request_signature_header_malformed`). Dropping
+ * those buys a clean skip count by not grading the vectors that test the
+ * thing.
+ */
+function contentDigestDeclarationMismatch(
+  vector: PositiveVector | NegativeVector,
+  kind: 'positive' | 'negative',
+  agentPolicy: 'required' | 'forbidden' | 'either'
+): string | undefined {
+  const vectorCd = vector.verifier_capability.covers_content_digest;
+  if (vectorCd === 'either' || vectorCd === agentPolicy) return undefined;
+  if (agentPolicy === 'either') {
+    const expected = kind === 'negative' ? (vector as NegativeVector).expected_error_code : undefined;
+    if (expected === undefined || !CONTENT_DIGEST_POLICY_REFUSALS.has(expected)) return undefined;
+  }
+  return (
+    `Vector asserts covers_content_digest='${vectorCd}' but agent declares '${agentPolicy}'. ` +
+    `The vector can't grade against this profile — its expected verifier behavior doesn't match what the agent implements.`
+  );
+}
+
+/**
+ * Capability-profile mismatch resolver used when the operator passes
+ * `agentContentDigestPolicy` without a full `agentCapability` fixture.
+ * Combines two checks:
+ *   - Declared-policy check (negatives only): see
+ *     {@link contentDigestDeclarationMismatch}. Positives are unaffected
+ *     because acceptance under a permissive agent still demonstrates the
+ *     verifier's acceptance contract.
+ *   - Structural shape check (positives and negatives): the vector's
+ *     actual `Signature-Input` shape must coexist with the agent's
+ *     policy — otherwise the verifier short-circuits with a
+ *     `request_signature_components_*` error before any other path can
+ *     fire.
+ */
+function contentDigestPolicyMismatch(
+  vector: PositiveVector | NegativeVector,
+  kind: 'positive' | 'negative',
+  agentPolicy: 'required' | 'forbidden' | 'either'
+): string | undefined {
+  if (kind === 'negative') {
+    const declared = contentDigestDeclarationMismatch(vector, kind, agentPolicy);
+    if (declared) return declared;
+  }
+  return contentDigestStructuralMismatch(vector, agentPolicy);
+}
+
+/**
+ * Narrow policy gate for an agent's discovered capability advertisement.
+ *
+ * Unlike the operator-selected `agentContentDigestPolicy` path above, an
+ * untrusted advertisement must not suppress unrelated signing coverage. It
+ * may exclude only the two negatives whose expected refusal exists solely
+ * under a strict content-digest policy: 007 (`required`) and 018
+ * (`forbidden`). Matching strict policies remain graded; `either` excludes
+ * both.
+ */
+export function advertisedContentDigestPolicyExclusion(
+  vector: PositiveVector | NegativeVector,
+  kind: 'positive' | 'negative',
+  agentPolicy: 'required' | 'forbidden' | 'either'
+): SemanticVectorExclusion | undefined {
+  if (kind !== 'negative') return undefined;
+  const expectedError = (vector as NegativeVector).expected_error_code;
+  const vectorPolicy = vector.verifier_capability.covers_content_digest;
+  const requiredPolicy =
+    expectedError === 'request_signature_components_incomplete' && vectorPolicy === 'required'
+      ? 'required'
+      : expectedError === 'request_signature_components_unexpected' && vectorPolicy === 'forbidden'
+        ? 'forbidden'
+        : undefined;
+  if (!requiredPolicy || agentPolicy === requiredPolicy) return undefined;
+  return {
+    skip_reason: 'capability_profile_mismatch',
+    diagnostic:
+      `Vector expects ${expectedError} under covers_content_digest='${requiredPolicy}', ` +
+      `but the agent declares '${agentPolicy}'.`,
+  };
+}
+
+/**
+ * Narrow `required_for` gate for an agent's discovered capability
+ * advertisement — the third axis after content-digest policy (#2993) and
+ * `protocol_methods_required_for`.
+ *
+ * A vector whose `verifier_capability.required_for` names an operation the
+ * agent does not declare in its own `request_signing.required_for` tests a
+ * rejection path the agent never opted into: `required_for: []` with
+ * `supported: true` is the spec's 3.x shadow posture (signing optional in
+ * 3.x, required for spend-committing operations in 4.0). Such a vector is
+ * out of scope for that agent and skips `capability_profile_mismatch`, the
+ * same verdict `capabilityMismatch()` already reaches for an
+ * operator-selected profile.
+ *
+ * Narrow on purpose, like {@link advertisedContentDigestPolicyExclusion}:
+ * nearly every vector's fixture lists `create_media_buy` under
+ * `required_for`, because that is the profile the vector was authored
+ * against — comparing the whole field to a live advertisement would exclude
+ * 39 of 40 vectors and let an agent switch the storyboard off by
+ * under-declaring. The gate fires only for the refusal that exists *solely*
+ * because of `required_for`: a negative vector expecting
+ * `request_signature_required` (the unsigned-request pre-check) whose
+ * fixture `required_for` names an operation the agent does not declare —
+ * vector 001 today. Vectors expecting any other refusal (wrong tag, digest
+ * mismatch, malformed header, …) test the verifier, not the posture, and
+ * stay graded; 027 and 028 expect `request_signature_required` too but
+ * declare `required_for: []`, so they are never excluded here. An agent
+ * that declares `required_for: ["create_media_buy"]` keeps grading vector
+ * 001 unchanged.
+ */
+export function advertisedRequiredForExclusion(
+  vector: PositiveVector | NegativeVector,
+  kind: 'positive' | 'negative',
+  agentRequiredFor: readonly string[]
+): SemanticVectorExclusion | undefined {
+  if (kind !== 'negative') return undefined;
+  if ((vector as NegativeVector).expected_error_code !== 'request_signature_required') return undefined;
+  const vectorRequiredFor = vector.verifier_capability.required_for ?? [];
+  if (vectorRequiredFor.length === 0) return undefined;
+  const declared = new Set(agentRequiredFor);
+  const missing = vectorRequiredFor.filter(op => !declared.has(op));
+  if (missing.length === 0) return undefined;
+  return {
+    skip_reason: 'capability_profile_mismatch',
+    diagnostic:
+      `Vector asserts required_for includes [${missing.join(', ')}] but the agent declares ` +
+      `required_for [${agentRequiredFor.join(', ')}]. The vector tests a rejection path the ` +
+      `agent has not opted into; add the operation to request_signing.required_for to grade it.`,
+  };
+}
+
+/**
+ * Compare a vector's `verifier_capability` fixture and actual signed shape
+ * against the agent's declared capability profile. Returns a
+ * human-readable diagnostic when the vector can't grade against this
+ * profile — or `undefined` when the vector is gradable.
+ *
+ * Rules (all four must hold for a graded run):
+ *   - `supported`: must match. A vector with `supported: true` doesn't
+ *     grade against an agent that declares `supported: false` (the
+ *     conformance storyboard already skips such agents outright, but
+ *     defense-in-depth).
+ *   - `covers_content_digest`: asymmetric. Vector-side `'either'` is
+ *     permissive only at the declaration level — the structural shape
+ *     check below still applies. Agent-side `'either'` is permissive
+ *     except against the two vectors whose expected outcome IS the
+ *     narrowing — an agent that declares `'either'` accepts covered AND
+ *     uncovered requests, so it can't pass vectors 007
+ *     (`components_incomplete`) or 018 (`components_unexpected`). Those
+ *     auto-skip with `capability_profile_mismatch`; every other
+ *     content-digest vector still grades. See
+ *     {@link contentDigestDeclarationMismatch}.
+ *   - structural shape: the vector's actual `Signature-Input` must
+ *     coexist with the agent's policy regardless of what
+ *     `verifier_capability.covers_content_digest` declares. A vector
+ *     signing without `content-digest` can't grade a `'required'`
+ *     verifier; a vector signing with `content-digest` can't grade a
+ *     `'forbidden'` verifier. Either short-circuits with a
+ *     `request_signature_components_*` error before the vector's
+ *     intended assertion fires.
+ *   - `required_for` / `protocol_methods_required_for`: if the vector
+ *     asserts a required_for operation or method, the agent's
+ *     `required_for` / `protocol_methods_required_for` must include it.
+ *     The reverse is fine — an agent that requires MORE operations is
+ *     still conformant against a vector that asserts fewer.
+ */
+function capabilityMismatch(
+  vector: PositiveVector | NegativeVector,
+  kind: 'positive' | 'negative',
+  agentCap: VerifierCapabilityFixture
+): string | undefined {
+  const vectorCap = vector.verifier_capability;
+  if (vectorCap.supported !== agentCap.supported) {
+    return (
+      `Vector asserts supported=${vectorCap.supported} but agent declares supported=${agentCap.supported}. ` +
+      `Verify the agent's request_signing capability block.`
+    );
+  }
+  // `covers_content_digest` asymmetry: vector-side `'either'` is
+  // permissive only if the vector's actual signed shape is compatible
+  // with the agent's policy (handled by the structural check below).
+  // Agent-side `'either'` is permissive except against the two vectors
+  // whose expected outcome is the narrowing itself.
+  const declared = contentDigestDeclarationMismatch(vector, kind, agentCap.covers_content_digest);
+  if (declared) return declared;
+  // Structural shape check: even when vectorCap is permissive (`'either'`),
+  // the vector's actual `Signature-Input` either covers `content-digest` or
+  // not. A `'required'` verifier rejects every uncovered request with
+  // `request_signature_components_incomplete`; a `'forbidden'` verifier
+  // rejects every covered request with `request_signature_components_unexpected`.
+  // Both fire before the vector's intended error path, masking the result.
+  const structural = contentDigestStructuralMismatch(vector, agentCap.covers_content_digest);
+  if (structural) return structural;
+  // `required_for` on the vector: every op the vector expects to be
+  // required must also be required by the agent. Otherwise a negative
+  // vector (e.g., missing signature on `create_media_buy`) would test a
+  // rejection path the agent didn't opt into.
+  const vectorRequiredFor = vectorCap.required_for ?? [];
+  const agentRequiredForSet = new Set(agentCap.required_for ?? []);
+  const missingRequiredFor = vectorRequiredFor.filter(op => !agentRequiredForSet.has(op));
+  if (missingRequiredFor.length > 0) {
+    return (
+      `Vector asserts required_for includes [${missingRequiredFor.join(', ')}] but agent's required_for does not. ` +
+      `Either add the operation to the agent's request_signing.required_for, or accept the skip.`
+    );
+  }
+  return protocolMethodCoverageMismatch(vector, agentCap);
+}
+
+/**
+ * The `protocol_methods_required_for` slice of `capabilityMismatch`
+ * (adcp#4326 namespace): negative vectors that grade a JSON-RPC protocol
+ * method (only `028-unsigned-protocol-method-required` today) don't apply to
+ * an agent that never claimed to require a signature on that method, exactly
+ * as `required_for` works for AdCP-tool vectors.
+ *
+ * Split out and exported because it is the one dimension safe to decide from
+ * an agent's *advertised* `request_signing` block. The others describe the
+ * profile a vector was authored against — an operator selects a matching one
+ * with `--covers-content-digest` / `agentCapability`, and reading them off a
+ * live advertisement instead would exclude most of the vector set (a
+ * `covers_content_digest: 'either', required_for: []` advertisement mismatches
+ * 39 of 40 vectors), quietly gutting the storyboard it was meant to sharpen.
+ */
+export function protocolMethodCoverageMismatch(
+  vector: PositiveVector | NegativeVector,
+  agentCap: Pick<VerifierCapabilityFixture, 'protocol_methods_required_for'>
+): string | undefined {
+  const required = vector.verifier_capability.protocol_methods_required_for ?? [];
+  const declared = new Set(agentCap.protocol_methods_required_for ?? []);
+  const missing = required.filter(method => !declared.has(method));
+  if (missing.length === 0) return undefined;
+  return (
+    `Vector asserts protocol_methods_required_for includes [${missing.join(', ')}] ` +
+    `but agent's protocol_methods_required_for does not. Either add the method to the agent's ` +
+    `request_signing.protocol_methods_required_for, or accept the skip.`
+  );
+}
+
+function buildNegativeDiagnostic(vector: NegativeVector, probe: ProbeResult): string | undefined {
+  if (probe.error) return `probe error: ${probe.error}`;
+  if (probe.status === 401 && probe.wwwAuthenticateErrorCode === vector.expected_error_code) {
+    return undefined;
+  }
+  const actual = probe.wwwAuthenticateErrorCode ?? '(none)';
+  if (probe.status !== 401) {
+    return `expected 401 with error="${vector.expected_error_code}", got ${probe.status} (error="${actual}"). Vector: ${vector.name}`;
+  }
+  return `expected error="${vector.expected_error_code}", got error="${actual}". Check verifier step ordering — several vectors (015/017/020) depend on revocation/cap checks firing BEFORE crypto verify.`;
+}
