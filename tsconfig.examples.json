@@ -1,0 +1,47 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "baseUrl": ".",
+    "paths": {
+      "@adcp/sdk": ["./dist/lib/index.d.ts"],
+      "@adcp/sdk/testing": ["./dist/lib/testing/index.d.ts"],
+      "@adcp/sdk/server": ["./dist/lib/server/index.d.ts"],
+      "@adcp/sdk/*": ["./dist/lib/*"]
+    }
+  },
+  "include": [
+    "examples/supply-path-verification.ts",
+    "examples/wholesale-feed-sync.ts",
+    "examples/comply-controller-seller.ts",
+    "examples/seller-3.2-starter.ts",
+    "examples/seller-test-controller.ts",
+    "examples/gcp-kms-signing-provider.ts",
+    "examples/error-compliant-server.ts",
+    "examples/existing-platform-thin.ts",
+    "examples/durable-buyer-writes/caller.ts",
+    "examples/durable-buyer-writes/worker.ts",
+    "examples/targeting-input-existing-platform.ts",
+    "examples/signals-agent.ts",
+    "examples/decisioning-platform-mock-seller.ts",
+    "examples/decisioning-platform-broadcast-tv.ts",
+    "examples/decisioning-platform-identity-graph.ts",
+    "examples/decisioning-platform-multi-tenant.ts",
+    "examples/decisioning-platform-multi-tenant-db.ts",
+    "examples/decisioning-platform-path-routed.ts",
+    "examples/decisioning-platform-programmatic.ts",
+    "examples/hello-cluster.ts",
+    "examples/hello_signals_adapter_marketplace.ts",
+    "examples/hello_creative_adapter_template.ts",
+    "examples/hello_creative_adapter_ad_server.ts",
+    "examples/hello_seller_adapter_social.ts",
+    "examples/proxy-seller-snap/index.ts",
+    "examples/hello_seller_adapter_guaranteed.ts",
+    "examples/hello_seller_adapter_non_guaranteed.ts",
+    "examples/hello_seller_adapter_multi_tenant.ts",
+    "examples/hello_seller_adapter_proposal_mode.ts",
+    "examples/hello_si_adapter_brand.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

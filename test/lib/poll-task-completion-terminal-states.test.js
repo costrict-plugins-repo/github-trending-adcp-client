@@ -1,0 +1,458 @@
+// Tests that pollTaskCompletion exits immediately on terminal/paused states
+// instead of spinning until timeout.
+//
+// Calls pollTaskCompletion directly (bypassing executeTask) to isolate the
+// polling loop behavior from schema validation on the initial call.
+
+const { test, describe, beforeEach, afterEach, mock } = require('node:test');
+const assert = require('node:assert');
+const { createTestProduct } = require('./test-fixtures');
+
+describe('pollTaskCompletion terminal state handling', () => {
+  let TaskExecutor;
+  let ProtocolClient;
+  let originalCallTool;
+  let mockAgent;
+
+  beforeEach(() => {
+    delete require.cache[require.resolve('../../dist/lib/index.js')];
+    const lib = require('../../dist/lib/index.js');
+    TaskExecutor = lib.TaskExecutor;
+    ProtocolClient = lib.ProtocolClient;
+    originalCallTool = ProtocolClient.callTool;
+
+    // Use 'a2a' protocol so getTaskStatus goes directly to ProtocolClient.callTool
+    // (the 'mcp' path tries getMCPTaskStatus first, which requires a live server).
+    mockAgent = {
+      id: 'test-agent',
+      name: 'Test Agent',
+      agent_uri: 'https://test.example.com',
+      protocol: 'a2a',
+    };
+  });
+
+  afterEach(() => {
+    if (originalCallTool) {
+      ProtocolClient.callTool = originalCallTool;
+    }
+  });
+
+  test('exits loop and returns failure when tasks/get returns rejected (error field)', async () => {
+    ProtocolClient.callTool = mock.fn(async () => ({
+      task: {
+        taskId: 'task-abc',
+        status: 'rejected',
+        error: 'Request rejected by agent policy',
+        taskType: 'create_media_buy',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    }));
+
+    const executor = new TaskExecutor();
+    const result = await executor.pollTaskCompletion(mockAgent, 'task-abc', 10);
+
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.status, 'failed');
+    assert.ok(
+      result.error.includes('rejected by agent policy'),
+      `Expected error to include rejection message, got: ${result.error}`
+    );
+  });
+
+  test('preserves message field as error fallback when error field is absent on rejection', async () => {
+    ProtocolClient.callTool = mock.fn(async () => ({
+      task: {
+        taskId: 'task-def',
+        status: 'rejected',
+        message: 'Budget cap exceeded — task not started',
+        taskType: 'create_media_buy',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    }));
+
+    const executor = new TaskExecutor();
+    const result = await executor.pollTaskCompletion(mockAgent, 'task-def', 10);
+
+    assert.strictEqual(result.success, false);
+    assert.ok(result.error.includes('Budget cap exceeded'), `Expected error from message field, got: ${result.error}`);
+  });
+
+  for (const returnedTaskId of ['', 'different-task']) {
+    test(`fails closed when tasks/get returns ${returnedTaskId ? 'a different' : 'no'} task identity`, async () => {
+      ProtocolClient.callTool = mock.fn(async () => ({
+        task: {
+          taskId: returnedTaskId,
+          status: 'completed',
+          taskType: 'create_media_buy',
+          result: { media_buy_id: 'must-not-complete', packages: [] },
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+      }));
+
+      const executor = new TaskExecutor();
+      const result = await executor.pollTaskCompletion(mockAgent, 'expected-task', 10);
+
+      assert.strictEqual(result.success, false);
+      assert.strictEqual(result.status, 'failed');
+      assert.match(result.error, /task identity.*does not match/);
+      assert.strictEqual(result.data, undefined);
+    });
+  }
+
+  test('preserves legacy media-buy lifecycle status in completed task result', async () => {
+    ProtocolClient.callTool = mock.fn(async () => ({
+      task: {
+        taskId: 'task-legacy-result',
+        status: 'completed',
+        taskType: 'create_media_buy',
+        result: {
+          media_buy_id: 'mb-legacy-result',
+          status: 'pending_creatives',
+          packages: [],
+        },
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    }));
+
+    const executor = new TaskExecutor();
+    const result = await executor.pollTaskCompletion(mockAgent, 'task-legacy-result', 10);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.status, 'completed');
+    assert.strictEqual(result.data.status, 'pending_creatives');
+    assert.strictEqual(result.data.media_buy_status, 'pending_creatives');
+  });
+
+  test('tasks/get A2A envelope uses latest artifact result, not stale first artifact', async () => {
+    ProtocolClient.callTool = mock.fn(async () => ({
+      result: {
+        kind: 'task',
+        id: 'a2a-task-id',
+        status: { state: 'completed' },
+        artifacts: [
+          {
+            artifactId: 'stale',
+            parts: [
+              {
+                kind: 'data',
+                data: {
+                  task_id: 'task-latest-artifact',
+                  task_type: 'create_media_buy',
+                  status: 'completed',
+                  result: {
+                    media_buy_id: 'mb_stale',
+                    status: 'pending_creatives',
+                    packages: [],
+                  },
+                },
+              },
+            ],
+          },
+          {
+            artifactId: 'final',
+            parts: [
+              {
+                kind: 'data',
+                data: {
+                  task_id: 'task-latest-artifact',
+                  task_type: 'create_media_buy',
+                  status: 'completed',
+                  result: {
+                    media_buy_id: 'mb_latest',
+                    status: 'active',
+                    packages: [],
+                  },
+                },
+              },
+            ],
+          },
+        ],
+      },
+    }));
+
+    const executor = new TaskExecutor();
+    const result = await executor.pollTaskCompletion(mockAgent, 'task-latest-artifact', 10);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.status, 'completed');
+    assert.strictEqual(result.data.media_buy_id, 'mb_latest');
+    assert.strictEqual(result.data.status, 'active');
+  });
+
+  test('does not add synthetic status to completed task result with media_buy_status only', async () => {
+    ProtocolClient.callTool = mock.fn(async () => ({
+      task: {
+        taskId: 'task-media-buy-status-only',
+        status: 'completed',
+        taskType: 'create_media_buy',
+        result: {
+          media_buy_id: 'mb-media-buy-status-only',
+          media_buy_status: 'pending_creatives',
+          packages: [],
+        },
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    }));
+
+    const executor = new TaskExecutor();
+    const result = await executor.pollTaskCompletion(mockAgent, 'task-media-buy-status-only', 10);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.data.status, undefined);
+    assert.strictEqual(result.data.media_buy_status, 'pending_creatives');
+  });
+
+  test('returns success when completed task result has advisory errors[]', async () => {
+    ProtocolClient.callTool = mock.fn(async () => ({
+      task: {
+        taskId: 'task-advisory-success',
+        status: 'completed',
+        taskType: 'get_products',
+        result: {
+          status: 'completed',
+          cache_scope: 'public',
+          products: [createTestProduct({ product_id: 'prod-advisory-polled' })],
+          errors: [{ code: 'FORMAT_DECLARATION_DIVERGENT', message: 'advisory only' }],
+        },
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    }));
+
+    const executor = new TaskExecutor();
+    const result = await executor.pollTaskCompletion(mockAgent, 'task-advisory-success', 10);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.status, 'completed');
+    assert.strictEqual(result.data.products[0].product_id, 'prod-advisory-polled');
+    assert.strictEqual(result.data.errors[0].code, 'FORMAT_DECLARATION_DIVERGENT');
+    assert.strictEqual(result.adcpError, undefined);
+  });
+
+  test('returns failure when completed task result has explicit failed status', async () => {
+    ProtocolClient.callTool = mock.fn(async () => ({
+      task: {
+        taskId: 'task-terminal-payload',
+        status: 'completed',
+        taskType: 'report_usage',
+        result: {
+          status: 'failed',
+          accepted: 0,
+          errors: [{ code: 'INVALID_USAGE_ROW', message: 'all rows rejected' }],
+        },
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    }));
+
+    const executor = new TaskExecutor();
+    const result = await executor.pollTaskCompletion(mockAgent, 'task-terminal-payload', 10);
+
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.status, 'failed');
+    assert.match(result.error, /all rows rejected/);
+    assert.strictEqual(result.adcpError.code, 'INVALID_USAGE_ROW');
+  });
+
+  test('returns failure when completed create_media_buy result lacks media_buy_id', async () => {
+    ProtocolClient.callTool = mock.fn(async () => ({
+      task: {
+        taskId: 'task-invalid-media-buy',
+        status: 'completed',
+        taskType: 'create_media_buy',
+        result: {
+          status: 'completed',
+          packages: [],
+          errors: [{ code: 'INVALID_RESPONSE', message: 'missing media_buy_id' }],
+        },
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    }));
+
+    const executor = new TaskExecutor();
+    const result = await executor.pollTaskCompletion(mockAgent, 'task-invalid-media-buy', 10);
+
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.status, 'failed');
+    assert.match(result.error, /missing media_buy_id/);
+  });
+
+  test('exits on first poll without retries when tasks/get returns rejected', async () => {
+    let pollCount = 0;
+
+    ProtocolClient.callTool = mock.fn(async () => {
+      pollCount++;
+      return {
+        task: {
+          taskId: 'task-ghi',
+          status: 'rejected',
+          error: 'Rejected immediately',
+          taskType: 'create_media_buy',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+      };
+    });
+
+    const executor = new TaskExecutor();
+    await executor.pollTaskCompletion(mockAgent, 'task-ghi', 10);
+
+    assert.strictEqual(pollCount, 1, 'Should exit after exactly one poll on rejected');
+  });
+
+  test('exits on failed status (regression — pre-existing branch, now in shared FAILED|CANCELED|REJECTED block)', async () => {
+    let pollCount = 0;
+    ProtocolClient.callTool = mock.fn(async () => {
+      pollCount++;
+      return {
+        task: {
+          taskId: 'task-failed',
+          status: 'failed',
+          error: 'Internal error',
+          taskType: 'create_media_buy',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+      };
+    });
+
+    const executor = new TaskExecutor();
+    const result = await executor.pollTaskCompletion(mockAgent, 'task-failed', 10);
+
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.status, 'failed');
+    assert.ok(result.error.includes('Internal error'));
+    assert.strictEqual(pollCount, 1, 'failed exits on first poll, like rejected');
+  });
+
+  test('exits on canceled status (regression — pre-existing branch)', async () => {
+    let pollCount = 0;
+    ProtocolClient.callTool = mock.fn(async () => {
+      pollCount++;
+      return {
+        task: {
+          taskId: 'task-canceled',
+          status: 'canceled',
+          message: 'Buyer canceled before activation',
+          taskType: 'create_media_buy',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+      };
+    });
+
+    const executor = new TaskExecutor();
+    const result = await executor.pollTaskCompletion(mockAgent, 'task-canceled', 10);
+
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.status, 'failed');
+    assert.ok(result.error.includes('Buyer canceled'), `expected message-field fallback, got: ${result.error}`);
+    assert.strictEqual(pollCount, 1);
+  });
+
+  test('generic error string when no error or message field on rejection', async () => {
+    ProtocolClient.callTool = mock.fn(async () => ({
+      task: {
+        taskId: 'task-jkl',
+        status: 'rejected',
+        taskType: 'create_media_buy',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    }));
+
+    const executor = new TaskExecutor();
+    const result = await executor.pollTaskCompletion(mockAgent, 'task-jkl', 10);
+
+    assert.strictEqual(result.success, false);
+    assert.ok(result.error.includes('rejected'), `Expected fallback error to mention status, got: ${result.error}`);
+  });
+
+  // ────────────────────────────────────────────────────────────
+  // Paused states (#977 part 2): input-required / auth-required.
+  //
+  // Polling alone can't advance these. The polling loop returns a
+  // TaskResultIntermediate so callers can branch on `result.status` and
+  // choose an explicit application/protocol-specific recovery path,
+  // matching the synchronous handleInputRequired no-handler path
+  // (`success: true` because the task is progressing, not failed).
+  //
+  // Pre-fix: pollTaskCompletion ignored these statuses and looped
+  // until timeout — a worse failure mode than a clean paused-state
+  // result.
+  // ────────────────────────────────────────────────────────────
+
+  test('exits with TaskResultIntermediate when status === input-required', async () => {
+    let pollCount = 0;
+    ProtocolClient.callTool = mock.fn(async () => {
+      pollCount++;
+      return {
+        task: {
+          taskId: 'task-input',
+          status: 'input-required',
+          taskType: 'create_media_buy',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+      };
+    });
+
+    const executor = new TaskExecutor();
+    const result = await executor.pollTaskCompletion(mockAgent, 'task-input', 10);
+
+    assert.strictEqual(result.success, true, 'task is progressing, not failed');
+    assert.strictEqual(result.status, 'input-required');
+    assert.strictEqual(pollCount, 1, 'should not loop on paused state');
+  });
+
+  test('exits with TaskResultIntermediate when status === auth-required', async () => {
+    let pollCount = 0;
+    ProtocolClient.callTool = mock.fn(async () => {
+      pollCount++;
+      return {
+        task: {
+          taskId: 'task-auth',
+          status: 'auth-required',
+          taskType: 'create_media_buy',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+      };
+    });
+
+    const executor = new TaskExecutor();
+    const result = await executor.pollTaskCompletion(mockAgent, 'task-auth', 10);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.status, 'auth-required');
+    assert.strictEqual(pollCount, 1, 'should not loop on paused state');
+  });
+
+  test('paused-state result preserves the wire status (not collapsed)', async () => {
+    // Distinct from `failed`/`canceled`/`rejected` which all collapse
+    // to `status: 'failed'` on TaskResultFailure. Paused states
+    // preserve their wire status so callers can pattern-match.
+    ProtocolClient.callTool = mock.fn(async () => ({
+      task: {
+        taskId: 'task-distinct',
+        status: 'auth-required',
+        taskType: 'create_media_buy',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    }));
+
+    const executor = new TaskExecutor();
+    const result = await executor.pollTaskCompletion(mockAgent, 'task-distinct', 10);
+
+    assert.notStrictEqual(result.status, 'failed');
+    assert.notStrictEqual(result.status, 'completed');
+    assert.strictEqual(result.status, 'auth-required');
+  });
+});

@@ -1,0 +1,848 @@
+# Migrating from SDK 16 to 17
+
+SDK 17 beta pins the signed AdCP `3.3.0-beta.6` release. Use the beta in
+development and staging; production remains on SDK 16 and AdCP 3.2.
+
+## Companion packages
+
+The next release pairs **`@adcp/sdk@17.0.0-beta.2`** with
+**`@adcp/reporting-storage@0.3.0-beta.1`**. The storage package requires SDK
+`^17.0.0-beta.2`; install and lock both packages together after publication:
+
+```bash
+npm install --save-exact @adcp/sdk@17.0.0-beta.2 @adcp/reporting-storage@0.3.0-beta.1
+npm ls @adcp/sdk @adcp/reporting-storage
+```
+
+The `beta` tags select that release train once published. Stable storage
+`0.2.0` accepts SDK `^16.5.0`, including SDK 16.6; it does not accept SDK 17.
+The earlier SDK 17 beta.0/beta.1 pair used storage `0.2.1-beta.0`, whose code
+and SQL migrations matched `0.2.0` and whose peer range was `^17.0.0-beta.0`.
+A stable range such as `~0.2.0` does not select either storage prerelease.
+
+Storage `0.3.0-beta.1` also includes reporting configuration history. Reapply
+`REPORTING_LEDGER_MIGRATION` (from the next storage beta, run `npx adcp-reporting-storage migrate`,
+which applies it as version `0002`) before starting the new workers: it adds the
+nullable `adcp_reporting_configurations.history_start` audit column and
+live-priority indexes idempotently. Upgrade all workers before granting or
+extending historical ownership. Existing configurations retain their original
+history boundary until the trusted host explicitly changes it. See the
+[reporting ledger guide](./guides/REPORTING-LEDGER.md) for history, source
+retention, pacing, and custom-store requirements.
+
+If upgrading from SDK 16.4 or earlier, also read the
+[storage 0.2.0 notes](https://github.com/adcontextprotocol/adcp-client/blob/main/packages/reporting-storage/CHANGELOG.md#020)
+for BigQuery sinks that omit `location`.
+
+## Added union and enum members
+
+These additions are relative to the bundled AdCP 3.2.7 contract. Update exhaustive
+switches and runtime accept-lists deliberately; the unversioned `*Values` arrays
+always describe the SDK's current pin, not the negotiated seller release.
+
+| Surface | Added members or requirement | Migration action |
+| --- | --- | --- |
+| Account notification types | `collection_card.updated`, `collection_card.removed`, `collection_catalog.bulk_change`, `proposal.created` | Add handlers or explicitly exclude them from subscriptions. `ACCOUNT_NOTIFICATION_TYPES` includes all four. |
+| `OutcomeTarget.goal.kind` | `vendor_metric` | Narrow all three goal kinds before accessing `metric`; see below. |
+| `UniversalMacroValues` | `ADDTL_CONSENT` | Review macro accept-lists. Parameterized `GDPR_CONSENT_<gvl_id>` names also remain valid; the finite runtime array does not enumerate them. |
+| Delivery `metric_id` / `AvailableMetric` | `print_metrics`, `publication` | Handle print-specific delivery aggregates. |
+| `DemographicSystem` | `nmo`, `videoamp` | Review audience and demographic system filters. |
+| Price adjustment `kind` | `operator_fee` | Include operator fees in supported price adjustment handling. |
+| Seller-originated account changes | Nonempty `changed_paths` for `origin.kind: 'adcp'` or `'seller_operator'` | Populate paths on 3.3 pages. This is not required on 3.2 pages. |
+| Creative asset content types / format slots | `video_brief` | Accept generation briefs separately from finished video assets. |
+| Canonical format option kinds | `seller_rendered_stateful_display`, `coordinated_placements` | Update format-kind switches. |
+| `PrincipalChangedWebhook.reason` | `relationship_changed`, `relationship_expiring` | Refresh relationship state when these invalidations arrive. |
+| Product card asset `role` | `sample_content` | Update card-reference rendering switches. |
+| Wholesale feed `entity_type` | `collection` | Handle collection invalidations; the feed event and webhook type unions include the three collection events above. |
+| `ErrorCode` | `CREATIVE_MERGE_REJECTED`, `ACCOUNT_CHANGE_REQUIRES_NEW_ACCOUNT`, `RIGHTS_CHANNEL_VIOLATION` | Handle the advertised recovery behavior; do not assume every new code is transient. |
+| `IndicatorType` | `flight_extension_opportunity`, `scale_budget_opportunity` | Update indicator filters and displays. |
+| `PixelTrackingEvent` | `start`, `first_quartile`, `midpoint`, `third_quartile`, `complete` | Review tracking event accept-lists. |
+| Refinement action | `extend_hold` | Handle explicit hold extension. |
+| `Specialism` | `sales-fixed-rate` | Include fixed-rate sellers in capability classification. |
+| Canonical hosted-video codecs / containers | `mpeg2`, `avc_intra`, `xavc` / `mxf` | Update media validation and ingest routing. |
+| Brand identity requested / available fields | `collections` | Handle collection identity fields if requested. |
+| Creative listing fields | `provenance` | Include provenance only when requested and authorized. |
+| Signal listing fields | `age_determination_bases`, `signal_status`, `source_audience_id` | Update field-selection lists. |
+| Account change repair task / lifecycle tools | `list_proposals` | Refresh proposal state for relevant invalidations. |
+| Event-source sync row action | `archived` | Handle archived source readback. |
+| Entity hydration types | `creative_seller_revision`, `governance_budget_period` | Update entity type routing if used. |
+| Agent permission denial reason | `grant_absent` | Handle missing grants in permission diagnostics. |
+| Compliance controller operation | `mutate_definition` | Available to test-controller scenarios. |
+
+`OutcomeTarget.goal` is now `metric | event | vendor_metric`. After excluding
+`event`, a value can still be `vendor_metric`, which has `vendor` and `metric_id`
+instead of `metric`. On proposal requests and refinements, sellers declaring
+outcome-target planning but supporting only delivery metrics should reject
+unsupported goals with `INVALID_REQUEST` naming `criteria.outcome_target.goal`.
+A vendor goal requires the product's declared vendor/metric pair and a cumulative
+total. Sellers that do not declare outcome-target planning reject the field
+with `UNSUPPORTED_FEATURE`. On `list_products` the field is inert: perform schema
+validation but do not reject it merely because the goal is unsupported.
+
+## Public asset and targeting types
+
+Import the shared `AssetVariant` union from `@adcp/sdk`, `@adcp/sdk/types`, or
+`@adcp/sdk/schemas`. Per-tool type slices stay self-contained and expose the
+same structural contract. `AssetVariantSchema` has an explicit `z.ZodType`
+annotation to keep `z.output<typeof AssetVariantSchema>` shallow and assignable
+to that union, including nonempty video-brief segments and macro declarations.
+
+`DaypartTarget` is a union of complete whole-hour and minute-resolution forms.
+Check `start_hour !== undefined` before using hour arithmetic; minute windows
+use `start_time` and `end_time` and can cross midnight. Mixing the forms or
+omitting either endpoint is a type error.
+
+`TargetingOverlayKeys` and `TargetingOverlaySupportKeys` are frozen runtime key
+arrays exported from `@adcp/sdk` and `@adcp/sdk/types`. They include
+`collection_lists`, `collection_lists_exclude`, and extension fields. Use them
+for exhaustive dimension handling instead of maintaining local copies.
+
+`streamAccountChanges` validates each page using trusted negotiated/wire
+metadata before any seller echo. Without authoritative release metadata, the
+drain falls back to the seller echo and then the client's configured version. Custom
+readers can pass `adcpVersion: '3.2.8'` in the drain options. This selects
+validation only; the reader remains responsible for sending the matching
+request release. Existing cursor, account identity, and acknowledgement checks
+still apply.
+
+A `3.3.0` or `3.3` configuration pin does not select a beta. Use the exact
+`3.3.0-beta.6` bundle (wire alias `3.3-beta.6`); unavailable pins now produce a
+short list of bundled release lines instead of every compatible patch.
+
+## pnpm peer resolution
+
+The official A2A SDK `1.0.1` already marks its Express peer optional, and the
+AdCP SDK marks OpenTelemetry optional. AdCP cannot change a transitive package's
+peer metadata by adding an Express entry to its own manifest. pnpm can still
+create multiple SDK instances when workspace importers supply different peer
+versions or different optional-peer sets. Install one compatible peer set at
+the workspace root and align it across importers.
+
+For workspaces that need explicit convergence, declare the three packages as
+direct root dependencies, then use their declared specs in `pnpm-workspace.yaml`:
+
+```yaml
+dedupePeerDependents: true
+resolvePeersFromWorkspaceRoot: true
+overrides:
+  '@a2a-js/sdk': '$@a2a-js/sdk'
+  '@modelcontextprotocol/sdk': '$@modelcontextprotocol/sdk'
+  '@opentelemetry/api': '$@opentelemetry/api'
+```
+
+Choose versions satisfying all consumers before applying overrides; they do not
+make incompatible peer contracts compatible. Run `pnpm install`, `pnpm dedupe`,
+and `pnpm why -r @adcp/sdk` to inspect the resulting graph. See
+[pnpm's dependency-resolution settings](https://github.com/pnpm/pnpm/blob/main/pnpm/docs/settings/dependency-resolution.md)
+and [peer-dependency settings](https://pnpm.io/settings#dedupepeerdependents).
+
+## Protocol and discovery
+
+The SDK packages the exact 3.3 beta schema and compliance bundle alongside
+maintained AdCP 3.2.8, 3.1.31 and 3.0.25 bundles. A seller must advertise
+`3.3-beta.6` (or its full bundle version, `3.3.0-beta.6`) before the buyer
+selects that preview. A different beta, a moving `3.3-beta` alias, or a
+served-version echo alone does not establish support. The buyer can negotiate
+an older stable release the seller advertises. Missing or synthetic capability
+evidence cannot authorize a preview request.
+
+`AgentClient` and `SingleAgentClient` expose `listCollections()` and
+`listProposals()`, including typed completion handlers. The corresponding
+server handlers are `mediaBuy.listCollections` and `mediaBuy.listProposals`,
+or optional methods on `MediaBuyLifecyclePlatform`. Their synchronous results
+use `outcome` and do not acquire a synthetic task `status` field.
+
+### Origin-only `authorized_agents[].url` entries
+
+At AdCP 3.3, an `authorized_agents[].url` whose canonical form has the root
+path and no query (`https://agent.example.com`) authorizes the agent at that
+origin whatever its path, so it matches an agent at
+`https://agent.example.com/mcp` ([Agent URL matching](https://adcontextprotocol.org/docs/governance/property/adagents#agent-url-matching),
+DR-0023). An entry with a path still matches only that canonical URL. At 3.3
+the comparison also drops one trailing root-label dot from a DNS host
+(`https://agent.example.` matches `https://agent.example/mcp`) and matches
+nothing for a host ending in more than one dot.
+
+`resolveAgentProperties(adAgents, agentUrl, { adcpVersion })` and the new
+`agentUrlMatchesAuthorizedEntry(entryUrl, agentUrl, { adcpVersion })` apply
+the rule at 3.3 or later. `adcpVersion` defaults to the SDK pin, so an SDK 16
+caller that relied on a bare-origin entry not matching a path-mounted agent
+now sees a match. Pass the release you negotiated (for example `'3.2'`) to keep
+exact canonical-URL matching. At 3.3 every matching entry authorizes the
+agent, and its scope is the union of theirs: an exact entry and an origin-only
+entry for the same agent combine, so a narrower entry never removes scope
+another grants. `matched_entries` lists them all. Their `signing_keys` combine
+by the same reasoning, over the entries that also authorize the signed message's
+scope: the agent is pinned only if every such entry pins, and may then sign with
+any of their keys. The new
+`resolvePublisherSigningKeyPin(adagents, agentUrl, { adcpVersion, country, propertyIds, at })`
+applies that rule
+([adcp#9016](https://github.com/adcontextprotocol/adcp/issues/9016)). Below 3.3, two exact matches
+still fail closed as `ambiguous_agent_url`. `PropertyCrawler`
+uses each agent's served release, else its new `adcpVersion` option.
+Supply-path verification keeps exact matching under semantics version 1
+([adcp#8943](https://github.com/adcontextprotocol/adcp/issues/8943)).
+
+## Creative start policy on `control_media_buy`
+
+AdCP 3.3 lets a buyer hold a package's first enablement for serving until every
+assigned creative is approved: `packages[].start_requires_all_creatives_approved`
+on `control_media_buy`. A seller that does not declare
+`media_buy.features.creative_start_policy: true` must reject `true` with
+`UNSUPPORTED_FEATURE` before mutation, and buyers must not send it.
+
+**This breaks sellers that honored `true` without declaring the feature.** When
+the server's `adcpVersion` is 3.3 or later, the dispatcher now refuses such a
+request itself, before the idempotency lookup, and the handler never sees it:
+
+```json
+{
+  "code": "UNSUPPORTED_FEATURE",
+  "message": "start_requires_all_creatives_approved: true requires media_buy.features.creative_start_policy, which this seller does not declare",
+  "recovery": "correctable",
+  "field": "packages[0].start_requires_all_creatives_approved",
+  "suggestion": "Omit start_requires_all_creatives_approved or send false; check media_buy.features.creative_start_policy in get_adcp_capabilities before opting in",
+  "details": {
+    "feature": "media_buy.features.creative_start_policy",
+    "fields": ["packages[0].start_requires_all_creatives_approved"]
+  },
+  "mutation_outcome": "not_applied"
+}
+```
+
+`field` names the first opted-in package and `details.fields` lists every one.
+`false` and omission always reach the handler. To accept `true`, hold the
+package's first enablement until every current assignment is approved, echo the
+policy on `get_media_buys`, and declare the feature:
+
+```ts
+createAdcpServer({
+  capabilities: { features: { creativeStartPolicy: true } },
+  // ...
+});
+```
+
+`createAdcpServerFromPlatform` takes the same `capabilities.features.creativeStartPolicy`.
+`capabilities.overrides.media_buy.features.creative_start_policy` also counts.
+Under `createTenantRegistry` each tenant's own capabilities decide.
+`create_media_buy` and `update_media_buy` no longer carry the field: AdCP
+`3.3.0-beta.6` withdrew it from their packages (adcontextprotocol/adcp#8767), so
+`control_media_buy` is the only way to set it.
+
+`mediaBuyActionResolver.resolve()` follows the same rule: it offers
+`update_creative_start_policy` only when you pass `creativeStartPolicy: true`
+with `metadata.update_creative_start_policy`. Without it the action is reported
+unavailable (`not_supported_on_buy`), because the dispatcher would refuse the
+opt-in it advertises. A seller that already offers the action adds the option:
+
+```ts
+mediaBuyActionResolver.resolve({
+  buy,
+  decide,
+  creativeStartPolicy: true,
+  metadata: { update_creative_start_policy: decision },
+});
+```
+
+On the buyer side, `control_media_buy` throws `ProtocolFeatureUnsupportedError`
+before sending when the call targets 3.3 or later and the seller's discovered
+capabilities lack the feature. The error has `code: 'UNSUPPORTED_FEATURE'`, the
+same `field`, `details.feature` and `details.fields` as the seller's refusal, and
+`dispatched: false`; `getClientPreflightAdcpError(error)` returns the AdCP error.
+With synthetic or missing capabilities the client sends and the seller decides.
+Check `client.supports('creative_start_policy')`, or
+`capabilities.features.creativeStartPolicy`, before opting in.
+
+## Custom tool input validation
+
+Tools registered with a zod `inputSchema` now validate it in the AdCP layer
+instead of the MCP SDK (#3666). This covers:
+
+- `customTools` on `createAdcpServer`, and so `tasks_get` on `createAdcpServerFromPlatform`
+- `comply_test_controller` from `registerTestController`, `createComplyController().register()` and `createAdcpServerFromPlatform({ complyTest })`
+
+MCP `tools/list` still advertises the declared schema.
+
+**Buyers: the error shape changed.** A call that fails the schema used to get
+the MCP SDK's bare `-32602` text result, with no `structuredContent` and no
+`context`. It now gets an AdCP error that echoes `context`, like framework tools:
+
+```jsonc
+{
+  "adcp_error": {
+    "code": "INVALID_REQUEST",
+    "message": "search_brands request failed schema validation at /query: must have required property 'query'",
+    "recovery": "correctable",
+    "field": "query",
+    "issues": [{ "pointer": "/query", "message": "must have required property 'query'", "keyword": "required" }],
+    "details": { "tool": "search_brands", "side": "request", "issues": [/* the same issues */] }
+  },
+  "context": { "trace": "tr-1" },
+  "status": "failed",
+  "adcp_version": "3.3-beta.6"
+}
+```
+
+Read `adcp_error` instead of matching the `-32602` text or its `Input
+validation error:` prefix. Framework tools still use `VALIDATION_ERROR` for
+request-schema failures. #3674 tracks moving them to `INVALID_REQUEST`, the
+spec's code for schema violations.
+
+**Sellers: handlers receive the parsed value on every path.** On MCP, nothing
+changes for a valid call: the handler gets the value the schema parsed, with
+coercion, defaults and transforms applied and undeclared keys stripped.
+`AdcpServer.invoke()`, `dispatchTestRequest()` and A2A used to skip the schema
+and pass the caller's raw arguments to the handler. **They now validate too, and
+pass the same parsed, stripped value.** A handler on those paths no longer sees
+keys its schema does not declare, and an invalid call no longer reaches it.
+
+If a handler reads keys its schema does not declare, declare them. To keep every
+key, use a loose object:
+
+```ts
+customTools: {
+  vendor_lookup: {
+    // Keeps undeclared keys instead of stripping them.
+    inputSchema: z.looseObject({ query: z.string() }), // zod 3: z.object({...}).passthrough()
+    handler: async args => {
+      /* … */
+    },
+  },
+},
+```
+
+The arguments are parsed once, and everything that reads them uses the parsed
+value: `identity33` authorization, release selection and the handler. On
+`invoke()`, `dispatchTestRequest()` and A2A, authorization and release selection
+used to read the raw arguments. They now see the parsed value.
+
+**Behavior change on A2A, `invoke()` and `dispatchTestRequest()`:** a custom tool
+whose schema does not declare `adcp_version` used to let the caller's raw
+`adcp_version` select the release on those paths. Now the schema strips that
+field, so the server's default release applies, as it always has on MCP. A2A
+has no AdCP version negotiation at the envelope level: `A2A-Version` selects
+only the A2A wire. Framework tools are unchanged. To let a buyer pick the
+release, declare `adcp_version` (and `adcp_major_version`) in the schema. A
+declared default or coercion then selects the release.
+
+Rejections on these tools echo the caller's `context` even when the schema
+strips it: validation, version, authorization, and errors your handler returns
+or throws.
+
+## AdCP 3.3.0-beta.6
+
+SDK 17 now pins AdCP `3.3.0-beta.6` and no longer packages or advertises
+`3.3.0-beta.5`. Preview negotiation is exact, so a beta.5 peer and a beta.6
+peer settle on a stable release they share, and an explicit
+`adcpVersion: '3.3.0-beta.5'` pin fails with a configuration error.
+
+Beta.6 applies the adcontextprotocol/adcp#8501 dispositions: 3.3 additions leave
+the deprecated tasks, and some are withdrawn until 4.0. **Code that used these
+fields on beta.5 breaks.** The generated types no longer declare them, and a
+3.3 seller no longer defines them.
+
+- **`get_products` (adcp#8758).** `include_collections` and `collections`,
+  `include_execution_readiness` and `execution_readiness` (both now on
+  `list_products`), the `target_audiences` product filter, the `refine` package
+  action, and the resolved flight and `result_product_id` on
+  `refinement_applied` are gone.
+- **`sync_creatives` assignments (adcp#8758).** Per-assignment
+  `landing_page_url` and `trackers` are gone.
+- **`create_media_buy` and `update_media_buy` (adcp#8767).** Lineage
+  (`predecessor_media_buy_id`, `lineage_reason`) is now carried only by
+  `buy_products` and `accept_proposal`, and `get_media_buys` filters on
+  `predecessor_media_buy_id`. Package `start_requires_all_creatives_approved` is
+  set only through `control_media_buy` and read back on `get_media_buys`.
+  Package `target_audiences` (audience evidence targets, with
+  `core/audience-evidence-target.json`) and `artifact_webhook.signing_profile`
+  are gone.
+- **Price adjustments (adcp#8758).** `price_adjustments` leaves every pricing
+  option, along with `pricing-options/price-adjustments.json` and the
+  price-adjustments mismatch error details. The accepted-terms verifier
+  (`verifyProposalCommercialTerms`) no longer checks a
+  `price_adjustments_resolution` contract for beta.6.
+- **SLAs (adcp#8762).** `core/sla-window.json` returns to its 3.2 shape:
+  `clock` and `business_calendar_id` move to `core/creative-review-sla.json`,
+  along with the business-calendar contract. `escalation-sla` loses `clock`.
+- **Reporting capabilities (adcp#8957).** `available_installment_statuses`
+  moves to the canonical reporting capabilities.
+- **Measurement terms.** `billing_measurement.counting_mechanisms` is
+  withdrawn.
+- **Signed terms bind every member (adcp#8884).** A party that cannot interpret
+  every member of signed commercial terms, at any depth and including `ext`,
+  must not accept them. A seller rejects the request with the new error code
+  `UNRECOGNIZED_TERMS` (correctable); a buyer declines with the new
+  `decline_proposals` reason `unrecognized_terms`. The SDK does not reject or
+  decline for you: `createAdcpServer` passes signed terms to your handler, so
+  refuse members you do not interpret. The buyer retry policy treats
+  `UNRECOGNIZED_TERMS` like `UNSUPPORTED_FEATURE`.
+- **`media_buy.supported_delivery_types` (adcp#8458).** Sellers can declare the
+  delivery types (`guaranteed`, `non_guaranteed`) their products carry in
+  `get_adcp_capabilities`. Absent means undeclared, not empty.
+- **`https_put` reporting transport (adcp#8793, experimental).** A file-transfer
+  destination can use `https_put`, where the seller signs every write as its Web
+  Bot Auth origin. A seller must not hold, request or store any caller-issued
+  secret to write a managed destination.
+- **Installment refinement (adcp#8974, experimental
+  `media_buy.installment_refinement`).** A `refine_proposals` revise can carry
+  `installment_changes`, a list of `{ product_id, installment_ref, action }`
+  entries unique by `(product_id, installment_ref)`, to choose installments
+  without opening `commercial_terms`. The seller answers with a product whose
+  installments are the chosen set, and repeats each entry it could not satisfy,
+  with a `reason`, in `unsatisfied_installment_changes` on a
+  `constraint_unsatisfiable` result. `installment_changes` is a
+  `proposal_refinement.supported_dimensions` value. The SDK's refinement
+  helpers follow: capability discovery accepts the dimension,
+  `validateRefineProposalsRequest` accepts `installment_changes` on 3.3 requests
+  only (closed `installment_ref`, 1-500 unique entries) and returns
+  `UNSUPPORTED_FEATURE` when the seller does not advertise it,
+  `classifyProposalRefinementFailure` counts unsatisfied installment changes,
+  and the response verifier requires each unsatisfied entry to repeat a
+  requested one.
+- **Installment creative assignment (adcp#8972, experimental
+  `media_buy.installment_creative_assignment`).** `sync_creatives` `assign` and
+  `replace` operations can carry `installment_refs` to assign a creative to
+  specific installments of a package; `list_creatives` and `get_media_buys`
+  creative approvals read them back.
+- **Geo display labels (adcp#8966).** Targeting gains `geo_value_labels`
+  (labels for the country and region codes) and metro entries gain
+  `value_labels`. Labels are diagnostics only: they must not be used to resolve
+  or apply targeting and are ignored when comparing targeting. The
+  accepted-terms verifier reviews their key-membership annotations for beta.6.
+  `TargetingOverlayKeys` includes `geo_value_labels`.
+- **Report definitions 1.2 (adcp#8983, experimental Reliable Reporting).** A
+  `contract_version` `1.2` report definition keeps every 1.1 rule, and a
+  definition whose dimensions include `media_buy_id` must also include
+  `package_id`. Callers pinned below 3.3 accept only 1.0 and 1.1 definitions, so
+  serve them 1.0 or 1.1 offerings. The reporting manifest inspector now accepts
+  1.0, 1.1 and 1.2 definitions. Before this release it accepted only 1.0. It
+  requires `official_correction_mode: 'adjustments_only'` on 1.1 and 1.2 and
+  enforces the 1.2 `package_id` rule. The inspector does not know the caller's
+  pinned version, so it does not refuse a 1.2 definition for you.
+- **Open schemas (adcp#8866).** 3.3 schemas that were closed by accident accept
+  additional properties again, and the generated Zod schemas pass extension
+  members through. Where the SDK relied on a closed schema to keep data out, it
+  now refuses the known cases by name:
+  - `list_accounts`/`sync_accounts` projections refuse reporting delivery
+    states and identity objects (`account`, `operator_unit`, `identity_change`,
+    `identity_change_preview`) carrying credential-shaped keys (including
+    `secretAccessKey`, `accessKeyId`, `clientSecret`, `sasToken`,
+    `connectionString`), `ctx_metadata`, `authInfo`, or the write-only
+    `destination_billing_entity`, `billing_entity`, `bank` or
+    `invoice_recipient`. After 17.0.0-beta.24 every other undeclared member is
+    dropped, at any depth, so only declared members reach the wire; in
+    17.0.0-beta.24 they passed through. These schemas declare no extension
+    point, so keep extension data off these records. `notification_configs`
+    get the same treatment, including refusal of a retained `webhook_secret`
+    or `authentication.signing_secret`.
+  - `@adcp/reporting-storage` managed delivery refuses adapter evidence whose
+    resource, verification or nested evidence carries undeclared members
+    (after 17.0.0-beta.24), so an adapter that adds a vendor field fails the
+    delivery with `DELIVERY_FAILED`. `undeclaredReportingMaterializationMembers`
+    on `@adcp/sdk/reporting/ledger` lists the offending paths.
+  - The reporting ledger's `sync_reporting_status` ingest still refuses
+    undeclared status and period members, so the ledger stores exactly the
+    fields it interprets.
+  - The notification runtime refuses `proposal.created` and (after
+    17.0.0-beta.24) `proposal.offered` payloads carrying anything but their
+    identifier fields (and `ext`): the notifications "cannot inject terms or
+    instructions into a buyer agent". It also refuses a payload that violates
+    a `not` exclusion of its webhook schema at any depth, such as
+    `access_token` on `reporting.delivery_ready` or `setup.url` on
+    `account.status_changed`.
+  - `parseAccountChangeNotification` accepts undeclared members and drops them
+    from the normalized notification, including inside `resource`.
+  - `reportingSubscriptionScopeIncludesV1` selects nothing for an unknown
+    selector or a scope with more than one key. After 17.0.0-beta.24
+    `sync_principal` refuses a scope whose single member is an unknown
+    selector, and the coverage engine covers every account only for an
+    explicit `all_authorized_accounts: true`.
+  - A request that merges both account variants now fails with `oneOf`; the
+    validation hint still says to pick one variant.
+- **Smaller additions.** Video containers `3gp`, `m4v` and `mpeg`; canonical
+  `image_carousel` `card_image_sizes`; creative capability
+  `supports_registry_policy_enforcement`.
+- **Version-translation vectors.** The vendored 3.3 ↔ 3.2 vectors drop their
+  `get_products` and `create_media_buy` cases, which no longer have a 3.3
+  surface to translate.
+- **No reporting-subscription changes.** The canonical reporting-subscription
+  vectors and pinned storyboards are byte-identical to beta.5.
+
+## AdCP 3.3.0-beta.5
+
+SDK 17 pinned AdCP `3.3.0-beta.5` and no longer packages or advertises
+`3.3.0-beta.4`. **This breaks beta.4 pins.** Preview negotiation is exact, so a
+beta.4 peer and a beta.5 peer settle on a stable release they share, usually
+AdCP 3.2, and an explicit `adcpVersion: '3.3.0-beta.4'` (or `'3.3-beta.4'`) pin
+fails with a configuration error. The SDK keeps one 3.3 preview at a time
+because betas are not additive over each other: a later beta can withdraw
+fields an earlier one accepted. Upgrade buyers and sellers together when you
+test preview-only features.
+
+- **Experimental match keys (adcp#8375).** `core/match-key.json` (generated
+  `MatchKey`) declares one identifier a party resolves: its `uid_type`, an
+  optional `vendor`, the reach-unit `scopes` it resolves at and its `uses`
+  (`MatchKeyUse`: `audience_include`, `audience_exclude`, `frequency_cap`,
+  `identity_match`, `conversion_attribution`). Sellers declare seller-wide keys
+  in `get_adcp_capabilities` `media_buy.supported_match_keys` and per-product
+  keys in `Product.identity.match_keys`; TMP provider registrations gain
+  `match_keys` alongside `uid_types`. Sellers using any of them list
+  `media_buy.match_keys` in `experimental_features`. All fields are optional.
+  When an SDK-hosted seller serves an AdCP 3.2 buyer, `get_products` removes
+  `Product.identity.match_keys` and reports the drift. `get_adcp_capabilities`
+  passes `supported_match_keys` through, as it does other 3.3 capability
+  additions, because the 3.2 capability schema is open.
+- **`ProductIdentity` type.** The schema now carries a conditional rule, so the
+  generated `ProductIdentity` is a type alias instead of an interface.
+  `extends` and `implements` keep working; declaration merging does not.
+- **`sales-fixed-rate` is stable.** Its storyboard is unchanged and fully
+  graded; a passing claim now counts toward AAO Verified media-buy badges.
+- **Compliance fixtures.** `deterministic_testing`,
+  `canonical_format_validate_input`, `product_filter_behavior`,
+  `vendor_metric_catalog_precondition` and `sales-non-guaranteed` bind their
+  seeded products and pricing options to the complete sandbox account that
+  consumes them (`brand.domain`, `operator`, `sandbox`). The storyboard schema
+  also defines the offline legacy-format catalog form of
+  `$build_assets_from_format` (`catalog: test_kit`, gated on
+  `test_kit_format_catalog_runner`), which the runner already supports.
+- **No reporting-subscription changes.** The canonical reporting vectors are
+  byte-identical to beta.4.
+
+## AdCP 3.3.0-beta.4
+
+SDK 17 pinned AdCP `3.3.0-beta.4` and no longer packages or advertises
+`3.3.0-beta.3`. Preview negotiation is exact, so a beta.3 peer and a beta.4
+peer settle on a stable release they share, and an explicit
+`adcpVersion: '3.3.0-beta.3'` pin fails with a configuration error.
+
+- **Packages added after confirmation (adcp#8718).** Sellers advertising
+  reporting subscriptions must serve `packages[].added_at` on `get_media_buys`
+  for every package added after `confirmed_at`. Coverage owes such a package
+  from the period containing `added_at`; adding a package is never a cutover.
+  `ReportingSubscriptionBuyPackageV1.added_at` carries it through the
+  `subscriptions.buys` and `listAccountBuys` hooks.
+- **Reduced grants (adcp#8718).** A grant reduced to tasks without
+  `get_reporting_status` is a loss of reporting authority: the account is
+  listed in `accounts_unauthorized[]`, and `get_reporting_status` for it is
+  refused with `SCOPE_INSUFFICIENT`. Restoring the task is a re-grant.
+- **`SUBSCRIPTIONS_REQUIRE_ACCOUNT_ID_KEY`.** A managed-delivery offering
+  without `account_id` in `reporting_profile.primary_keys` is refused with this
+  code instead of `PLATFORM_CONFIG_INVALID`.
+- **`destination_overrides[]` type.** The generated item type is one object
+  with `account_ids`, `operator_domains`, `destination_id` and
+  `path_template`; beta.3 generated an intersection of empty objects.
+- **Durations.** `reporting-schedule` and `reporting-schedule-offering` reject
+  a `period_duration` mixing date and time components (`P1DT12H`) under any
+  alignment but `utc`.
+- **Conformance probe (adcp#8717).** A seller listing
+  `reporting_subscription_probe` must list `reset_state`:
+  `createComplyController` refuses `reportingSubscriptionProbe` without
+  `resetState`. `set_account_timezone` returns `SetAccountTimezoneResult`, and
+  `owed_periods_match` compares over the spec's retention window.
+
+## AdCP 3.3.0-beta.3
+
+SDK 17 now pins AdCP `3.3.0-beta.3` and no longer packages or advertises
+`3.3.0-beta.2`. Preview negotiation is exact, so a beta.2 seller and a beta.3
+buyer settle on a stable release they share, and an explicit
+`adcpVersion: '3.3.0-beta.2'` pin fails with a configuration error. Upgrade
+both sides together when you test preview-only features.
+
+- **Protocol envelope on every response (adcp#8547).** Every 3.3 task response
+  composes `core/protocol-envelope.json`, so `status` is required on every
+  response and the generated response types no longer restate envelope fields
+  (`task_id`, `message`, `replayed`, `adcp_version`). `createAdcpServer` stamps
+  the envelope; a hand-built 3.3 response must carry `status`.
+- **Account requests (adcp#8620).** A request that resolves as `matched` or
+  `created` must carry `account` with its money terms; one that resolves as
+  `updated` and changed `billing`, `billing_entity` or `payment_terms` carries
+  `effective_at`; a change request that resolves as `created` carries
+  `not_carried_over`. A `requestAccount` handler that returns a resolved
+  record without them now fails response validation.
+- **Live creative updates (experimental `creative.live_updates`).** The types,
+  the `CREATIVE_LIVE_UPDATE_UNSUPPORTED` error code and the
+  `creative.staged_update_changed` notification type are generated;
+  `ACCOUNT_NOTIFICATION_TYPES` includes the notification type.
+- **Reporting subscriptions (experimental).** `authorization.regranted_at` is
+  an account authorization field; `toWireAccount` and `windDownGrant` keep it. Media buys carry
+  `cancellation_effective_at` and `flight_history`, packages carry
+  `reporting_delivery_offering_ids`, offerings carry `available_from` and
+  `withdrawn_at`, billing obligations may carry `stub: true`, and
+  `subscription_coverage[].status` may be `inactive` with `deactivated_at`.
+  Readbacks list at most 16 `prior_versions` and carry
+  `prior_versions_count`, `accounts_with_exceptions_count` and
+  `accounts_unauthorized_count`. A subscription response served without a
+  negotiated release now uses the pinned release, as the Python SDK does.
+- **Hand-modelled wire types removed from `@adcp/sdk/reporting/advanced`.**
+  The generated types now carry every field, so
+  `ReportingDeliveryOfferingWithDimensionsV1`,
+  `ReportingSubscriptionCoverageWithOfferingsV1`,
+  `ReportingSubscriptionExclusionEntryV1`, `ReportingSubscriptionGapV1`,
+  `ReportingSubscriptionInactiveIntervalV1`,
+  `ReportingSubscriptionStateWithIntervalsV1` and
+  `ReportingSubscriptionTimezoneCutoverV1` are gone. Use
+  `ReportingDeliveryOffering`, `ReportingSubscriptionCoverage` and
+  `ReportingSubscriptionState` (and their indexed members, such as
+  `NonNullable<ReportingSubscriptionCoverage['gaps']>[number]`) from
+  `@adcp/sdk`. `ReportingSubscriptionOfferingV1` is now an alias of
+  `ReportingDeliveryOffering`.
+
+## AdCP 3.3.0-beta.2
+
+SDK 17 beta.10 pinned AdCP `3.3.0-beta.2` and no longer packaged or advertised
+`3.3.0-beta.1`. Preview negotiation is exact, so a beta.1 seller and a beta.2
+buyer settle on a stable release they share, and an explicit
+`adcpVersion: '3.3.0-beta.1'` pin fails with a configuration error. Upgrade
+both sides together when you test preview-only features.
+
+- **Withdrawn from 3.3 (adcp#8537).** Definition pins
+  (`commercial_terms.definition_pins[]`, `DefinitionPin`, the
+  `REFERENCE_DEFINITION_CHANGED` error code, the `definition_changed`
+  refinement reason and `drifted_pins[]`), purchase rights
+  (`purchases[].rights[]`, the `paid_amplification` and `content_reuse` right
+  uses) and installment selection (`purchases[].installments[]`,
+  `installment_changes`, `unsatisfied_installment_changes`) are gone from the
+  types and schemas. Remove any code that builds or reads them, and stop
+  listing `media_buy.purchase_rights` and `media_buy.installment_selection` in
+  `experimental_features`. Installments on canonical products and the `holds[]`
+  readback remain.
+- **Account changes as a separate account.** `requestAccount()` accepts
+  `allow_separate_account` (default `false`). A change request may resolve as
+  `created` (a separate account carrying the change, only with the opt-in) or
+  `matched` (an account the caller already holds); in both cases the resolved
+  `account_id` differs from `requested.account_id` and the named account is
+  unchanged. Without the opt-in, a seller that would take the change only on a
+  new account returns `ACCOUNT_CHANGE_REQUIRES_NEW_ACCOUNT` (correctable).
+- **Seller offers (experimental `media_buy.seller_offers`).** Canonical
+  proposals carry `proposal_initiator`, `list_proposals` rows carry
+  `offer_reason`, and `proposal.offered` is a notification type.
+- **Measurement provenance (experimental `media_buy.measurement_provenance`).**
+  `CollectionMechanism`, `measurement_terms.billing_measurement.counting_mechanisms[]`
+  and delivery `vendor_metric_provenance[]` are typed.
+- **Reporting subscriptions.** Offerings gain `standard_dimensions` and
+  `unmapped_dimensions`; `subscription_coverage.excluded[]`, `gaps[]` and
+  `timezone_cutovers[]` entries may carry `offering_id`; subscription readbacks
+  carry `prior_versions[].configuration` and `inactive_intervals`.
+- **Deprecations.** `principal_kind` / `expected_principal_kind` on the
+  principal tasks are deprecated; a bound buyer agent is always `buyer_agent`.
+
+## AdCP 3.3.0-beta.1
+
+SDK 17 beta.5 through beta.9 pinned AdCP `3.3.0-beta.1` and no longer packaged or advertised
+`3.3.0-beta.0`. Preview negotiation is exact, so a beta.0 seller and a beta.1
+buyer settle on a stable release they share. Upgrade both sides together when
+you test preview-only features.
+
+- **Account requests (experimental `account.requests`).** `requestAccount()`
+  opens an account (`brand` + `operator`) or, with `account_id` plus fields,
+  requests a change. Send `revision` when changing `billing`, `billing_entity`
+  or `payment_terms`; a stale revision returns `CONFLICT`. A completed change
+  resolves with `resolution: 'updated'`. Send `request_id` to pick a candidate
+  from an `ambiguous` request. Read requests back with
+  `listAccounts({ include_requests: true })` or `request_ids`; requests page
+  through `requests_pagination` / `account_requests_pagination`, independent of
+  the account `pagination`. There is no `get_account_requests` task.
+  `sync_accounts` stays stable. Servers can register a raw
+  `accounts.requestAccount` handler; the decisioning platform (`definePlatform`)
+  has no `request_account` hook yet.
+- **Media-buy issues.** `reportMediaBuyIssue()` and `getMediaBuyIssue()` cover
+  `media_buy.issue_reporting`. Servers can register raw `mediaBuy` handlers.
+- **Reporting subscriptions (experimental `media_buy.reporting_subscriptions`).**
+  The `sync_principal` / `get_principal` `reporting_subscriptions` section,
+  `get_reporting_status` `subscription_coverage`, `configuration_tasks`, and
+  `account.authorization.authorized_at` are typed. The built-in principal
+  runtime does not implement subscriptions and answers a submitted
+  `reporting_subscriptions` section with `UNSUPPORTED_FEATURE`.
+- **Type changes.** `DemographicTargetingIntent.age` is optional because 3.3
+  adds gender-only targeting; narrow it before reading. Product
+  `publisher_properties` and `collections` may be empty arrays, which mean an
+  undisclosed roster rather than an empty one.
+
+## Postgres replay store
+
+`PostgresReplayStore` inserts through a table-specific guarded function
+(`<table>_insert_guarded`) that keeps the replay check, the per-key cap and the
+insert on one backend. A database created by an earlier SDK has the table but
+not the function. Every insert then fails with "PostgresReplayStore database
+migration is outdated", and signed requests answer 503 (Web Bot Auth) or are
+refused. Rerun the migration for each replay table before deploying SDK 17:
+
+```ts
+import { getReplayStoreMigration } from '@adcp/sdk/signing/server';
+
+await pool.query(getReplayStoreMigration('adcp_replay_cache')); // your table name
+```
+
+The migration is idempotent. If you manage schema with numbered migration
+files, add a new file with the current `getReplayStoreMigration()` output; a
+file copied from an older SDK does not create the function.
+
+## Account resolution and optional declarations
+
+On a served AdCP 3.3 route, buyer-supplied account references require a
+reference-aware resolver. Unresolved references return `ACCOUNT_NOT_FOUND`
+before the handler runs, even when `strictAccountReferences: false` was set
+for an older compatibility route. `list_accounts.account` is a filter.
+Discovery and negotiation resolvers receive `provisioning: false`; they must
+not create or activate accounts or accept billing terms.
+
+The generated types and validators include the beta's optional catalog
+ingestion, onboarding, DOOH location/inventory, audience-size, collection,
+proposal and creative declarations. If a seller declares `catalog_ingestion`,
+its handlers must enforce the advertised types, modes, formats and limits
+before mutation. Review fields that previously used an open extension name:
+`catalog_ingestion` now has an object schema, and `ext.adcp` is reserved.
+
+Asset unions gain `video_brief`; update exhaustive switches. The experimental
+build-creative evaluator agent form uses `agent_url` instead of `evaluator_id`.
+Provide an allowlisted evaluator URL explicitly; an opaque old evaluator ID
+cannot be converted into a trustworthy URL by the SDK.
+
+The `@adcp/sdk/identity-3.3` and Web Bot Auth opt-in remains experimental.
+Changing the protocol pin does not enable that opt-in or graduate its APIs.
+Existing RFC 9421 signing and verified agent-resolution checks remain active.
+
+## HTML-markup formats use inline-markup display tags
+
+The AAO legacy formats `display_html` and `display_WxH_html` accept HTML
+markup rendered by the seller. SDK 17 projects them to canonical `display_tag`
+with `supported_delivery_types: ['inline_markup']`. The previous `html5`
+classification described a zip bundle and prevented correctly classified
+third-party markup from matching these formats.
+
+If your application created `html5` creatives containing an `html` snippet for
+these formats, change the creative to `format_kind: 'display_tag'` and send its
+markup as an inline-markup asset:
+
+```typescript
+const asset = {
+  asset_type: 'display_tag',
+  delivery_type: 'inline_markup',
+  markup_type: 'standard',
+  markup: legacyHtmlAsset.content,
+};
+```
+
+Use the seller's declared slot, typically `html_creative`. Explicit
+`format_parameters.width` and `format_parameters.height` take precedence when
+selecting among multiple sizes. AdCP 3.3 also carries rendered dimensions on
+`zip`, `html`, and `display_tag` assets; when `format_parameters` is absent,
+the SDK uses one unambiguous rendered asset size.
+
+Update code branching on `resolveCanonicalFormatKind` or
+`canonicalDeclarationFromBareId`: `_html` IDs now resolve to `display_tag`,
+including when the local `assetType: 'html5'` hint selects an `_html` ID.
+Actual zip creatives remain `html5` and cannot match HTML-markup-only products.
+
+Legacy delivery preserves the seller's format URL and size and emits the markup
+bytes in `html_creative.content`. The rendered `width`, `height` and `sizes` are
+AdCP 3.3 asset fields, so they are not copied onto the legacy `html` asset: the
+selected `display_WxH_html` ref carries the size. Sellers on 3.3 get the
+canonical `display_tag` with those fields. Tag URLs and inline markup select only legacy
+refs that accept their delivery type. A paired redirect or inline-markup creative
+cannot use a ref that accepts only tag URLs. Multi-size tag-URL declarations keep
+their seller-asserted refs rather than expanding into inline-markup HTML formats.
+This applies to every unsized representative ref: without a size-bearing ID,
+the SDK cannot establish a catalog family for expansion and retains the
+`FORMAT_DECLARATION_V1_LOSSY_MULTI_SIZE` diagnostic.
+
+When a seller publishes a standard format ID under its own creative-agent URL,
+the SDK preserves that URL and converts inline markup to legacy HTML. It keeps
+the asset keys unless an exact or caller-supplied format definition identifies
+the seller's slots; a matching bare ID alone does not establish those slot names.
+
+The legacy HTML asset has no field for `macro_declarations`. SDK 17 refuses that
+conversion before dispatch; deliver creatives with declared macros through the
+canonical `display_tag` contract. Legacy HTML also has no `markup_type` field;
+when converted for a canonical request, its markup type defaults to `standard`. Existing legacy
+request assets remain unchanged on the legacy wire. Explicit seller declarations
+retain their format kind and delivery types. In dual-emitted products, an old
+`html5` option paired with a `display_*_html` ID does not erase valid pairings
+for sibling image/video options. The incompatible HTML option is left unpaired;
+fix that seller declaration to `display_tag` with inline-markup delivery before
+using it. The SDK does not reinterpret a seller's declared zip contract.
+
+These changes follow [adcp#8339](https://github.com/adcontextprotocol/adcp/issues/8339)
+and [adcp#8357](https://github.com/adcontextprotocol/adcp/pull/8357). They use the
+existing inline-markup display-tag contract. This mapping changes public
+helper return values and projected creative wire shapes, so it ships in the
+SDK 17 major release. SDK 16 keeps its existing HTML-markup mapping.
+
+On 3.3 routes, the server automatically advertises the required experimental feature IDs for registered handlers: `list_collections` adds `media_buy.collection_catalog` and `media_buy.collection_cards` and `list_proposals` adds `media_buy.open_opportunities`. These APIs remain experimental in the protocol beta.
+
+Account verification applies to the selected request release. Unversioned callers select the server default, now the 3.3 beta. On 3.3 routes, `required_for_products` enforces `ACCOUNT_REQUIRED`; set `strictAccountReferences: true` to apply the same policy to older routes. Proposal discovery always requires an authenticated caller and a resolved account, including when schema validation is off.
+
+The direct governance helpers and governance middleware retain their configured client protocol pin. For a stable governance agent, use a client configured with `adcpVersion: '3.2.8'`; `syncPlans` and `getPlanAuditLogs` also accept an explicit `wireAdcpVersion` in their task options. Per-agent negotiation for these direct governance paths remains follow-up work.
+
+AdCP 3.3.0-beta.2 withdraws definition pins, purchase rights and installment selection from 3.3 (adcp#8537); they return through a `commercial_terms` extension point in 4.0. The verifier reads this from the selected schema: against beta.2, `definition_pins` and purchase `installments[]` / `rights[]` are unknown fields that the closed `commercial_terms` rejects, and publisher format references and placement, collection or signal targeting compare as ordinary snapshot terms. A snapshot verified against a retained beta.0 or beta.1 schema root still fails closed on definition pins and the references they covered, because that release required current-source pin verification. The verifier enforces collection-list uniqueness by reference identity.
+
+AdCP 3.3 snapshot rules that need data the snapshot does not carry: the verifier fails closed on SLA windows that name a `business_calendar_id` (business-clock SLAs resolve against capability calendars). Elapsed-clock SLA windows verify normally. Against a retained beta.1 schema root it also fails closed on purchase `installments[]`. For `price_adjustments`, the accepted snapshot deliberately omits the discovery-time table, so the verifier checks schema validity and `pricing_option_id` identity but does not re-resolve `pricing.fixed_price`; a buyer holding the table must resolve it before accepting.
+
+For AdCP 3.0 buyers, `create_media_buy` and `update_media_buy` responses move
+`media_buy_status` back into lifecycle `status` before schema projection. A buy
+waiting on creatives therefore returns `status: 'pending_creatives'`; 3.1+
+responses keep task `status` separate from `media_buy_status`.
+
+This projection applies to responses the framework emits. A webhook your
+platform builds itself from a copy of the response, such as an inline completion
+callback to a 3.0 buyer, does not pass through it. Apply the same mapping so the
+webhook `result` matches the buyer-visible response: for a 3.0 buyer, carry the
+media buy status as `status` and omit `media_buy_status`. A test comparing the
+webhook `result` with the synchronous response catches drift. Exporting the
+projection for seller-emitted webhooks is tracked in #3475.
+
+## Receivers with their own delivery webhook verification
+
+`parseMediaBuyDeliveryWebhook` from `@adcp/sdk/webhooks` validates an already
+authenticated body at a trusted `adcpVersion`, with readable envelope/result
+errors and an explicit, marked `acceptBareDeliveryReport` compatibility option.
+The registered reporting-delivery branch of `verifyAndParseWebhook` delegates
+to it and accepts a per-call `adcpVersion` for stored buy contracts.
+
+Use `MediaBuyDeliveryReportSchema` and `MediaBuyDeliveryReport` for one polled
+and pushed ingestion shape without fabricating task status. Full poll response
+schemas keep the status required by their referenced protocol envelope;
+`MediaBuyDeliveryWebhookResultSchema` now enforces required `by_package` rows.
+See [Parsing media-buy delivery webhooks](./guides/DELIVERY-WEBHOOK-PARSING.md).
+
+Registered reporting receivers now distinguish `webhook_result_invalid` from
+`webhook_envelope_invalid`, and use `webhook_unsupported_payload` for another
+task type or a bare report. Update exhaustive code switches accordingly.
+Invalid reporting schema configuration returns `webhook_verification_unavailable`
+before consuming a nonce. Routing metadata uses the trusted registration's
+operation ID; the seller's original ID stays in the validated envelope.
+
+Zod schemas now enforce protocol-authored `minItems` bounds throughout, including
+nonempty creative segments and render-guidance positions. Correct previously
+accepted empty arrays where the protocol requires at least one item; nonempty
+array output types are now `[T, ...T[]]`.
+
+## Account identity in sync results
+
+`accounts.upsert` results now preserve `account`, `operator_unit`, `revision`,
+`identity_change`, `identity_change_preview`, `currency`, and `timezone` (#3466).
+`SyncAccountsResultRow` declares these fields. For 3.2+ settings updates, return
+`account` as the identity anchor and omit flat `brand`/`operator`; provisioning
+results use the natural key. Older releases still require the flat pair. Failed
+3.2+ rows may omit `status` when the account state could not be determined.
+
+The entire `destination_billing_entity` is request-only and is stripped from
+responses, including its legal name and tax details. This differs from the
+current `billing_entity`, whose non-bank metadata is returned while `bank` is
+stripped. The rule applies both to framework `accounts.upsert` projection and
+the raw account response builders before replay caching.
+
+Consumers reading `SyncAccountsResultRow` should narrow the identity anchor and
+check failed rows before assuming `brand`, `operator`, or `status` are present.
+The type now rejects missing or mixed identity anchors and successful rows
+without a lifecycle status.
+
+Nested account and operator identity objects must conform to their closed
+protocol schemas. Internal fields accidentally retained from a request or DB
+record are rejected before response emission, even when whole-response
+validation is off.
+
+`SyncAccountsResultRow` is now a union type. Replace interface extension with
+an intersection alias such as `type MyRow = SyncAccountsResultRow & { upstreamId?: string }`.
+Identity objects are emitted as detached validated snapshots. Raw account
+response builders also strip top-level `authInfo` and `ctx_metadata`.

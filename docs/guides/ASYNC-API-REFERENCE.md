@@ -1,0 +1,1200 @@
+# ADCP Async Execution API Reference
+
+## Overview
+
+This document provides comprehensive API reference for the ADCP TypeScript client library's async execution model introduced in PR #78. It covers all types, interfaces, classes, and methods available for implementing handler-controlled async patterns.
+
+## Table of Contents
+
+1. [Core Types](#core-types)
+2. [Task Execution](#task-execution)
+3. [Handler Types](#handler-types)
+4. [Async Patterns](#async-patterns)
+5. [Error Types](#error-types)
+6. [Utility Functions](#utility-functions)
+7. [Configuration](#configuration)
+
+---
+
+## Core Types
+
+### Message
+
+Represents a single message in a conversation with an agent.
+
+```typescript
+interface Message {
+  /** Unique identifier for this message */
+  id: string;
+  /** Role of the message sender */
+  role: 'user' | 'agent' | 'system';
+  /** Message content - can be structured or text */
+  content: any;
+  /** Timestamp when message was created */
+  timestamp: string;
+  /** Optional metadata about the message */
+  metadata?: {
+    /** Tool/task name if this message is tool-related */
+    toolName?: string;
+    /** Message type (request, response, clarification, etc.) */
+    type?: string;
+    /** Additional context data */
+    [key: string]: any;
+  };
+}
+```
+
+**Usage:**
+```typescript
+const message: Message = {
+  id: 'msg-123',
+  role: 'user',
+  content: { tool: 'getProducts', params: { brief: 'Campaign brief' } },
+  timestamp: '2024-01-01T12:00:00Z',
+  metadata: { toolName: 'getProducts', type: 'request' }
+};
+```
+
+### InputRequest
+
+Request for input from the agent when clarification is needed.
+
+```typescript
+interface InputRequest {
+  /** Human-readable question or prompt */
+  question: string;
+  /** Specific field being requested (if applicable) */
+  field?: string;
+  /** Expected type of response */
+  expectedType?: 'string' | 'number' | 'boolean' | 'object' | 'array';
+  /** Suggested values or options */
+  suggestions?: any[];
+  /** Whether this input is required */
+  required?: boolean;
+  /** Validation rules for the input */
+  validation?: {
+    min?: number;
+    max?: number;
+    pattern?: string;
+    enum?: any[];
+  };
+  /** Additional context about why this input is needed */
+  context?: string;
+}
+```
+
+**Usage:**
+```typescript
+const inputRequest: InputRequest = {
+  question: 'What is your budget for this campaign?',
+  field: 'budget',
+  expectedType: 'number',
+  suggestions: [25000, 50000, 100000],
+  required: true,
+  validation: { min: 1000, max: 1000000 },
+  context: 'Budget is needed to find appropriate advertising products'
+};
+```
+
+### ConversationContext
+
+Complete conversation context provided to input handlers.
+
+```typescript
+interface ConversationContext {
+  /** Full conversation history for this task */
+  messages: Message[];
+  /** Current input request from the agent */
+  inputRequest: InputRequest;
+  /** Unique task identifier */
+  taskId: string;
+  /** Agent configuration */
+  agent: {
+    id: string;
+    name: string;
+    protocol: 'mcp' | 'a2a';
+  };
+  /** Current clarification attempt number (1-based) */
+  attempt: number;
+  /** Maximum allowed clarification attempts */
+  maxAttempts: number;
+  
+  /** Helper method to defer task to human */
+  deferToHuman(): Promise<{ defer: true; token: string }>;
+  
+  /** Helper method to abort the task */
+  abort(reason?: string): never;
+  
+  /** Get conversation summary for context */
+  getSummary(): string;
+  
+  /** Check if a field was previously discussed */
+  wasFieldDiscussed(field: string): boolean;
+  
+  /** Get previous response for a field */
+  getPreviousResponse(field: string): any;
+}
+```
+
+**Usage:**
+```typescript
+const handler: InputHandler = async (context: ConversationContext) => {
+  console.log(`Question: ${context.inputRequest.question}`);
+  console.log(`Attempt: ${context.attempt}/${context.maxAttempts}`);
+  console.log(`Agent: ${context.agent.name}`);
+  
+  if (context.attempt > 2) {
+    return context.deferToHuman();
+  }
+  
+  if (context.inputRequest.field === 'budget') {
+    return 50000;
+  }
+  
+  return context.abort('Unsupported field');
+};
+```
+
+---
+
+## Task Execution
+
+### TaskExecutor
+
+Core task execution engine that handles the conversation loop with agents.
+
+```typescript
+class TaskExecutor {
+  constructor(config?: {
+    /** Resettable idle/progress timeout for protocol work in 'working' status */
+    workingTimeout?: number;
+    /** Default max clarification attempts */
+    defaultMaxClarifications?: number;
+    /** Enable conversation storage */
+    enableConversationStorage?: boolean;
+    /** Webhook manager for submitted tasks */
+    webhookManager?: WebhookManager;
+    /** Durable storage with atomic create, generation-claim, and conditional-cleanup operations */
+    deferredStorage?: DeferredTaskStorage;
+    /** Resolve current trusted agent configuration after restart */
+    resolveDeferredAgent?: (agentId: string) =>
+      AgentConfig | undefined | Promise<AgentConfig | undefined>;
+    /** Persisted continuation lifetime in seconds (default seven days) */
+    deferredTaskTtlSeconds?: number;
+  });
+
+  /** Execute a task with an agent using PR #78 async patterns */
+  executeTask<T = any>(
+    agent: AgentConfig,
+    taskName: string,
+    params: any,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<T>>;
+
+  /** List all active tasks for an agent */
+  listTasks(agent: AgentConfig): Promise<TaskInfo[]>;
+
+  /** Get status of a specific task */
+  getTaskStatus(agent: AgentConfig, taskId: string): Promise<TaskInfo>;
+
+  /** Poll task until completion */
+  pollTaskCompletion<T>(
+    agent: AgentConfig,
+    taskId: string, 
+    pollInterval?: number
+  ): Promise<TaskResult<T>>;
+
+  /** Resume a deferred task */
+  resumeDeferredTask<T>(token: string, input: any): Promise<TaskResult<T>>;
+
+  /** Get conversation history for a task */
+  getConversationHistory(taskId: string): Message[] | undefined;
+
+  /** Clear conversation history for a task */
+  clearConversationHistory(taskId: string): void;
+
+  /** Get all active tasks */
+  getActiveTasks(): TaskState[];
+}
+```
+
+**Usage:**
+```typescript
+const executor = new TaskExecutor({
+  workingTimeout: 120000,
+  enableConversationStorage: true
+});
+
+const result = await executor.executeTask(
+  agent,
+  'getProducts',
+  { brief: 'Campaign brief' },
+  handler,
+  { timeout: 30000 }
+);
+```
+
+### TaskOptions
+
+Configuration options for task execution.
+
+```typescript
+interface TaskOptions {
+  /** Absolute deadline for the full call; does not reset on progress (ms) */
+  timeout?: number;
+  /** Caller cancellation, composed with the absolute deadline */
+  signal?: AbortSignal;
+  /** Maximum clarification rounds before failing */
+  maxClarifications?: number;
+  /** Context ID to continue existing conversation */
+  contextId?: string;
+  /** Enable debug logging for this task */
+  debug?: boolean;
+  /** Operation-routed crash recovery for direct A2A mutations */
+  durableContinuationRecovery?: {
+    /** Stable host authorization scope for the authenticated principal + account */
+    ownerScope: string;
+  };
+  /** Additional metadata to include */
+  metadata?: Record<string, any>;
+}
+```
+
+### TaskResult
+
+Result of a task execution with different status types.
+
+```typescript
+interface TaskResult<T = any> {
+  /** Whether the task completed successfully */
+  success: boolean;
+  /** Task execution status */
+  status: 'completed' | 'deferred' | 'submitted';
+  /** Task result data (if successful) */
+  data?: T;
+  /** Error message (if failed) */
+  error?: string;
+  /** Deferred continuation (client needs time for input) */
+  deferred?: DeferredContinuation<T>;
+  /** Submitted continuation (server needs time for processing) */
+  submitted?: SubmittedContinuation<T>;
+  /** Task execution metadata */
+  metadata: {
+    taskId: string;
+    taskName: string;
+    agent: {
+      id: string;
+      name: string;
+      protocol: 'mcp' | 'a2a';
+    };
+    /** Total execution time in milliseconds */
+    responseTimeMs: number;
+    /** ISO timestamp of completion */
+    timestamp: string;
+    /** Number of clarification rounds */
+    clarificationRounds: number;
+    /** Final status */
+    status: TaskStatus;
+  };
+  /** Full conversation history */
+  conversation?: Message[];
+  /** Debug logs (if debug enabled) */
+  debugLogs?: any[];
+}
+```
+
+**Usage:**
+```typescript
+const result = await agent.getProducts(params, handler);
+
+if (result.success && result.status === 'completed') {
+  console.log('Products:', result.data.products);
+  console.log('Execution time:', result.metadata.responseTimeMs);
+} else if (result.status === 'deferred' && result.deferred) {
+  const userInput = await getUserInput(result.deferred.question);
+  const final = await result.deferred.resume(userInput);
+} else if (result.status === 'submitted' && result.submitted) {
+  const final = await result.submitted.waitForCompletion();
+}
+```
+
+### TaskInfo
+
+Task tracking information from tasks/get endpoint.
+
+```typescript
+interface TaskInfo {
+  /** Task ID */
+  taskId: string;
+  /** Current status */
+  status: string;
+  /** Task type/name */
+  taskType: string;
+  /** Creation timestamp */
+  createdAt: number;
+  /** Last update timestamp */
+  updatedAt: number;
+  /** Task result (if completed) */
+  result?: any;
+  /** Error message (if failed) */
+  error?: string;
+  /** Webhook URL (if applicable) */
+  webhookUrl?: string;
+}
+```
+
+---
+
+## Handler Types
+
+### InputHandler
+
+Function signature for input handlers.
+
+```typescript
+type InputHandler = (context: ConversationContext) => InputHandlerResponse;
+```
+
+### InputHandlerResponse
+
+Different types of responses an input handler can provide.
+
+```typescript
+type InputHandlerResponse = 
+  | any                              // Direct answer
+  | Promise<any>                     // Async answer  
+  | { defer: true; token: string }   // Defer to human
+  | { abort: true; reason?: string } // Abort task
+  | never;                           // For control flow (abort() helper)
+```
+
+**Usage:**
+```typescript
+// Direct response
+const simpleHandler: InputHandler = (context) => {
+  if (context.inputRequest.field === 'budget') return 50000;
+  return true;
+};
+
+// Async response
+const asyncHandler: InputHandler = async (context) => {
+  const data = await fetchExternalData();
+  return data.recommendation;
+};
+
+// Defer response
+const deferHandler: InputHandler = (context) => {
+  if (context.inputRequest.field === 'approval') {
+    return context.deferToHuman();
+  }
+  return true;
+};
+
+// Abort response
+const abortHandler: InputHandler = (context) => {
+  if (context.attempt > 3) {
+    return { abort: true, reason: 'Too many attempts' };
+  }
+  return true;
+};
+```
+
+### Pre-built Handlers
+
+#### autoApproveHandler
+
+```typescript
+const autoApproveHandler: InputHandler;
+```
+
+Always returns `true` for any input request.
+
+**Usage:**
+```typescript
+const result = await agent.getProducts(params, autoApproveHandler);
+```
+
+#### deferAllHandler
+
+```typescript
+const deferAllHandler: InputHandler;
+```
+
+Always defers to human for every input request.
+
+**Usage:**
+```typescript
+const result = await agent.getProducts(params, deferAllHandler);
+if (result.status === 'deferred') {
+  // Handle human approval workflow
+}
+```
+
+### Handler Factory Functions
+
+#### createFieldHandler
+
+```typescript
+function createFieldHandler(
+  fieldMap: FieldHandlerConfig,
+  defaultResponse?: any | InputHandler
+): InputHandler;
+
+interface FieldHandlerConfig {
+  [fieldName: string]: any | ((context: ConversationContext) => any);
+}
+```
+
+Create a field-specific handler that provides different responses based on the field being requested.
+
+**Usage:**
+```typescript
+const handler = createFieldHandler({
+  budget: 50000,
+  targeting: ['US', 'CA'],
+  approval: (context) => context.attempt === 1,
+  creative_format: 'video'
+}, deferAllHandler); // Default for unmapped fields
+```
+
+#### createConditionalHandler
+
+```typescript
+function createConditionalHandler(
+  conditions: Array<{
+    condition: (context: ConversationContext) => boolean;
+    handler: InputHandler;
+  }>,
+  defaultHandler?: InputHandler
+): InputHandler;
+```
+
+Create a conditional handler that applies different logic based on context conditions.
+
+**Usage:**
+```typescript
+const handler = createConditionalHandler([
+  {
+    condition: (ctx) => ctx.inputRequest.field === 'budget',
+    handler: (ctx) => ctx.agent.name.includes('Premium') ? 100000 : 50000
+  },
+  {
+    condition: (ctx) => ctx.attempt > 2,
+    handler: (ctx) => ctx.deferToHuman()
+  }
+], autoApproveHandler);
+```
+
+#### createRetryHandler
+
+```typescript
+function createRetryHandler(
+  responses: any[],
+  defaultResponse?: any | InputHandler
+): InputHandler;
+```
+
+Create a retry handler that provides different responses based on attempt number.
+
+**Usage:**
+```typescript
+const handler = createRetryHandler([
+  100000,  // First attempt
+  75000,   // Second attempt
+  50000    // Third attempt
+], deferAllHandler);
+```
+
+#### createSuggestionHandler
+
+```typescript
+function createSuggestionHandler(
+  suggestionIndex?: number,
+  fallbackHandler?: InputHandler
+): InputHandler;
+```
+
+Create a suggestion-based handler that uses agent suggestions when available.
+
+**Usage:**
+```typescript
+const handler = createSuggestionHandler(0, deferAllHandler); // Use first suggestion
+const lastHandler = createSuggestionHandler(-1, deferAllHandler); // Use last suggestion
+```
+
+#### createValidatedHandler
+
+```typescript
+function createValidatedHandler(
+  value: any,
+  fallbackHandler?: InputHandler
+): InputHandler;
+```
+
+Create a validation-aware handler that respects input validation rules.
+
+**Usage:**
+```typescript
+const handler = createValidatedHandler(75000, deferAllHandler);
+// Will check validation rules before returning the value
+```
+
+#### combineHandlers
+
+```typescript
+function combineHandlers(
+  handlers: InputHandler[],
+  defaultHandler?: InputHandler
+): InputHandler;
+```
+
+Combine multiple handlers with fallback logic.
+
+**Usage:**
+```typescript
+const handler = combineHandlers([
+  createFieldHandler({ budget: 50000 }),
+  createSuggestionHandler(0),
+  autoApproveHandler
+], deferAllHandler);
+```
+
+---
+
+## Async Patterns
+
+### DeferredContinuation
+
+Continuation for deferred client tasks (client needs time).
+
+```typescript
+interface DeferredContinuation<T> {
+  /** Token for resuming the task */
+  token: string;
+  /** Question that triggered the deferral */
+  question?: string;
+  /** Resume the task with user input */
+  resume: (input: any) => Promise<TaskResult<T>>;
+  /** Host-only route capability; present for opted-in direct mutations */
+  recovery?: {
+    operationId: string;
+    recoveryKey: string;
+  };
+}
+```
+
+**Usage:**
+```typescript
+const result = await agent.getProducts(params, handler);
+
+if (result.status === 'deferred' && result.deferred) {
+  console.log(`Deferred: ${result.deferred.question}`);
+  
+  // Later, when human provides input
+  const userInput = await getUserApproval();
+  const final = await result.deferred.resume(userInput);
+}
+```
+
+### SubmittedContinuation
+
+Continuation for submitted server tasks (server needs time).
+
+```typescript
+interface SubmittedContinuation<T> {
+  /** Task ID for tracking */
+  taskId: string;
+  /** Webhook URL where server will notify completion */
+  webhookUrl?: string;
+  /** Get current task status */
+  track: () => Promise<TaskInfo>;
+  /** Wait for completion with polling */
+  waitForCompletion: (pollInterval?: number) => Promise<TaskResult<T>>;
+}
+```
+
+**Usage:**
+```typescript
+const result = await agent.createMediaBuy(params, handler);
+
+if (result.status === 'submitted' && result.submitted) {
+  console.log(`Task submitted: ${result.submitted.taskId}`);
+  
+  // Option 1: Webhook handling
+  if (result.submitted.webhookUrl) {
+    setupWebhookHandler(result.submitted.webhookUrl);
+  }
+  
+  // Option 2: Polling
+  const final = await result.submitted.waitForCompletion(30000); // Poll every 30s
+  
+  // Option 3: Manual tracking
+  const status = await result.submitted.track();
+  console.log('Current status:', status.status);
+}
+```
+
+### ADCP Status Constants
+
+```typescript
+const ADCP_STATUS = {
+  SUBMITTED: 'submitted',        // Long-running (hours/days) - webhook required
+  WORKING: 'working',            // Processing (<120s) - keep connection open  
+  INPUT_REQUIRED: 'input-required', // Needs user input via handler
+  COMPLETED: 'completed',        // Task completed successfully
+  FAILED: 'failed',             // Task failed
+  CANCELED: 'canceled',         // Task was canceled
+  REJECTED: 'rejected',         // Task was rejected
+  AUTH_REQUIRED: 'auth-required', // Authentication required
+  UNKNOWN: 'unknown'            // Unknown status
+} as const;
+
+type ADCPStatus = typeof ADCP_STATUS[keyof typeof ADCP_STATUS];
+```
+
+---
+
+## Error Types
+
+### InputRequiredError
+
+Legacy compatibility export. Current execution does not throw this as normal
+handler-less pause control flow. Inspect the returned `input-required` or
+`auth-required` status instead. A2A can expose a continuation only when the
+seller supplied an exact task ID. A2A without that ID and MCP return the pause
+without invoking an input handler or attaching a resume closure, so recovery
+is application/protocol-specific.
+
+```typescript
+class InputRequiredError extends Error {
+  constructor(question: string);
+}
+```
+
+**Pause handling:**
+```typescript
+const result = await agent.getProducts(params);
+if (result.status === 'input-required' || result.status === 'auth-required') {
+  if (result.deferred) {
+    // A2A: resume the exact seller task.
+    await result.deferred.resume(userInput);
+  } else {
+    // MCP: use an application/protocol-specific recovery path.
+  }
+}
+```
+
+### TaskTimeoutError
+
+Thrown when `TaskOptions.timeout` reaches its absolute wall-clock deadline.
+`workingTimeout` remains a separate resettable idle/progress timeout.
+
+```typescript
+class TaskTimeoutError extends Error {
+  constructor(taskId: string, timeout: number);
+  /** Present for a mutating request once its retry identity is known */
+  idempotency_key?: string;
+  /** Present when the deadline expired during governance outcome reporting */
+  governanceRecovery?: {
+    checkId: string;
+    outcome?: 'completed' | 'failed';
+    outcomeIdempotencyKey?: string;
+  };
+}
+```
+
+**Usage:**
+```typescript
+try {
+  const result = await agent.complexAnalysis(params, handler);
+} catch (error) {
+  if (error instanceof TaskTimeoutError) {
+    // Reuse error.idempotency_key when reconciling the seller mutation.
+    // If governanceRecovery is present, pass its outcomeIdempotencyKey to
+    // reportGovernanceOutcome after recovering the seller result.
+    console.log('Task timed out - consider using submitted pattern');
+  }
+}
+```
+
+### MaxClarificationError
+
+Thrown when a task exceeds maximum clarification attempts.
+
+```typescript
+class MaxClarificationError extends Error {
+  constructor(taskId: string, maxAttempts: number);
+}
+```
+
+**Usage:**
+```typescript
+try {
+  const result = await agent.getProducts(params, handler);
+} catch (error) {
+  if (error instanceof MaxClarificationError) {
+    console.log('Too many clarifications - improve handler logic');
+  }
+}
+```
+
+### DeferredTaskError
+
+Thrown when a task is deferred (normal flow for deferred tasks).
+
+```typescript
+class DeferredTaskError extends Error {
+  readonly token: string; // Readable, but non-enumerable and non-writable at runtime
+  constructor(token: string);
+}
+```
+
+**Usage:**
+```typescript
+try {
+  // This would be internal library usage
+  const result = await internalTaskExecution();
+} catch (error) {
+  if (error instanceof DeferredTaskError) {
+    await approvedContinuationStore.save(error.token);
+    console.log('Task deferred; continuation stored securely.');
+  }
+}
+```
+
+The token is a bearer capability. Do not log or expose it; persist and pass it only through an approved secret-bearing path.
+
+---
+
+## Utility Functions
+
+### Type Guards
+
+#### isDeferResponse
+
+```typescript
+function isDeferResponse(response: any): response is { defer: true; token: string };
+```
+
+Check if a response is a defer response.
+
+#### isAbortResponse
+
+```typescript
+function isAbortResponse(response: any): response is { abort: true; reason?: string };
+```
+
+Check if a response is an abort response.
+
+### Response Handling
+
+#### normalizeHandlerResponse
+
+```typescript
+async function normalizeHandlerResponse(
+  response: InputHandlerResponse,
+  context: ConversationContext
+): Promise<any>;
+```
+
+Utility to normalize handler responses.
+
+---
+
+## Configuration
+
+### AgentConfig
+
+Configuration for individual agents.
+
+```typescript
+interface AgentConfig {
+  /** Unique agent identifier */
+  id: string;
+  /** Human-readable agent name */
+  name: string;
+  /** Agent endpoint URL */
+  agent_uri: string;
+  /** Protocol type */
+  protocol: 'mcp' | 'a2a';
+  /** Whether authentication is required */
+  requiresAuth?: boolean;
+  /** Environment variable containing auth token */
+  auth_token_env?: string;
+}
+```
+
+### ConversationConfig
+
+Configuration for conversation management.
+
+```typescript
+interface ConversationConfig {
+  /** Maximum messages to keep in history */
+  maxHistorySize?: number;
+  /** Whether to persist conversations */
+  persistConversations?: boolean;
+  /** Resettable idle/progress timeout for protocol work in 'working' status */
+  workingTimeout?: number;
+  /** Default max clarifications */
+  defaultMaxClarifications?: number;
+}
+```
+
+### Storage Interfaces
+
+#### Storage
+
+Generic storage interface for persistence.
+
+```typescript
+interface Storage<T> {
+  get(key: string): Promise<T | undefined>;
+  set(key: string, value: T, ttl?: number): Promise<void>;
+  delete(key: string): Promise<void>;
+  has(key: string): Promise<boolean>;
+  keys(): Promise<string[]>;
+  clear(): Promise<void>;
+}
+```
+
+#### DeferredTaskStorage
+
+Durable storage for restart-safe A2A `input-required` and `auth-required`
+continuations. Claiming must atomically replace the exact record generation;
+implementing it as separate `get()` and `set()` calls can let two replicas
+resume the same seller task or create a token-reuse ABA gap.
+
+```typescript
+interface DeferredTaskState {
+  continuationVersion: string; // Opaque atomic record generation
+  continuationClaimed?: boolean; // Seller continuation dispatch is fenced
+  settlementResumeDispatchLease?: {
+    ownerId: string;
+    phase: 'admission' | 'dispatch-committed';
+    expiresAt: number;
+  }; // Renewable admission owner or permanent uncertain-dispatch fence
+  taskId: string; // Client correlation ID
+  contextId?: string; // Seller A2A context ID
+  a2aTaskId: string; // Exact seller A2A Task.id
+  serverVersion: 'v2' | 'v3'; // Original seller wire generation
+  agentId: string; // Resolved through trusted current configuration
+  taskName: string;
+  params: unknown;
+  messages: Message[];
+  pauseStatus?: 'input-required' | 'auth-required' | 'deferred'; // Exact public pause arm
+  pauseQuestion?: string; // Prompt returned when an interrupted handoff is rediscovered
+  clientContext?: unknown; // Opaque SDK context; round-trip unchanged
+  settlementOperationId?: string; // Trusted committed-mutation recovery route
+  settlementOperationRouteRequired?: true; // New-format routed record; preserve on every successor
+  directContinuationRecovery?: true; // Routed direct pause, not committed settlement
+  directContinuationRecoveryKeyDigest?: string; // SHA-256; raw capability is never stored
+  directContinuationOwnerBindingDigest?: string; // Authenticated owner/account + trusted seller binding
+  settlementResumeAuthorizationRequired?: boolean; // Owning coordinator must authorize seller-input dispatch
+  settlementServerTaskId?: string; // Durably bound seller work handle
+  settlementPendingTaskId?: string; // Nonterminal seller work retained for restart polling
+  settlementTerminalResult?: unknown; // Opaque retryable terminal observation; round-trip unchanged
+  settlementFinalizationLease?: { ownerId: string; expiresAt: number }; // Internal renewable active-owner fence
+  settlementFinalizedResult?: unknown; // Exact finalized replay; handlers do not run again
+  settlementCompletionHandlerPublished?: boolean; // Internal durable handler-publication fence
+  createdAt: number; // Epoch milliseconds
+  expiresAt: number; // Epoch milliseconds
+}
+
+interface DeferredTaskStorage extends Storage<DeferredTaskState> {
+  putIfAbsent(key: string, value: DeferredTaskState, ttl?: number): Promise<boolean>;
+  replaceIfVersion(
+    key: string,
+    expectedVersion: string,
+    value: DeferredTaskState,
+    ttl?: number,
+  ): Promise<boolean>;
+  takeIfVersion(key: string, expectedVersion: string): Promise<DeferredTaskState | undefined>;
+  putForSettlementOperationIfAbsent(
+    operationId: string,
+    key: string,
+    value: DeferredTaskState,
+    ttl?: number,
+  ): Promise<boolean>;
+  getBySettlementOperationId(
+    operationId: string,
+  ): Promise<{ token: string; state: DeferredTaskState } | undefined>;
+  replaceForSettlementOperationIfVersion(
+    operationId: string,
+    currentKey: string,
+    expectedVersion: string,
+    replacementKey: string,
+    replacementValue: DeferredTaskState,
+    ttl?: number,
+  ): Promise<boolean>;
+}
+```
+
+`putIfAbsent()` must atomically reject an existing unexpired key.
+Custom adapters MUST round-trip every `DeferredTaskState` field opaquely,
+including fields introduced by newer SDK versions. When A→B moves an
+operation route but retains A as a dispatch fence, later deletion or expiry of
+A MUST clear the route only if it still points at A; it must never delete the
+route that now points at B. Deploy readers that preserve new fields before
+enabling new routed writers in a shared store.
+For ordinary and marker-absent legacy records, `replaceIfVersion()` is the
+exclusive seller-dispatch claim: it must replace only the exact generation and
+keep the key present under the SDK-supplied internal safety TTL. New
+`settlementOperationRouteRequired: true` records use same-key
+`replaceForSettlementOperationIfVersion()` for that claim and every later
+transition so token and route remain one linearizable unit. This safety horizon
+is independent of the configurable human-input token lifetime and expands for
+configured transport/working waits.
+Committed continuations first hold a renewable `admission` lease while current
+route authorization and trusted-agent resolution run. The SDK then performs an
+exact generation CAS to `dispatch-committed` immediately before calling the
+seller. Only an expired `admission` lease is reclaimable; a
+`dispatch-committed` record represents uncertain seller dispatch and must never
+redispatch the human input. Authoritative callbacks may replace either phase.
+`takeIfVersion()` performs post-completion cleanup only when that claimed
+generation is still current. If trusted agent resolution fails before
+dispatch, the SDK generation-conditionally restores the original state with
+its remaining human-input TTL.
+
+The three settlement-operation methods form a second atomic index over
+committed continuations and opted-in direct mutation pauses. Initial pause creation writes the opaque token and
+operation route together. A nested pause writes B and moves the route from the
+exact dispatch-committed generation A in one transaction while retaining A as
+a dispatch fence. `getBySettlementOperationId()` returns that exact current
+token/state pair. Passing the same current and replacement key performs an
+in-place route-fenced state CAS; callback terminal checkpointing uses this mode
+so it competes atomically with A→B. New atomically indexed records carry
+`settlementOperationRouteRequired: true`; adapters and record reconstruction
+MUST preserve that discriminator on every successor so generic state updates
+cannot detach the record TTL from its operation route. Marker-absent records
+written by earlier prereleases retain exact-token compatibility behavior. An
+exact purchase retry can therefore rediscover B after a
+crash between SDK checkpointing, coordinator binding, and returning the token
+to the caller, without resending A's human input.
+
+When a pause crossed a committed mutation boundary, the SDK persists its
+trusted settlement operation identity. A terminal restart resume is returned
+only after a reconstructed durable coordinator settles it; without a matching
+recoverer, the resume fails closed.
+
+Direct A2A mutations opt in per call with an authenticated owner/account scope:
+
+```typescript
+const paused = await agent.buyProducts(request, undefined, {
+  durableContinuationRecovery: {
+    ownerScope: `principal:${principalId}/account:${accountId}`,
+  },
+});
+
+// Persist this pair once in host-only storage. The recovery key is distinct
+// from the human-facing resume token and must never be sent to the seller.
+const route = paused.deferred?.recovery;
+if (!route) throw new Error('Seller did not return a recoverable A2A pause');
+
+const recovered = await restartedAgent.recoverDirectPauseContinuation({
+  operationId: route.operationId,
+  recoveryKey: route.recoveryKey,
+  ownerScope: `principal:${principalId}/account:${accountId}`,
+});
+```
+
+The SDK stores only the recovery-key digest, binds it to the supplied stable
+principal/account owner scope and trusted seller ID/origin, and validates the route
+store before seller dispatch. Unknown routes, wrong capabilities, owner drift,
+and seller drift fail without revealing a token. The host must authenticate
+the caller before constructing `ownerScope`; request fields are not an
+authentication source. Keep the scope byte-stable for the operation lifetime;
+do not use a mutable display name, seller-supplied value, seller task ID, or
+request idempotency key. Custom stores must round-trip all three
+`directContinuation*` fields and implement the operation-route methods as one
+linearizable index. Direct routes do not enter committed-settlement recovery,
+so the existing callback and terminal settlement fences remain unchanged.
+The operation route covers resumable pause generations. If resume instead
+reaches `submitted` or a terminal result, persist the returned seller task ID
+and result through the normal host operation record; terminal uncertainty is
+reconciled by polling that seller task ID, never by redispatching the mutation.
+Persist the first returned recovery pair before considering the initial pause
+restart-safe. After any possible continuation dispatch, an absent pause route
+does not authorize redispatch.
+
+### Committed coordinator checkpoints
+
+If seller continuation reaches a terminal result, the SDK replaces the human
+input record with an opaque terminal checkpoint using the same independent
+safety horizon. Recovery and application completion handlers retry from that
+checkpoint without redispatching seller work. The checkpoint is retained
+through its TTL as an exact-replay fence, so custom storage must not recycle
+its token early. After settlement, public response finalization, and completion
+handlers all succeed, the checkpoint records the exact finalized result. Later
+token retries replay that value without rerunning seller dispatch, settlement
+recovery, or application handlers. Recovery and handler publication are
+protected by a renewable generation-fenced active lease, so healthy concurrent
+replicas do not finalize the same checkpoint at once. Failed finalization releases
+the checkpoint for retry, while a crashed owner's lease eventually expires.
+Recovery callbacks and completion handlers must still be idempotent: after lease
+expiry or loss, a replacement owner cannot stop a partitioned or event-loop-stalled
+former owner from finishing an already-started external side effect.
+
+If a committed resume instead returns `working` or `submitted`, the same token
+retains the seller work handle under the safety horizon. After restart,
+`resumeDeferredTask()` reconstructs a submitted polling continuation from that
+handle and never sends the human input a second time. Only an authoritative
+terminal `tasks/get` response advances that checkpoint; local cancellation,
+task eviction, binding mismatch, and malformed polling responses leave the
+pending route retryable. A terminal result observed through `track()` is saved
+but not finalized through that `TaskInfo` surface: resume the durable token to
+run settlement, response projection, and completion handlers. If polling
+instead observes `input-required` or `auth-required`, the SDK returns the pause
+without inventing a continuation: the AdCP polling work handle is not an A2A
+transport task ID. The durable pending route remains intact for later polling,
+but the pause is nonresumable unless a future protocol response supplies a
+verified continuation identity.
+
+Configure durable continuation recovery on `SingleAgentClient`:
+
+```typescript
+const client = new SingleAgentClient(agent, {
+  deferredStorage,
+  deferredTaskTtlSeconds: 7 * 24 * 60 * 60,
+  // Optional for registries that can resolve more than this client's agent.
+  resolveDeferredAgent: agentId => trustedAgentRegistry.get(agentId),
+});
+
+const result = await client.resumeDeferredTask(token, humanInput);
+```
+
+When the token belongs to a committed legacy-purchase compatibility flow,
+reconstruct an `AgentClient`, negotiate its `MediaBuyLifecycleCoordinator` with
+the same durable continuation store and scopes, and call
+`agent.resumeDeferredTask(token, humanInput)`. The coordinator registers its
+settlement recoverer and exact-token authorizer on that `AgentClient`'s owned
+client, so a separate `SingleAgentClient` cannot safely redeem the token.
+If the seller pauses again, that same coordinator generation-conditionally
+rebinds the committed operation from the consumed token to the replacement
+before the old checkpoint is removed or the replacement is returned.
+
+Durable continuation tokens are bearer capabilities and must be generated by a
+cryptographically secure random source. The SDK accepts either a UUIDv4 or an
+opaque URL-safe identifier containing 43–256 ASCII letters, digits,
+underscores, or hyphens (43 base64url characters can encode 256 random bits).
+It rejects weaker or malformed tokens before a storage lookup or write. The
+built-in `context.deferToHuman()` uses `crypto.randomUUID()`.
+
+When `resolveDeferredAgent` is omitted, `SingleAgentClient` accepts only its own
+configured agent ID and repeats MCP endpoint discovery or A2A canonical URL
+resolution before dispatch. Persisted state stores no agent credentials or
+endpoint authority.
+
+`DeferredTaskState` does contain snapshotted request parameters, conversation
+messages, and opaque client projection context. The SDK recursively redacts
+secret-shaped fields (including callback credentials and auth tokens) before
+writing those snapshots. A matched object-valued credentials container is
+removed as a whole, and a subtree deeper than the supported JSON depth is
+truncated rather than written unvisited. Treat the remaining backing store as
+sensitive application data: encrypt it at rest, restrict access by service
+identity, enforce the configured expiry, and do not place bearer tokens or
+other credentials in unstructured values that cannot be recognized by key.
+
+An authenticated request `property_list` normally needs its `auth_token` again
+when buyer-side product-property policy runs after restart. Because the SDK
+does not persist that credential, `getProducts()` fails before seller dispatch
+when durable storage and request-list verification are both enabled. Use a
+client without durable continuation storage for that request, or explicitly
+set `validation.productPropertyPolicy.enforceRequestPropertyList` to `false`
+when seller-side filtering is the intended trust boundary.
+
+Canonical projection remains deterministic across recovery. Per-call
+`projectionCatalogs` are snapshotted into the opaque client context and reused
+after restart. Per-call `legacyFormatConverter` functions are rejected when
+`deferredStorage` is configured because executable functions cannot be
+serialized; configure the converter on `SingleAgentClient` so every replica
+can supply the same implementation, or use serializable projection catalogs.
+
+#### WebhookManager
+
+Interface for webhook management in submitted tasks.
+
+```typescript
+interface WebhookManager {
+  generateUrl(taskId: string): string;
+  registerWebhook(agent: AgentConfig, taskId: string, webhookUrl: string): Promise<void>;
+  processWebhook(token: string, body: any): Promise<void>;
+}
+```
+
+---
+
+## Usage Examples
+
+### Complete Task Execution Example
+
+```typescript
+import { 
+  ADCPMultiAgentClient,
+  TaskExecutor,
+  createFieldHandler,
+  createConditionalHandler,
+  TaskTimeoutError
+} from '@adcp/sdk';
+
+// Setup
+const client = ADCPMultiAgentClient.fromConfig();
+const executor = new TaskExecutor({
+  workingTimeout: 120000,
+  enableConversationStorage: true
+});
+
+// Create sophisticated handler
+const handler = createConditionalHandler([
+  {
+    condition: (ctx) => ctx.inputRequest.field === 'budget',
+    handler: createFieldHandler({
+      budget: (ctx) => ctx.agent.name.includes('Premium') ? 100000 : 50000
+    })
+  },
+  {
+    condition: (ctx) => ctx.attempt > 2,
+    handler: (ctx) => ctx.deferToHuman()
+  }
+], autoApproveHandler);
+
+// Execute task with full error handling
+async function executeTaskWithHandling() {
+  try {
+    const result = await executor.executeTask(
+      agent,
+      'getProducts',
+      { brief: 'Campaign brief' },
+      handler,
+      { timeout: 30000, debug: true }
+    );
+
+    switch (result.status) {
+      case 'completed':
+        console.log('Products:', result.data.products);
+        break;
+        
+      case 'deferred':
+        const userInput = await getUserInput(result.deferred.question);
+        const final = await result.deferred.resume(userInput);
+        console.log('Final result:', final.data);
+        break;
+        
+      case 'submitted':
+        const completed = await result.submitted.waitForCompletion(60000);
+        console.log('Submitted task completed:', completed.data);
+        break;
+    }
+
+  } catch (error) {
+    if (error instanceof TaskTimeoutError) {
+      console.error('Task timeout:', error.message);
+    } else {
+      console.error('Unexpected error:', error.message);
+    }
+  }
+}
+```
+
+This API reference provides complete documentation for implementing robust ADCP async execution patterns with proper error handling, type safety, and production-ready features.

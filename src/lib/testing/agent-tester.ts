@@ -1,0 +1,631 @@
+/**
+ * AdCP Agent E2E Tester
+ *
+ * Provides comprehensive end-to-end testing of AdCP agents (sales, creative, signals).
+ *
+ * Features:
+ * - Channel-aware testing (only tests features the agent supports)
+ * - Sandbox mode for safe testing (real testing requires actual media buys)
+ * - Comprehensive scenario coverage based on AdCP spec
+ * - Schema validation via @adcp/sdk
+ *
+ * @example
+ * ```typescript
+ * import { testAgent, formatTestResults } from '@adcp/sdk/testing';
+ *
+ * const result = await testAgent(
+ *   'https://test-agent.adcontextprotocol.org/mcp',
+ *   'discovery',
+ *   { auth: { type: 'bearer', token: 'your-token' } }
+ * );
+ * console.log(formatTestResults(result));
+ * ```
+ */
+
+// Re-export types
+export type {
+  TestScenario,
+  TestOptions,
+  TestStepResult,
+  AgentProfile,
+  TestResult,
+  SuiteResult,
+  TaskResult,
+  Logger,
+} from './types';
+export type { TestClient } from './client';
+
+// Re-export client utilities
+export { setAgentTesterLogger, getLogger, createTestClient, runStep } from './client';
+
+// Re-export formatter
+export { formatTestResults, formatTestResultsJSON, formatTestResultsSummary } from './formatter';
+
+// Import scenarios
+import {
+  testHealthCheck,
+  testDiscovery,
+  testCreateMediaBuy,
+  testFullSalesFlow,
+  testReportingFlow,
+  testCreativeSync,
+  testCreativeInline,
+  testCreativeReference,
+  testCreativeFlow,
+  testCreativeLifecycle,
+  testSignalsFlow,
+  testErrorHandling,
+  testValidation,
+  testPricingEdgeCases,
+  testTemporalValidation,
+  testBehaviorAnalysis,
+  testResponseConsistency,
+  // v3 scenarios
+  testGovernancePropertyLists,
+  testGovernanceContentStandards,
+  testPropertyListFilters,
+  testCampaignGovernance,
+  testCampaignGovernanceDenied,
+  testCampaignGovernanceConditions,
+  testCampaignGovernanceDelivery,
+  testSellerGovernanceContext,
+  testSISessionLifecycle,
+  testSIAvailability,
+  testSIHandoff,
+  testCapabilityDiscovery,
+  testSyncAudiences,
+  testSchemaCompliance,
+  testErrorCodes,
+  testErrorStructure,
+  testErrorTransport,
+  // State machine compliance
+  testMediaBuyLifecycle,
+  testTerminalStateEnforcement,
+  testPackageLifecycle,
+  // Deterministic state machine testing
+  testCreativeStateMachine,
+  testMediaBuyStateMachine,
+  testAccountStateMachine,
+  testSessionStateMachine,
+  testDeliverySimulation,
+  testBudgetSimulation,
+  testControllerValidation,
+  // Brand rights
+  testBrandIdentity,
+  testBrandRightsFlow,
+  testCreativeApproval,
+} from './scenarios';
+
+// Import types
+import type { TestScenario, TestOptions, TestResult, TestStepResult, AgentProfile } from './types';
+import { getLogger } from './client';
+
+const REDACTED = '[redacted]';
+
+/**
+ * Strip credentials out of `TestOptions` before it reaches a logger.
+ *
+ * `TestOptions` carries bearer tokens, Basic passwords, OAuth access/refresh
+ * tokens, client-credential secrets, test-kit API keys, and caller-supplied
+ * headers that may hold any of the above. The default logger serializes its
+ * whole context with `JSON.stringify` to `console.log`, so logging the object
+ * verbatim puts live credentials into ordinary stdout and CI logs. Shapes are
+ * preserved — which auth type and which header names were in play is the useful
+ * part for debugging; the values are not.
+ */
+function redactTestOptions(options: TestOptions): Record<string, unknown> {
+  // Allowlist, not `{...options}` minus known secrets.
+  //
+  // Spreading was the bug: `TestOptions._client` is a live `SingleAgentClient`,
+  // set on the primary `comply()` and orchestrator paths, and its `agent` field
+  // is an own enumerable property — so `JSON.stringify` walked straight back
+  // into the bearer token, OAuth tokens, client secret, custom headers, and
+  // `webhookSecret` that the masking above had just removed, three times over
+  // via nested client references. A denylist over a graph that holds a
+  // reference to the whole client cannot be made safe; only naming what may be
+  // logged can.
+  const safe: Record<string, unknown> = {};
+
+  for (const key of LOGGABLE_OPTION_KEYS) {
+    if (options[key] !== undefined) safe[key] = options[key];
+  }
+
+  if (options.auth) {
+    // Keep `type` so the log still shows which scheme was exercised.
+    safe.auth = { type: options.auth.type, ...redactedFieldsFor(options.auth) };
+  }
+  if (options.headers) {
+    // Names are the debuggable part; values may be credentials.
+    safe.headers = Object.fromEntries(Object.keys(options.headers).map(name => [name, REDACTED]));
+  }
+  if (options.test_kit) {
+    // Test kits come from arbitrary `test-kits/*.yaml` and the type carries an
+    // index signature, so a credential can sit at any depth. Log the shape only.
+    safe.test_kit = { keys: Object.keys(options.test_kit) };
+  }
+
+  return safe;
+}
+
+/**
+ * Fields of `TestOptions` that may be written to a log verbatim.
+ *
+ * Anything not named here is dropped — in particular the `_`-prefixed internals
+ * (`_client`, `_profile`, `_webhookReceiver`, …), which hold live client objects
+ * whose own fields include every credential the caller supplied. `agentUrl` is
+ * logged separately by the caller, so the client adds no diagnostic value.
+ */
+const LOGGABLE_OPTION_KEYS = [
+  'protocol',
+  'adcpVersion',
+  'wireAdcpVersion',
+  'versionEnvelope',
+  'schemaRoot',
+  'userAgent',
+  'brand',
+  'brief',
+  'budget',
+  'format_ids',
+  'sandbox',
+  'test_session_id',
+] as const satisfies readonly (keyof TestOptions)[];
+
+/** Every credential-bearing field of the auth union, masked. */
+function redactedFieldsFor(auth: NonNullable<TestOptions['auth']>): Record<string, string> {
+  switch (auth.type) {
+    case 'bearer':
+      return { token: REDACTED };
+    case 'basic':
+      return { username: REDACTED, password: REDACTED };
+    case 'oauth':
+      return { tokens: REDACTED };
+    case 'oauth_client_credentials':
+      return { credentials: REDACTED, tokens: REDACTED };
+    default:
+      // Unreachable for the declared union; masks wholesale if it ever widens.
+      return { value: REDACTED };
+  }
+}
+
+/**
+ * Main entry point: Run a test scenario against an agent
+ */
+export async function testAgent(
+  agentUrl: string,
+  scenario: TestScenario,
+  options: TestOptions = {}
+): Promise<TestResult> {
+  const startTime = Date.now();
+  let steps: TestStepResult[] = [];
+  let profile: AgentProfile | undefined;
+  const logger = getLogger();
+
+  const effectiveOptions: TestOptions = {
+    ...options,
+    sandbox: options.sandbox !== false,
+    test_session_id: options.test_session_id || `addie-test-${Date.now()}`,
+  };
+
+  logger.info({ agentUrl, scenario, options: redactTestOptions(effectiveOptions) }, 'Starting agent test');
+
+  try {
+    let result: { steps: TestStepResult[]; profile?: AgentProfile };
+
+    switch (scenario) {
+      case 'health_check':
+        steps = await testHealthCheck(agentUrl, effectiveOptions);
+        break;
+
+      case 'discovery':
+        result = await testDiscovery(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'create_media_buy':
+        result = await testCreateMediaBuy(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'full_sales_flow':
+        result = await testFullSalesFlow(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'reporting_flow':
+        result = await testReportingFlow(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'creative_sync':
+        result = await testCreativeSync(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'creative_inline':
+        result = await testCreativeInline(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'creative_reference':
+        result = await testCreativeReference(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'pricing_models':
+        // Re-use pricing edge cases for now
+        result = await testPricingEdgeCases(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'creative_flow':
+        result = await testCreativeFlow(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'creative_lifecycle':
+        result = await testCreativeLifecycle(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'signals_flow':
+        result = await testSignalsFlow(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'error_handling':
+        result = await testErrorHandling(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'validation':
+        result = await testValidation(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'pricing_edge_cases':
+        result = await testPricingEdgeCases(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'temporal_validation':
+        result = await testTemporalValidation(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'behavior_analysis':
+        result = await testBehaviorAnalysis(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'response_consistency':
+        result = await testResponseConsistency(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      // v3 Governance protocol scenarios
+      case 'governance_property_lists':
+        result = await testGovernancePropertyLists(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'governance_content_standards':
+        result = await testGovernanceContentStandards(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'property_list_filters':
+        result = await testPropertyListFilters(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      // v3 Campaign governance scenarios
+      case 'campaign_governance':
+        result = await testCampaignGovernance(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'campaign_governance_denied':
+        result = await testCampaignGovernanceDenied(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'campaign_governance_conditions':
+        result = await testCampaignGovernanceConditions(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'campaign_governance_delivery':
+        result = await testCampaignGovernanceDelivery(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'seller_governance_context':
+        result = await testSellerGovernanceContext(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      // v3 SI protocol scenarios
+      case 'si_session_lifecycle':
+        result = await testSISessionLifecycle(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'si_availability':
+        result = await testSIAvailability(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'si_handoff':
+        result = await testSIHandoff(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      // v3 Capability discovery
+      case 'capability_discovery':
+        result = await testCapabilityDiscovery(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'sync_audiences':
+        result = await testSyncAudiences(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'schema_compliance':
+        result = await testSchemaCompliance(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'error_codes':
+        result = await testErrorCodes(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'error_structure':
+        result = await testErrorStructure(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'error_transport':
+        result = await testErrorTransport(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      // State machine compliance
+      case 'media_buy_lifecycle':
+        result = await testMediaBuyLifecycle(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'terminal_state_enforcement':
+        result = await testTerminalStateEnforcement(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'package_lifecycle':
+        result = await testPackageLifecycle(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      // Deterministic state machine scenarios (require comply_test_controller)
+      case 'deterministic_creative':
+        result = await testCreativeStateMachine(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'deterministic_media_buy':
+        result = await testMediaBuyStateMachine(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'deterministic_account':
+        result = await testAccountStateMachine(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'deterministic_session':
+        result = await testSessionStateMachine(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'deterministic_delivery':
+        result = await testDeliverySimulation(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'deterministic_budget':
+        result = await testBudgetSimulation(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'controller_validation':
+        result = await testControllerValidation(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      // Brand rights protocol
+      case 'brand_identity':
+        result = await testBrandIdentity(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'brand_rights_flow':
+        result = await testBrandRightsFlow(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      case 'creative_approval':
+        result = await testCreativeApproval(agentUrl, effectiveOptions);
+        steps = result.steps;
+        profile = result.profile;
+        break;
+
+      default:
+        steps = [
+          {
+            step: 'Unknown scenario',
+            passed: false,
+            duration_ms: 0,
+            error: `Unknown test scenario: ${scenario}`,
+          },
+        ];
+    }
+  } catch (error) {
+    logger.error({ error, agentUrl, scenario }, 'Agent test failed with exception');
+    steps.push({
+      step: 'Test execution',
+      passed: false,
+      duration_ms: Date.now() - startTime,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const totalDuration = Date.now() - startTime;
+  const passedCount = steps.filter(s => s.passed).length;
+  const failedCount = steps.filter(s => !s.passed).length;
+  const overallPassed = failedCount === 0 && passedCount > 0;
+
+  // Generate summary
+  let summary: string;
+  if (overallPassed) {
+    summary = `All ${passedCount} test step(s) passed in ${totalDuration}ms`;
+  } else if (passedCount === 0) {
+    summary = `All ${failedCount} test step(s) failed`;
+  } else {
+    summary = `${passedCount} passed, ${failedCount} failed out of ${steps.length} step(s)`;
+  }
+
+  const testResult: TestResult = {
+    agent_url: agentUrl,
+    scenario,
+    overall_passed: overallPassed,
+    steps,
+    summary,
+    total_duration_ms: totalDuration,
+    tested_at: new Date().toISOString(),
+    agent_profile: profile,
+  };
+
+  logger.info({ agentUrl, scenario, overallPassed, passedCount, failedCount, totalDuration }, 'Agent test completed');
+
+  return testResult;
+}
+
+// Re-export orchestrator
+export {
+  testAllScenarios,
+  getApplicableScenarios,
+  SCENARIO_REQUIREMENTS,
+  DEFAULT_SCENARIOS,
+  formatSuiteResults,
+  formatSuiteResultsJSON,
+  type OrchestratorOptions,
+} from './orchestrator';
+
+// Re-export individual scenarios for direct use
+export {
+  testHealthCheck,
+  testDiscovery,
+  testCreateMediaBuy,
+  testFullSalesFlow,
+  testReportingFlow,
+  testCreativeSync,
+  testCreativeInline,
+  testCreativeFlow,
+  testCreativeLifecycle,
+  testSignalsFlow,
+  testErrorHandling,
+  testValidation,
+  testPricingEdgeCases,
+  testTemporalValidation,
+  testBehaviorAnalysis,
+  testResponseConsistency,
+  // v3 scenarios
+  testGovernancePropertyLists,
+  testGovernanceContentStandards,
+  testPropertyListFilters,
+  testCampaignGovernance,
+  testCampaignGovernanceDenied,
+  testCampaignGovernanceConditions,
+  testCampaignGovernanceDelivery,
+  testSellerGovernanceContext,
+  testSISessionLifecycle,
+  testSIAvailability,
+  testSIHandoff,
+  testCapabilityDiscovery,
+  testSyncAudiences,
+  resolveAccountForMediaBuy,
+  resolveAccountForAudiences,
+  testSchemaCompliance,
+  testErrorCodes,
+  testErrorStructure,
+  testErrorTransport,
+  // State machine compliance
+  testMediaBuyLifecycle,
+  testTerminalStateEnforcement,
+  testPackageLifecycle,
+  // Deterministic state machine testing
+  testCreativeStateMachine,
+  testMediaBuyStateMachine,
+  testAccountStateMachine,
+  testSessionStateMachine,
+  testDeliverySimulation,
+  testBudgetSimulation,
+  testControllerValidation,
+  // Brand rights
+  testBrandIdentity,
+  testBrandRightsFlow,
+  testCreativeApproval,
+  hasBrandRightsTools,
+  // v3 helpers
+  hasGovernanceTools,
+  hasCampaignGovernanceTools,
+  hasSITools,
+  likelySupportsV3,
+} from './scenarios';

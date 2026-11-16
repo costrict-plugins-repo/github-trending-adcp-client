@@ -1,0 +1,569 @@
+/**
+ * Per-specialism agent routing for the storyboard runner (#1066).
+ *
+ * Resolves each step's `task` to one of N agents in
+ * `StoryboardRunOptions.agents` so storyboards that span specialisms
+ * (e.g., a `signal_marketplace/governance_denied` flow that calls
+ * `sync_governance` then `activate_signal`) can hit the tenant that
+ * actually owns each tool.
+ *
+ * Resolution order per step:
+ *   1. Explicit `step.agent` (escape hatch for cross-domain tools)
+ *   2. `TASK_FEATURE_MAP` → first protocol → unique claimant in the agents map
+ *   3. `options.default_agent`
+ *   4. Throw `RoutingError`
+ *
+ * Multi-claim conflicts (two agents claim the same protocol AND a step
+ * relying on that protocol lacks an explicit `agent:` override) fail-fast
+ * at routing-context build time, BEFORE any non-discovery network calls.
+ *
+ * Every `RoutingError` is a failure; routing never treats an unresolved route
+ * as inapplicability.
+ *
+ * ## Webhook receiver topology in routed mode
+ *
+ * When `StoryboardRunOptions.webhook_receiver` is set alongside `agents`,
+ * the receiver is **shared** across all tenants — one HTTP server, one base
+ * URL. The runner does not create per-tenant receivers and does not need to:
+ * delivery correlation is by **step-keyed URL** (`/step/<step_id>/<op_id>`),
+ * not by source agent. If both a governance tenant and a signals tenant
+ * emit webhooks during the same run, the assertion harness matches each
+ * delivery to its `expect_webhook*` step by URL path, regardless of which
+ * tenant posted it. This means:
+ *
+ *   - `{{runner.webhook_base}}` substitutes the same URL for every step
+ *     across all agents — no per-agent variable needed.
+ *   - `{{runner.webhook_url:<step_id>}}` is always sufficient to pin a
+ *     delivery to the step that requested it, even when multiple tenants
+ *     emit concurrently.
+ *   - Per-tenant receivers are not supported; if a future storyboard needs
+ *     delivery-source disambiguation, use distinct step IDs (they already
+ *     produce distinct URL paths).
+ *
+ * See `StoryboardRunOptions.webhook_receiver` JSDoc and `webhook-receiver.ts`
+ * for implementation details.
+ */
+import { redactOAuthUrlForOutput, redactOAuthUrlsInText } from './oauth-metadata-graph';
+import { selectProbeTask } from './test-kit';
+import type { TestClient } from '../client';
+import { getOrCreateClient, getOrDiscoverStoryboardProfile } from '../client';
+import type { AgentProfile, TestStepResult } from '../types';
+import { TASK_FEATURE_MAP, type AdcpProtocol } from '../../utils/capabilities';
+import type { AgentEntry, Storyboard, StoryboardRunOptions, StoryboardStep } from './types';
+import { applyNativeA2AComplianceTransportOptions } from './native-a2a-compliance';
+
+/** Storyboard applicability is any-of; it does not authorize individual steps. */
+export function hasAnyRequiredTool(required: readonly string[] | undefined, tools: readonly string[]): boolean {
+  return !required?.length || required.some(tool => tools.includes(tool));
+}
+
+/** Normalize legacy discovery entries, retaining the single-agent empty-list fallback. */
+export function normalizeAgentToolNames(tools: unknown): string[] | undefined {
+  if (!Array.isArray(tools)) return undefined;
+  const names = tools.flatMap(tool => {
+    if (typeof tool === 'string') return [tool];
+    if (tool && typeof tool === 'object' && typeof tool.name === 'string') return [tool.name];
+    return [];
+  });
+  return names.length > 0 ? names : undefined;
+}
+
+/**
+ * Resolve a `$test_kit.<path>` task reference against the runtime options.
+ * Falls back to `step.task_default`. Returns undefined when neither yields a string.
+ */
+export function resolveTaskName(step: StoryboardStep, options: StoryboardRunOptions): string | undefined {
+  if (!step.task.startsWith('$test_kit.')) return step.task;
+  const path = step.task.slice('$test_kit.'.length).split('.');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic test-kit shape
+  let value: any = options.test_kit;
+  for (const segment of path) {
+    if (value == null || typeof value !== 'object') {
+      value = undefined;
+      break;
+    }
+    value = (value as Record<string, unknown>)[segment];
+  }
+  const configured = typeof value === 'string' && value.length > 0 ? value : step.task_default;
+  if (step.task === '$test_kit.auth.probe_task') {
+    // Transport matters: the no-allowlist fallback is the MCP session probe,
+    // and there is no A2A equivalent (see `selectProbeTask`).
+    return selectProbeTask(configured, options.agentTools, { protocol: options.protocol });
+  }
+  return configured;
+}
+
+// `compliance_testing` is on the wire as a top-level capability block, NOT
+// in `supported_protocols`. `parseCapabilitiesResponse`
+// (`src/lib/utils/capabilities.ts`) normalizes the block into the
+// `protocols[]` list before `getOrDiscoverProfile` writes it onto the
+// profile, so by the time routing reads `profile.supported_protocols`
+// the value is present. Any future refactor that strips that
+// normalization needs to either preserve it or drop `compliance_testing`
+// from this set.
+const KNOWN_PROTOCOLS: ReadonlySet<AdcpProtocol> = new Set([
+  'media_buy',
+  'signals',
+  'governance',
+  'creative',
+  'sponsored_intelligence',
+  'trusted_match',
+  'compliance_testing',
+  'brand',
+]);
+
+/**
+ * Redact common auth-token patterns before propagating an upstream error
+ * message into runner output / CI logs / `StoryboardResult.error`. The
+ * concrete leak path: a misconfigured agent that echoes its received
+ * `Authorization: Bearer <token>` header in a 401 body would put the
+ * caller's own bearer for that tenant into CI artifacts. The bearer is
+ * already in the caller's CI environment, so this is parity with single-
+ * agent mode rather than a fix for a new leak — but defense-in-depth is
+ * cheap and the regex is bounded.
+ *
+ * Patterns covered:
+ *   - `Authorization: Bearer <token>` (any case, common in 401 echoes)
+ *   - `Bearer <token>` standalone
+ *   - `?token=<value>` / `&token=<value>` query-string tokens
+ *
+ * Best-effort. Anything unusual (custom-header schemes, base64-encoded
+ * blobs in JSON bodies) is not caught — operators should still treat
+ * upstream-error CI logs as sensitive.
+ */
+function scrubAuthSecrets(text: string): string {
+  // The character class `[A-Za-z0-9._~+/=-]+` looks like high-entropy
+  // content to entropy-based secret scanners (GitGuardian/gitleaks). It
+  // is the redaction pattern itself — no secret is encoded here.
+  // ggignore
+  return redactOAuthUrlsInText(text)
+    .replace(/(authorization\s*:\s*bearer\s+)[A-Za-z0-9._~+/=-]+/gi, '$1[REDACTED]') // ggignore
+    .replace(/\bbearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]') // ggignore
+    .replace(/([?&]token=)[A-Za-z0-9._~+/=-]+/gi, '$1[REDACTED]'); // ggignore
+}
+
+/** Per-agent options view: per-entry overrides shadow run-level defaults. */
+function buildAgentOptions(entry: AgentEntry, options: StoryboardRunOptions): StoryboardRunOptions {
+  return applyNativeA2AComplianceTransportOptions({
+    ...options,
+    auth: entry.auth ?? options.auth,
+    protocol: entry.transport ?? options.protocol,
+    // _client, _profile, and agents are run-scoped — never inherit into
+    // per-agent views. `_profile` is the load-bearing one: when comply()
+    // sets it on the run-level options, `getOrDiscoverProfile` (`client.ts`)
+    // short-circuits to that cached profile and skips the actual probe.
+    // Without this clear, every per-agent discovery would return
+    // comply()'s primary-tenant profile instead of probing the real
+    // tenant — silently breaking the protocol-claim index that routing
+    // depends on.
+    _client: undefined,
+    _profile: undefined,
+    profile: undefined,
+    _controllerCapabilities: undefined,
+    agents: undefined,
+    agentTools: undefined,
+  });
+}
+
+/** Bind execution gates and transport observations to the same agent as dispatch. */
+export function routedAgentOptions(
+  entry: AgentEntry,
+  options: StoryboardRunOptions,
+  profile: AgentProfile
+): StoryboardRunOptions {
+  // An empty discovered list is authoritative in routed mode.
+  const tools = normalizeAgentToolNames(profile.tools) ?? [];
+  const raw = profile.raw_capabilities;
+  const compliance = raw && typeof raw === 'object' && 'compliance_testing' in raw ? raw.compliance_testing : undefined;
+  const scenarios =
+    compliance && typeof compliance === 'object' && 'scenarios' in compliance ? compliance.scenarios : undefined;
+  return {
+    ...buildAgentOptions(entry, options),
+    // Scenario opt-in must be the selected agent's declaration too; a
+    // comply() caller's controller cache belongs to its single agent.
+    _controllerCapabilities:
+      Array.isArray(scenarios) &&
+      scenarios.length > 0 &&
+      scenarios.every(s => typeof s === 'string') &&
+      tools.includes('comply_test_controller')
+        ? {
+            detected: true,
+            scenarios,
+          }
+        : { detected: false },
+    profile,
+    _profile: profile,
+    agentTools: tools,
+  };
+}
+
+export interface AgentRoutingContext {
+  /** Per-agent transport client. Lifecycle owned by the runner. */
+  clients: Map<string, TestClient>;
+  /** Per-agent discovered profile (`get_adcp_capabilities` result). */
+  profiles: Map<string, AgentProfile>;
+  /** Actual discovery exchanges, retained separately from compact rollup steps. */
+  discoverySteps?: ReadonlyMap<string, TestStepResult>;
+  /** Protocol → keys of agents that claim it. */
+  protocolIndex: Map<AdcpProtocol, string[]>;
+  /** Resolved (key → URL) for echo on the storyboard result. */
+  agentMap: Record<string, string>;
+  /**
+   * Agents whose discovery failed when `discovery_resilient: true` was set.
+   * Empty in the default (hard-failure) mode — if any agent failed and
+   * resilient mode is off, `buildRoutingContext` throws `DiscoveryFailure`
+   * instead of returning. The runner echoes this list onto
+   * `StoryboardResult.discovery_failures` so operators see the topology
+   * breakage even when the storyboard otherwise completes.
+   */
+  discoveryFailures: DiscoveryFailure[];
+}
+
+export class RoutingError extends Error {
+  constructor(
+    message: string,
+    public readonly task: string,
+    public readonly hint: string
+  ) {
+    super(message);
+    this.name = 'RoutingError';
+  }
+}
+
+export class DiscoveryFailure extends Error {
+  constructor(
+    message: string,
+    public readonly agentKey: string,
+    public readonly url: string,
+    public readonly underlying: string,
+    public readonly step?: TestStepResult
+  ) {
+    super(message);
+    this.name = 'DiscoveryFailure';
+  }
+}
+
+/**
+ * Discover every agent in the map in parallel and build the routing index.
+ *
+ * Failure modes:
+ *   - default (`options.discovery_resilient !== true`): any agent's
+ *     discovery failure → throw `DiscoveryFailure` (caller surfaces as a
+ *     hard storyboard failure, never a per-step skip). Correct for
+ *     production multi-tenant flows where every tenant is load-bearing.
+ *   - resilient (`options.discovery_resilient === true`, #1367): failed
+ *     agents are excluded from `profiles` + `protocolIndex` and reported
+ *     on `AgentRoutingContext.discoveryFailures`. Per-step routing then
+ *     surfaces failures only for storyboards that actually need the
+ *     broken tenant — unrelated storyboards complete normally.
+ *   - protocol claimed by 2+ agents AND ≥1 storyboard step that needs it
+ *     lacks `step.agent` → `RoutingError` (conflict). Independent of
+ *     resilient mode.
+ */
+export async function discoverAgentRouting(options: StoryboardRunOptions): Promise<AgentRoutingContext> {
+  const agents = options.agents!;
+  const entries = Object.entries(agents);
+  const resilient = options.discovery_resilient === true;
+
+  const clients = new Map<string, TestClient>();
+  const agentMap: Record<string, string> = {};
+  for (const [key, entry] of entries) {
+    const perAgentOptions = buildAgentOptions(entry, options);
+    clients.set(key, getOrCreateClient(entry.url, perAgentOptions));
+    agentMap[key] = entry.url;
+  }
+
+  // Parallel discovery — one tenant's slowness does not block another.
+  const profiles = new Map<string, AgentProfile>();
+  const discoverySteps = new Map<string, TestStepResult>();
+  const discoveryFailures: DiscoveryFailure[] = [];
+  if (options._routingProfiles) {
+    for (const [key] of entries) {
+      const profile = options._routingProfiles.get(key);
+      if (!profile) {
+        throw new Error(`Pre-discovered routing profiles are missing agent "${key}".`);
+      }
+      profiles.set(key, profile);
+    }
+    return {
+      clients,
+      profiles,
+      discoverySteps,
+      protocolIndex: buildProtocolIndex(profiles),
+      agentMap,
+      discoveryFailures,
+    };
+  }
+
+  const discoveryResults = await Promise.all(
+    entries.map(async ([key, entry]) => {
+      const perAgentOptions = buildAgentOptions(entry, options);
+      try {
+        const { profile, step, evidence } = await getOrDiscoverStoryboardProfile(clients.get(key)!, perAgentOptions);
+        return { key, profile, step, evidence };
+      } catch (err) {
+        return {
+          key,
+          profile: undefined,
+          step: {
+            step: 'Discover agent capabilities',
+            passed: false,
+            duration_ms: 0,
+            error: scrubAuthSecrets((err as Error)?.message || String(err)),
+          },
+        };
+      }
+    })
+  );
+  for (const r of discoveryResults) {
+    discoverySteps.set(r.key, 'evidence' in r && r.evidence ? r.evidence : r.step);
+    if (!r.profile || r.step.passed === false) {
+      // Bound the attacker-influenced upstream string. A malicious agent
+      // could return an arbitrarily large error body during the discovery
+      // probe; the unbounded string would flow into
+      // `StoryboardResult.discovery_failures[].error` where downstream
+      // dashboards / LLM contexts ingest it. 512 chars is enough for a
+      // human to read the failure and grep logs for more.
+      const rawDetail = scrubAuthSecrets(r.step.error ?? 'Discovery returned no profile.');
+      const detail = rawDetail.length > 512 ? `${rawDetail.slice(0, 512)} …(truncated)` : rawDetail;
+      // Default mode appends a signposted escape hatch so CI operators
+      // discover the resilient flag without grep'ing the JSDoc. Suppressed
+      // in resilient mode (the operator already opted in) so the hint
+      // doesn't appear in every per-agent failure attached to the result.
+      const baseMessage = `Discovery failed for agent "${r.key}" (${redactOAuthUrlForOutput(agents[r.key]!.url)}): ${detail}`;
+      const message = resilient
+        ? baseMessage
+        : `${baseMessage}\n\nIf this is hello-cluster / exploratory CI and you want unrelated storyboards to complete despite this failure, ` +
+          `set \`StoryboardRunOptions.discovery_resilient: true\`. Do NOT set it in production — a topology with a broken tenant ` +
+          `is a hard misconfiguration there.`;
+      const failure = new DiscoveryFailure(message, r.key, agents[r.key]!.url, detail, { ...r.step, error: detail });
+      if (!resilient) throw failure;
+      discoveryFailures.push(failure);
+      continue;
+    }
+    profiles.set(r.key, r.profile);
+  }
+
+  return {
+    clients,
+    profiles,
+    discoverySteps,
+    protocolIndex: buildProtocolIndex(profiles),
+    agentMap,
+    discoveryFailures,
+  };
+}
+
+/** Discover the routed topology, then validate conflicts for one storyboard. */
+export async function buildRoutingContext(
+  storyboard: Storyboard,
+  options: StoryboardRunOptions
+): Promise<AgentRoutingContext> {
+  const context = await discoverAgentRouting(options);
+  detectMultiClaimConflicts(storyboard, context.protocolIndex, options);
+  return context;
+}
+
+/**
+ * Test seam: build a routing context from pre-baked profiles instead of
+ * running discovery. Lets unit tests exercise conflict detection and
+ * per-step resolution without spinning up live agents. Production code
+ * uses `buildRoutingContext`; this entry point is exported for the
+ * `agent-routing.test.js` harness.
+ */
+export function buildRoutingContextFromProfiles(
+  storyboard: Storyboard,
+  options: StoryboardRunOptions,
+  profiles: Map<string, AgentProfile>
+): AgentRoutingContext {
+  const agents = options.agents!;
+  const agentMap: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(agents)) {
+    agentMap[key] = entry.url;
+  }
+  const protocolIndex = buildProtocolIndex(profiles);
+  detectMultiClaimConflicts(storyboard, protocolIndex, options);
+  // Empty client map — callers that only test routing shouldn't dispatch.
+  return { clients: new Map(), profiles, protocolIndex, agentMap, discoveryFailures: [] };
+}
+
+/**
+ * Reverse-index `AgentProfile.supported_protocols` so routing can pick an
+ * agent by tool→protocol→agent in O(1).
+ *
+ * Sorts the agent-key list per protocol for deterministic conflict-error
+ * output and reproducible tests.
+ */
+function buildProtocolIndex(profiles: Map<string, AgentProfile>): Map<AdcpProtocol, string[]> {
+  const index = new Map<AdcpProtocol, string[]>();
+  for (const [key, profile] of profiles) {
+    const protocols = profile.supported_protocols ?? [];
+    for (const p of protocols) {
+      if (!KNOWN_PROTOCOLS.has(p as AdcpProtocol)) continue;
+      const proto = p as AdcpProtocol;
+      const list = index.get(proto) ?? [];
+      list.push(key);
+      index.set(proto, list);
+    }
+  }
+  for (const list of index.values()) list.sort();
+  return index;
+}
+
+/**
+ * Walk the storyboard once and surface any tool→protocol resolution that
+ * has 2+ candidate agents AND no explicit `step.agent` override.
+ *
+ * We could defer this to per-step routing time, but a multi-claim is
+ * almost always a topology bug (two tenants accidentally claiming the
+ * same protocol) — surfacing it before the first non-discovery network
+ * call gives a much better error than a half-run storyboard.
+ */
+function detectMultiClaimConflicts(
+  storyboard: Storyboard,
+  protocolIndex: Map<AdcpProtocol, string[]>,
+  options: StoryboardRunOptions
+): void {
+  const conflicts: Array<{ task: string; protocol: AdcpProtocol; agents: string[]; stepIds: string[] }> = [];
+  for (const phase of storyboard.phases ?? []) {
+    for (const step of phase.steps ?? []) {
+      if (step.agent !== undefined) continue;
+      const task = resolveTaskName(step, { ...options, agentTools: undefined }) ?? step.task;
+      const protocol = primaryProtocolFor(task);
+      if (!protocol) continue;
+      const candidates = protocolIndex.get(protocol);
+      if (!candidates || candidates.length < 2) continue;
+      const existing = conflicts.find(c => c.task === task && c.protocol === protocol);
+      if (existing) {
+        existing.stepIds.push(step.id);
+      } else {
+        conflicts.push({
+          task,
+          protocol,
+          agents: candidates,
+          stepIds: [step.id],
+        });
+      }
+    }
+  }
+  if (conflicts.length === 0) return;
+
+  const lines = conflicts.map(
+    c =>
+      `  - tool "${c.task}" (protocol ${c.protocol}) is claimed by [${c.agents.join(', ')}] ` +
+      `but step(s) [${c.stepIds.join(', ')}] do not declare \`agent:\` override.`
+  );
+  throw new RoutingError(
+    `Routing conflict: multiple agents claim the same protocol and the storyboard ` +
+      `does not disambiguate.\n${lines.join('\n')}\n` +
+      `Fix: either remove one of the conflicting agents from the map, or add ` +
+      `\`agent: <key>\` to each affected step.`,
+    conflicts[0]!.task,
+    `Conflicting agents: ${conflicts[0]!.agents.join(', ')}`
+  );
+}
+
+/**
+ * First protocol-typed feature in `TASK_FEATURE_MAP[task]`, or `undefined`
+ * for tools intentionally unmapped (e.g. `sync_creatives`, which serves
+ * both media-buy and creative domains and requires explicit per-step
+ * routing in multi-agent mode).
+ */
+function primaryProtocolFor(task: string): AdcpProtocol | undefined {
+  const features = TASK_FEATURE_MAP[task];
+  if (!features) return undefined;
+  for (const f of features) {
+    if (KNOWN_PROTOCOLS.has(f as AdcpProtocol)) return f as AdcpProtocol;
+  }
+  return undefined;
+}
+
+/**
+ * Resolve a step to its target agent key. Throws `RoutingError` when no
+ * route can be determined; callers convert to a synthetic step result
+ * (see Stage 4 in the runner).
+ */
+export function resolveAgentForStep(
+  step: StoryboardStep,
+  options: StoryboardRunOptions,
+  ctx: AgentRoutingContext
+): string {
+  if (step.agent !== undefined) {
+    // If the override targets an agent whose discovery failed under
+    // resilient mode, surface that explicitly rather than handing
+    // dispatch a transport client to a broken tenant (which would
+    // otherwise fail at the wire layer with a misleading transport
+    // error). Only meaningful when `discoveryFailures` is non-empty;
+    // under default (hard-failure) mode `buildRoutingContext` throws
+    // before we reach this branch.
+    const failed = ctx.discoveryFailures.find(f => f.agentKey === step.agent);
+    if (failed) {
+      throw new RoutingError(
+        `Step "${step.id}" targets agent "${step.agent}" via \`step.agent\` override, ` +
+          `but that agent's discovery failed: ${failed.underlying} ` +
+          `(${redactOAuthUrlForOutput(failed.url)}). Either remove the override, fix the agent, or ` +
+          `route the step to a healthy agent.`,
+        step.task,
+        `agent "${step.agent}" failed discovery`
+      );
+    }
+    return step.agent;
+  }
+  const protocol = primaryProtocolFor(step.task);
+  if (protocol) {
+    const candidates = ctx.protocolIndex.get(protocol) ?? [];
+    if (candidates.length === 1) return candidates[0]!;
+    if (candidates.length > 1) {
+      // Conflict already detected at build time, but `step.agent` is
+      // unset here. This branch is unreachable in well-formed runs; keep
+      // it as a fail-loud sanity check.
+      throw new RoutingError(
+        `Internal: step "${step.id}" task "${step.task}" maps to protocol ` +
+          `"${protocol}" claimed by [${candidates.join(', ')}], no step.agent override. ` +
+          `This should have been caught at routing-context build time.`,
+        step.task,
+        `agents: ${candidates.join(', ')}`
+      );
+    }
+    // Zero candidates — no agent in the map claims this protocol.
+    if (options.default_agent) return options.default_agent;
+    // Under `discovery_resilient`, an agent that was supposed to claim
+    // this protocol may have been excluded by a failed probe. Suffix the
+    // error so the operator sees the connection without correlating logs.
+    const failedHint =
+      ctx.discoveryFailures.length > 0
+        ? ` Discovery failed for: ${ctx.discoveryFailures.map(f => `${f.agentKey} (${redactOAuthUrlForOutput(f.url)})`).join(', ')}.`
+        : '';
+    // An agent that advertises the tool without claiming its protocol is a
+    // declaration bug the operator can fix on the agent (or with an
+    // `agent:` annotation) — the topology CAN serve the step. Name those
+    // agents in the message so the error points at the fix. The step is still
+    // a routing failure either way; the names are operator guidance, not a
+    // field on the error (adcp-client#2945).
+    const toolAdvertisedBy = [...ctx.profiles]
+      .filter(([, profile]) => (normalizeAgentToolNames(profile.tools) ?? []).includes(step.task))
+      .map(([key]) => key);
+    const advertisedHint = toolAdvertisedBy.length
+      ? ` Agent(s) [${toolAdvertisedBy.join(', ')}] advertise "${step.task}" but do not declare ` +
+        `"${protocol}" in supported_protocols — fix that declaration, or pin the step with \`agent:\`.`
+      : '';
+    throw new RoutingError(
+      `No agent in the map claims protocol "${protocol}" required by tool ` +
+        `"${step.task}" (step "${step.id}"). Available agents: ` +
+        `${[...ctx.profiles.keys()].join(', ') || '(none — every agent failed discovery)'}.${failedHint} ` +
+        `Add an agent that supports ${protocol}, or set \`default_agent\` to fall back.${advertisedHint}`,
+      step.task,
+      `protocol ${protocol} unclaimed`
+    );
+  }
+  // Tool not in TASK_FEATURE_MAP (e.g., sync_creatives, list_authorized_properties,
+  // get_adcp_capabilities post-discovery, future tasks).
+  if (options.default_agent) return options.default_agent;
+  throw new RoutingError(
+    `Tool "${step.task}" (step "${step.id}") has no specialism mapping ` +
+      `(it serves multiple domains or is unrecognized). Set \`agent: <key>\` ` +
+      `on the step, or set \`default_agent\` on the run options.`,
+    step.task,
+    'no protocol mapping'
+  );
+}

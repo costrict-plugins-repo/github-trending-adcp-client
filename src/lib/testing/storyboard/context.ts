@@ -1,0 +1,900 @@
+/**
+ * Context propagation for storyboard steps.
+ *
+ * After each successful step, known IDs and references are extracted
+ * from the response and accumulated in a StoryboardContext. Before
+ * executing a step, context values are injected into the request via
+ * "$context.<key>" placeholders.
+ *
+ * This convention-based approach avoids requiring YAML enrichment
+ * (context_outputs/context_inputs) while still enabling stateful flows.
+ */
+
+import { randomUUID } from 'node:crypto';
+import type { StoryboardContext, ContextOutput, ContextInput, ContextProvenanceEntry } from './types';
+import { resolvePath, setPath } from './path';
+import { detachProtectedValue, isProtectedContextKey } from './protected-context';
+import { getAuthoritativeMediaBuyStatus } from '../../utils/media-buy-status';
+
+// ────────────────────────────────────────────────────────────
+// Context extraction: pull known IDs from task responses
+// ────────────────────────────────────────────────────────────
+
+/**
+ * `adcpVersion` is the release the step was requested at. Media-buy mutation
+ * extractors use it to tell a 3.1+ task-envelope `status` from a 3.0
+ * lifecycle `status` when the response does not echo its version.
+ */
+type ContextExtractor = (data: unknown, adcpVersion?: string) => Record<string, unknown>;
+
+const PRODUCT_CONTEXT_KEYS = [
+  'product',
+  'products',
+  'product_id',
+  'pricing_option',
+  'pricing_option_id',
+  'feed_version',
+  'pricing_version',
+];
+const PROPOSAL_CONTEXT_KEYS = [
+  'proposal',
+  'proposals',
+  'proposal_id',
+  'proposal_status',
+  'proposal_kind',
+  'terms_digest',
+  'proposal_terms_digest',
+];
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function readMediaBuyStatus(record: Record<string, unknown> | undefined): unknown {
+  return getAuthoritativeMediaBuyStatus(record);
+}
+
+function readMediaBuyFields(data: unknown, adcpVersion?: string): { mediaBuyId?: unknown; status?: unknown } {
+  const outer = asRecord(data);
+  const nested = asRecord(outer?.media_buy);
+  return {
+    mediaBuyId: nested?.media_buy_id ?? outer?.media_buy_id,
+    status: readMediaBuyStatus(nested) ?? readMediaBuyStatus(withRequestedVersion(outer, adcpVersion)),
+  };
+}
+
+/**
+ * A create/update response's top-level `status` is the task envelope from
+ * AdCP 3.1. When the seller omits the optional version echo, read the payload
+ * at the requested release so a bare `completed` is not taken as a lifecycle.
+ */
+function withRequestedVersion(
+  record: Record<string, unknown> | undefined,
+  adcpVersion: string | undefined
+): Record<string, unknown> | undefined {
+  if (!record || !adcpVersion) return record;
+  if (typeof record.adcp_version === 'string' || typeof record.adcp_major_version === 'number') return record;
+  return { ...record, adcp_version: adcpVersion };
+}
+
+function readProposalFields(proposal: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!proposal) return {};
+  const extracted: Record<string, unknown> = {};
+  if (proposal.proposal_id) extracted.proposal_id = proposal.proposal_id;
+  if (proposal.proposal_status) extracted.proposal_status = proposal.proposal_status;
+  if (proposal.proposal_kind) extracted.proposal_kind = proposal.proposal_kind;
+  if (proposal.terms_digest) {
+    extracted.terms_digest = proposal.terms_digest;
+    extracted.proposal_terms_digest = proposal.terms_digest;
+  }
+  return extracted;
+}
+
+function readCompactMediaBuyFields(data: unknown): Record<string, unknown> {
+  const outer = asRecord(data);
+  if (!outer || outer.status !== 'completed') return {};
+  const mediaBuyId = outer.media_buy_id;
+  // Compact responses use `status` for task completion and
+  // `media_buy_status` for lifecycle state. Never reinterpret a bare
+  // `status: completed` as the MediaBuy's status when the optional lifecycle
+  // field is absent.
+  const status = readMediaBuyStatus({ media_buy_status: outer.media_buy_status });
+  const acceptedProposal = asRecord(outer.accepted_proposal);
+  const extracted: Record<string, unknown> = {};
+  if (mediaBuyId) extracted.media_buy_id = mediaBuyId;
+  if (status) extracted.media_buy_status = status;
+  if (outer.revision) {
+    extracted.revision = outer.revision;
+    extracted.media_buy_revision = outer.revision;
+  }
+  if (acceptedProposal) {
+    Object.assign(extracted, readProposalFields(acceptedProposal));
+  }
+  if (Array.isArray(outer.available_actions)) extracted.available_actions = outer.available_actions;
+  return extracted;
+}
+
+export const CONTEXT_EXTRACTORS: Record<string, ContextExtractor> = {
+  sync_accounts(data) {
+    const d = data as Record<string, unknown> | undefined;
+    if (d?.dry_run === true) return {};
+    const accounts = d?.accounts as Array<Record<string, unknown>> | undefined;
+    if (!accounts?.[0]) return {};
+    const first = accounts[0];
+    if (first.action === 'failed') return {};
+    const extracted: Record<string, unknown> = {};
+    if (first.account_id) extracted.account_id = first.account_id;
+    if (first.status) extracted.account_status = first.status;
+    // Build an account reference for downstream steps. Only include fields
+    // the response actually carries — propagating `operator: undefined`
+    // would serialize away on the wire (JSON.stringify drops undefined),
+    // leaving the natural-key arm short of its required `operator` field
+    // (#1419). The brand/operator pair stays paired or both absent.
+    const accountRef: Record<string, unknown> = {};
+    if (first.brand) accountRef.brand = first.brand;
+    if (first.operator) accountRef.operator = first.operator;
+    for (const field of ['operator_unit', 'currency', 'timezone', 'sandbox']) {
+      if (first[field] !== undefined) accountRef[field] = first[field];
+    }
+    if (!first.brand && !first.operator && first.account_id) accountRef.account_id = first.account_id;
+    extracted.account = accountRef;
+    return extracted;
+  },
+
+  list_accounts(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const accounts = d?.accounts as Array<Record<string, unknown>> | undefined;
+    if (!accounts?.[0]) return {};
+    return { account_id: accounts[0].account_id };
+  },
+
+  get_products(data) {
+    const d = asRecord(data);
+    const products = d?.products as Array<Record<string, unknown>> | undefined;
+    const extracted: Record<string, unknown> = {};
+    if (products?.[0]) {
+      extracted.products = products;
+      if (products[0].product_id) extracted.product_id = products[0].product_id;
+    }
+    // Extract proposal_id if proposals are returned
+    const proposals = d?.proposals as Array<Record<string, unknown>> | undefined;
+    if (proposals?.[0]?.proposal_id) extracted.proposal_id = proposals[0].proposal_id;
+    // Wholesale conditional-fetch steps need the response's scope and version
+    // metadata even when `unchanged: true` legitimately omits product rows.
+    if (d?.wholesale_feed_version !== undefined) extracted.wholesale_feed_version = d.wholesale_feed_version;
+    if (d?.pricing_version !== undefined) extracted.pricing_version = d.pricing_version;
+    if (d?.cache_scope !== undefined) extracted.cache_scope = d.cache_scope;
+    return extracted;
+  },
+
+  list_products(data) {
+    const d = asRecord(data);
+    const products = d?.products as Array<Record<string, unknown>> | undefined;
+    if (!products?.[0]) return {};
+    const first = products[0];
+    const pricingOptions = first.pricing_options as Array<Record<string, unknown>> | undefined;
+    const extracted: Record<string, unknown> = {};
+    if (first.product_id) extracted.product_id = first.product_id;
+    if (pricingOptions?.[0]) {
+      if (pricingOptions[0].pricing_option_id) extracted.pricing_option_id = pricingOptions[0].pricing_option_id;
+    }
+    if (d?.feed_version) extracted.feed_version = d.feed_version;
+    if (d?.pricing_version) extracted.pricing_version = d.pricing_version;
+    return extracted;
+  },
+
+  request_proposals(data) {
+    const d = asRecord(data);
+    const proposals = d?.proposals as Array<Record<string, unknown>> | undefined;
+    if (!proposals?.[0]) return {};
+    return readProposalFields(proposals[0]);
+  },
+
+  refine_proposals(data) {
+    const d = asRecord(data);
+    const results = d?.results as Array<Record<string, unknown>> | undefined;
+    if (!results?.length) return {};
+    const proposalResult = results.find(result => asRecord(result.proposal) || Array.isArray(result.proposals));
+    const proposal =
+      asRecord(proposalResult?.proposal) ??
+      (proposalResult?.proposals as Array<Record<string, unknown>> | undefined)?.[0] ??
+      undefined;
+    return proposal ? readProposalFields(proposal) : {};
+  },
+
+  decline_proposals() {
+    return {};
+  },
+
+  buy_products(data) {
+    return readCompactMediaBuyFields(data);
+  },
+
+  accept_proposal(data) {
+    return readCompactMediaBuyFields(data);
+  },
+
+  control_media_buy(data) {
+    return readCompactMediaBuyFields(data);
+  },
+
+  create_media_buy(data, adcpVersion) {
+    const { mediaBuyId, status } = readMediaBuyFields(data, adcpVersion);
+    const extracted: Record<string, unknown> = {};
+    if (mediaBuyId) extracted.media_buy_id = mediaBuyId;
+    if (status) extracted.media_buy_status = status;
+    return extracted;
+  },
+
+  update_media_buy(data, adcpVersion) {
+    const { mediaBuyId, status } = readMediaBuyFields(data, adcpVersion);
+    const extracted: Record<string, unknown> = {};
+    if (mediaBuyId) extracted.media_buy_id = mediaBuyId;
+    if (status) extracted.media_buy_status = status;
+    return extracted;
+  },
+
+  get_media_buys(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const buys = d?.media_buys as Array<Record<string, unknown>> | undefined;
+    if (!buys?.[0]) return {};
+    // Don't extract a single-resource ID from a broad-list page. When
+    // has_more: true the caller is mid-pagination walk and buys[0] is not
+    // the canonical buy — extracting it here causes the enricher to inject
+    // media_buy_ids: [that_id] on the next step, turning a continuation into
+    // an ID-lookup. Conservative: === true matches the codebase convention
+    // (absent has_more is treated as terminal, not as a list-in-progress).
+    const pagination = d?.pagination as Record<string, unknown> | undefined;
+    if (pagination?.has_more === true) return {};
+    const extracted: Record<string, unknown> = {
+      media_buy_id: buys[0].media_buy_id,
+      media_buy_status: readMediaBuyStatus(buys[0]),
+    };
+    if (buys[0].revision) {
+      extracted.revision = buys[0].revision;
+      extracted.media_buy_revision = buys[0].revision;
+    }
+    if (Array.isArray(buys[0].available_actions)) extracted.available_actions = buys[0].available_actions;
+    return extracted;
+  },
+
+  list_creative_formats(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const formats = d?.formats as Array<Record<string, unknown>> | undefined;
+    if (!formats?.[0]) return {};
+    return {
+      formats,
+      format_id: formats[0].format_id,
+    };
+  },
+
+  build_creative(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const extracted: Record<string, unknown> = {};
+    // Single response: creative_manifest
+    const manifest = d?.creative_manifest as Record<string, unknown> | undefined;
+    if (manifest) {
+      extracted.creative_manifest = manifest;
+      if (manifest.format_id) extracted.format_id = manifest.format_id;
+    }
+    // Multi response: creative_manifests
+    const manifests = d?.creative_manifests as Array<Record<string, unknown>> | undefined;
+    if (manifests?.[0]) {
+      extracted.creative_manifests = manifests;
+      if (manifests[0].format_id) extracted.format_id = manifests[0].format_id;
+    }
+    // Variant response: creatives[].variants[] (BuildCreativeVariantSuccess).
+    const creatives = d?.creatives as Array<Record<string, unknown>> | undefined;
+    if (creatives?.[0]) {
+      extracted.creatives = creatives;
+
+      const variants = creatives.flatMap(creative => {
+        const creativeVariants = creative.variants as Array<Record<string, unknown>> | undefined;
+        return Array.isArray(creativeVariants) ? creativeVariants : [];
+      });
+      if (variants[0]) {
+        extracted.variants = variants;
+        if (variants[0].build_variant_id) extracted.build_variant_id = variants[0].build_variant_id;
+
+        const variantManifest = variants[0].creative_manifest as Record<string, unknown> | undefined;
+        if (variantManifest) {
+          extracted.creative_manifest ??= variantManifest;
+          if (!extracted.format_id && variantManifest.format_id) extracted.format_id = variantManifest.format_id;
+        }
+      }
+    }
+    return extracted;
+  },
+
+  sync_creatives(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const results = d?.creatives as Array<Record<string, unknown>> | undefined;
+    if (!results?.length) return {};
+    return { creative_results: results };
+  },
+
+  list_creatives(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const creatives = d?.creatives as Array<Record<string, unknown>> | undefined;
+    if (!creatives?.[0]) return {};
+    const extracted: Record<string, unknown> = { creatives };
+    if (creatives[0].creative_id) extracted.creative_id = creatives[0].creative_id;
+    return extracted;
+  },
+
+  preview_creative(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const previews = d?.previews as Array<Record<string, unknown>> | undefined;
+    if (!previews?.length) return {};
+    return { previews };
+  },
+
+  get_signals(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const signals = d?.signals as Array<Record<string, unknown>> | undefined;
+    if (!signals?.[0]) return {};
+    return {
+      signals,
+      signal_id: signals[0].signal_id,
+    };
+  },
+
+  activate_signal(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const deployments = d?.deployments as Array<Record<string, unknown>> | undefined;
+    if (!deployments?.[0]) return {};
+    const first = deployments[0];
+    const extracted: Record<string, unknown> = { deployments };
+    if (first.activation_key) extracted.activation_key = first.activation_key;
+    if (first.type) extracted.deployment_type = first.type;
+    return extracted;
+  },
+
+  sync_catalogs(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const catalogs = d?.catalogs as Array<Record<string, unknown>> | undefined;
+    if (!catalogs?.[0]) return {};
+    const extracted: Record<string, unknown> = { catalogs };
+    if (catalogs[0].catalog_id) extracted.catalog_id = catalogs[0].catalog_id;
+    return extracted;
+  },
+
+  sync_audiences(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const audiences = d?.audiences as Array<Record<string, unknown>> | undefined;
+    if (!audiences?.[0]) return {};
+    const extracted: Record<string, unknown> = { audiences };
+    if (audiences[0].audience_id) extracted.audience_id = audiences[0].audience_id;
+    return extracted;
+  },
+
+  sync_event_sources(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const sources = d?.event_sources as Array<Record<string, unknown>> | undefined;
+    if (!sources?.[0]) return {};
+    const extracted: Record<string, unknown> = { event_sources: sources };
+    if (sources[0].event_source_id) extracted.event_source_id = sources[0].event_source_id;
+    return extracted;
+  },
+
+  si_initiate_session(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const extracted: Record<string, unknown> = {};
+    if (d?.session_id) extracted.session_id = d.session_id;
+    return extracted;
+  },
+
+  si_get_offering(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const extracted: Record<string, unknown> = {};
+    if (d?.offering_id) extracted.offering_id = d.offering_id;
+    const offerings = d?.offerings as Array<Record<string, unknown>> | undefined;
+    if (offerings?.[0]?.offering_id) extracted.offering_id = offerings[0].offering_id;
+    return extracted;
+  },
+
+  sync_plans(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const plans = d?.plans as Array<Record<string, unknown>> | undefined;
+    if (!plans?.[0]) return {};
+    return { plan_id: plans[0].plan_id };
+  },
+
+  create_property_list(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const list = d?.list as Record<string, unknown> | undefined;
+    if (!list) return {};
+    const extracted: Record<string, unknown> = {};
+    if (list.list_id) extracted.property_list_id = list.list_id;
+    if (list.name) extracted.property_list_name = list.name;
+    // auth_token intentionally not extracted — avoid leaking credentials into
+    // storyboard context which may appear in logs or compliance reports.
+    return extracted;
+  },
+
+  create_content_standards(data) {
+    const d = data as Record<string, unknown> | undefined;
+    if (!d?.standards_id) return {};
+    return { content_standards_id: d.standards_id };
+  },
+
+  get_rights(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const rights = d?.rights as Array<Record<string, unknown>> | undefined;
+    if (!rights?.[0]?.rights_id) return {};
+    return { rights_id: rights[0].rights_id };
+  },
+
+  acquire_rights(data) {
+    const d = data as Record<string, unknown> | undefined;
+    if (!d?.rights_grant_id) return {};
+    return { rights_grant_id: d.rights_grant_id, rights_id: d.rights_id };
+  },
+
+  sync_governance(data) {
+    // Governance registration — no IDs to extract, just confirmation
+    return { governance_synced: true, governance_response: data };
+  },
+
+  check_governance(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const extracted: Record<string, unknown> = {};
+    if (d?.governance_context) extracted.governance_context = d.governance_context;
+    if (d?.check_id) extracted.check_id = d.check_id;
+    if (d?.plan_id) extracted.plan_id = d.plan_id;
+    if (d?.verdict) extracted.governance_status = d.verdict;
+    return extracted;
+  },
+
+  report_plan_outcome(data) {
+    const d = data as Record<string, unknown> | undefined;
+    const extracted: Record<string, unknown> = {};
+    if (d?.outcome_id) extracted.outcome_id = d.outcome_id;
+    if (d?.outcome_state) extracted.outcome_status = d.outcome_state;
+    return extracted;
+  },
+};
+
+/**
+ * Extract context values from a task response.
+ *
+ * @param adcpVersion - Optional AdCP release the request was sent at. Used
+ *   only when the response does not echo `adcp_version`, to read a
+ *   create/update top-level `status` as the 3.1+ task status rather than a
+ *   3.0 media-buy lifecycle.
+ */
+export function extractContext(taskName: string, data: unknown, adcpVersion?: string): Record<string, unknown> {
+  const extractor = CONTEXT_EXTRACTORS[taskName];
+  if (!extractor) return {};
+  try {
+    return extractor(data, adcpVersion);
+  } catch {
+    return {};
+  }
+}
+
+// ────────────────────────────────────────────────────────────
+// Context injection: substitute $context.<key> in requests
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Per-context alias cache for `$generate:uuid_v4#<alias>` placeholders.
+ *
+ * A WeakMap keyed off the StoryboardContext identity avoids landing
+ * implementation-detail keys on the serialized context object and avoids
+ * fragility when context is shallow-cloned between steps — the cache
+ * follows the context reference rather than riding as an owned key.
+ *
+ * Propagation across steps is handled by `forwardAliasCache` (called by
+ * the runner when it rolls context forward to the next step), keeping
+ * this a deliberate design choice rather than an invisible by-reference
+ * leak through `{ ...context }`.
+ */
+const aliasCaches = new WeakMap<StoryboardContext, Record<string, string>>();
+
+/**
+ * Ensure an alias cache exists for the given context and return it.
+ */
+function getAliasCache(context: StoryboardContext): Record<string, string> {
+  let cache = aliasCaches.get(context);
+  if (!cache) {
+    // Null-prototype: the alias grammar (`[A-Za-z0-9_.-]+`) admits
+    // `__proto__`, `constructor`, `toString` and every other
+    // `Object.prototype` member, so a plain `{}` would report them as
+    // already cached and hand back the inherited value — a function or
+    // the prototype object — where a UUID string is expected.
+    cache = Object.create(null) as Record<string, string>;
+    aliasCaches.set(context, cache);
+  }
+  return cache;
+}
+
+/**
+ * Propagate the alias cache from one context to another — call after
+ * shallow-cloning context between storyboard steps so replay tests
+ * (initial + replay sharing `$generate:uuid_v4#<alias>`) resolve to the
+ * same UUID. No-op when `from` has no cache.
+ */
+export function forwardAliasCache(from: StoryboardContext, to: StoryboardContext): void {
+  const cache = aliasCaches.get(from);
+  if (cache) aliasCaches.set(to, cache);
+}
+
+/**
+ * Runner-owned substitution variables.
+ *
+ * Parallels `$context.*` but lives outside the serialized context object so
+ * implementation details (the receiver's bound URL, per-step operation ids)
+ * stay off the compliance report. Expanded within strings (embedded
+ * substitution), unlike `$context.*` which matches whole strings only.
+ *
+ * Supported patterns:
+ *   - `{{runner.webhook_base}}` — base URL of the receiver.
+ *   - `{{runner.webhook_url:<step_id>}}` — per-step webhook URL
+ *     (`<base>/step/<step_id>/<operation_id>`). The operation_id is minted
+ *     lazily on first expansion and cached for the rest of the run so the
+ *     matching `{{prior_step.<step_id>.operation_id}}` reference downstream
+ *     resolves to the same value.
+ *   - `{{prior_step.<step_id>.operation_id}}` — operation_id the runner
+ *     allocated when expanding `{{runner.webhook_url:<step_id>}}`.
+ */
+export interface RunnerVariables {
+  /** Millisecond timestamp captured once at run start for deterministic enrichment. */
+  runStartMs?: number;
+  /** Base URL of the runner's webhook receiver, when enabled. */
+  webhookBase?: string;
+  /** step_id → operation_id, filled lazily on expansion. */
+  stepOperationIds: Map<string, string>;
+  /**
+   * Free-form slot for cross-step run state that isn't user-facing. Used
+   * today to share a single `InMemoryReplayStore` / `InMemoryRevocationStore`
+   * across every `expect_webhook_signature_valid` call in a run so a
+   * replayed (keyid, nonce) across two deliveries of the same event is
+   * actually detected. Untyped here to keep the context module free of
+   * signing-module imports.
+   */
+  runState: Map<string, unknown>;
+}
+
+export function createRunnerVariables(opts: { webhookBase?: string } = {}): RunnerVariables {
+  return {
+    runStartMs: Date.now(),
+    ...(opts.webhookBase !== undefined && { webhookBase: opts.webhookBase }),
+    stepOperationIds: new Map(),
+    runState: new Map(),
+  };
+}
+
+/**
+ * Deep-walk an object and replace recognized placeholder strings:
+ *
+ * - `$context.<key>` → value from `context[key]` (anchored whole-string match)
+ * - `$generate:uuid_v4` → fresh UUID v4 per occurrence (anchored)
+ * - `$generate:uuid_v4#<alias>` → fresh UUID v4 on first occurrence, then the
+ *   same UUID for every subsequent occurrence of the same alias within this
+ *   run (anchored)
+ * - `{{runner.*}}` / `{{prior_step.<id>.operation_id}}` → embedded runner-
+ *   variable substitution (only when `runnerVars` is supplied)
+ *
+ * Returns a new object (does not mutate the input).
+ */
+export function injectContext(
+  obj: Record<string, unknown>,
+  context: StoryboardContext,
+  runnerVars?: RunnerVariables
+): Record<string, unknown> {
+  return deepReplace(obj, context, runnerVars) as Record<string, unknown>;
+}
+
+function deepReplace(value: unknown, context: StoryboardContext, runnerVars?: RunnerVariables): unknown {
+  if (typeof value === 'string') {
+    // Mustache first — expands in-place within the string, so anchored
+    // patterns below still apply to the post-expansion result.
+    const expanded = runnerVars ? expandMustache(value, runnerVars) : value;
+
+    const ctxMatch = expanded.match(/^\$context\.(\w+)$/);
+    if (ctxMatch?.[1]) {
+      const key = ctxMatch[1];
+      // Own-key lookup only. `in` walks the prototype chain, so a polluted
+      // prototype could otherwise answer for a reserved key that was never
+      // committed.
+      if (!Object.hasOwn(context, key)) return expanded;
+      // Fixture-preparation snapshots are handed out as detached clones.
+      // Request builders legitimately mutate the objects they receive, and
+      // the canonical value is returned by reference everywhere else, so
+      // without this a mutated request could write back into the pinned
+      // snapshot it was built from. Ordinary keys keep their existing
+      // by-reference semantics unchanged.
+      return isProtectedContextKey(key) ? detachProtectedValue(context[key]) : context[key];
+    }
+    const genMatch = expanded.match(/^\$generate:(uuid_v4|opaque_id)(?:#([A-Za-z0-9_.-]+))?$/);
+    if (genMatch) {
+      const alias = genMatch[2];
+      if (alias) {
+        const cache = getAliasCache(context);
+        if (!Object.hasOwn(cache, alias)) cache[alias] = randomUUID();
+        return cache[alias];
+      }
+      return randomUUID();
+    }
+    return expanded;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(item => deepReplace(item, context, runnerVars));
+  }
+
+  if (value !== null && typeof value === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      result[k] = deepReplace(v, context, runnerVars);
+    }
+    return result;
+  }
+
+  return value;
+}
+
+/**
+ * Expand every `{{runner.*}}` and `{{prior_step.*}}` token in a string.
+ * Unknown tokens are left in place so the runner can surface a pointed
+ * "unresolved substitution" error rather than silently shipping the
+ * literal mustache tokens to an agent.
+ */
+/**
+ * Token shape for the outer expander. Single `[^{}]+` (excludes braces on
+ * both sides) so nested or partial `{{…` can't straddle a token boundary
+ * and force the engine to backtrack character-by-character. Unified prefix
+ * alternation (`runner|prior_step`) keeps the two recognized names in one
+ * place — the inner expander still narrows each. Closes CodeQL alert #49
+ * (js/polynomial-redos).
+ */
+const MUSTACHE_TOKEN_RE = /\{\{((?:runner|prior_step)\.[^{}]+)\}\}/g;
+
+function expandMustache(input: string, runnerVars: RunnerVariables): string {
+  return input.replace(MUSTACHE_TOKEN_RE, (match, inner) => {
+    if (inner === 'runner.webhook_base') {
+      return runnerVars.webhookBase ?? match;
+    }
+    const webhookUrlMatch = /^runner\.webhook_url:([A-Za-z0-9_]+)$/.exec(inner);
+    if (webhookUrlMatch?.[1]) {
+      if (!runnerVars.webhookBase) return match;
+      const stepId = webhookUrlMatch[1];
+      let opId = runnerVars.stepOperationIds.get(stepId);
+      if (!opId) {
+        opId = randomUUID();
+        runnerVars.stepOperationIds.set(stepId, opId);
+      }
+      return `${runnerVars.webhookBase}/step/${stepId}/${opId}`;
+    }
+    const priorMatch = /^prior_step\.([A-Za-z0-9_]+)\.operation_id$/.exec(inner);
+    if (priorMatch?.[1]) {
+      return runnerVars.stepOperationIds.get(priorMatch[1]) ?? match;
+    }
+    return match;
+  });
+}
+
+// ────────────────────────────────────────────────────────────
+// Explicit context_outputs: extract values by path
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Apply explicit context_outputs rules to extract values from response data.
+ * Entries with `generate` set are skipped — use `applyContextOutputsWithProvenance`
+ * (which accepts a context for alias-cache access) to handle those.
+ *
+ * Per runner-output-contract.yaml v2.0.0, paths that resolve to `undefined`,
+ * `null`, or `""` are equally non-resolvable — capturing null or "" produces
+ * fabricated downstream state. The provenance-aware variant additionally
+ * surfaces the failures on `ContextWriteResult.failures` so the runner can
+ * synthesize a `capture_path_not_resolvable` validation result; this lower-
+ * level form drops them silently and is kept for callers that don't need
+ * the structured failure surface.
+ */
+export function applyContextOutputs(data: unknown, outputs: ContextOutput[]): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const output of outputs) {
+    if (!output.path) continue;
+    const value = resolvePath(data, output.path);
+    if (value !== undefined && value !== null && value !== '') {
+      result[output.key] = value;
+    }
+  }
+  return result;
+}
+
+/**
+ * Result of a context write with per-key provenance. The runner consumes
+ * `provenance` to emit `context_value_rejected` hints when a later step's
+ * seller response rejects a value that traces back to one of these keys.
+ * `values` carries the same Record as the non-provenance call so the
+ * runner's downstream `Object.assign(updatedContext, values)` path is
+ * unchanged.
+ */
+export interface ContextWriteResult {
+  values: Record<string, unknown>;
+  provenance: Record<string, ContextProvenanceEntry>;
+  /**
+   * Convention-owned alias groups that must be removed before applying
+   * `values`. Conditional groups only clear when the current context key
+   * matches one of the response-derived values.
+   */
+  clearGroups?: Array<{
+    keys: string[];
+    when?: { key: string; values: unknown[] };
+  }>;
+  /**
+   * `path:` entries whose declared response path did not resolve to a usable
+   * value (absent, `null`, or `""`). Per runner-output-contract.yaml v2.0.0,
+   * the runner synthesizes a `capture_path_not_resolvable` validation result
+   * for each entry — capturing null or "" produces fabricated downstream
+   * state and is as incorrect as a missing path. Generator entries do not
+   * appear here; they cannot fail to resolve. Absent or empty when every
+   * `path:` entry produced a value.
+   */
+  failures?: Array<{ key: string; path: string; resolved: unknown }>;
+}
+
+/**
+ * Like `extractContext`, but also returns provenance for each written key
+ * tagging it as a convention-based extraction. `response_path` is absent
+ * for convention extractors — they're hardcoded functions, not YAML paths.
+ */
+export function extractContextWithProvenance(
+  taskName: string,
+  data: unknown,
+  stepId: string,
+  adcpVersion?: string
+): ContextWriteResult {
+  const values = extractContext(taskName, data, adcpVersion);
+  const clearGroups = (() => {
+    const response = asRecord(data);
+    switch (taskName) {
+      case 'list_products':
+        return response?.outcome === 'listed' && Array.isArray(response.products)
+          ? [{ keys: PRODUCT_CONTEXT_KEYS }]
+          : undefined;
+      case 'request_proposals':
+        return values.proposal_id ? [{ keys: PROPOSAL_CONTEXT_KEYS }] : undefined;
+      case 'refine_proposals':
+        return values.proposal_id ? [{ keys: PROPOSAL_CONTEXT_KEYS }] : undefined;
+      case 'decline_proposals':
+        const declinedIds = Array.isArray(response?.results)
+          ? response.results
+              .map(asRecord)
+              .filter(result => result?.outcome === 'declined')
+              .map(result => result?.proposal_id)
+              .filter(proposalId => proposalId !== undefined)
+          : [];
+        return declinedIds.length
+          ? [{ keys: PROPOSAL_CONTEXT_KEYS, when: { key: 'proposal_id', values: declinedIds } }]
+          : undefined;
+      default:
+        return undefined;
+    }
+  })();
+  const provenance: Record<string, ContextProvenanceEntry> = {};
+  for (const key of Object.keys(values)) {
+    provenance[key] = {
+      source_step_id: stepId,
+      source_kind: 'convention',
+      source_task: taskName,
+    };
+  }
+  return { values, provenance, ...(clearGroups && { clearGroups }) };
+}
+
+/**
+ * Like `applyContextOutputs`, but also returns provenance for each written
+ * key carrying the YAML `response_path` so diagnostics can cite it verbatim.
+ *
+ * Pass `context` to enable `generate:` entries with alias-cache coherence.
+ * When an output declares `generate`, the runner mints a UUID v4 (or reuses
+ * the value already cached under `output.key` if an inline `$generate:…#<alias>`
+ * substitution ran in the same step). The generated value is written back into
+ * the alias cache so that any later step referencing `$generate:opaque_id#<key>`
+ * resolves to the same UUID.
+ *
+ * Omitting `context` disables alias-cache coherence: each generator entry mints
+ * an independent UUID that cannot be matched by an inline `$generate:…` form.
+ *
+ * Generator entries fire regardless of whether `data` is present; path
+ * entries are silently skipped when the resolved value is null/undefined.
+ */
+export function applyContextOutputsWithProvenance(
+  data: unknown,
+  outputs: ContextOutput[],
+  stepId: string,
+  taskName: string,
+  context?: StoryboardContext
+): ContextWriteResult {
+  const values: Record<string, unknown> = {};
+  const provenance: Record<string, ContextProvenanceEntry> = {};
+  const failures: Array<{ key: string; path: string; resolved: unknown }> = [];
+  for (const output of outputs) {
+    if (output.generate !== undefined) {
+      // Generator entries require a context — without one the alias cache
+      // can't be populated, so a later step's `$generate:opaque_id#<key>` would
+      // mint an independent UUID that doesn't match the value stored here.
+      // Loud error beats silent divergence.
+      if (!context) {
+        throw new Error(
+          `applyContextOutputsWithProvenance: context_outputs entry '${output.key}' ` +
+            `declares generate='${output.generate}' but no context was provided. ` +
+            `Generator entries require a context for alias-cache coherence.`
+        );
+      }
+      const cache = getAliasCache(context);
+      let value: string;
+      if (Object.hasOwn(cache, output.key)) {
+        value = cache[output.key]!;
+      } else {
+        value = randomUUID();
+        cache[output.key] = value;
+      }
+      values[output.key] = value;
+      provenance[output.key] = {
+        source_step_id: stepId,
+        source_kind: 'generator',
+        source_task: taskName,
+      };
+    } else if (output.path) {
+      const value = resolvePath(data, output.path);
+      // Per runner-output-contract.yaml v2.0.0 / storyboard-schema.yaml,
+      // null, "", and structurally-absent paths are equally non-resolvable
+      // for capture purposes — capturing null or "" produces fabricated
+      // downstream state and is as incorrect as a missing path.
+      const resolved = value === undefined || value === null || value === '';
+      if (!resolved) {
+        values[output.key] = value;
+        provenance[output.key] = {
+          source_step_id: stepId,
+          source_kind: 'context_outputs',
+          response_path: output.path,
+          source_task: taskName,
+        };
+      } else {
+        failures.push({
+          key: output.key,
+          path: output.path,
+          resolved: value === undefined ? null : value,
+        });
+      }
+    }
+  }
+  return { values, provenance, ...(failures.length > 0 ? { failures } : {}) };
+}
+
+// ────────────────────────────────────────────────────────────
+// Explicit context_inputs: inject values into request by path
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Apply explicit context_inputs rules to inject context values into a request.
+ * Returns a new object (does not mutate the input).
+ */
+export function applyContextInputs(
+  request: Record<string, unknown>,
+  inputs: ContextInput[],
+  context: StoryboardContext
+): Record<string, unknown> {
+  const result = structuredClone(request);
+  for (const input of inputs) {
+    // Own-key lookup, for the same reason as `$context.<key>` substitution.
+    if (Object.hasOwn(context, input.key)) {
+      // Same detachment rule as `$context.<key>` substitution: the request is
+      // a mutable working copy, so a protected snapshot must not be aliased
+      // into it.
+      setPath(
+        result,
+        input.inject_at,
+        isProtectedContextKey(input.key) ? detachProtectedValue(context[input.key]) : context[input.key]
+      );
+    }
+  }
+  return result;
+}
+
+// setPath is re-exported from ./path for backwards compat
+export { setPath } from './path';

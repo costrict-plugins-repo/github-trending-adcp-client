@@ -1,0 +1,251 @@
+import type { LegacyCreativeFormatSummary } from '../types';
+
+// Re-export logger utilities
+export { logger, createLogger, type LogLevel, type LoggerConfig } from './logger';
+import { logger } from './logger';
+
+// Re-export preview utilities
+export {
+  batchPreviewProducts,
+  batchPreviewFormatsLegacy,
+  clearPreviewCache,
+  type PreviewResult,
+  type LegacyPreviewResult,
+  type BatchPreviewOptions,
+  type PreviewCacheBackend,
+  type PreviewCacheEntry,
+} from './preview-utils';
+export {
+  resolvePreviewAuthority,
+  type PlacementPreviewCandidate,
+  type PreviewAuthorityInput,
+  type PreviewAuthorityResolution,
+  type PreviewFidelity,
+  type SelectedPreviewAuthority,
+  type SellerPreviewCandidate,
+} from './preview-authority';
+
+// Configuration constants
+export const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '30000'); // 30 seconds
+export const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '5');
+
+// Legacy named creative formats (hardcoded migration fixtures)
+export const LEGACY_STANDARD_FORMATS: LegacyCreativeFormatSummary[] = [
+  {
+    format_id: {
+      agent_url: 'https://creatives.adcontextprotocol.org',
+      id: 'banner_728x90',
+    },
+    name: 'Leaderboard',
+    dimensions: { width: 728, height: 90 },
+    aspect_ratio: '8:1',
+    file_types: ['jpg', 'jpeg', 'png', 'gif'],
+    max_file_size: 150000,
+  },
+  {
+    format_id: {
+      agent_url: 'https://creatives.adcontextprotocol.org',
+      id: 'banner_300x250',
+    },
+    name: 'Medium Rectangle',
+    dimensions: { width: 300, height: 250 },
+    aspect_ratio: '6:5',
+    file_types: ['jpg', 'jpeg', 'png', 'gif'],
+    max_file_size: 150000,
+  },
+  {
+    format_id: {
+      agent_url: 'https://creatives.adcontextprotocol.org',
+      id: 'banner_320x50',
+    },
+    name: 'Mobile Banner',
+    dimensions: { width: 320, height: 50 },
+    aspect_ratio: '32:5',
+    file_types: ['jpg', 'jpeg', 'png', 'gif'],
+    max_file_size: 40000,
+  },
+  {
+    format_id: {
+      agent_url: 'https://creatives.adcontextprotocol.org',
+      id: 'video_1920x1080',
+    },
+    name: 'Full HD Video',
+    dimensions: { width: 1920, height: 1080 },
+    aspect_ratio: '16:9',
+    file_types: ['mp4', 'webm'],
+    max_file_size: 10000000,
+    duration_range: { min: 6, max: 30 },
+  },
+];
+
+/**
+ * Circuit Breaker for handling agent failures
+ */
+export class CircuitBreaker {
+  private failures = 0;
+  private lastFailTime = 0;
+  private state: 'closed' | 'open' | 'half-open' = 'closed';
+  private readonly failureThreshold = 5;
+  private readonly resetTimeout = 60000; // 1 minute
+
+  constructor(private agentId: string) {}
+
+  async call<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state === 'open') {
+      if (Date.now() - this.lastFailTime > this.resetTimeout) {
+        this.state = 'half-open';
+        logger.info(`🔄 Circuit breaker for ${this.agentId} attempting to close...`);
+      } else {
+        throw new Error(`Circuit breaker is open for agent ${this.agentId}`);
+      }
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (error) {
+      this.onFailure();
+      throw error;
+    }
+  }
+
+  private onSuccess(): void {
+    this.failures = 0;
+    if (this.state === 'half-open') {
+      this.state = 'closed';
+      logger.info(`✅ Circuit breaker for ${this.agentId} closed successfully`);
+    }
+  }
+
+  private onFailure(): void {
+    this.failures++;
+    this.lastFailTime = Date.now();
+
+    if (this.failures >= this.failureThreshold) {
+      this.state = 'open';
+      logger.warn(`🚨 Circuit breaker opened for agent ${this.agentId} after ${this.failures} failures`);
+    }
+  }
+}
+
+// Circuit breaker instances for each agent
+const circuitBreakers = new Map<string, CircuitBreaker>();
+
+export function getCircuitBreaker(agentId: string): CircuitBreaker {
+  if (!circuitBreakers.has(agentId)) {
+    circuitBreakers.set(agentId, new CircuitBreaker(agentId));
+  }
+  return circuitBreakers.get(agentId)!;
+}
+
+/**
+ * Get legacy named creative formats for migration tooling.
+ */
+export function getStandardFormatsLegacy(): LegacyCreativeFormatSummary[] {
+  return LEGACY_STANDARD_FORMATS;
+}
+
+// Re-export response unwrapping utilities
+export {
+  unwrapProtocolResponse,
+  isAdcpError,
+  isAdcpSuccess,
+  isTerminalAdcpError,
+  hasAdvisorySuccessPayload,
+} from './response-unwrapper';
+export type { AdCPResponse } from './response-unwrapper';
+export {
+  ensureGetProductsCacheScope,
+  validateGetProductsCacheScope,
+  type EnsureGetProductsCacheScopeOptions,
+  type GetProductsCacheScope,
+  type GetProductsResponseWithCacheScope,
+  type GetProductsCacheScopeValidation,
+} from './get-products-cache-scope';
+export { getAuthoritativeMediaBuyStatus, isMediaBuyStatus } from './media-buy-status';
+export {
+  resolveTaskState,
+  type EffectiveTaskState,
+  type ResolvedTaskState,
+  type ResolveTaskStateOptions,
+} from './task-state';
+
+// Lightweight MCP CallToolResult extractor (prefers structuredContent, falls back to JSON text).
+export { extractResult, type ToolCallResultLike } from './extract-result';
+
+// Re-export retry utilities
+export { isRetryable, getRetryDelay } from './retry';
+
+// Re-export error extraction utilities
+export {
+  extractAdcpErrorFromMcp,
+  extractAdcpErrorFromTransport,
+  extractAdcpErrorInfo,
+  extractCorrelationId,
+  resolveRecovery,
+  getExpectedAction,
+} from './error-extraction';
+export type { ExtractedAdcpError } from './error-extraction';
+
+// Re-export protocol detection utilities
+export { detectProtocol, detectProtocolWithTimeout } from './protocol-detection';
+
+// Re-export A2A discovery utilities
+export {
+  A2A_CARD_PATHS,
+  TRANSPORT_SUFFIX_REGEX,
+  isAgentCardPath,
+  isWellKnownAgentCardUrl,
+  buildCardUrls,
+  stripAgentCardPath,
+  stripTransportSuffix,
+} from './a2a-discovery';
+
+// Re-export format asset utilities
+export {
+  getFormatAssets,
+  getRequiredAssets,
+  getOptionalAssets,
+  getIndividualAssets,
+  getRepeatableGroups,
+  usesDeprecatedAssetsField,
+  getAssetCount,
+  hasAssets,
+  type CanonicalFormatAssetSlot,
+  type FormatAssetsInput,
+  type IndividualFormatAssetSlot,
+  type RepeatableFormatAssetGroup,
+} from './format-assets';
+
+// Re-export pricing adapter utilities (v3 pricing field compatibility)
+export {
+  normalizeProductChannels,
+  normalizePricingOption,
+  normalizeProductPricing,
+  normalizeGetProductsResponse,
+  usesV2PricingFields,
+  usesV3PricingFields,
+  isFixedPricing,
+  isCPAPricing,
+  getPrice,
+  getFloorPrice,
+  type PricingOptionV2,
+  type PricingOptionV3,
+  type PriceGuidanceV2,
+  type PriceGuidanceV3,
+} from './pricing-adapter';
+
+// Re-export creative delivery helpers for package-scoped inline creatives
+export { inlineCreativesForPackages, inlineCreativesForPackagesLegacy } from './creative-delivery';
+export type {
+  InlineCreativeAssignment,
+  InlineCreativePackage,
+  InlineCreativePackagePatch,
+  InlineCreativesForPackagesOptions,
+  InlineCreativesForPackagesLegacyOptions,
+  LegacyInlineCreativePackage,
+} from './creative-delivery';
+
+// Re-export pagination utilities
+export { paginate, paginatePages, type PaginateOptions } from './pagination';

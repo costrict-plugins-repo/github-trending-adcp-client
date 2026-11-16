@@ -1,0 +1,776 @@
+/**
+ * Ephemeral webhook receiver for storyboard runs.
+ *
+ * The runner binds an HTTP listener, mints per-step URLs under
+ * `/step/<step_id>/<operation_id>`, and captures inbound POSTs so
+ * `expect_webhook*` pseudo-steps can observe outbound webhook behavior
+ * (idempotency_key presence, retry-key stability, 9421 signature validity).
+ *
+ * Matches the `webhook_receiver_runner` test-kit contract in
+ * adcontextprotocol/adcp#2431:
+ *   - Per-step URL template `{{runner.webhook_base}}/step/<step_id>/<operation_id>`.
+ *   - Retry-replay: the receiver returns a configurable 5xx for the first N
+ *     deliveries on a given `(step_id, operation_id)`, then 2xx, so senders
+ *     are forced to retry and retry-key stability can be graded.
+ *   - Loopback-mock mode (HTTP on 127.0.0.1, zero external deps) by default;
+ *     proxy-URL mode swaps in an operator-supplied public base.
+ */
+
+import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
+import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
+import { randomUUID } from 'node:crypto';
+import { isIP, type AddressInfo } from 'node:net';
+import { getSchemaValidatorByRef } from '../../validation/schema-loader';
+
+/**
+ * Size cap on any single webhook body. A non-conformant sender retrying
+ * with oversize payloads shouldn't be able to exhaust the runner's memory.
+ */
+const MAX_BODY_BYTES = 1_048_576; // 1 MiB
+const MAX_CHALLENGE_BODY_BYTES = 16_384; // 16 KiB; challenge envelopes are tiny
+
+/**
+ * Caps on cumulative capture state. `MAX_CAPTURED_TOTAL` bounds the total
+ * number of webhooks retained for the run; `MAX_CAPTURED_PER_KEY` bounds
+ * per-(step_id, operation_id) deliveries — a publisher stuck in a retry
+ * loop can't exhaust memory. Once a cap is hit the receiver stops retaining
+ * bodies but continues the configured retry-status sequence (or returns 204
+ * when no rejection remains), so the cap cannot trap a sender in a retry loop.
+ */
+const MAX_CAPTURED_TOTAL = 1000;
+const MAX_CAPTURED_PER_KEY = 100;
+
+/**
+ * HTTP transport hardening. Defaults in Node 20 are generous (headers
+ * 60s, no body timeout). A hostile / slow publisher shouldn't be able to
+ * hold the runner's event loop with trickled requests or exhaust the
+ * socket table.
+ */
+const HEADERS_TIMEOUT_MS = 10_000;
+const REQUEST_TIMEOUT_MS = 30_000;
+const KEEP_ALIVE_TIMEOUT_MS = 5_000;
+const MAX_CONNECTIONS = 64;
+const MAX_HEADERS_COUNT = 64;
+
+/** Default path shape under the receiver base. */
+const STEP_PATH_RE = /^\/step\/([A-Za-z0-9_]+)\/([A-Za-z0-9_-]+)\/?$/;
+
+/**
+ * Header names whose values are redacted before a captured webhook lands
+ * in a compliance report. Mirrors the `SECRET_KEY_PATTERN` in runner.ts
+ * so both paths honor the contract's "Secrets SHOULD be redacted" rule.
+ */
+const SECRET_HEADER_PATTERN =
+  /^(authorization|credentials?|token|api[_-]?key|x-api[_-]?key|x-auth[_-]?token|password|secret|client[_-]secret|refresh[_-]token|access[_-]token|bearer|session[_-]token|cookie|set[_-]cookie)$/i;
+
+/**
+ * Strip user-info, scheme-policed, and CRLF/NUL-rejected proxy URLs so a
+ * misconfigured operator (or a compromised storyboard loader) can't
+ * advertise an `http://169.254.169.254`, `file://…`, or header-splitting
+ * URL that would then be embedded in outbound `push_notification_config.url`.
+ */
+function validateProxyUrl(raw: string, allowHttp: boolean): string {
+  if (/[\r\n\x00]/.test(raw)) {
+    throw new Error('webhook_receiver.public_url must not contain CR/LF/NUL');
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`webhook_receiver.public_url is not a valid URL: ${raw}`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`webhook_receiver.public_url must be http(s); got ${parsed.protocol}`);
+  }
+  if (parsed.protocol === 'http:' && !allowHttp) {
+    throw new Error('webhook_receiver.public_url must use https (set allowHttp only for controlled local development)');
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('webhook_receiver.public_url must not include userinfo');
+  }
+  if (parsed.search || parsed.hash) {
+    throw new Error('webhook_receiver.public_url must not include a query string or fragment');
+  }
+  return raw.replace(/\/+$/, '');
+}
+
+export interface CapturedWebhook {
+  /** Runner-assigned id; stable across filter matches. */
+  id: string;
+  /** Step id extracted from the URL path. */
+  step_id: string;
+  /** Operation id extracted from the URL path. */
+  operation_id: string;
+  /** Delivery sequence number for this (step_id, operation_id) — 1-based. */
+  delivery_index: number;
+  /** Wall-clock millis at receipt. */
+  received_at: number;
+  method: string;
+  /** Path + query. */
+  path: string;
+  /** Lowercased header names; duplicate values joined with ", ". */
+  headers: Record<string, string>;
+  /** Raw request body — needed for RFC 9421 content-digest recompute. */
+  raw_body: string;
+  /** Parsed JSON body; undefined on parse failure. */
+  body?: unknown;
+  /** Parse error message when raw_body was non-empty but not valid JSON. */
+  parse_error?: string;
+  /** HTTP status the receiver returned (reflects retry-replay policy). */
+  response_status: number;
+}
+
+/** Proof-of-control challenge retained separately from event deliveries. */
+export interface CapturedWebhookChallenge {
+  id: string;
+  step_id: string;
+  operation_id: string;
+  received_at: number;
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  raw_body: string;
+  body: Record<string, unknown>;
+  response_status: 200;
+}
+
+/** Match predicate applied when waiting for a webhook. */
+export interface WebhookFilter {
+  /** Millisecond observation boundary captured before the triggering request. */
+  received_at_or_after?: number;
+  /** Exact registered path, including query, relative to the receiver base. */
+  path?: string;
+  /** Internal observation guard: previously observed account/change identities. */
+  exclude_account_changes?: ReadonlySet<string>;
+  /** Physical or logical deliveries already used by an ordinary positive assertion. */
+  exclude_notifications?: ReadonlySet<string>;
+  /** Body paths that must exist with a non-null value (published wildcard selector). */
+  present?: readonly string[];
+  /** Restrict matches to this step id's URL. */
+  step_id?: string;
+  /** Restrict matches to this operation id. */
+  operation_id?: string;
+  /** Dotted-path → expected-value pairs compared against the parsed body. */
+  body?: Record<string, unknown>;
+}
+
+export type WebhookWaitResult =
+  | { webhook: CapturedWebhook; timed_out?: false }
+  | { timed_out: true; webhook?: undefined };
+
+export interface RetryReplayPolicy {
+  /** How many deliveries to reject before accepting. */
+  count: number;
+  /** HTTP status to return on rejection. */
+  http_status: number;
+}
+
+export interface WebhookReceiver {
+  /** Public base URL (`http://host:port` for loopback, operator URL for proxy). */
+  readonly base_url: string;
+  /** Whether the receiver is in loopback-mock or proxy-url mode. */
+  readonly mode: 'loopback_mock' | 'proxy_url';
+  /** Local address the listener is bound to. */
+  readonly bind_host?: string;
+  /** All webhooks captured so far, in arrival order. */
+  all(): CapturedWebhook[];
+  /** Schema-valid proof-of-control challenges, kept separate from event deliveries. */
+  challenges(): CapturedWebhookChallenge[];
+  /** Webhooks matching a filter, in arrival order. */
+  matching(filter: WebhookFilter): CapturedWebhook[];
+  /**
+   * Configure the receiver to return `http_status` for the first `count`
+   * deliveries at `(step_id, operation_id)` and 2xx afterwards. Idempotent:
+   * setting a new policy replaces any existing one for the same key.
+   */
+  set_retry_replay(key: { step_id: string; operation_id: string }, policy: RetryReplayPolicy): void;
+  /** Resolve with the first match within `timeout_ms`, or `timed_out: true`. */
+  wait(filter: WebhookFilter, timeout_ms: number): Promise<WebhookWaitResult>;
+  /**
+   * Resolve with every match observed between call time and deadline. Used
+   * by `expect_webhook_retry_keys_stable` which needs the full sequence of
+   * deliveries for the retry-replay assertion.
+   */
+  wait_all(filter: WebhookFilter, timeout_ms: number): Promise<CapturedWebhook[]>;
+  /** Stop the listener. Idempotent. */
+  close(): Promise<void>;
+}
+
+export interface CreateWebhookReceiverOptions {
+  mode?: 'loopback_mock' | 'proxy_url';
+  /** Bind host for the local listener. Defaults to `127.0.0.1`. */
+  host?: string;
+  /** Bind port. `0` (default) lets the kernel assign one. */
+  port?: number;
+  /** Public URL to advertise when `mode: 'proxy_url'`. */
+  public_url?: string;
+  /**
+   * Permit an HTTP public URL for controlled local-development topologies.
+   */
+  allowHttp?: boolean;
+  /**
+   * TLS material for serving HTTPS directly. Omit when HTTPS terminates at a
+   * tunnel or reverse proxy in front of this listener.
+   */
+  tls?: {
+    cert: string | Buffer;
+    key: string | Buffer;
+    passphrase?: string;
+  };
+}
+
+interface RetryKey {
+  step_id: string;
+  operation_id: string;
+}
+
+function retryKeyString(k: RetryKey): string {
+  return `${k.step_id}::${k.operation_id}`;
+}
+
+export async function createWebhookReceiver(options: CreateWebhookReceiverOptions = {}): Promise<WebhookReceiver> {
+  const mode = options.mode ?? 'loopback_mock';
+  if (mode === 'proxy_url' && !options.public_url) {
+    throw new Error('webhook_receiver.mode=proxy_url requires `public_url`');
+  }
+
+  const host = options.host ?? '127.0.0.1';
+  // Keep loopback_mock literal: aliases for wildcard addresses (including
+  // expanded IPv6 forms) must not turn a CI runner into an open POST endpoint.
+  // Operators who genuinely want non-loopback exposure use mode=proxy_url.
+  if (mode === 'loopback_mock' && !isLoopbackHost(host)) {
+    throw new Error(
+      `webhook_receiver host ${host} is not permitted in loopback_mock mode. ` +
+        'Use mode=proxy_url with an explicit public_url for publicly-reachable runs.'
+    );
+  }
+  const port = options.port ?? 0;
+  const proxyBase =
+    mode === 'proxy_url' ? validateProxyUrl(options.public_url!, options.allowHttp === true) : undefined;
+  if (options.tls && proxyBase && new URL(proxyBase).protocol !== 'https:') {
+    throw new Error('webhook_receiver.public_url must use https when local TLS is configured');
+  }
+  const publicRouteSuffix = mode === 'proxy_url' ? `/_adcp_receiver/${randomUUID()}` : '';
+  const routePrefix = proxyBase ? `${new URL(proxyBase).pathname.replace(/\/+$/, '')}${publicRouteSuffix}` : '';
+
+  const captured: CapturedWebhook[] = [];
+  const challenges: CapturedWebhookChallenge[] = [];
+  const waiters: Array<{
+    filter: WebhookFilter;
+    resolve: (result: WebhookWaitResult) => void;
+    timer: NodeJS.Timeout;
+  }> = [];
+  const waitAllTimers: Array<{
+    filter: WebhookFilter;
+    resolve: (result: CapturedWebhook[]) => void;
+    timer: NodeJS.Timeout;
+  }> = [];
+  const retryPolicies = new Map<string, { policy: RetryReplayPolicy; delivered: number }>();
+  const deliveryCounts = new Map<string, number>();
+  const challengeCounts = new Map<string, number>();
+  let closed = false;
+
+  const requestListener = (req: IncomingMessage, res: ServerResponse) =>
+    handleRequest(req, res, {
+      captured,
+      challenges,
+      waiters,
+      retryPolicies,
+      deliveryCounts,
+      challengeCounts,
+      routePrefix,
+    });
+  const server = options.tls
+    ? createHttpsServer(
+        {
+          cert: options.tls.cert,
+          key: options.tls.key,
+          ...(options.tls.passphrase !== undefined && { passphrase: options.tls.passphrase }),
+        },
+        requestListener
+      )
+    : createServer(requestListener);
+  // Transport-level hardening — trim Node's generous defaults so a slow /
+  // hostile publisher can't wedge the runner.
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
+  server.requestTimeout = REQUEST_TIMEOUT_MS;
+  server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
+  server.maxConnections = MAX_CONNECTIONS;
+  server.maxHeadersCount = MAX_HEADERS_COUNT;
+
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: Error) => reject(err);
+    server.once('error', onError);
+    server.listen(port, host, () => {
+      server.off('error', onError);
+      resolve();
+    });
+  });
+
+  const bound = server.address() as AddressInfo;
+  const base_url = proxyBase
+    ? `${proxyBase}${publicRouteSuffix}`
+    : `${options.tls ? 'https' : 'http'}://${formatHost(bound.address)}:${bound.port}`;
+
+  return {
+    base_url,
+    mode,
+    bind_host: host,
+    all: () => captured.slice(),
+    challenges: () => challenges.slice(),
+    matching: filter => captured.filter(w => matchesFilter(w, filter)),
+    set_retry_replay: (key, policy) => {
+      retryPolicies.set(retryKeyString(key), { policy, delivered: 0 });
+    },
+    wait: (filter, timeout_ms) => {
+      if (!closed) return wait(filter, timeout_ms, captured, waiters);
+      const already = captured.find(w => matchesFilter(w, filter));
+      return Promise.resolve(already ? { webhook: already } : { timed_out: true });
+    },
+    wait_all: (filter, timeout_ms) =>
+      closed
+        ? Promise.resolve(captured.filter(w => matchesFilter(w, filter)))
+        : waitAll(filter, timeout_ms, captured, waitAllTimers),
+    close: () => {
+      closed = true;
+      return closeServer(server, captured, waiters, waitAllTimers);
+    },
+  };
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.toLowerCase();
+  if (normalized === 'localhost') return true;
+  if (isIP(host) === 4) return /^127(?:\.\d{1,3}){3}$/.test(host);
+  if (isIP(host) === 6) return normalized === '::1' || /^(?:0:){7}1$/.test(normalized);
+  return false;
+}
+
+// ────────────────────────────────────────────────────────────
+// Request handling
+// ────────────────────────────────────────────────────────────
+
+interface HandlerState {
+  captured: CapturedWebhook[];
+  challenges: CapturedWebhookChallenge[];
+  waiters: Array<{
+    filter: WebhookFilter;
+    resolve: (r: WebhookWaitResult) => void;
+    timer: NodeJS.Timeout;
+  }>;
+  retryPolicies: Map<string, { policy: RetryReplayPolicy; delivered: number }>;
+  deliveryCounts: Map<string, number>;
+  challengeCounts: Map<string, number>;
+  routePrefix: string;
+}
+
+function handleRequest(req: IncomingMessage, res: ServerResponse, state: HandlerState): void {
+  if (req.method !== 'POST') {
+    res.statusCode = 405;
+    res.end();
+    return;
+  }
+
+  const pathParts = parseStepPath(req.url ?? '', state.routePrefix);
+  if (!pathParts) {
+    res.statusCode = 404;
+    res.end();
+    return;
+  }
+  const { step_id, operation_id, logical_path } = pathParts;
+
+  let size = 0;
+  const chunks: Buffer[] = [];
+  let tooLarge = false;
+
+  req.on('data', (chunk: Buffer) => {
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) {
+      tooLarge = true;
+      req.destroy();
+      return;
+    }
+    chunks.push(chunk);
+  });
+
+  req.on('end', () => {
+    if (tooLarge) {
+      if (!res.headersSent) {
+        res.statusCode = 413;
+        res.end();
+      }
+      return;
+    }
+    const raw = Buffer.concat(chunks).toString('utf8');
+    const headers = normalizeHeaders(req.headers);
+    const parsedBody = parseBody(raw, headers['content-type']);
+
+    // Notification-config proof is POSTed to the configured webhook URL
+    // itself. Validate the complete protocol envelope, echo only the
+    // challenge field, and retain the request separately so conformance
+    // checks can inspect its RFC 9421 headers without treating it as an
+    // event delivery.
+    if (isWebhookChallenge(parsedBody.body)) {
+      if (Buffer.byteLength(raw, 'utf8') > MAX_CHALLENGE_BODY_BYTES) {
+        res.statusCode = 413;
+        res.end();
+        return;
+      }
+      const challenge = parsedBody.body.challenge;
+      const schemaRef =
+        parsedBody.body.scope === 'agent' ? 'core/agent-webhook-challenge.json' : 'core/webhook-challenge.json';
+      const validate = getSchemaValidatorByRef(schemaRef);
+      if (!validate || !validate(parsedBody.body) || typeof challenge !== 'string') {
+        res.statusCode = 400;
+        res.end();
+        return;
+      }
+      const key = retryKeyString({ step_id, operation_id });
+      const perKey = state.challengeCounts.get(key) ?? 0;
+      if (state.captured.length + state.challenges.length >= MAX_CAPTURED_TOTAL || perKey >= MAX_CAPTURED_PER_KEY) {
+        res.statusCode = 429;
+        res.setHeader('retry-after', '1');
+        res.end();
+        return;
+      }
+      state.challengeCounts.set(key, perKey + 1);
+      state.challenges.push({
+        id: randomUUID(),
+        step_id,
+        operation_id,
+        received_at: Date.now(),
+        method: req.method ?? 'POST',
+        path: logical_path,
+        headers: redactHeaders(headers),
+        raw_body: raw,
+        body: parsedBody.body as Record<string, unknown>,
+        response_status: 200,
+      });
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ challenge }));
+      return;
+    }
+
+    const key = retryKeyString({ step_id, operation_id });
+    const deliveryIndex = (state.deliveryCounts.get(key) ?? 0) + 1;
+    const status = nextResponseStatus(state.retryPolicies, key);
+
+    // Stop retaining bodies once a capture cap is exhausted, but preserve the
+    // configured retry-replay status sequence. Unconditionally returning 503
+    // here masks the policy's eventual 2xx forever and can amplify a sender's
+    // retries after the runner has already reached its memory bound (#2653).
+    const perKey = state.deliveryCounts.get(key) ?? 0;
+    if (state.captured.length + state.challenges.length >= MAX_CAPTURED_TOTAL || perKey >= MAX_CAPTURED_PER_KEY) {
+      res.statusCode = status;
+      if (status === 429 || status >= 500) res.setHeader('retry-after', '1');
+      res.end();
+      return;
+    }
+
+    state.deliveryCounts.set(key, deliveryIndex);
+
+    const webhook: CapturedWebhook = {
+      id: randomUUID(),
+      step_id,
+      operation_id,
+      delivery_index: deliveryIndex,
+      received_at: Date.now(),
+      method: req.method ?? 'POST',
+      path: logical_path,
+      headers: redactHeaders(headers),
+      raw_body: raw,
+      ...parsedBody,
+      response_status: status,
+    };
+    state.captured.push(webhook);
+
+    // Deliver to any matching waiters. First-match-wins per waiter; later
+    // arrivals may still deliver to other waiters in the queue.
+    for (let i = state.waiters.length - 1; i >= 0; i--) {
+      const waiter = state.waiters[i]!;
+      if (matchesFilter(webhook, waiter.filter)) {
+        clearTimeout(waiter.timer);
+        state.waiters.splice(i, 1);
+        waiter.resolve({ webhook });
+      }
+    }
+
+    res.statusCode = status;
+    res.end();
+  });
+
+  req.on('error', () => {
+    if (!res.headersSent) {
+      res.statusCode = 400;
+      res.end();
+    }
+  });
+}
+
+function isWebhookChallenge(
+  body: unknown
+): body is { type: 'webhook.challenge'; challenge: unknown } & Record<string, unknown> {
+  return (
+    body !== null &&
+    typeof body === 'object' &&
+    !Array.isArray(body) &&
+    (body as Record<string, unknown>).type === 'webhook.challenge'
+  );
+}
+
+function requestPathname(reqUrl: string): string {
+  const q = reqUrl.indexOf('?');
+  return q === -1 ? reqUrl : reqUrl.slice(0, q);
+}
+
+function parseStepPath(
+  reqUrl: string,
+  routePrefix: string
+): { step_id: string; operation_id: string; logical_path: string } | undefined {
+  const pathname = requestPathname(reqUrl);
+  if (routePrefix && !pathname.startsWith(`${routePrefix}/`)) return undefined;
+  const logicalPath = routePrefix ? pathname.slice(routePrefix.length) : pathname;
+  const match = STEP_PATH_RE.exec(logicalPath);
+  if (!match) return undefined;
+  const queryIndex = reqUrl.indexOf('?');
+  const query = queryIndex === -1 ? '' : reqUrl.slice(queryIndex);
+  return { step_id: match[1]!, operation_id: match[2]!, logical_path: `${logicalPath}${query}` };
+}
+
+function normalizeHeaders(raw: IncomingMessage['headers']): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (value === undefined) continue;
+    out[key.toLowerCase()] = Array.isArray(value) ? value.join(', ') : value;
+  }
+  return out;
+}
+
+function redactHeaders(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    out[k] = SECRET_HEADER_PATTERN.test(k) ? '[redacted]' : v;
+  }
+  return out;
+}
+
+function parseBody(raw: string, contentType: string | undefined): Pick<CapturedWebhook, 'body' | 'parse_error'> {
+  if (raw.length === 0) return {};
+  const looksJson = !contentType || /json/i.test(contentType);
+  if (!looksJson) return {};
+  try {
+    return { body: JSON.parse(raw) };
+  } catch (err) {
+    return { parse_error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+// ────────────────────────────────────────────────────────────
+// Filter matching
+// ────────────────────────────────────────────────────────────
+
+/** @internal Shared identity for retry-safe positive observation consumption. */
+export function webhookObservationKeys(webhook: CapturedWebhook): string[] {
+  const keys: string[] = [];
+  if (typeof webhook.id === 'string' && webhook.id.length > 0) keys.push(`capture:${webhook.id}`);
+  const body = webhook.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return keys;
+  const record = body as Record<string, unknown>;
+  for (const field of ['notification_id', 'idempotency_key']) {
+    const id = record[field];
+    if (typeof id === 'string' && id.length > 0) {
+      keys.push(
+        JSON.stringify([
+          field,
+          webhook.path,
+          record.subscriber_id ?? null,
+          record.account_id ?? null,
+          record.notification_type ?? null,
+          id,
+        ])
+      );
+    }
+  }
+  return keys;
+}
+
+function matchesFilter(webhook: CapturedWebhook, filter: WebhookFilter): boolean {
+  if (
+    filter.exclude_notifications &&
+    webhookObservationKeys(webhook).some(key => filter.exclude_notifications!.has(key))
+  )
+    return false;
+  if (filter.received_at_or_after !== undefined && webhook.received_at < filter.received_at_or_after) return false;
+  if (filter.path !== undefined && webhook.path !== filter.path) return false;
+  if (filter.step_id && webhook.step_id !== filter.step_id) return false;
+  if (filter.operation_id && webhook.operation_id !== filter.operation_id) return false;
+  if (
+    filter.exclude_account_changes?.has(
+      JSON.stringify([resolveDottedPath(webhook.body, 'account_id'), resolveDottedPath(webhook.body, 'change_id')])
+    )
+  )
+    return false;
+  if (filter.present?.some(key => resolveDottedPath(webhook.body, key) == null)) return false;
+  if (filter.body && Object.keys(filter.body).length > 0) {
+    if (webhook.body === undefined) return false;
+    for (const [path, expected] of Object.entries(filter.body)) {
+      const actual = resolveDottedPath(webhook.body, path);
+      if (!deepEqual(actual, expected)) return false;
+    }
+  }
+  return true;
+}
+
+function resolveDottedPath(obj: unknown, path: string): unknown {
+  if (obj === null || obj === undefined) return undefined;
+  const segments = path.split('.');
+  let cursor: unknown = obj;
+  for (const seg of segments) {
+    if (cursor === null || cursor === undefined) return undefined;
+    if (typeof cursor !== 'object') return undefined;
+    cursor = (cursor as Record<string, unknown>)[seg];
+  }
+  return cursor;
+}
+
+/**
+ * Structural deep-equal. Stringify-based comparison is key-order-sensitive
+ * (`{a:1,b:2}` !== `{b:2,a:1}`); for filter bodies that's a false negative
+ * when a publisher's JSON serializer emits fields in a different order
+ * than the storyboard author. Recurse explicitly instead.
+ */
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== typeof b) return false;
+  if (a === null || b === null) return a === b;
+  if (typeof a !== 'object') return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b)) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!deepEqual(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  const keysA = Object.keys(a as Record<string, unknown>);
+  const keysB = Object.keys(b as Record<string, unknown>);
+  if (keysA.length !== keysB.length) return false;
+  for (const k of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+    if (!deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k])) return false;
+  }
+  return true;
+}
+
+// ────────────────────────────────────────────────────────────
+// Retry-replay policy
+// ────────────────────────────────────────────────────────────
+
+function nextResponseStatus(
+  retryPolicies: Map<string, { policy: RetryReplayPolicy; delivered: number }>,
+  key: string
+): number {
+  const entry = retryPolicies.get(key);
+  if (!entry) return 204;
+  if (entry.delivered < entry.policy.count) {
+    entry.delivered += 1;
+    return entry.policy.http_status;
+  }
+  return 204;
+}
+
+// ────────────────────────────────────────────────────────────
+// wait / wait_all
+// ────────────────────────────────────────────────────────────
+
+function wait(
+  filter: WebhookFilter,
+  timeout_ms: number,
+  captured: CapturedWebhook[],
+  waiters: Array<{ filter: WebhookFilter; resolve: (r: WebhookWaitResult) => void; timer: NodeJS.Timeout }>
+): Promise<WebhookWaitResult> {
+  const already = captured.find(w => matchesFilter(w, filter));
+  if (already) return Promise.resolve({ webhook: already });
+  return new Promise<WebhookWaitResult>(resolve => {
+    const timer = setTimeout(
+      () => {
+        const idx = waiters.findIndex(w => w.timer === timer);
+        if (idx >= 0) waiters.splice(idx, 1);
+        resolve({ timed_out: true });
+      },
+      Math.max(0, timeout_ms)
+    );
+    timer.unref?.();
+    waiters.push({ filter, resolve, timer });
+  });
+}
+
+/**
+ * Poll until the deadline, then return every capture matching `filter`.
+ * Used when the assertion needs the whole delivery sequence (retry-stability).
+ * Waits a minimum of `timeout_ms` even if matches arrive earlier — callers
+ * that need "resolve on first match" should use `wait` instead.
+ */
+function waitAll(
+  filter: WebhookFilter,
+  timeout_ms: number,
+  captured: CapturedWebhook[],
+  waitAllTimers: Array<{
+    filter: WebhookFilter;
+    resolve: (result: CapturedWebhook[]) => void;
+    timer: NodeJS.Timeout;
+  }>
+): Promise<CapturedWebhook[]> {
+  return new Promise<CapturedWebhook[]>(resolve => {
+    const timer = setTimeout(
+      () => {
+        const idx = waitAllTimers.findIndex(entry => entry.timer === timer);
+        if (idx >= 0) waitAllTimers.splice(idx, 1);
+        resolve(captured.filter(w => matchesFilter(w, filter)));
+      },
+      Math.max(0, timeout_ms)
+    );
+    timer.unref?.();
+    waitAllTimers.push({ filter, resolve, timer });
+  });
+}
+
+// ────────────────────────────────────────────────────────────
+// close
+// ────────────────────────────────────────────────────────────
+
+function closeServer(
+  server: HttpServer | HttpsServer,
+  captured: CapturedWebhook[],
+  waiters: Array<{ filter: WebhookFilter; resolve: (r: WebhookWaitResult) => void; timer: NodeJS.Timeout }>,
+  waitAllTimers: Array<{
+    filter: WebhookFilter;
+    resolve: (result: CapturedWebhook[]) => void;
+    timer: NodeJS.Timeout;
+  }>
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    server.close(err => {
+      if (err && (err as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') reject(err);
+      else resolve();
+    });
+    // Stop accepting new sockets before force-closing existing keep-alive
+    // connections; the opposite order leaves a small acceptance race.
+    server.closeAllConnections?.();
+    while (waiters.length > 0) {
+      const w = waiters.pop()!;
+      clearTimeout(w.timer);
+      w.resolve({ timed_out: true });
+    }
+    while (waitAllTimers.length > 0) {
+      const pending = waitAllTimers.pop()!;
+      clearTimeout(pending.timer);
+      pending.resolve(captured.filter(w => matchesFilter(w, pending.filter)));
+    }
+  });
+}
+
+function formatHost(address: string): string {
+  return address.includes(':') ? `[${address}]` : address;
+}

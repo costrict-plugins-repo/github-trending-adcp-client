@@ -1,0 +1,421 @@
+// Unit tests for pricing adapter utilities
+const { test, describe } = require('node:test');
+const assert = require('node:assert');
+
+// Import pricing adapter functions
+const {
+  usesV2PricingFields,
+  usesV3PricingFields,
+  isFixedPricing,
+  getPrice,
+  getFloorPrice,
+  normalizePricingOption,
+  normalizeProductPricing,
+  normalizeGetProductsResponse,
+} = require('../../dist/lib/utils/pricing-adapter.js');
+
+describe('pricing adapter utilities', () => {
+  describe('usesV2PricingFields', () => {
+    test('should detect v2 rate field', () => {
+      assert.strictEqual(usesV2PricingFields({ rate: 5.0 }), true);
+    });
+
+    test('should detect v2 is_fixed field', () => {
+      assert.strictEqual(usesV2PricingFields({ is_fixed: true }), true);
+      assert.strictEqual(usesV2PricingFields({ is_fixed: false }), true);
+    });
+
+    test('should detect v2 price_guidance.floor field', () => {
+      assert.strictEqual(usesV2PricingFields({ price_guidance: { floor: 1.0 } }), true);
+    });
+
+    test('should return false for v3-only fields', () => {
+      assert.strictEqual(usesV2PricingFields({ fixed_price: 5.0 }), false);
+      assert.strictEqual(usesV2PricingFields({ floor_price: 1.0 }), false);
+    });
+
+    test('should return false for null/undefined', () => {
+      assert.strictEqual(usesV2PricingFields(null), false);
+      assert.strictEqual(usesV2PricingFields(undefined), false);
+    });
+
+    test('should return false for non-objects', () => {
+      assert.strictEqual(usesV2PricingFields('string'), false);
+      assert.strictEqual(usesV2PricingFields(123), false);
+    });
+  });
+
+  describe('usesV3PricingFields', () => {
+    test('should detect v3 fixed_price field', () => {
+      assert.strictEqual(usesV3PricingFields({ fixed_price: 5.0 }), true);
+    });
+
+    test('should detect v3 floor_price field', () => {
+      assert.strictEqual(usesV3PricingFields({ floor_price: 1.0 }), true);
+    });
+
+    test('should return false for v2-only fields', () => {
+      assert.strictEqual(usesV3PricingFields({ rate: 5.0 }), false);
+      assert.strictEqual(usesV3PricingFields({ is_fixed: true }), false);
+    });
+
+    test('should return false for null/undefined', () => {
+      assert.strictEqual(usesV3PricingFields(null), false);
+      assert.strictEqual(usesV3PricingFields(undefined), false);
+    });
+  });
+
+  describe('isFixedPricing', () => {
+    test('should return true for v3 fixed_price', () => {
+      assert.strictEqual(isFixedPricing({ fixed_price: 5.0 }), true);
+    });
+
+    test('should return true for v2 is_fixed: true', () => {
+      assert.strictEqual(isFixedPricing({ is_fixed: true }), true);
+    });
+
+    test('should return false for v2 is_fixed: false', () => {
+      assert.strictEqual(isFixedPricing({ is_fixed: false }), false);
+    });
+
+    test('should return true for v2 rate (implies fixed)', () => {
+      assert.strictEqual(isFixedPricing({ rate: 5.0 }), true);
+    });
+
+    test('should return false when no indicators present', () => {
+      assert.strictEqual(isFixedPricing({ pricing_model: 'cpm' }), false);
+    });
+  });
+
+  describe('getPrice', () => {
+    test('should return v3 fixed_price', () => {
+      assert.strictEqual(getPrice({ fixed_price: 5.0 }), 5.0);
+    });
+
+    test('should return v2 rate', () => {
+      assert.strictEqual(getPrice({ rate: 3.5 }), 3.5);
+    });
+
+    test('should prefer v3 fixed_price over v2 rate', () => {
+      assert.strictEqual(getPrice({ fixed_price: 5.0, rate: 3.5 }), 5.0);
+    });
+
+    test('should return undefined when neither field present', () => {
+      assert.strictEqual(getPrice({ pricing_model: 'cpm' }), undefined);
+    });
+  });
+
+  describe('getFloorPrice', () => {
+    test('should return v3 floor_price', () => {
+      assert.strictEqual(getFloorPrice({ floor_price: 1.0 }), 1.0);
+    });
+
+    test('should return v2 price_guidance.floor', () => {
+      assert.strictEqual(getFloorPrice({ price_guidance: { floor: 0.5 } }), 0.5);
+    });
+
+    test('should prefer v3 floor_price over v2', () => {
+      assert.strictEqual(getFloorPrice({ floor_price: 1.0, price_guidance: { floor: 0.5 } }), 1.0);
+    });
+
+    test('should return undefined when neither field present', () => {
+      assert.strictEqual(getFloorPrice({ pricing_model: 'cpm' }), undefined);
+    });
+  });
+
+  describe('normalizePricingOption', () => {
+    test('should convert v2 rate and is_fixed to v3 fixed_price', () => {
+      const v2Option = {
+        pricing_option_id: 'cpm_fixed',
+        pricing_model: 'cpm',
+        currency: 'USD',
+        rate: 5.0,
+        is_fixed: true,
+      };
+
+      const v3Option = normalizePricingOption(v2Option);
+
+      assert.strictEqual(v3Option.fixed_price, 5.0);
+      assert.strictEqual(v3Option.rate, undefined);
+      assert.strictEqual(v3Option.is_fixed, undefined);
+    });
+
+    test('should convert v2 price_guidance.floor to v3 floor_price', () => {
+      const v2Option = {
+        pricing_option_id: 'cpm_auction',
+        pricing_model: 'cpm',
+        currency: 'USD',
+        is_fixed: false,
+        price_guidance: {
+          floor: 1.0,
+          p25: 1.5,
+          p50: 2.5,
+          p75: 3.5,
+        },
+      };
+
+      const v3Option = normalizePricingOption(v2Option);
+
+      assert.strictEqual(v3Option.floor_price, 1.0);
+      assert.strictEqual(v3Option.price_guidance.p25, 1.5);
+      assert.strictEqual(v3Option.price_guidance.p50, 2.5);
+      assert.strictEqual(v3Option.price_guidance.p75, 3.5);
+      assert.strictEqual(v3Option.price_guidance.floor, undefined);
+    });
+
+    test('should pass through v3 options unchanged', () => {
+      const v3Option = {
+        pricing_option_id: 'cpm_fixed',
+        pricing_model: 'cpm',
+        currency: 'USD',
+        fixed_price: 5.0,
+      };
+
+      const result = normalizePricingOption(v3Option);
+
+      assert.strictEqual(result.fixed_price, 5.0);
+    });
+
+    test('should handle v2 rate without explicit is_fixed (implies fixed)', () => {
+      const v2Option = {
+        pricing_option_id: 'cpm_fixed',
+        pricing_model: 'cpm',
+        currency: 'USD',
+        rate: 5.0,
+      };
+
+      const v3Option = normalizePricingOption(v2Option);
+
+      assert.strictEqual(v3Option.fixed_price, 5.0);
+    });
+
+    test('should not convert rate if is_fixed is false', () => {
+      const v2Option = {
+        pricing_option_id: 'cpm_auction',
+        pricing_model: 'cpm',
+        currency: 'USD',
+        rate: 5.0,
+        is_fixed: false,
+      };
+
+      const v3Option = normalizePricingOption(v2Option);
+
+      // rate should not become fixed_price when is_fixed is false
+      assert.strictEqual(v3Option.fixed_price, undefined);
+    });
+  });
+
+  describe('normalizeProductPricing', () => {
+    test('should normalize pricing_options array', () => {
+      const product = {
+        id: 'product-1',
+        name: 'Test Product',
+        pricing_options: [
+          {
+            pricing_option_id: 'cpm_fixed',
+            pricing_model: 'cpm',
+            currency: 'USD',
+            rate: 5.0,
+            is_fixed: true,
+          },
+          {
+            pricing_option_id: 'cpm_auction',
+            pricing_model: 'cpm',
+            currency: 'USD',
+            is_fixed: false,
+            price_guidance: { floor: 1.0 },
+          },
+        ],
+      };
+
+      const normalized = normalizeProductPricing(product);
+
+      assert.strictEqual(normalized.pricing_options[0].fixed_price, 5.0);
+      assert.strictEqual(normalized.pricing_options[1].floor_price, 1.0);
+    });
+
+    test('should pass through products without pricing_options', () => {
+      const product = {
+        id: 'product-1',
+        name: 'Test Product',
+      };
+
+      const normalized = normalizeProductPricing(product);
+
+      assert.deepStrictEqual(normalized, product);
+    });
+
+    test('should handle null/undefined products', () => {
+      assert.strictEqual(normalizeProductPricing(null), null);
+      assert.strictEqual(normalizeProductPricing(undefined), undefined);
+    });
+  });
+
+  describe('normalizeGetProductsResponse', () => {
+    test('should normalize all products in response', () => {
+      const response = {
+        products: [
+          {
+            id: 'product-1',
+            pricing_options: [
+              { pricing_option_id: 'opt1', rate: 5.0, is_fixed: true, pricing_model: 'cpm', currency: 'USD' },
+            ],
+          },
+          {
+            id: 'product-2',
+            pricing_options: [
+              {
+                pricing_option_id: 'opt2',
+                is_fixed: false,
+                price_guidance: { floor: 1.0 },
+                pricing_model: 'cpm',
+                currency: 'USD',
+              },
+            ],
+          },
+        ],
+      };
+
+      const normalized = normalizeGetProductsResponse(response);
+
+      assert.strictEqual(normalized.products[0].pricing_options[0].fixed_price, 5.0);
+      assert.strictEqual(normalized.products[1].pricing_options[0].floor_price, 1.0);
+    });
+
+    test('should pass through response without products array', () => {
+      const response = { error: 'Not found' };
+
+      const normalized = normalizeGetProductsResponse(response);
+
+      assert.deepStrictEqual(normalized, response);
+    });
+
+    test('should preserve other response fields', () => {
+      const response = {
+        products: [
+          {
+            id: 'p1',
+            pricing_options: [
+              { rate: 5.0, is_fixed: true, pricing_model: 'cpm', currency: 'USD', pricing_option_id: 'opt1' },
+            ],
+          },
+        ],
+        total: 1,
+        property_list_applied: true,
+      };
+
+      const normalized = normalizeGetProductsResponse(response);
+
+      assert.strictEqual(normalized.total, 1);
+      assert.strictEqual(normalized.property_list_applied, true);
+    });
+
+    test('should convert non-array products to error response', () => {
+      const response = { products: 'not an array' };
+
+      const normalized = normalizeGetProductsResponse(response);
+
+      assert.ok(Array.isArray(normalized.errors), 'Should have errors array');
+      assert.strictEqual(normalized.errors[0].code, 'invalid_response');
+      assert.ok(normalized.errors[0].message.includes('Expected products to be an array'));
+      assert.strictEqual(normalized.products, undefined, 'Should not have products field');
+    });
+
+    test('should convert null products to error response', () => {
+      const response = { products: null };
+
+      const normalized = normalizeGetProductsResponse(response);
+
+      assert.ok(Array.isArray(normalized.errors), 'Should have errors array');
+      assert.strictEqual(normalized.errors[0].code, 'invalid_response');
+    });
+
+    test('should pass through error response without products key', () => {
+      const response = { errors: [{ code: 'agent_error', message: 'Something failed' }] };
+
+      const normalized = normalizeGetProductsResponse(response);
+
+      assert.deepStrictEqual(normalized, response);
+    });
+
+    test('should convert object products to error response', () => {
+      const response = { products: { id: 'not-an-array' } };
+
+      const normalized = normalizeGetProductsResponse(response);
+
+      assert.ok(Array.isArray(normalized.errors), 'Should have errors array');
+      assert.ok(normalized.errors[0].message.includes('got object'));
+    });
+
+    test('should convert numeric products to error response', () => {
+      const response = { products: 123 };
+
+      const normalized = normalizeGetProductsResponse(response);
+
+      assert.ok(Array.isArray(normalized.errors), 'Should have errors array');
+      assert.ok(normalized.errors[0].message.includes('got number'));
+    });
+
+    test('should convert undefined products to error response', () => {
+      const response = { products: undefined };
+
+      const normalized = normalizeGetProductsResponse(response);
+
+      assert.ok(Array.isArray(normalized.errors), 'Should have errors array');
+      assert.ok(normalized.errors[0].message.includes('got undefined'));
+    });
+
+    test('should normalize empty products array without error', () => {
+      const response = { products: [] };
+
+      const normalized = normalizeGetProductsResponse(response);
+
+      assert.ok(Array.isArray(normalized.products), 'Should still be an array');
+      assert.strictEqual(normalized.products.length, 0);
+    });
+
+    test('normalizes explicitly zoned legacy forecast timestamps without losing fractional precision (#2677)', () => {
+      const vectors = [
+        ['2026-08-23T22:00:00+02:00', '2026-08-23T20:00:00Z'],
+        ['2026-08-24t02:30:00.123456+02:30', '2026-08-24T00:00:00.123456Z'],
+        [' 2026-08-23 22:00:00.123456+0200 ', '2026-08-23T20:00:00.123456Z'],
+        ['2026-08-23t20:00:00z', '2026-08-23T20:00:00Z'],
+        ['2026-08-23T20:00:00 UTC', '2026-08-23T20:00:00Z'],
+        ['2026-08-23T22:00:00+02', '2026-08-23T20:00:00Z'],
+        [{ $date: '2026-08-23T20:00:00Z' }, '2026-08-23T20:00:00Z'],
+        [{ value: '2026-08-24T02:30:00+02:30' }, '2026-08-24T00:00:00Z'],
+      ];
+
+      for (const [input, expected] of vectors) {
+        const response = {
+          products: [{ product_id: 'legacy', forecast: { generated_at: input, valid_until: input } }],
+        };
+        const auditCopy = structuredClone(response);
+        const normalized = normalizeGetProductsResponse(response);
+
+        assert.strictEqual(normalized.products[0].forecast.generated_at, expected);
+        assert.strictEqual(normalized.products[0].forecast.valid_until, expected);
+        assert.deepStrictEqual(response, auditCopy, 'normalization must not mutate the preserved seller wire object');
+      }
+    });
+
+    test('omits null and empty forecast timestamps but leaves ambiguous values untouched (#2677)', () => {
+      const ambiguous = { $date: '2026-08-23T20:00:00Z', value: '2026-08-24T00:00:00Z' };
+      const unknownOffset = '2026-08-23T20:00:00-00:00';
+      const expandedUtcYear = '9999-12-31T23:59:59-23:59';
+      const normalized = normalizeGetProductsResponse({
+        products: [
+          { product_id: 'empty', forecast: { generated_at: null, valid_until: { value: {} } } },
+          { product_id: 'ambiguous', forecast: { generated_at: ambiguous, valid_until: '2026-08-23T20:00:00' } },
+          { product_id: 'unknown-offset', forecast: { generated_at: unknownOffset, valid_until: expandedUtcYear } },
+        ],
+      });
+
+      assert.deepStrictEqual(normalized.products[0].forecast, {});
+      assert.deepStrictEqual(normalized.products[1].forecast.generated_at, ambiguous);
+      assert.strictEqual(normalized.products[1].forecast.valid_until, '2026-08-23T20:00:00');
+      assert.strictEqual(normalized.products[2].forecast.generated_at, unknownOffset);
+      assert.strictEqual(normalized.products[2].forecast.valid_until, expandedUtcYear);
+    });
+  });
+});

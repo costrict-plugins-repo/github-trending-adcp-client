@@ -1,0 +1,587 @@
+/**
+ * SalesPlatform — sales specialism platform interface.
+ *
+ * **Unified hybrid shape.** `get_products`, `create_media_buy`, and `sync_creatives` use a
+ * single method each. The method returns the wire success arm (sync fast
+ * path) OR `ctx.handoffToTask(fn)` to promote the call to a background
+ * task (HITL slow path). Branch per-call — the same method handles
+ * programmatic remnant, guaranteed inventory, curated discovery, and hybrid
+ * sellers. Every other tool is sync-only:
+ *
+ *   - `get_products` — sync OR `ctx.handoffToTask(...)` for curated brief/refine flows.
+ *   - `create_media_buy` — sync OR `ctx.handoffToTask(...)`.
+ *   - `update_media_buy` — sync only. Re-approval flows that need HITL run
+ *     out-of-band; `publishStatusChange` carries the result.
+ *   - `sync_creatives` — sync OR `ctx.handoffToTask(...)`.
+ *   - `get_media_buy_delivery` — sync only.
+ *
+ * Sync-only tools that need long-running semantics use `publishStatusChange`
+ * (see `status-changes.ts`) — that's the spec-aligned channel for tools
+ * whose wire response unions don't define a Submitted arm.
+ *
+ * Each method either returns the value or throws `AdcpError` for structured
+ * rejection. Generic thrown errors map to `SERVICE_UNAVAILABLE`.
+ *
+ * **Method groups** — implement the group(s) matching your specialism:
+ *
+ * | Group | Methods | Claim when |
+ * |---|---|---|
+ * | Core sales (required) | `getProducts`, `updateMediaBuy`, `getMediaBuyDelivery` | Any `sales-*` specialism |
+ * | Core sales (unified hybrid) | `createMediaBuy` | Any `sales-*` specialism |
+ * | Core sales (unified hybrid) | `syncCreatives` | Any `sales-*` specialism |
+ * | Read / feedback | `getMediaBuys`, `providePerformanceFeedback`, `listCreativeFormats`, `listCreatives` | Most sellers; optional |
+ * | Retail-media extensions | `syncCatalogs`, `logEvent`, `syncEventSources` | `sales-catalog-driven`, `sales-retail-media` |
+ *
+ * New adopters implementing a non-retail seller (GAM, FreeWheel, a social
+ * platform) only need the three core-required methods plus `createMediaBuy`
+ * and `syncCreatives`. The retail-media extension methods (`syncCatalogs`,
+ * `logEvent`, `syncEventSources`) are unnecessary unless you claim
+ * `sales-catalog-driven` or `sales-retail-media`.
+ *
+ * **No-account tools (`providePerformanceFeedback`, `listCreativeFormats`):**
+ * the wire requests for these two tools don't carry an `account` field, so
+ * `ctx.account` may be `undefined` when `accounts.resolution === 'explicit'`.
+ * Three safe patterns:
+ *
+ * 1. **`'derived'` resolution** — `accounts.resolve(undefined)` returns the
+ *    credential's single reachable account; `ctx.account` is set whenever
+ *    the credential is bound to exactly one upstream account.
+ * 2. **Don't implement the method** — the framework returns
+ *    `UNSUPPORTED_FEATURE`; buyers using the merge-seam custom handler or
+ *    external creative agents still receive a response.
+ * 3. **Explicit-mode with defensive read** — cast `ctx.account as Account |
+ *    undefined` and derive the account from the request body (e.g., via a
+ *    `media_buy_id` lookup), or throw `AdcpError('ACCOUNT_REQUIRED')` when
+ *    the request omitted the account needed to select a tenant.
+ *    Full `resolveAccount(undefined, { authInfo, toolName })` support for
+ *    explicit-mode lands in rc.1.
+ *
+ * Status: Preview / 6.0.
+ *
+ * @public
+ */
+
+import type { Account, NoAccountCtx } from '../account';
+import type { RequestContext } from '../context';
+import type { TaskHandoff } from '../async-outcome';
+import type { ResponseWithSummary } from '../response-summary';
+import type { RequireCacheScopeWhenProducts, ServerPayload } from '../../../types/server-payload';
+import type {
+  GetProductsRequest,
+  GetProductsResponse,
+  CreateMediaBuyError,
+  CreateMediaBuySuccess,
+  UpdateMediaBuySuccess,
+  GetMediaBuysRequest,
+  GetMediaBuysResponse,
+  GetMediaBuyDeliveryRequest,
+  GetMediaBuyDeliveryResponse,
+  ProvidePerformanceFeedbackRequest,
+  ProvidePerformanceFeedbackSuccess,
+  ListCreativeFormatsRequest,
+  ListCreativeFormatsResponse,
+  ListCreativesRequest,
+  ListCreativesResponse,
+  MediaBuyStatus,
+  SyncCatalogsRequest,
+  SyncCatalogsSuccess,
+  LogEventRequest,
+  LogEventSuccess,
+  SyncEventSourcesRequest,
+  SyncEventSourcesSuccess,
+  SyncCreativesError,
+  SyncCreativesSuccess,
+} from '../../../types/tools.generated';
+import type { ProposalRefinementCapabilities } from '../../../negotiation/types';
+import type { AdcpToolMap } from '../../create-adcp-server';
+import type {
+  CanonicalSyncCreativeAsset,
+  CanonicalCreateMediaBuyRequest,
+  CanonicalCreativeResponse,
+  CanonicalGetProductsRequest,
+  CanonicalListCreativesRequest,
+  CanonicalListCreativesResponse,
+  CanonicalProduct,
+  CanonicalUpdateMediaBuyRequest,
+} from '../../../v2/projection/creative-delivery';
+import type { ProjectionCatalogSnapshot } from '../../../v2/projection/catalog-snapshot';
+import type { V1ProductInput } from '../../../v2/projection/types';
+
+type SyncCreative = CanonicalSyncCreativeAsset;
+type Ctx<TCtxMeta> = RequestContext<Account<TCtxMeta>>;
+type ExclusivePayload<TLeft, TRight> =
+  | (TLeft & { [K in Exclude<keyof TRight, keyof TLeft>]?: never })
+  | (TRight & { [K in Exclude<keyof TLeft, keyof TRight>]?: never });
+type LegacyMediaBuyStatusInput<T> = T & { status?: MediaBuyStatus };
+
+export type GetProductsProjectionInput = (CanonicalProduct | V1ProductInput) & {
+  /** Exact owner-scoped aliases used only while projecting this product; never emitted on the wire. */
+  projectionCatalogs?: readonly ProjectionCatalogSnapshot[];
+};
+type CanonicalGetProductsPayload = Omit<ServerPayload<CanonicalCreativeResponse<GetProductsResponse>>, 'products'> & {
+  products?: GetProductsProjectionInput[];
+};
+export type GetProductsPayload = RequireCacheScopeWhenProducts<CanonicalGetProductsPayload>;
+type CreateMediaBuySuccessPayload = LegacyMediaBuyStatusInput<
+  ServerPayload<CanonicalCreativeResponse<CreateMediaBuySuccess>>
+>;
+type CreateMediaBuyErrorPayload = ServerPayload<CanonicalCreativeResponse<CreateMediaBuyError>>;
+export type CreateMediaBuyPayload = ExclusivePayload<CreateMediaBuySuccessPayload, CreateMediaBuyErrorPayload>;
+export type UpdateMediaBuyPayload = LegacyMediaBuyStatusInput<
+  ServerPayload<CanonicalCreativeResponse<UpdateMediaBuySuccess>>
+>;
+export type GetMediaBuyDeliveryPayload = ServerPayload<CanonicalCreativeResponse<GetMediaBuyDeliveryResponse>>;
+export type GetMediaBuysPayload = ServerPayload<CanonicalCreativeResponse<GetMediaBuysResponse>>;
+export type ProvidePerformanceFeedbackPayload = ServerPayload<ProvidePerformanceFeedbackSuccess>;
+export type LegacyListCreativeFormatsPayload = ServerPayload<ListCreativeFormatsResponse>;
+export type ListCreativesPayload = ServerPayload<CanonicalListCreativesResponse>;
+export type LegacyGetProductsPayload = RequireCacheScopeWhenProducts<ServerPayload<GetProductsResponse>>;
+export type LegacyCreateMediaBuyPayload = ExclusivePayload<
+  LegacyMediaBuyStatusInput<ServerPayload<CreateMediaBuySuccess>>,
+  ServerPayload<CreateMediaBuyError>
+>;
+export type LegacyUpdateMediaBuyPayload = LegacyMediaBuyStatusInput<ServerPayload<UpdateMediaBuySuccess>>;
+export type LegacyGetMediaBuyDeliveryPayload = ServerPayload<GetMediaBuyDeliveryResponse>;
+export type LegacyGetMediaBuysPayload = ServerPayload<GetMediaBuysResponse>;
+export type LegacyListCreativesPayload = ServerPayload<ListCreativesResponse>;
+export type SyncCreativesSuccessPayload = ServerPayload<SyncCreativesSuccess>;
+export type SyncCreativesErrorPayload = ServerPayload<SyncCreativesError>;
+export type SyncCreativesPayload = SyncCreativesSuccessPayload | SyncCreativesErrorPayload;
+export type SyncCatalogsPayload = ServerPayload<SyncCatalogsSuccess>;
+export type LogEventPayload = ServerPayload<LogEventSuccess>;
+export type SyncEventSourcesPayload = ServerPayload<SyncEventSourcesSuccess>;
+export type ListProductsPayload = AdcpToolMap['list_products']['result'];
+export type RequestProposalsPayload = AdcpToolMap['request_proposals']['result'];
+export type DeclineProposalsPayload = AdcpToolMap['decline_proposals']['result'];
+export type BuyProductsPayload = AdcpToolMap['buy_products']['result'];
+export type AcceptProposalPayload = AdcpToolMap['accept_proposal']['result'];
+export type ControlMediaBuyPayload = AdcpToolMap['control_media_buy']['result'];
+export type RefineProposalsPayload = AdcpToolMap['refine_proposals']['result'];
+
+/**
+ * Wire success-row shape for `sync_creatives`. Returning the array of these
+ * rows from `syncCreatives` is what adopters write — the framework wraps
+ * with `{ creatives: [...] }` to form `SyncCreativesSuccess`.
+ */
+export type SyncCreativesRow = SyncCreativesSuccess['creatives'][number];
+/**
+ * Native product discovery result. Use `withResponseSummary(payload, text)`
+ * for a synchronous MCP text override while the SDK retains payload projection
+ * and validation; task handoffs continue to resolve to structured payloads.
+ */
+export type GetProductsHandlerResult =
+  | GetProductsPayload
+  | ResponseWithSummary<GetProductsPayload>
+  | TaskHandoff<GetProductsPayload>;
+export type CreateMediaBuyHandlerResult = CreateMediaBuyPayload | TaskHandoff<CreateMediaBuySuccessPayload>;
+export type UpdateMediaBuyHandlerResult = UpdateMediaBuyPayload | TaskHandoff<UpdateMediaBuyPayload>;
+export type SyncCreativesHandlerResult = SyncCreativesRow[] | TaskHandoff<SyncCreativesRow[]>;
+
+type CompactLifecycleHandlerResult<T> = T | TaskHandoff<T>;
+
+/**
+ * Primary AdCP 3.2 media-buy lifecycle surface.
+ *
+ * This lives beside {@link SalesPlatform} so SDK 14 adopters can implement
+ * the compact protocol without translating it back into deprecated
+ * `get_products` / `create_media_buy` / `update_media_buy` methods. Keep a
+ * `SalesPlatform` implementation as well when the same deployment must serve
+ * legacy 3.0/3.1 buyers; the server advertises only the compact profile to
+ * 3.2 MCP discovery while retaining those older call routes.
+ *
+ * `refineProposals` requires `proposalRefinement` so capability discovery can
+ * declare the supported structured refinement dimensions truthfully.
+ *
+ * @public
+ */
+export interface MediaBuyLifecyclePlatform<TCtxMeta = Record<string, unknown>> {
+  proposalRefinement?: ProposalRefinementCapabilities;
+  listProducts?(req: AdcpToolMap['list_products']['params'], ctx: Ctx<TCtxMeta>): Promise<ListProductsPayload>;
+  listCollections?(
+    req: AdcpToolMap['list_collections']['params'],
+    ctx: Ctx<TCtxMeta>
+  ): Promise<AdcpToolMap['list_collections']['result']>;
+  listProposals?(
+    req: AdcpToolMap['list_proposals']['params'],
+    ctx: Ctx<TCtxMeta>
+  ): Promise<AdcpToolMap['list_proposals']['result']>;
+  requestProposals?(
+    req: AdcpToolMap['request_proposals']['params'],
+    ctx: Ctx<TCtxMeta>
+  ): Promise<CompactLifecycleHandlerResult<RequestProposalsPayload>>;
+  refineProposals?(
+    req: AdcpToolMap['refine_proposals']['params'],
+    ctx: Ctx<TCtxMeta>
+  ): Promise<CompactLifecycleHandlerResult<RefineProposalsPayload>>;
+  declineProposals?(
+    req: AdcpToolMap['decline_proposals']['params'],
+    ctx: Ctx<TCtxMeta>
+  ): Promise<CompactLifecycleHandlerResult<DeclineProposalsPayload>>;
+  buyProducts?(
+    req: AdcpToolMap['buy_products']['params'],
+    ctx: Ctx<TCtxMeta>
+  ): Promise<CompactLifecycleHandlerResult<BuyProductsPayload>>;
+  acceptProposal?(
+    req: AdcpToolMap['accept_proposal']['params'],
+    ctx: Ctx<TCtxMeta>
+  ): Promise<CompactLifecycleHandlerResult<AcceptProposalPayload>>;
+  controlMediaBuy?(
+    req: AdcpToolMap['control_media_buy']['params'],
+    ctx: Ctx<TCtxMeta>
+  ): Promise<CompactLifecycleHandlerResult<ControlMediaBuyPayload>>;
+  getMediaBuys?(req: GetMediaBuysRequest, ctx: Ctx<TCtxMeta>): Promise<GetMediaBuysPayload>;
+  getMediaBuyDelivery?(filter: GetMediaBuyDeliveryRequest, ctx: Ctx<TCtxMeta>): Promise<GetMediaBuyDeliveryPayload>;
+}
+
+export type MediaBuyLifecycleCorePlatform<TCtxMeta = Record<string, unknown>> = Required<
+  Pick<
+    MediaBuyLifecyclePlatform<TCtxMeta>,
+    'listProducts' | 'buyProducts' | 'controlMediaBuy' | 'getMediaBuys' | 'getMediaBuyDelivery'
+  >
+>;
+
+export type MediaBuyLifecycleProposalPlatform<TCtxMeta = Record<string, unknown>> = Required<
+  Pick<
+    MediaBuyLifecyclePlatform<TCtxMeta>,
+    | 'proposalRefinement'
+    | 'listProducts'
+    | 'requestProposals'
+    | 'refineProposals'
+    | 'declineProposals'
+    | 'acceptProposal'
+    | 'getMediaBuys'
+    | 'getMediaBuyDelivery'
+  >
+>;
+
+export interface SalesPlatform<TCtxMeta = Record<string, unknown>> {
+  // **Method shape — all optional, enforced per-specialism.** Every method on
+  // `SalesPlatform` is declared optional so the type accommodates non-media-
+  // buy walled gardens (sales-social, audience-sync, sales-proposal-mode)
+  // that don't accept inbound media buys but compose ingestion methods on
+  // this same surface. Compile-time enforcement of "you claimed
+  // sales-non-guaranteed, therefore you MUST implement getProducts /
+  // createMediaBuy / updateMediaBuy / getMediaBuyDelivery / getMediaBuys"
+  // moves up to `RequiredPlatformsFor<S>` — see the {@link SalesCorePlatform}
+  // type alias and the per-specialism mapping in `platform.ts`. Runtime
+  // enforcement is preserved: the dispatcher returns `UNSUPPORTED_FEATURE`
+  // for tools whose method is absent, and `validateSpecialismRequiredTools`
+  // throws / warns when a specialism's required tools aren't implemented.
+  //
+  // Adopters who implement the full media-buy surface keep working — their
+  // implementation is a superset of every per-specialism requirement.
+  // Adopters who only do ingestion (e.g. a Meta CAPI integration claiming
+  // `sales-social`) drop the 5 core stubs without compile errors.
+
+  // ── get_products: unified hybrid shape ────────────────────────────
+  // get_products is a CATALOG LOOKUP — fast read against the seller's
+  // existing inventory. rc8 allows curated brief/refine lookups to return a
+  // Submitted arm when the seller needs async enrichment. Adopters express
+  // that by returning ctx.handoffToTask(fn); the framework owns task_id
+  // allocation, polling state, and optional completion webhook delivery.
+  //
+  // Wholesale catalog dumps remain sync: if the seller cannot serve the
+  // full catalog directly, it should maintain an internal cache and return
+  // the current catalog view instead of turning wholesale discovery into a
+  // long-running operation.
+  /** Catalog discovery: return products directly or hand off curated discovery to a background task. */
+  getProducts?(req: CanonicalGetProductsRequest, ctx: Ctx<TCtxMeta>): Promise<GetProductsHandlerResult>;
+
+  // ── create_media_buy: unified hybrid shape ──────────────────────────
+
+  /**
+   * Create a media buy. Return the wire success-arm shape (sync fast path)
+   * OR `ctx.handoffToTask(fn)` to promote the call to a background task
+   * (HITL slow path). Adopters can branch per-call: hybrid sellers route
+   * programmatic remnant sync, guaranteed inventory through HITL, all
+   * from the same method.
+   *
+   * Buyers pattern-match on the wire response shape (`media_buy_id` on
+   * the immediate response → sync; `task_id` + `status: 'submitted'` →
+   * poll `tasks_get` or receive webhook). Predictable per request,
+   * dynamic per call.
+   *
+   * Status changes flow via `publishStatusChange(...)` regardless of
+   * which path was taken.
+   *
+   * For synchronous domain validation that produces multiple failures,
+   * return the pure Error arm (`{ errors: [...] }`) with no success-only
+   * fields. Handoff callbacks remain success-only; throw `AdcpError` inside
+   * a handoff to transition the task to `failed`.
+   *
+   * The handoff function's return value is persisted as JSONB in the
+   * task registry. Postgres-backed registries cap row size at 4MB —
+   * offload large payloads to blob storage and return references.
+   *
+   * @example Sync-only adopter (no HITL inventory)
+   * ```ts
+   * createMediaBuy: async (req, ctx) => {
+   *   return await this.commitSync(req);
+   * }
+   * ```
+   *
+   * @example HITL-only adopter (every call goes through trafficker review)
+   * ```ts
+   * createMediaBuy: async (req, ctx) => {
+   *   return ctx.handoffToTask(async (taskCtx) => {
+   *     await taskCtx.update({ message: 'Awaiting trafficker' });
+   *     return await this.runHITL(req);
+   *   });
+   * }
+   * ```
+   *
+   * @example Hybrid adopter (programmatic + guaranteed in same tenant)
+   * ```ts
+   * createMediaBuy: async (req, ctx) => {
+   *   if (this.requiresHITL(req)) {
+   *     return ctx.handoffToTask(async (taskCtx) => await this.runHITL(req));
+   *   }
+   *   return await this.commitSync(req);
+   * }
+   * ```
+   */
+  createMediaBuy?(req: CanonicalCreateMediaBuyRequest, ctx: Ctx<TCtxMeta>): Promise<CreateMediaBuyHandlerResult>;
+
+  // ── update_media_buy: unified hybrid shape
+  /**
+   * Update a media buy. Return the patched buy immediately (sync fast path)
+   * OR `ctx.handoffToTask(fn)` when the upstream activation or approval flow
+   * must continue in the background. The framework owns task registration,
+   * caller scoping, polling, and completion webhooks on the handoff path.
+   */
+  updateMediaBuy?(
+    buyId: string,
+    patch: CanonicalUpdateMediaBuyRequest,
+    ctx: Ctx<TCtxMeta>
+  ): Promise<UpdateMediaBuyHandlerResult>;
+
+  // ── sync_creatives: unified hybrid shape ────────────────────────────
+
+  /**
+   * Push creatives. Return the array of wire success rows (sync fast
+   * path) OR `ctx.handoffToTask(fn)` to defer to a background task
+   * (HITL slow path — manual review, brand-suitability gates, etc.).
+   * Hybrid: branch per-batch — auto-approve simple creatives sync,
+   * route everything else to HITL.
+   *
+   * Each row carries `action` (CRUD outcome) and optional `status`
+   * (review state). Buyers see mixed `approved` / `pending_review`
+   * rows on the sync path; subsequent review changes flow via
+   * `publishStatusChange(...)`.
+   *
+   * @example Hybrid adopter
+   * ```ts
+   * syncCreatives: async (creatives, ctx) => {
+   *   if (creatives.some(c => this.needsReview(c))) {
+   *     return ctx.handoffToTask(async (taskCtx) => {
+   *       return await this.reviewAndPersist(creatives);
+   *     });
+   *   }
+   *   return creatives.map(c => ({ creative_id: c.creative_id, action: 'created', status: 'approved' }));
+   * }
+   * ```
+   */
+  syncCreatives?(creatives: SyncCreative[], ctx: Ctx<TCtxMeta>): Promise<SyncCreativesHandlerResult>;
+
+  // ── get_media_buy_delivery: sync only ───────────────────────────────
+
+  /**
+   * Per-media-buy delivery actuals (impressions, spend, pacing,
+   * conversions). Sync — report-running platforms with manual report
+   * cycles return the latest cached actuals and emit `delivery_report`
+   * status changes via `publishStatusChange` when fresh reports are
+   * available.
+   *
+   * **Multi-id contract.** `filter.media_buy_ids` is an array — buyers
+   * routinely request delivery for multiple buys in one call. The
+   * platform MUST iterate every id and return one element per id in
+   * `media_buy_deliveries[]`. Implementations that read only
+   * `media_buy_ids[0]` silently truncate the buyer's request — a
+   * correctness bug that has bitten multiple adopters (closes #1342).
+   *
+   * Pass-through is the framework contract: the platform owns fan-out
+   * because `aggregated_totals` requires platform-domain knowledge —
+   * `reach` (cross-buy dedup capability), `new_to_brand_rate` (weighted
+   * across buys, not a per-buy average), and `frequency` (depends on
+   * dedup) cannot be synthesized correctly by a naive framework loop.
+   * Sellers that can't compute the cross-buy fields omit them and emit
+   * the safely-summable fields (`impressions`, `spend`, `clicks`,
+   * `media_buy_count`); buyers fall back to per-buy values when needed.
+   *
+   * Recommended pattern — prefer the upstream's native multi-id query
+   * over a per-id loop. Most reporting APIs (GAM ReportService's
+   * `WHERE LINE_ITEM_ID IN (...)`, TTD, DV360, Magnite, PubMatic, retail
+   * media) take an id list in one round-trip; iterating one-id-at-a-time
+   * is an N-roundtrip pattern that triggers upstream rate limits on
+   * 50-buy reports.
+   *
+   * ```ts
+   * getMediaBuyDelivery: async (req, ctx) => {
+   *   const ids = req.media_buy_ids ?? [];
+   *   // Native multi-id: one upstream round-trip.
+   *   const rows = await this.upstream.report({
+   *     mediaBuyIds: ids,
+   *     start: req.start_date,
+   *     end: req.end_date,
+   *   });
+   *   return {
+   *     reporting_period: { start, end },
+   *     currency: 'USD',
+   *     media_buy_deliveries: rows,
+   *     aggregated_totals: this.upstream.aggregate(rows),
+   *   };
+   * }
+   * ```
+   *
+   * **Single-id fallback** — only if your upstream is genuinely single-id:
+   *
+   * ```ts
+   * const deliveries = await Promise.all(ids.map(id => fetchOne(id, ctx)));
+   * ```
+   *
+   * When `media_buy_ids` is omitted, return a paginated set of
+   * accessible media buys per the wire schema. `status_filter`
+   * defaults to `['active']` when omitted; honor the filter in your
+   * iteration.
+   */
+  getMediaBuyDelivery?(filter: GetMediaBuyDeliveryRequest, ctx: Ctx<TCtxMeta>): Promise<GetMediaBuyDeliveryPayload>;
+
+  // ── get_media_buys: sync only — REQUIRED ──────────────────────────────
+  // Read tool — buyers fetch a list of their media buys (often filtered by
+  // status / time window). Required because:
+  //   1. Every seller needs to support reading back what they created.
+  //   2. Idempotent retries depend on it (replay safe-by-design).
+  //   3. The 6.2 patch-decomposition redesign needs single-id reads;
+  //      `getMediaBuys` is the foundation.
+  //   4. Framework auto-stores returned media buys for hydration on
+  //      subsequent updateMediaBuy calls (see `hydratePackagesWithProducts`
+  //      pattern in `from-platform.ts`).
+  //
+  // Proposal-mode adopters (write-only via push channels) return an empty
+  // `media_buys: []` array — that's a valid response.
+  /**
+   * List media buys this account owns. Filter + pagination per the wire shape.
+   *
+   * **Multi-id contract.** `req.media_buy_ids` is an array — buyers
+   * routinely request a specific set of buys in one call. The platform
+   * MUST iterate every id and return one element per id in the response
+   * `media_buys[]` array. Reading only `media_buy_ids[0]` silently
+   * truncates the buyer's request — same correctness bug that #1342
+   * documented for `getMediaBuyDelivery`. Same recommended pattern: prefer
+   * an upstream multi-id query (one round-trip), fall back to per-id loop
+   * only when the upstream is single-id-only.
+   *
+   * When `media_buy_ids` is omitted, return a paginated set of accessible
+   * buys filtered by `status_filter` (defaults to `['active']`).
+   */
+  getMediaBuys?(req: GetMediaBuysRequest, ctx: Ctx<TCtxMeta>): Promise<GetMediaBuysPayload>;
+
+  // ── provide_performance_feedback: sync only ─────────────────────────
+  // Write tool — buyers report aggregate creative-level performance
+  // (impressions, clicks, conversions) to help the seller's optimizer learn.
+  // Optional because not every sales agent runs an optimizer, but every
+  // buyer expects to be able to call it. Framework returns UNSUPPORTED_FEATURE
+  // when omitted.
+  //
+  // ⚠️  NO-ACCOUNT TOOL — `ctx: NoAccountCtx<TCtxMeta>`. The wire request
+  // does not carry an `account` field. `ctx.account` may be `undefined` for
+  // `'explicit'`-resolution adopters; narrow before reading
+  // `ctx.account.ctx_metadata`. See {@link NoAccountCtx} and the
+  // `SalesPlatform` JSDoc ("No-account tools") for safe patterns.
+  /** Accept buyer-side performance signals on a media buy / creative. */
+  providePerformanceFeedback?(
+    req: ProvidePerformanceFeedbackRequest,
+    ctx: NoAccountCtx<TCtxMeta>
+  ): Promise<ProvidePerformanceFeedbackPayload>;
+
+  // ── list_creative_formats: sync only ────────────────────────────────
+  // Discovery tool — buyers query what creative formats this seller
+  // accepts. Optional because sellers that delegate to external
+  // `creative_agents` (declared in `capabilities.creative_agents[]`) don't
+  // own format definitions; framework can resolve from the declared agents.
+  // Self-hosted sellers (own creative library) implement this directly.
+  //
+  // ⚠️  NO-ACCOUNT TOOL — `ctx: NoAccountCtx<TCtxMeta>`. See
+  // `providePerformanceFeedback` note above.
+  listCreativeFormatsLegacy?(
+    req: ListCreativeFormatsRequest,
+    ctx: NoAccountCtx<TCtxMeta>
+  ): Promise<LegacyListCreativeFormatsPayload>;
+
+  // ── list_creatives: sync only ───────────────────────────────────────
+  // Read tool — buyers query the seller's creative library. Optional
+  // because most sales adopters delegate creative state to the
+  // `creative_agents` declared in capabilities; ad-server-style sales
+  // platforms implement directly. Note: also lives on `CreativeAdServerPlatform.listCreatives`
+  // for the standalone-creative-agent shape.
+  listCreatives?(req: CanonicalListCreativesRequest, ctx: Ctx<TCtxMeta>): Promise<ListCreativesPayload>;
+
+  // ── sync_catalogs: sync only ────────────────────────────────────────
+  // Retail-media catalog sync. Buyers push product catalogs (SKUs, ASINs,
+  // store-ids) for `sales-catalog-driven` agents (Amazon, Criteo, Citrusad,
+  // Walmart Connect, Shopify ad surfaces). Optional — non-retail sales
+  // adopters omit. Idempotent on the buyer's `idempotency_key`.
+  syncCatalogs?(req: SyncCatalogsRequest, ctx: Ctx<TCtxMeta>): Promise<SyncCatalogsPayload>;
+
+  // ── log_event: sync only ────────────────────────────────────────────
+  // Conversion / engagement event logging. Buyers post events tied to
+  // a `media_buy_id` for performance attribution. Used by retail-media
+  // (post-purchase events) and conversion-tracked sales (Snap pixel,
+  // Meta CAPI, LinkedIn conversions API). Optional.
+  logEvent?(req: LogEventRequest, ctx: Ctx<TCtxMeta>): Promise<LogEventPayload>;
+
+  // ── sync_event_sources: sync only ──────────────────────────────────
+  // Register conversion event sources (websites, apps, offline pixel
+  // IDs) so subsequent `log_event` calls can be attributed correctly.
+  // Optional — adopters who don't expose conversion tracking omit.
+  syncEventSources?(req: SyncEventSourcesRequest, ctx: Ctx<TCtxMeta>): Promise<SyncEventSourcesPayload>;
+}
+
+/**
+ * Names the **core sales surface** — bidding + media-buy lifecycle. Required
+ * for `sales-*` specialisms that own pricing/pacing
+ * (`sales-non-guaranteed`, `sales-guaranteed`, `sales-broadcast-tv`,
+ * `sales-streaming-tv`, `sales-exchange`, `sales-catalog-driven`,
+ * `sales-retail-media`).
+ *
+ * Walled-garden specialisms whose value surface is asset ingestion
+ * (`sales-social`, the `audience-sync` track, pure conversion-tracking
+ * adopters) DON'T need to implement these — see {@link SalesIngestionPlatform}.
+ *
+ * Used by `RequiredPlatformsFor<S>` to pick the right slice of `SalesPlatform`
+ * per claimed specialism.
+ *
+ * @public
+ */
+export type SalesCorePlatform<TCtxMeta = Record<string, unknown>> = Required<
+  Pick<
+    SalesPlatform<TCtxMeta>,
+    'getProducts' | 'createMediaBuy' | 'updateMediaBuy' | 'getMediaBuyDelivery' | 'getMediaBuys'
+  >
+>;
+
+/**
+ * Names the **asset-ingestion surface** — sync surfaces for creatives,
+ * audiences (via {@link import('./audiences').AudiencePlatform}), catalogs,
+ * events, plus the read/feedback tools. Walled-garden specialisms
+ * (`sales-social`) live here.
+ *
+ * Every method is optional individually. Adopters claiming `sales-social`
+ * pick whichever ingestion surfaces apply (typically `syncCreatives` +
+ * `logEvent` + `syncEventSources`); the rest stay omitted.
+ *
+ * Used by `RequiredPlatformsFor<S>` so claiming `sales-social` only requires
+ * this slice of `SalesPlatform`, not the full {@link SalesCorePlatform}.
+ *
+ * @public
+ */
+export type SalesIngestionPlatform<TCtxMeta = Record<string, unknown>> = Pick<
+  SalesPlatform<TCtxMeta>,
+  | 'syncCreatives'
+  | 'syncCatalogs'
+  | 'syncEventSources'
+  | 'logEvent'
+  | 'listCreativeFormatsLegacy'
+  | 'listCreatives'
+  | 'providePerformanceFeedback'
+>;

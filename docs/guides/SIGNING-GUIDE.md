@@ -1,0 +1,853 @@
+# Request Signing (RFC 9421)
+
+AdCP 3.0 supports [HTTP Message Signatures (RFC 9421)](https://www.rfc-editor.org/rfc/rfc9421) for cryptographic request authentication. A buyer signs outbound requests so the seller can verify who sent them and that the payload wasn't tampered with. A seller signs outbound webhooks so the buyer can verify authenticity.
+
+Signing is **optional in AdCP 3.0** — sellers populate `request_signing.required_for` selectively during per-counterparty pilots. AdCP **4.0** (the next breaking-changes window) requires signed requests on **spend-committing operations** (`create_media_buy`, `acquire_*`, etc.). Agents that don't sign yet must still tolerate signature headers (`Signature`, `Signature-Input`, `Content-Digest`) on inbound requests without breaking.
+
+## When You Need This
+
+| You are a... | You need to... | Why |
+|---|---|---|
+| **Buyer** (calls seller tools) | Sign outbound requests | Sellers may require proof that the request came from you |
+| **Buyer** (receives webhooks) | Verify inbound webhook signatures | Confirm the webhook came from the seller, not a spoofed source |
+| **Seller** (receives tool calls) | Verify inbound request signatures | Confirm the buyer is who they claim to be |
+| **Seller** (sends webhooks) | Sign outbound webhooks | Let buyers verify webhook authenticity |
+| **Orchestrator** (proxies to sellers) | Sign outbound requests + verify inbound webhooks | You're the buyer from the seller's perspective |
+
+## Concepts
+
+### Signature Coverage
+
+The AdCP signing profile always covers:
+
+- `@method` — HTTP method (POST)
+- `@target-uri` — full request URL
+- `@authority` — host header
+- `content-type` — media type (application/json)
+
+`content-digest` (SHA-256 or SHA-512 hash of the request body) is covered **conditionally**, controlled by the seller's `covers_content_digest` capability:
+
+- `'required'` — signers MUST cover `content-digest`. Body-unbound signatures rejected with `request_signature_components_incomplete`. **Recommended for spend-committing operations** in production.
+- `'either'` (default) — signer chooses per-request; verifier accepts both forms.
+- `'forbidden'` — signers MUST NOT cover `content-digest`. Opt-out for legacy infrastructure that can't preserve body bytes.
+
+If any covered component changes after signing, verification fails.
+
+### Key Separation
+
+Every agent needs **separate keys per purpose**:
+
+- `adcp_use: "request-signing"` — for signing outbound tool calls
+- `adcp_use: "webhook-signing"` — for signing outbound webhooks
+
+Reusing a key across purposes is forbidden by the spec. Each key has a unique `kid` (key ID) that verifiers use to look it up.
+
+### Discovery Chain
+
+Verifiers find your public key through a three-step chain:
+
+```
+Your domain (e.g., agent.example.com)
+  -> /.well-known/brand.json           # brand manifest with agent declarations
+     -> agents[].jwks_uri              # pointer to your key store
+        -> /.well-known/jwks.json      # JSON Web Key Set with public keys
+```
+
+`@adcp/sdk` provides `ResolvedAgentJwksResolver` which handles this entire chain automatically, with caching and refresh.
+
+## Step 1: Generate a Signing Key
+
+### CLI (recommended)
+
+```bash
+adcp signing generate-key --alg ed25519 --kid my-agent-2026 \
+  --private-out ./private.jwk --public-out ./public-jwks.json
+```
+
+This generates an Ed25519 keypair and writes:
+- `private.jwk` — the private key (JWK with `d` field). Keep this secret.
+- `public-jwks.json` — the public key in JWKS format. Publish this.
+
+### Programmatic
+
+```typescript
+import { generateKeyPair, exportJWK } from 'jose';
+
+const { publicKey, privateKey } = await generateKeyPair('EdDSA', { crv: 'Ed25519' });
+const publicJwk = await exportJWK(publicKey);
+const privateJwk = await exportJWK(privateKey);
+
+// Tag with metadata
+const kid = 'my-agent-2026';
+publicJwk.kid = kid;
+publicJwk.use = 'sig';
+publicJwk.key_ops = ['verify'];
+```
+
+### Supported Algorithms
+
+| Algorithm | `alg` value | Key type | Notes |
+|---|---|---|---|
+| Ed25519 | `ed25519` | `OKP` / `Ed25519` | Preferred. Fast, small signatures. |
+| ECDSA P-256 | `ecdsa-p256-sha256` | `EC` / `P-256` | Widely supported. GCP KMS recommended. |
+
+### Storing the Private Key
+
+The private key must be available to your application at runtime. Options:
+
+- **Environment variable**: `ADCP_SIGNING_PRIVATE_KEY='{"kid":"...","kty":"OKP",...}'`
+- **Secret manager** (GCP Secret Manager, AWS Secrets Manager, etc.): Load at boot, keep in memory for the process lifetime
+- **File**: For development only. Never commit to version control.
+
+## Step 2: Publish Your Public Keys
+
+### JWKS Endpoint
+
+Serve a JSON Web Key Set at a stable HTTPS URL:
+
+```
+GET https://agent.example.com/.well-known/jwks.json
+```
+
+```json
+{
+  "keys": [
+    {
+      "kid": "my-agent-2026",
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "x": "<base64url-encoded-public-key>",
+      "use": "sig",
+      "key_ops": ["verify"],
+      "adcp_use": "request-signing"
+    }
+  ]
+}
+```
+
+Only public keys go here — no `d` field. Set `Cache-Control: max-age=3600` or similar.
+
+If you serve both request-signing and webhook-signing keys, include both in the same JWKS with different `kid` values and `adcp_use` tags.
+
+### brand.json
+
+Serve at `/.well-known/brand.json` on your brand domain. This is the entry point for key discovery:
+
+```json
+{
+  "name": "My Company",
+  "domain": "example.com",
+  "agents": [
+    {
+      "type": "sales",
+      "id": "acme_sales",
+      "url": "https://agent.example.com",
+      "jwks_uri": "https://agent.example.com/.well-known/jwks.json"
+    }
+  ]
+}
+```
+
+Required per agent: `type`, `id`, `url`. The `type` enum is `brand | rights | measurement | governance | creative | sales | buying | signals` — pick the one matching this agent's role. `jwks_uri` is optional but recommended; verifiers default to `/.well-known/jwks.json` on the origin of `url` when absent.
+
+## Step 3: Sign Outbound Requests (Buyer / Orchestrator)
+
+### Wrapping fetch
+
+`createSigningFetch` wraps any `fetch`-compatible function to sign outbound requests:
+
+```typescript
+import { createSigningFetch } from '@adcp/sdk/signing';
+
+const privateJwk = JSON.parse(process.env.ADCP_SIGNING_PRIVATE_KEY);
+
+const signingFetch = createSigningFetch(fetch, {
+  keyid: 'my-agent-2026',
+  alg: 'ed25519',
+  privateKey: privateJwk,
+});
+
+// Use signingFetch anywhere you'd use fetch.
+// Signature, Signature-Input, and Content-Digest headers are added automatically.
+await signingFetch('https://seller.example.com/mcp', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(payload),
+});
+```
+
+Fetch implementations differ on whether a bare trailing `?` reaches the wire. `createSigningFetch` and `createSigningFetchAsync` reject signed URLs with that empty query marker before sending; use an endpoint URL without it for Fetch-based agent calls.
+
+### Agent-aware signing (recommended)
+
+For the common single-seller case, `createAgentSignedFetch` bundles capability detection, capability caching, and signing into one call. It only signs when the target seller advertises `signed-requests` support — so the `get_adcp_capabilities` priming call itself is always unsigned, as the spec requires.
+
+```typescript
+import { createAgentSignedFetch } from '@adcp/sdk/signing';
+
+const signedFetch = createAgentSignedFetch({
+  signing: {
+    kid: 'my-agent-2026',
+    alg: 'ed25519',
+    private_key: privateJwk,
+    agent_url: 'https://agent.example.com',
+  },
+  sellerAgentUri: 'https://seller.example.com',
+});
+
+await signedFetch('https://seller.example.com/mcp', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(payload),
+});
+```
+
+For multi-seller adapters, construct one preset per seller, or drop down to `buildAgentSigningFetch` directly with a request-dispatching `getCapability` callback:
+
+```typescript
+import { buildAgentSigningFetch, CapabilityCache } from '@adcp/sdk/signing/client';
+
+const capabilityCache = new CapabilityCache();
+const signingFetch = buildAgentSigningFetch({
+  signing: { kid: 'my-agent-2026', alg: 'ed25519', private_key: privateJwk, agent_url: 'https://agent.example.com' },
+  getCapability: () => capabilityCache.get('https://seller.example.com'),
+});
+```
+
+### Diagnosing a seller's rejection of a signed request
+
+The client evaluates the seller's `request_signing.protocol_methods_required_for` and `protocol_methods_warn_for` separately from AdCP operation lists. With `sign_supported: true`, it also signs methods in `protocol_methods_supported_for`. Matching uses the decoded, case-sensitive JSON-RPC method: `tasks/cancel` and `CancelTask` are distinct. `tools/call` belongs to the AdCP-operation namespace through `params.name` and cannot appear in protocol-method overrides.
+
+Use `request_signing.always_sign_protocol_methods: ['tasks/cancel', 'CancelTask']` for a pilot before the seller advertises coverage. This works with inline keys and signing providers, including a cold capability cache. Keep `always_sign` for AdCP operation names. Cached transports and shared discovery/testing clients distinguish these signing policies. An ambiguous JSON body is refused before dispatch when protocol-method signing policy applies.
+
+The SDK's compatibility task polls (`tasks_get` over MCP and skill `tasks/get` over A2A) are signed when a signer is configured and the seller declares `request_signing.supported: true` with a compatible signing profile. They need no operation-list entry. Each poll uses a fresh nonce; native MCP `tasks/get`, `tasks/result`, `tasks/list`, and `tasks/cancel` on a signing-configured transport follow protocol-method coverage. A misconfigured signing identity can now cause these compatibility polls to fail signature verification even if a bearer previously let the unsigned poll through. Best-effort A2A cancellation retains its signing policy and uses the active AdCP wire-version pin. With Web Bot Auth, cancellation requires cached profile support; if that evidence is unavailable, the best-effort cancellation is abandoned.
+
+For SDK client calls over A2A or MCP, a signed HTTP 401 with a `Signature` challenge (or no challenge) produces an `AuthenticationRequiredError` with `requestSigned: true` and `status: 401`. Its `code` remains `AUTHENTICATION_REQUIRED` for compatibility; `signatureErrorCode` carries a recognized seller `request_signature_*` code, and the message includes the protocol's repair hint. Check the public discovery chain, `brand_json_url` → `agents[]` → `jwks_uri`, when the seller cannot resolve your key. Explicit Bearer or Basic gateway challenges retain their existing authentication recovery. For client-credentials agents, a bare 401 still permits one token refresh; a persistent signed rejection keeps its diagnostics. Other signed bare 401s bypass unsigned authentication probes and interactive OAuth recovery, so gateways requiring those flows should send an explicit Bearer challenge.
+
+`error.responseBody` contains a bounded, redacted seller diagnostic when capture succeeds. It is non-enumerable and excluded from JSON error reports. Custom header values are conservatively treated as credentials; short values can mask matching diagnostic text. Treat it as untrusted operator diagnostic text; do not feed it to automated prompts or use it as recovery instructions. Failed `TaskResult` values preserve this error under `result.errorInstance`, so the diagnostic is available as `result.errorInstance.responseBody` after narrowing to `AuthenticationRequiredError`. Conformance raw capture uses the same bounded, redacted diagnostic rather than the original response bytes for these failures. Low-level signing fetch presets continue to return the original HTTP `Response`.
+
+## Step 3.5: Production Key Storage — KMS / HSM / Vault
+
+Holding a private JWK in process memory is fine for development and testing but it's not where you want production signing keys to live. A process compromise leaks the signing key, and the only remedy is rotation across every counterparty that's cached your public key (within their TTL). The AdCP spec recommends storing keys in a managed key store (HSM or KMS); the SDK supports this directly via the `SigningProvider` interface.
+
+### When to switch
+
+- **Stay in-process** for local development, integration tests, and pilot deployments where the signed traffic isn't financially significant.
+- **Move to KMS** before going live with mutating operations — `create_media_buy`, `acquire_*`, `sync_audiences`, anything that commits spend or changes shared state. RFC 9421 signing is recommended at AdCP 3.0 and **required for mutating ops at 3.1+**, so the threshold to care arrives soon.
+
+### The interface
+
+```typescript
+import type { SigningProvider } from '@adcp/sdk/signing';
+
+export interface SigningProvider {
+  sign(payload: Uint8Array): Promise<Uint8Array>;
+  readonly keyid: string;
+  readonly algorithm: 'ed25519' | 'ecdsa-p256-sha256';
+  readonly fingerprint: string;
+}
+```
+
+`sign(payload)` receives the canonical RFC 9421 signature base; the provider returns wire-format signature bytes (64-byte raw for Ed25519, 64-byte `r‖s` IEEE P1363 for ECDSA-P256 — **not** DER). `keyid` flows into `Signature-Input`; `algorithm` is the wire string; `fingerprint` is a stable opaque token (e.g., `projects/.../cryptoKeyVersions/N`) used by the SDK for transport-cache isolation. The SDK defensively hashes the fingerprint, so a buggy adapter that returns a low-entropy string can't collapse multi-tenant cache isolation.
+
+### Wiring a provider into your config
+
+`AgentRequestSigningConfig` is a discriminated union on `kind`. Existing literals continue to work — `kind` defaults to `'inline'` so adding the field isn't required. Switch to a KMS-backed signer by replacing the `private_key` block with `{ kind: 'provider', provider }`:
+
+```typescript
+import { createAgentSignedFetch } from '@adcp/sdk/signing';
+import { createGcpKmsSigningProvider } from './gcp-kms-signing-provider'; // see examples/
+
+const provider = await createGcpKmsSigningProvider({
+  versionName: process.env.ADCP_KMS_VERSION!,
+  kid: 'my-agent-2026',
+  algorithm: 'ed25519',
+  client: kmsClient,
+});
+
+const signedFetch = createAgentSignedFetch({
+  signing: {
+    kind: 'provider',
+    provider,
+    agent_url: 'https://agent.example.com',
+  },
+  sellerAgentUri: 'https://seller.example.com',
+});
+```
+
+The wire format is unchanged. Sellers can't tell the difference between a request signed in-process and one signed by KMS — the SDK's canonicalization is shared between the sync (in-process) and async (provider) paths via the same helpers.
+
+### GCP KMS reference adapter
+
+A complete reference lives at [`examples/gcp-kms-signing-provider.ts`](https://github.com/adcontextprotocol/adcp-client/blob/main/examples/gcp-kms-signing-provider.ts). The adapter handles two GCP-specific quirks:
+
+- **DER → IEEE P1363 conversion** for ECDSA. GCP KMS returns ECDSA signatures DER-encoded; AdCP and RFC 9421 §3.3.1 want raw `r‖s`. The SDK exports `derEcdsaToP1363(der, componentLen)` so any KMS adapter (GCP, AWS for ECDSA, Azure) can normalize at the boundary.
+- **Pre-flight algorithm check.** The adapter calls `getPublicKey` once at construction and throws `SigningProviderAlgorithmMismatchError` if the declared `algorithm` doesn't match the underlying key's algorithm. Without this, a misconfigured key produces signatures the verifier rejects with a generic `request_signature_invalid` — useless for diagnosis. Pre-flight failure is loud and specific.
+
+The published `@adcp/sdk` package keeps `@google-cloud/kms` out of its dependencies — copy the example into your project and `npm i @google-cloud/kms` yourself. Mirror the same shape for AWS KMS (`@aws-sdk/client-kms`), Azure Key Vault, or HashiCorp Vault Transit.
+
+### Setting up GCP KMS — the parts that actually matter
+
+1. **Key purpose.** Asymmetric sign. Algorithm: `EC_SIGN_P256_SHA256` is the well-trodden default; `EC_SIGN_ED25519` is GA but availability varies by region — verify before pinning.
+2. **Protection level.** Software is fine for AdCP — keeps the private scalar inside Google's KMS service (your process never sees it). HSM (~10× cost) is only required if you have a regulatory mandate.
+3. **IAM.** Grant `roles/cloudkms.signer` on the **key** (versions inherit the policy; per-version IAM isn't a knob GCP exposes). Treat the key as single-purpose — RFC 9421's `tag` parameter protects verifiers, not signers, so reusing the same KMS key across protocols creates a cross-protocol oracle. Bind IAM so only the AdCP signing path can call `asymmetricSign`.
+4. **JWKS publication.** Pull the public key (`gcloud kms keys versions get-public-key 1 --output-file=pub.pem`), convert PEM → JWK (the `jose` package's `importSPKI` + `exportJWK` is one line each), publish at your agent's `jwks_uri`. The `kid` you use in the `SigningProvider` must match what's published. Keep `kid` short and stable (e.g. `addie-2026-04`) — don't put the full GCP resource name on the wire; that's what `versionName` is for.
+5. **Rotation.** GCP KMS asymmetric keys don't auto-rotate. Pin `versionName` to a specific `cryptoKeyVersions/N`, redeploy when you cut a new version. This is consistent with publishing both versions in your JWKS during the transition.
+
+### Authentication when your runtime is outside GCP
+
+If your agent runs on Cloud Run / GKE / Compute Engine, ADC handles auth automatically — `new KeyManagementServiceClient()` finds credentials via the metadata service.
+
+If your agent runs **outside GCP** (Fly.io, Railway, AWS, your own VMs), you have two options, neither of them frictionless today:
+
+- **Service-account JSON key + Fly secret.** Simplest path. Create a service account, grant it `roles/cloudkms.signer` on the key, generate a JSON key, set as a Fly secret (or equivalent), construct the client with explicit credentials. The signing key still lives in KMS (never in your process); only the access credential lives in your secret store. Rotate the SA key every ~90 days as hygiene. **Caveat:** GCP orgs commonly enforce `constraints/iam.disableServiceAccountKeyCreation`, which blocks this — you'll need a temporary org-policy exception (project owner can grant themselves `orgpolicy.policyAdmin` and toggle the constraint for the project; takes seconds with the right role).
+- **Workload Identity Federation.** The right answer long-term, but requires the runtime to issue OIDC tokens GCP can trust. Fly currently issues Macaroons, not OIDC, so WIF doesn't drop in. Worth revisiting when Fly ships native OIDC.
+
+For non-GCP runtimes that lack OIDC and where the org policy blocks SA keys, the operationally clean fallback is a **Cloud Run remote-signer sidecar** — a tiny GCP-hosted service that exposes `POST /sign`, runs as the signer SA (gets ADC for free), authenticates incoming calls via shared secret. Adds 30–100 ms per signed request; no SA key in the off-cloud secret store.
+
+### Threat model upgrade — what you actually buy
+
+| Compromise | In-process key | KMS-backed signer (any auth path) |
+|---|---|---|
+| Process memory dump | Signing key gone — full impersonation until JWKS rotates everywhere | Signing key untouched — only the auth credential leaks (revocable in seconds) |
+| Recovery | Rotate the JWK + push to all counterparties + wait out their cache TTL | Revoke the SA key (or KMS access) — signing stops immediately, JWK unchanged |
+| Auditability | Whatever your app logs | Cloud audit log: every `asymmetricSign` call, by identity, with version |
+
+### Testing — `InMemorySigningProvider`
+
+The SDK ships `InMemorySigningProvider` under a separate import path so production imports surface the KMS path first. Use `mintEphemeralEd25519Key` to generate a typed keypair ready for use with the provider — it handles the Node `JsonWebKey.kty?: string` → `AdcpJsonWebKey.kty: string` reshape so you don't have to.
+
+**Buyer (request-signing):**
+
+```typescript
+import { createAgentSignedFetch } from '@adcp/sdk/signing';
+import { mintEphemeralEd25519Key, InMemorySigningProvider } from '@adcp/sdk/signing/testing';
+
+// Pass adcp_use: 'request-signing' — this section is about buyer outbound requests.
+const { kid, algorithm, privateKey, publicKey } = await mintEphemeralEd25519Key({
+  adcp_use: 'request-signing',
+});
+// Publish `publicKey` in your /.well-known/jwks.json `keys` array.
+
+const provider = new InMemorySigningProvider({ keyid: kid, algorithm, privateKey });
+const signedFetch = createAgentSignedFetch({
+  signing: { kind: 'provider', provider, agent_url: 'https://your-agent.example.com' },
+  sellerAgentUri: 'https://seller.example.com',
+});
+```
+
+**Seller (webhook-signing):** `mintEphemeralEd25519Key()` defaults to `adcp_use: 'webhook-signing'` — omit the option when generating test keys for outbound webhook callbacks.
+
+The `InMemorySigningProvider` constructor refuses to instantiate when `NODE_ENV=production` unless `ADCP_ALLOW_IN_MEMORY_SIGNER=1` is set explicitly — defense-in-depth so a copy-paste from a test file doesn't accidentally ship to prod. The gate is a self-discipline aid for the bundled implementation; the SDK can't enforce hygiene on third-party providers.
+
+### Validating a signer before going live — `adcp grade signer`
+
+Before pushing live signed traffic from a KMS-backed signer, exercise the full signing path through the SDK's verifier so misconfigurations surface as specific RFC 9421 error codes (the same codes a counterparty would reject with) rather than the generic `request_signature_invalid` you'd see in the seller's monitoring after the fact.
+
+```bash
+# KMS-backed signer via an HTTPS signing oracle (no private key handed to the CLI):
+adcp grade signer https://addie.example.com \
+  --signer-url https://signer.internal/sign \
+  --signer-auth "Bearer ${SIGNER_TOKEN}" \
+  --kid addie-2026-04 \
+  --alg ed25519 \
+  --jwks-url https://addie.example.com/.well-known/jwks.json
+```
+
+The grader produces a sample signed AdCP request through your signer, then verifies it against your published JWKS. PASS means a counterparty verifier will accept your signatures. FAIL produces a specific `error_code` and `step` matching the verifier-checklist semantics, so DER-vs-P1363 / kid-mismatch / wrong-key / algorithm-mismatch each surface as a distinct diagnostic.
+
+The signing-oracle protocol is intentionally minimal — `POST {payload_b64, kid, alg}` returns `{signature_b64}` — so any KMS adapter can put a small handler in front of `provider.sign()` for grading without exposing the underlying KMS.
+
+For local dev / non-KMS testing, `--key-file <jwk-path>` accepts an in-process JWK directly. Same grader, same report.
+
+## Step 4: Verify Inbound Signatures (Seller)
+
+### Express middleware
+
+```typescript
+import { createExpressVerifier, StaticJwksResolver } from '@adcp/sdk/signing';
+import { adcpOperationResolver } from '@adcp/sdk/server';
+
+// Raw-body capture MUST be mounted ahead of the verifier — express.json()
+// would otherwise consume the stream and the verifier would have no bytes to
+// hash. `rawBodyVerify` comes from `createExpressAdapter()`; the inline form is
+// equivalent.
+app.use(express.json({ verify: adapter.rawBodyVerify }));
+// or: app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); } }));
+
+app.post(
+  '/mcp',
+  createExpressVerifier({
+    capability: {
+      supported: true,
+      covers_content_digest: 'required',
+      required_for: ['create_media_buy', 'update_media_buy'],
+    },
+    jwks: new StaticJwksResolver(buyerPublicKeys),
+    resolveOperation: adcpOperationResolver,
+  }),
+  handler
+);
+```
+
+`replayStore` and `revocationStore` default to in-memory implementations — fine for single-process deployments.
+
+`createExpressVerifier()` scopes replay entries and their safety cap by the exact signed `@target-uri`, including the query string. It verifies signatures; it does not decide which URLs are equivalent application routes. If you mount it directly on an MCP endpoint such as `/mcp`, reject query-string variants before the verifier unless your router treats each variant as a distinct supported endpoint. Otherwise a valid signer could create many replay-cache scopes by varying the query. The higher-level `serve()` helper already rejects query variants on its MCP mount. Do not use the replay-cache cap as a global request rate limiter.
+
+Check the raw request target for `?` when enforcing that rule: `/mcp?` has an empty parsed query but remains a distinct signed target.
+
+**For multi-instance verifier deployments, the in-memory default is a real gap.** Each process has its own cache; an attacker who captures a signed request can replay it against a sibling instance whose cache hasn't seen the nonce. The replay-protection invariant is "this `(keyid, scope, nonce)` tuple has not been seen before" — that has to hold across the fleet, not per-process. RFC 9421 expiry bounds the window to 5 minutes, but that's plenty of time for an in-flight replay. Use a shared backend.
+
+The SDK ships `PostgresReplayStore` for this:
+
+```typescript
+import { Pool } from 'pg';
+import { PostgresReplayStore, getReplayStoreMigration, sweepExpiredReplays } from '@adcp/sdk/signing/server';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+// Run on every deploy before serving traffic. It is idempotent and upgrades
+// existing installations with the guarded-insert database function.
+await pool.query(getReplayStoreMigration());
+
+const replayStore = new PostgresReplayStore(pool);
+
+// Postgres has no native TTL — schedule the sweeper somewhere to delete
+// expired rows. Once a minute is fine for moderate traffic; tune down if
+// the verifier sees thousands of signed requests per second.
+setInterval(() => sweepExpiredReplays(pool).catch(console.error), 60_000);
+
+app.use(createExpressVerifier({
+  capability: { ... },
+  jwks,
+  replayStore,                                                  // <-- shared across instances
+  resolveOperation: adcpOperationResolver,
+}));
+```
+
+The schema uses one table with `(keyid, scope, nonce)` as the primary key, indexes on `expires_at` and `(keyid, scope, expires_at)`, and a table-specific guarded-insert function. Each insert attempt is one round trip to that function, which tries a transaction-scoped advisory lock and handles the replay/cap/insert decision atomically. Busy scopes use bounded client-side retry between queries, so pooled connections remain available to unrelated scopes. Rerun `getReplayStoreMigration()` before deploying an SDK upgrade so the function stays current; the migration is idempotent. The sweeper exists because Postgres has no native row-level TTL — it's a `DELETE FROM replay_cache WHERE expires_at <= now()` you call on a schedule. Other backends (Redis, KeyDB, anything supporting atomic insert-if-absent with TTL) can implement the `ReplayStore` interface the same way.
+
+The request and RFC 9421 webhook verifiers require an unpadded Base64URL nonce containing at least 16 bytes. SDK signers generate one by default. If you override `nonce`, use at least 16 random bytes encoded with `randomBytes(16).toString('base64url')`; short labels and padded values are rejected with `request_signature_params_incomplete` or `webhook_signature_params_incomplete` before key discovery.
+
+After signature and digest verification succeed, the verifier records the nonce before checking JSON body well-formedness. An authenticated malformed body returns `request_body_malformed` or `webhook_body_malformed` at checklist step 14; sending that frame again returns the replay error. Duplicate keys, invalid UTF-8 body bytes, and leading BOMs are refused. Errors contain a fixed message and reason code, without submitted body bytes or duplicate key names. Request operation-resolution prechecks can reject ambiguous bodies earlier, before signature verification.
+
+On successful verification, `req.verifiedSigner` contains `{ keyid, agent_url?, verified_at }`. On failure, the middleware returns `401` with `WWW-Authenticate: Signature error="<code>"`.
+
+### Operation resolution: MCP and A2A
+
+`required_for`, `supported_for`, and `warn_for` match the operation resolved from the request, not the JSON-RPC method (adcp#7945). `adcpOperationResolver` (from `@adcp/sdk/server`) implements the rule for both transports:
+
+| Request | Resolved operation |
+|---|---|
+| MCP `tools/call` | `params.name` |
+| A2A `SendMessage`, `SendStreamingMessage`, `message/send`, `message/stream` | `skill` of the Message's sole DataPart |
+| Any other JSON-RPC method (`tasks/*`, `CancelTask`, `initialize`) | none; matched by `protocol_methods_*` only |
+
+A body that does not resolve to exactly one operation returns the distinguished `UNRESOLVABLE_OPERATION`, and the verifier rejects it with `request_body_malformed` before it reads any signature header or capability list, signed or not. That covers zero or several DataParts, FileParts, a Part with two content members, a `skill` that is not a non-empty string, duplicate keys (after JSON string decoding), case variants of a recognized member name (`Skill`, `Parts`), and batches. Never treat an unresolvable body as "an operation that is not in `required_for`": a resolver that returns `undefined` for an A2A message (as `mcpToolNameResolver` does) leaves `required_for` unenforced over A2A.
+
+`createAdcpServer({ signedRequests })` and `createA2AAdapter` use this resolver for you. When you compose authenticators by hand, `requireAuthenticatedOrSigned` defaults to it, rejects unresolvable bodies, and also runs the verifier's unsigned-branch checks: `protocolMethodsRequiredFor`, and the webhook-authentication rule, which a valid bearer does not satisfy.
+
+### Composing with bearer auth
+
+`requireAuthenticatedOrSigned` bundles signature verification with credential fallback in one call: when signature headers are present, only signature auth runs (no bearer fallback — that prevents bypass attacks); when absent, the credential authenticator runs as normal; and `requiredFor` enforces the spec's `request_signature_required` 401 on mutating operations that arrive unsigned without other credentials.
+
+```typescript
+import { MUTATING_TASKS } from '@adcp/sdk';
+import {
+  serve,
+  verifyApiKey,
+  verifySignatureAsAuthenticator,
+  requireAuthenticatedOrSigned,
+  adcpOperationResolver,
+} from '@adcp/sdk/server';
+import { ResolvedAgentJwksResolver } from '@adcp/sdk/signing/server';
+
+serve(createAgent, {
+  authenticate: requireAuthenticatedOrSigned({
+    signature: verifySignatureAsAuthenticator({
+      capability: { supported: true, required_for: ['create_media_buy'], covers_content_digest: 'either' },
+      jwks: new ResolvedAgentJwksResolver(expectedBuyerAgentUrl, 'mcp'),
+      resolveOperation: adcpOperationResolver,
+    }),
+    fallback: verifyApiKey({ keys: { 'sk_live_abc': { principal: 'acct_42' } } }),
+    requiredFor: ['create_media_buy', 'update_media_buy'],
+    resolveOperation: adcpOperationResolver,
+  }),
+});
+```
+
+Set `requiredFor` to the AdCP operations you want to gate behind signatures — start narrow during pilots, then widen. The spec stance for 3.0 is "empty by default; populate selectively per counterparty." 4.0 will require all spend-committing operations to be in this list. `MUTATING_TASKS` (exported from `@adcp/sdk`) is the full mutating set if you want to spread it as the upper bound: `requiredFor: [...MUTATING_TASKS]` — note that includes audit-class operations like `sync_audiences` and `report_usage` that 4.0's mandate does NOT cover, so it's stricter than the spec floor.
+
+### JWKS resolution options
+
+| Resolver | Use case |
+|---|---|
+| `StaticJwksResolver` | Fixed set of known buyer keys. Good for dev/testing. |
+| `HttpsJwksResolver` | Fetches JWKS from a URL with caching and refresh. |
+| `ResolvedAgentJwksResolver` | Capability-bound discovery from an expected agent URL. Production recommended. |
+| `BrandJsonJwksResolver` | Confirms an operator mapping against capabilities; accepts an explicit `agentUrl` or infers a unique onboarding URL from existing configuration. |
+
+## Step 5: Verify Inbound Webhooks (Buyer / Orchestrator)
+
+When sellers send webhooks, verify the signature to confirm authenticity:
+
+```typescript
+import {
+  verifyWebhookSignature,
+  ResolvedAgentJwksResolver,
+  InMemoryReplayStore,
+  InMemoryRevocationStore,
+} from '@adcp/sdk/signing/server';
+
+const jwks = new ResolvedAgentJwksResolver(expectedSellerAgentUrl, 'mcp', { legacyWebhookFallback: true });
+const replayStore = new InMemoryReplayStore();
+const revocationStore = new InMemoryRevocationStore();
+
+app.post('/webhook', async (req, res) => {
+  try {
+    await verifyWebhookSignature(req, { jwks, replayStore, revocationStore });
+  } catch (err) {
+    return res.status(401).json({ error: 'invalid webhook signature' });
+  }
+
+  // Process the verified webhook...
+});
+```
+
+Webhook-v1 uses unpadded Base64URL for `Signature` throughout AdCP 3.x,
+including 3.2. Its URL canonicalization follows AdCP 3.2 independently of
+that encoding. The 3.2 request-signing migration to padded standard Base64
+does not change the webhook-v1 profile. Python senders should use
+`adcp.signing.webhook_signer.sign_webhook` rather than a generic
+`sign_request` call with `signing_profile_version="3.2"` and the webhook tag.
+See the [protocol's binary-value encoding rules](https://github.com/adcontextprotocol/adcp/blob/v3.2.5/docs/building/by-layer/L1/security.mdx#adcp-rfc-9421-profile).
+
+When a known peer uses a generic RFC 9421 signer that emits standard padded
+Base64, configure that receiver route explicitly:
+
+```typescript
+await verifyWebhookSignature(req, {
+  jwks,
+  replayStore,
+  revocationStore,
+  signatureEncoding: 'rfc8941-base64',
+});
+```
+
+`createWebhookVerifier` accepts the same option. Each mode strictly parses
+its configured encoding; neither retries the other encoding. Select this
+option from trusted integration configuration, independently of incoming
+headers or webhook payloads.
+
+## Step 6: Sign Outbound Webhooks (Seller)
+
+Configure `createAdcpServerFromPlatform` with a webhook signing key:
+
+```typescript
+serve(() => createAdcpServerFromPlatform(myPlatform, {
+  name: 'My Seller',
+  version: '1.0.0',
+  webhooks: {
+    signerKey: {
+      keyid: 'my-seller-webhook-2026',
+      alg: 'ed25519',
+      privateKey: webhookPrivateJwk,
+    },
+  },
+}));
+```
+
+The framework signs every outbound webhook automatically using the configured key.
+
+### Webhook SSRF defense — pin-and-bind fetch
+
+Buyers register an arbitrary `push_notification_config.url` and your agent posts signed payloads to it. Validating the literal hostname at registration time is not enough: a DNS-rebinding attack (TTL flip from a public IP to `169.254.169.254` or `127.0.0.1` between registration and delivery) routes the signed payload to attacker-controlled infrastructure or your own cloud-metadata endpoint.
+
+The SDK exports `createPinAndBindFetch()` — a `fetch` that resolves DNS, validates every resolved IP against the AdCP SSRF policy (RFC 1918, loopback, link-local, CGNAT, IPv6 ULA, IPv4-mapped IPv6, cloud metadata), and pins the TCP/TLS connection to the validated address. TLS SNI and the `Host:` header are preserved so HTTPS routing still works.
+
+Wire it as the `fetch` for production webhook delivery:
+
+```typescript
+import { createAdcpServerFromPlatform, createWebhookEmitter, createPinAndBindFetch } from '@adcp/sdk/server';
+
+createAdcpServerFromPlatform(myPlatform, {
+  name: 'My Seller',
+  version: '1.0.0',
+  webhooks: {
+    signerKey: { /* ... */ },
+    deliveryStore: durableWebhookDeliveryStore,
+    deliveryRecovery: durableWebhookOutbox,
+    fetch: createPinAndBindFetch(),
+  },
+});
+```
+
+`deliveryStore` must be shared and durable in production. Its atomic `claim()`
+binds the trusted publisher/tenant namespace plus one SDK-local delivery ID to
+the delivery key and canonical payload fingerprint. The backend supplies its
+authoritative first-attempt time and retains the full binding through the
+advertised retry horizon; the first later claim atomically replaces the binding
+with a permanent un-rebindable tombstone. The in-memory reference store is for
+development and tests only.
+
+`deliveryRecovery` is the corresponding durable outbox. Its `checkpoint()`
+runs before binding or network delivery and must retain the exact destination,
+payload (including its original timestamp), authentication reference, and
+retry policy. It must arrange replay of unsettled entries after process
+restart; `settle()` runs only after 2xx delivery or a non-retryable outcome.
+Encrypt authentication material at rest and store a key reference where your
+implementation can do so. This recovery seam is required in production so the
+advertised retry horizon represents actual recoverable state.
+
+The SDK includes PostgreSQL and Redis implementations for both layers, so
+applications do not need to reproduce the atomic binding and lease rules:
+
+```typescript
+import {
+  createPostgresWebhookRuntime,
+} from '@adcp/sdk/server';
+
+const deliveryTable = 'myagent_webhook_deliveries';
+const outboxTable = 'myagent_webhook_outbox';
+const webhooks = createPostgresWebhookRuntime({
+  db: pool,
+  publisherScope: 'myagent-production',
+  deliveries: { tableName: deliveryTable },
+  outbox: { tableName: outboxTable },
+  signerProvider,
+  authenticationAdapter: {
+    protect: (authentication, key) => secretManager.protect(authentication, key),
+    resolve: (protectedValue, key) => secretManager.resolve(protectedValue, key),
+  },
+});
+
+for (const sql of webhooks.migrations.all) await pool.query(sql);
+await webhooks.probe();
+
+createAdcpServerFromPlatform(platform, {
+  name: 'myagent-production',
+  version: '1.0.0',
+  webhooks: webhooks.serverConfig,
+});
+
+await webhooks.recoverOnce({
+  ownerToken: process.env.INSTANCE_ID,
+  errorRetryAfterMs: 30_000,
+  onError: (error, lease) => metrics.recordWebhookRecoveryError(error, lease.key),
+});
+```
+
+Redis deployments use `redisWebhookDeliveryStore()` and
+`redisWebhookDeliveryRecoveryBackend()` with deployment-unique prefixes. Both
+PostgreSQL table names and Redis key prefixes must be unique to the deployment;
+an isolated database can instead be acknowledged explicitly. Both
+backends use their own clocks for retention, leases, and retry scheduling. The
+initial checkpoint atomically leases the live send, preventing a recovery worker
+from racing the normal POST. Lease owner plus version fences stale workers after
+a crash or takeover; polling heartbeats one delivery before claiming the next.
+`pollWebhookDeliveryRecovery()` performs one bounded poll; the application owns
+its scheduler, retry policy, metrics, and alerting. A thrown delivery error is
+released after `errorRetryAfterMs` (one second by default), and `onError`
+receives delivery and lease-renewal failures without changing fence ownership.
+The `deliver` callback must enforce an abortable transport timeout shorter than
+the retry horizon. The poller deliberately does not time out the callback and
+release its lease: doing so cannot cancel an arbitrary side effect and could let
+a replacement worker duplicate an HTTP request that is still running.
+Terminal binding-retirement errors are fenced-settled instead of hot-looping.
+Recovery rejects serialized snapshots larger than 2 MiB by default
+(`maxSnapshotBytes` can set a lower application limit). `delivery_id` is a
+trusted server-generated identity, not a tenant-supplied wire value. Operators
+must still enforce database/Redis capacity quotas and alerts per deployment:
+delivery bindings and their retired tombstones intentionally remain durable so
+an expired identity cannot be rebound and replayed.
+Delivery handlers must be
+idempotent (or use a transactional outbox with their side effects), because no
+library can make an external HTTP effect and a separate database acknowledgement
+one atomic transaction.
+
+The SDK never owns KMS keys. `WebhookAuthenticationAdapter` is the boundary for
+encryption or opaque secret references; durable recovery rejects bearer/HMAC
+snapshots when no adapter is configured. The adapter must authenticate the
+supplied tenant, delivery, destination, and snapshot-context values as AAD.
+Backends verify stored snapshot hashes before secret resolution and redact the
+payload and protected secret reference at settlement. Tenant authorization, RBAC, product
+APIs, and any webhook-management UI remain application concerns.
+
+The default in 5.x is still `globalThis.fetch` because pin-and-bind blocks loopback http URLs (the storyboard runner's `createWebhookReceiver` listens on `http://127.0.0.1:port`); flipping the default would break in-process storyboard runs without a migration. In v6 the default flips to `createPinAndBindFetch()`. Adopters whose tests run against the storyboard runner should pass `LOOPBACK_OK_WEBHOOK_SSRF_POLICY` for those runs — it relaxes only the loopback + http rules and keeps every other CIDR / metadata-host deny in place:
+
+```typescript
+import { createPinAndBindFetch, LOOPBACK_OK_WEBHOOK_SSRF_POLICY } from '@adcp/sdk/server';
+
+const isStoryboardRun = process.env.ADCP_STORYBOARD === '1';
+const webhookFetch = createPinAndBindFetch({
+  policy: isStoryboardRun ? LOOPBACK_OK_WEBHOOK_SSRF_POLICY : undefined,
+});
+```
+
+`fetch: globalThis.fetch` is also valid as an escape hatch but disables every CIDR + scheme rule, not just loopback — `LOOPBACK_OK_WEBHOOK_SSRF_POLICY` is the safer override.
+
+For adopters running behind an egress proxy that already enforces the SSRF policy at the network boundary, keep your existing `fetch`; pin-and-bind is redundant in that case.
+
+`createPinAndBindFetch` is generic and not webhook-specific — wire it anywhere you make outbound calls to a URL you don't fully trust.
+
+### Multi-tenant: signing key on `TenantConfig` (auto-wired)
+
+When you're hosting many tenants with `createTenantRegistry`, set the webhook signing key once on `TenantConfig.signingKey` — the registry plumbs it into the tenant's webhook emitter automatically so you don't have to wire `serverOptions.webhooks.signerKey` per tenant.
+
+```typescript
+import { createTenantRegistry } from '@adcp/sdk/server';
+
+const registry = createTenantRegistry({
+  defaultServerOptions: { name: 'multi-tenant-host', version: '1.0.0' },
+});
+
+registry.register('acme', {
+  agentUrl: 'https://acme.example.com',
+  signingKey: {
+    keyId: 'acme-2026-05',
+    publicJwk: { ...acmePublicJwk, adcp_use: 'webhook-signing' },
+    privateJwk: { ...acmePrivateJwk, adcp_use: 'webhook-signing' },
+  },
+  platform: acmePlatform,
+});
+```
+
+The registry validates two things for you:
+
+1. **JWKS publication.** `publicJwk` MUST appear in the tenant's brand.json at `{agentUrl}/.well-known/brand.json` — the registry fetches it on register() and refuses traffic to tenants whose key isn't published (default validator).
+2. **Key purpose.** Both halves of the key MUST carry `adcp_use: "webhook-signing"`. Mismatched or missing `adcp_use` throws at register() with a remediation hint, citing adcp#2423 (key-purpose discriminator).
+
+Adopters wiring KMS-backed signing or a distinct webhook key per tenant set `serverOptions.webhooks.signerKey` / `signerProvider` explicitly — the explicit config wins and auto-wiring is skipped.
+
+### Self-signed dev path
+
+Production needs a published brand.json at `{agentUrl}/.well-known/brand.json` with the public key under `jwks.keys[]`. Dev / sandbox / fast-iteration loops don't have that yet, but adopters still want to exercise the signing pipeline locally. Two helpers cover the gap:
+
+```typescript
+import {
+  createTenantRegistry,
+  createSelfSignedTenantKey,
+  createNoopJwksValidator,
+} from '@adcp/sdk/server';
+
+// 1. Generate an Ed25519 keypair tagged adcp_use: 'webhook-signing'.
+//    No KMS, no JWKS publication — keypair lives in-process.
+const key = await createSelfSignedTenantKey({ keyId: 'dev-key-1' });
+
+// 2. Skip the brand.json roundtrip with the no-op validator.
+//    REFUSES to construct outside NODE_ENV ∈ {test, development} unless
+//    you set ADCP_NOOP_JWKS_ACK=1 — keeps prod safe by default.
+const registry = createTenantRegistry({
+  jwksValidator: createNoopJwksValidator(),
+  defaultServerOptions: { name: 'dev', version: '0.0.0' },
+});
+
+// 3. Register and go. The auto-wire still fires; webhooks are
+//    RFC 9421-signed with `key`, validation against brand.json is
+//    skipped, tenant reaches `healthy` immediately.
+registry.register('dev-tenant', {
+  agentUrl: 'https://dev-tenant.localhost',
+  signingKey: key,
+  platform: yourPlatform,
+});
+```
+
+Promotion path to production: replace `createNoopJwksValidator()` with the default (just remove the `jwksValidator` line), publish the public half of `key` at `{agentUrl}/.well-known/brand.json` under `jwks.keys[]` with `adcp_use: "webhook-signing"`, swap the in-memory key for a KMS-backed `SigningProvider` wired on `serverOptions.webhooks.signerProvider` for tenants where the in-process risk profile isn't acceptable.
+
+### Unsigned tenants (3.x optional path)
+
+AdCP 3.x classifies request signing as optional but recommended. Adopters spiking the SDK before standing up KMS or publishing brand.json can omit `signingKey` entirely:
+
+```typescript
+registry.register('not-signing-yet', {
+  agentUrl: 'https://later.example.com',
+  // signingKey omitted — JWKS validation skipped, webhook auto-wire
+  // skipped, tenant goes straight to `healthy` with
+  // reason: 'unsigned (no signingKey)'. Outbound webhooks are unsigned.
+  platform: yourPlatform,
+});
+```
+
+AdCP 4.0 will mandate `signingKey`; until then this is a soft launch path. Buyers MUST NOT break when an agent doesn't sign in 3.x — the "tolerate Signature headers regardless" baseline applies whether or not the agent signs (CLAUDE.md § Protocol-Wide Requirements).
+
+## Step 7: Declare the Capability
+
+If your seller agent verifies inbound signatures, declare `request_signing` in your capabilities so buyers know to sign:
+
+```typescript
+createAdcpServerFromPlatform(myPlatform, {
+  name: 'My Seller',
+  version: '1.0.0',
+  capabilities: {
+    overrides: {
+      request_signing: {
+        supported: true,
+        required_for: ['create_media_buy', 'update_media_buy'],
+        supported_for: ['sync_creatives', 'sync_audiences'],
+        covers_content_digest: 'required',
+      },
+    },
+  },
+});
+```
+
+The capability key is `request_signing` (not `signed_requests`) — that's what `AdcpCapabilitiesOverrides` and the spec's `get_adcp_capabilities` response advertise. The wrong key is silently dropped, leaving the verifier wired up but invisible to buyers.
+
+## Key Rotation
+
+The JWKS endpoint supports multiple keys simultaneously, enabling zero-downtime rotation:
+
+1. Generate a new keypair with a new `kid`
+2. Add the new public key to JWKS (both old and new are published)
+3. Update signing configuration to use the new private key
+4. After 24-48 hours, remove the old public key from JWKS
+
+## Testing
+
+### Conformance vectors
+
+The library ships 39 test vectors in `compliance/cache/3.0.0/test-vectors/request-signing/`:
+
+- **12 positive vectors**: Valid signed requests your verifier must accept (non-4xx response)
+- **27 negative vectors**: Invalid requests your verifier must reject with `401` and the correct error code
+
+### Grading your verifier
+
+```bash
+adcp grade request-signing https://agent.example.com/mcp --auth-token $TOKEN
+```
+
+### Debugging a single vector
+
+```bash
+adcp signing verify-vector \
+  --vector compliance/cache/3.0.0/test-vectors/request-signing/positive/001-basic-post.json
+```
+
+### Error codes
+
+When verification fails, return `401` with `WWW-Authenticate: Signature error="<code>"`. These are the codes the conformance vectors at `compliance/cache/3.0.0/test-vectors/request-signing/negative/` exercise — they're a separate signature-error namespace surfaced via `WWW-Authenticate`, not entries in the AdCP `enums/error-code.json`:
+
+| Code | Meaning |
+|---|---|
+| `request_signature_required` | Signature headers absent on an operation listed in `required_for` |
+| `request_signature_invalid` | Signature doesn't verify against the public key |
+| `request_signature_window_invalid` | `created` outside the acceptable freshness window |
+| `request_signature_replayed` | (`keyid`, `nonce`) tuple was already used |
+| `request_signature_key_revoked` | Key marked revoked in the revocation store |
+| `request_signature_key_unknown` | `keyid` not found in JWKS |
+| `request_signature_alg_not_allowed` | `alg` outside the AdCP-permitted set (`ed25519`, `ecdsa-p256-sha256`) |
+| `request_signature_components_incomplete` | `covers_content_digest: 'required'` but `content-digest` missing from coverage |
+| `request_signature_components_unexpected` | `covers_content_digest: 'forbidden'` but `content-digest` was covered anyway |
+| `request_signature_digest_mismatch` | `content-digest` header doesn't match the body bytes |
+| `request_signature_header_malformed` | `Signature` / `Signature-Input` parse error |
+| `request_signature_key_purpose_invalid` | Key's `adcp_use` doesn't permit request signing |
+| `request_signature_params_incomplete` | Missing required parameters (`created`, `nonce`, `tag`) |
+| `request_signature_rate_abuse` | Same `keyid` exceeded the verifier's rate ceiling |
+| `request_signature_tag_invalid` | `tag` parameter doesn't match the AdCP request-signing tag |
+
+## Related
+
+- [AdCP signing spec](https://adcontextprotocol.org/docs/building/implementation/security#signed-requests-transport-layer)
+- [VALIDATE-YOUR-AGENT.md](./VALIDATE-YOUR-AGENT.md) — full compliance validation including signing
+- [`examples/signals-agent.ts`](../../examples/signals-agent.ts) — agent example
+- [RFC 9421](https://www.rfc-editor.org/rfc/rfc9421) — HTTP Message Signatures specification

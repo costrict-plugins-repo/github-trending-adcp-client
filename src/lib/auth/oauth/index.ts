@@ -1,0 +1,374 @@
+/**
+ * OAuth module for MCP authentication
+ *
+ * OAuth tokens are stored directly in AgentConfig, same as static auth tokens.
+ *
+ * @example
+ * ```typescript
+ * import { MCPOAuthProvider, CLIFlowHandler, DEFAULT_CLIENT_METADATA } from '@adcp/sdk/auth';
+ * import type { AgentConfig } from '@adcp/sdk';
+ *
+ * // Agent config - tokens will be stored here
+ * const agent: AgentConfig = {
+ *   id: 'my-agent',
+ *   name: 'My Agent',
+ *   agent_uri: 'https://agent.example.com/mcp',
+ *   protocol: 'mcp',
+ *   // A fresh interactive flow saves issuer-bound tokens here.
+ * };
+ *
+ * // Create provider with CLI flow handler
+ * const provider = new MCPOAuthProvider({
+ *   allowInteractiveAuthorization: true,
+ *   agent,
+ *   flowHandler: new CLIFlowHandler(),
+ *   clientMetadata: DEFAULT_CLIENT_METADATA,
+ *   storage: myConfigStorage  // Optional: persists tokens to file/db
+ * });
+ *
+ * // Use with MCP transport
+ * const transport = new StreamableHTTPClientTransport(url, {
+ *   authProvider: provider
+ * });
+ * ```
+ */
+
+// Types
+export type {
+  OAuthFlowHandler,
+  OAuthProviderConfig,
+  OAuthConfigStorage,
+  OAuthClientInformation,
+  OAuthClientInformationFull,
+  OAuthClientMetadata,
+  OAuthTokens,
+  AgentConfig,
+  AgentOAuthTokens,
+  AgentOAuthClient,
+} from './types';
+
+export {
+  DEFAULT_CLIENT_METADATA,
+  OAuthError,
+  OAuthCancelledError,
+  OAuthTimeoutError,
+  toMCPTokens,
+  fromMCPTokens,
+  toMCPClientInfo,
+  fromMCPClientInfo,
+} from './types';
+
+// Flow handlers
+export { CLIFlowHandler, type CLIFlowHandlerConfig } from './CLIFlowHandler';
+export { NonInteractiveFlowHandler, type NonInteractiveFlowHandlerConfig } from './NonInteractiveFlowHandler';
+
+// Web (server-side) OAuth flow — companion to CLIFlowHandler for environments
+// where /oauth/start and /oauth/callback may be served by different processes.
+// Note: standalone functions, NOT a class implementing OAuthFlowHandler — see
+// docs/guides/WEB-OAUTH.md for the rationale (the contract spans two requests).
+export {
+  startWebOAuthFlow,
+  completeWebOAuthFlow,
+  safeReturnTo,
+  InMemoryPendingFlowStore,
+  InvalidOrExpiredFlowError,
+  StateMismatchError,
+  BrowserBindingRequiredError,
+  TokenExchangeError,
+  ProtectedResourceMetadataError,
+  AgentVanishedDuringFlowError,
+  AgentChangedDuringFlowError,
+  ConfidentialClientNotAllowedError,
+  DEFAULT_WEB_FLOW_TTL_MS,
+  type PendingWebFlow,
+  type PendingWebFlowStore,
+  type PendingFlowStore,
+  type StartWebFlowOptions,
+  type StartWebFlowResult,
+  type CompleteWebFlowOptions,
+  type CompleteWebFlowResult,
+} from './web-flow';
+
+export { serializePendingWebFlow, parsePendingWebFlow } from './pending-web-flow';
+
+// Main provider
+export { MCPOAuthProvider } from './MCPOAuthProvider';
+
+// ========================================
+// Convenience factory functions
+// ========================================
+
+import { MCPOAuthProvider } from './MCPOAuthProvider';
+import { CLIFlowHandler, type CLIFlowHandlerConfig } from './CLIFlowHandler';
+import { NonInteractiveFlowHandler } from './NonInteractiveFlowHandler';
+import type { OAuthClientMetadata, OAuthConfigStorage, AgentConfig } from './types';
+import { DEFAULT_CLIENT_METADATA } from './types';
+
+/**
+ * Create an OAuth provider for CLI usage
+ *
+ * @param agent Agent configuration (tokens stored here)
+ * @param options Optional configuration
+ * @returns Configured OAuth provider
+ *
+ * @example
+ * ```typescript
+ * const agent: AgentConfig = {
+ *   id: 'my-agent',
+ *   name: 'My Agent',
+ *   agent_uri: 'https://agent.example.com/mcp',
+ *   protocol: 'mcp'
+ * };
+ *
+ * const provider = createCLIOAuthProvider(agent);
+ *
+ * const transport = new StreamableHTTPClientTransport(url, {
+ *   authProvider: provider
+ * });
+ *
+ * try {
+ *   await client.connect(transport);
+ * } catch (error) {
+ *   if (error instanceof UnauthorizedError) {
+ *     const code = await provider.waitForCallback();
+ *     await transport.finishAuth(code);
+ *     await client.connect(transport);
+ *   }
+ * }
+ *
+ * // After successful auth, agent.oauth_tokens is populated
+ * console.log(agent.oauth_tokens);
+ * ```
+ */
+export function createCLIOAuthProvider(
+  agent: AgentConfig,
+  options?: {
+    /** Callback port (default: 8766) */
+    callbackPort?: number;
+    /** Auth timeout in ms (default: 300000 = 5 min) */
+    timeout?: number;
+    /** Custom client metadata overrides */
+    clientMetadata?: Partial<OAuthClientMetadata>;
+    /** Suppress console output */
+    quiet?: boolean;
+    /** Storage for persisting agent config */
+    storage?: OAuthConfigStorage;
+    /** Operator RFC 8707 override; `null` returns to metadata discovery. */
+    resourceOverride?: string | null;
+    /**
+     * Allow non-HTTPS resource URLs advertised in RFC 9728 protected-resource
+     * metadata. Mirrors the CLI's `--allow-http` flag. Defaults to `false`.
+     */
+    allowHttp?: boolean;
+  }
+): MCPOAuthProvider {
+  const flowConfig: CLIFlowHandlerConfig = {
+    callbackPort: options?.callbackPort,
+    timeout: options?.timeout,
+    quiet: options?.quiet,
+  };
+  const flowHandler = new CLIFlowHandler(flowConfig);
+
+  // Build complete client metadata
+  const clientMetadata: OAuthClientMetadata = {
+    ...DEFAULT_CLIENT_METADATA,
+    redirect_uris: [flowHandler.getRedirectUrl().toString()],
+    ...options?.clientMetadata,
+  };
+
+  return new MCPOAuthProvider({
+    allowInteractiveAuthorization: true,
+    agent,
+    flowHandler,
+    storage: options?.storage,
+    resourceOverride: options?.resourceOverride,
+    clientMetadata,
+    allowHttp: options?.allowHttp,
+  });
+}
+
+/**
+ * Create an OAuth provider that uses and auto-refreshes saved tokens but
+ * refuses to start a new interactive browser flow. Use this for storyboard
+ * runs, scheduled jobs, and other non-interactive contexts where you've
+ * already saved tokens via `createCLIOAuthProvider`.
+ *
+ * A failed grant can throw `OAuthError` with `owner_reauthorization_required`;
+ * missing or mismatched issuer bindings throw `oauth_issuer_required` or `oauth_issuer_mismatch`.
+ * The owner can run `adcp <alias> --clear-oauth`, then
+ * `adcp <alias> --oauth` to start a fresh browser sign-in.
+ */
+export function createNonInteractiveOAuthProvider(
+  agent: AgentConfig,
+  options?: {
+    /** Hint shown in error messages if an interactive flow is attempted. */
+    agentHint?: string;
+    /** Custom client metadata overrides (inherited from saved registration in practice). */
+    clientMetadata?: Partial<OAuthClientMetadata>;
+    /** Storage for persisting refreshed tokens back to disk. */
+    storage?: OAuthConfigStorage;
+    /** Operator RFC 8707 override reused during refresh; `null` disables it. */
+    resourceOverride?: string | null;
+    /**
+     * Allow non-HTTPS resource URLs advertised in RFC 9728 protected-resource
+     * metadata. Mirrors the CLI's `--allow-http` flag. Defaults to `false`.
+     */
+    allowHttp?: boolean;
+  }
+): MCPOAuthProvider {
+  const flowHandler = new NonInteractiveFlowHandler({ agentHint: options?.agentHint });
+
+  const clientMetadata: OAuthClientMetadata = {
+    ...DEFAULT_CLIENT_METADATA,
+    redirect_uris: [flowHandler.getRedirectUrl().toString()],
+    ...options?.clientMetadata,
+  };
+
+  return new MCPOAuthProvider({
+    allowInteractiveAuthorization: false,
+    agent,
+    flowHandler,
+    storage: options?.storage,
+    resourceOverride: options?.resourceOverride,
+    clientMetadata,
+    allowHttp: options?.allowHttp,
+  });
+}
+
+/**
+ * Check if an error indicates OAuth is required
+ */
+export function isOAuthRequired(error: unknown): boolean {
+  if (error instanceof Error) {
+    if (error.name === 'UnauthorizedError') return true;
+    const msg = error.message.toLowerCase();
+    if (msg.includes('unauthorized') || msg.includes('authentication required') || msg.includes('oauth')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Check if an agent has valid OAuth tokens
+ */
+export function hasValidOAuthTokens(agent: AgentConfig): boolean {
+  const tokens = agent.oauth_tokens;
+  if (!tokens?.access_token) return false;
+
+  if (tokens.expires_at) {
+    const expiresAt = new Date(tokens.expires_at);
+    // Expired if within 5 minutes of expiration
+    if (expiresAt.getTime() - Date.now() < 5 * 60 * 1000) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Clear OAuth tokens from an agent config
+ */
+export function clearOAuthTokens(agent: AgentConfig): void {
+  agent.oauth_tokens = undefined;
+  agent.oauth_client = undefined;
+  agent.oauth_code_verifier = undefined;
+  agent.oauth_discovery_state = undefined;
+}
+
+/**
+ * Get the effective auth token for an agent
+ * Returns OAuth access_token if available, otherwise static auth_token
+ */
+export function getEffectiveAuthToken(agent: AgentConfig): string | undefined {
+  // Prefer OAuth if available and valid
+  if (hasValidOAuthTokens(agent)) {
+    return agent.oauth_tokens!.access_token;
+  }
+  // Fall back to static token
+  return agent.auth_token;
+}
+
+// OAuth discovery
+export {
+  discoverOAuthMetadata,
+  supportsOAuth,
+  supportsDynamicRegistration,
+  type OAuthMetadata,
+  type DiscoveryOptions,
+} from './discovery';
+
+// Diagnostics utilities — for `adcp diagnose-auth` and consumer introspection
+export {
+  parseWWWAuthenticate,
+  decodeAccessTokenClaims,
+  validateTokenAudience,
+  type WWWAuthenticateChallenge,
+  type DecodedJWTHeader,
+  type DecodedJWTClaims,
+  type DecodedAccessToken,
+  type TokenAudienceResult,
+} from './diagnostics';
+
+// End-to-end OAuth handshake diagnosis (powers `adcp diagnose-auth`)
+export {
+  runAuthDiagnosis,
+  AUTH_DIAGNOSIS_SCHEMA_VERSION,
+  type DiagnoseOptions,
+  type HttpCapture,
+  type DiagnosisStep,
+  type Hypothesis,
+  type HypothesisVerdict,
+  type AuthDiagnosisReport,
+} from './diagnose';
+
+// Zero-config authorization discovery + actionable error type.
+// Raised automatically by `ProtocolClient.callTool` when an MCP agent returns
+// a 401 Bearer challenge and the caller has no saved tokens.
+export {
+  NeedsAuthorizationError,
+  discoverAuthorizationRequirements,
+  hasValidatedMcpAuthorizationRequirements,
+  probeAuthChallenge,
+  type AuthorizationRequirements,
+  type DiscoverAuthorizationOptions,
+} from './authorization-required';
+
+// File-backed `OAuthConfigStorage` implementation (agents.json format).
+export { createFileOAuthStorage, type FileOAuthStorageOptions } from './file-storage';
+
+// OAuth 2.0 client credentials grant (RFC 6749 §4.4) for machine-to-machine
+// token exchange. Used by the CLI for automated compliance runs where there
+// is no user to walk through an authorization-code flow.
+export {
+  exchangeClientCredentials,
+  ensureClientCredentialsTokens,
+  ClientCredentialsExchangeError,
+  type ExchangeClientCredentialsOptions,
+  type EnsureClientCredentialsOptions,
+} from './ClientCredentialsFlow';
+
+// `$ENV:VAR` indirection for client credentials so secrets can live in env
+// vars (CI) rather than on disk in the agent config.
+export {
+  resolveSecret,
+  isEnvSecretReference,
+  toEnvSecretReference,
+  extractEnvSecretName,
+  MissingEnvSecretError,
+} from './secret-resolver';
+
+// Type re-export — the credentials struct itself lives in the ADCP core types
+// module alongside `AgentOAuthTokens` / `AgentOAuthClient`.
+export type { AgentOAuthClientCredentials } from '../../types/adcp';
+export { AgentOAuthClientCredentialsSchema } from './client-credentials-schema';
+
+// Per-agent storage binding — the bridge that lets `callTool` pick up the
+// caller's chosen `OAuthConfigStorage` without a signature change.
+export { bindAgentStorage, getAgentStorage, unbindAgentStorage } from './storage-registry';
+
+// Re-exported MCP SDK OAuth error types so consumers can discriminate 401 causes
+// without string-matching on error messages. These originate from the MCP server
+// auth module but are the canonical OAuth error classes for client-side handling too.
+export { InvalidTokenError, InsufficientScopeError } from '@modelcontextprotocol/sdk/server/auth/errors.js';

@@ -1,0 +1,708 @@
+import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js';
+import { withMCPConnectionPolicy, type MCPConnectionPolicy } from './mcp-connection-policy';
+/**
+ * MCP Tasks protocol integration for async tool calls.
+ *
+ * When an MCP server declares `capabilities.tasks.requests.tools.call`, this module
+ * uses the SDK's experimental tasks API instead of custom AdCP tool calls for async
+ * lifecycle management. This removes the LLM from the polling path.
+ *
+ * Detection: check `client.getServerCapabilities()?.tasks?.requests?.tools?.call`
+ * after connection. The SDK's `isToolTask()` auto-detects per-tool `taskSupport`.
+ */
+
+import type { Client as MCPClient } from '@modelcontextprotocol/sdk/client/index.js';
+import type { DebugLogEntry } from '../types/adcp';
+import type { TaskInfo } from '../core/ConversationTypes';
+import { withCachedConnection } from './mcp';
+import { createMCPRequestHeaders } from '../auth';
+import { withSpan } from '../observability/tracing';
+import { signingContextStorage, type AgentSigningContext } from '../signing/client';
+import { redactArgsForLog as sharedRedactArgsForLog } from '../utils/redact-args';
+import { withResponseSizeLimit } from './responseSizeLimit';
+import { withTransportDiagnostics, type TransportActivityHandler } from './transportDiagnostics';
+import { isAbortOrTimeoutError, resolveClientRequestTimeoutMs } from './abort';
+import { tryCallModernMCPTool } from './mcp-modern';
+
+/** Response shape returned by MCPClient.callTool(). */
+type CallToolResponse = {
+  isError?: boolean;
+  content?: Array<{ type: string; text?: string }>;
+  [key: string]: unknown;
+};
+
+/** Connection identity for URL/token native task follow-up calls. */
+export interface MCPTaskConnectionOptions extends MCPConnectionPolicy {
+  headers?: Record<string, string>;
+  signingContext?: AgentSigningContext;
+}
+
+interface MCPTaskProtocolOptions {
+  signingContext?: AgentSigningContext;
+  headers?: Record<string, string>;
+  transport?: {
+    connectionPartition?: string;
+    connectionReuse?: 'process';
+    maxResponseBytes?: number;
+    trustedFetchFn?: typeof fetch;
+    requestTimeoutMs?: number;
+    allowPrivateIp?: boolean;
+  };
+  onTransportActivity?: TransportActivityHandler;
+  transportActivityContext?: {
+    agentId: string;
+    operationId?: string;
+    taskId?: string;
+    contextId?: string;
+    idempotencyKey?: string;
+  };
+}
+
+/**
+ * Track which MCP clients have had listTools() called.
+ * The SDK's isToolTask() needs tool metadata from listTools() to determine
+ * per-tool taskSupport. Without this, callToolStream silently degrades to
+ * a synchronous tools/call (no task creation).
+ */
+const toolsListedClients = new WeakSet<MCPClient>();
+
+/**
+ * Ensure tool metadata is cached in the SDK so isToolTask() works.
+ * Called once per client connection when tasks are supported.
+ */
+async function ensureToolsListed(client: MCPClient, signal?: AbortSignal, requestTimeoutMs?: number): Promise<void> {
+  if (toolsListedClients.has(client)) return;
+  await client.listTools(undefined, {
+    ...(signal && { signal }),
+    ...(requestTimeoutMs !== undefined && { timeout: requestTimeoutMs }),
+  });
+  toolsListedClients.add(client);
+}
+
+/**
+ * Check if an MCP server supports the Tasks protocol for tool calls.
+ */
+export function serverSupportsTasks(client: MCPClient): boolean {
+  const caps = client.getServerCapabilities();
+  return !!(caps as Record<string, any>)?.tasks?.requests?.tools?.call;
+}
+
+/**
+ * Map MCP Tasks status to AdCP status.
+ *
+ * MCP Tasks uses underscores and British spelling; AdCP uses hyphens and American spelling.
+ */
+export function mapMCPTaskStatus(mcpStatus: string): string {
+  switch (mcpStatus) {
+    case 'working':
+      return 'working';
+    case 'input_required':
+      return 'input-required';
+    case 'completed':
+      return 'completed';
+    case 'failed':
+      return 'failed';
+    case 'cancelled':
+      return 'canceled';
+    default:
+      return mcpStatus;
+  }
+}
+
+/**
+ * Map an MCP Task object to an AdCP TaskInfo.
+ */
+function mapMCPTaskToTaskInfo(
+  task: {
+    taskId: string;
+    status: string;
+    createdAt: string;
+    lastUpdatedAt: string;
+    statusMessage?: string;
+    pollInterval?: number;
+  },
+  toolName?: string
+): TaskInfo {
+  // Project `statusMessage → TaskInfo.error` against the
+  // POST-MAPPING AdCP status (not the raw MCP-side status). MCP
+  // Tasks emits `'cancelled'` (British) and never `'rejected'` as a
+  // standard status; checking against the AdCP set after mapping
+  // catches all terminal failures uniformly. Sellers that extend
+  // MCP with custom statuses (e.g. emit `'rejected'` via spec
+  // extension) flow through unchanged via the `default` arm of
+  // {@link mapMCPTaskStatus}.
+  const adcpStatus = mapMCPTaskStatus(task.status);
+  const isTerminalFailure = adcpStatus === 'failed' || adcpStatus === 'rejected' || adcpStatus === 'canceled';
+  return {
+    taskId: task.taskId,
+    status: adcpStatus,
+    taskType: toolName ?? 'unknown',
+    createdAt: new Date(task.createdAt).getTime(),
+    updatedAt: new Date(task.lastUpdatedAt).getTime(),
+    error: isTerminalFailure ? task.statusMessage : undefined,
+  };
+}
+
+/**
+ * Build auth headers for MCP connections.
+ */
+function buildAuthHeaders(authToken?: string, customHeaders?: Record<string, string>): Record<string, string> {
+  return createMCPRequestHeaders(customHeaders, authToken);
+}
+
+/**
+ * Redact sensitive fields from tool args before logging.
+ *
+ * Redacts:
+ * - `push_notification_config.authentication` — webhook signing secret
+ * - `idempotency_key` — retry-pattern oracle within the seller's TTL; opt-in
+ *   full logging via `ADCP_LOG_IDEMPOTENCY_KEYS=1`
+ */
+function redactArgsForLog(args: Record<string, unknown>): Record<string, unknown> {
+  return sharedRedactArgsForLog(args);
+}
+
+/**
+ * Validate taskId before passing to protocol methods.
+ */
+function validateTaskId(taskId: string): void {
+  if (!taskId || typeof taskId !== 'string' || taskId.length > 256) {
+    throw new Error(`Invalid taskId: expected non-empty string (max 256 chars)`);
+  }
+}
+
+/**
+ * Call an MCP tool with Tasks protocol support.
+ *
+ * If the server supports MCP Tasks and the tool has `taskSupport: 'optional' | 'required'`,
+ * uses `callToolStream()` which handles task creation, polling, and result retrieval.
+ *
+ * If the server doesn't support tasks, falls back to regular `client.callTool()`.
+ *
+ * The stream is consumed with a timeout. If the task doesn't complete within the timeout,
+ * returns a working-status response with the MCP task_id for follow-up polling.
+ */
+export async function callMCPToolWithTasks(
+  agentUrl: string,
+  toolName: string,
+  args: Record<string, unknown>,
+  authToken?: string,
+  debugLogs: DebugLogEntry[] = [],
+  customHeaders?: Record<string, string>,
+  options?: MCPConnectionPolicy & {
+    workingTimeout?: number;
+    signingContext?: AgentSigningContext;
+    signal?: AbortSignal;
+    requestTimeoutMs?: number;
+    fetchFn?: typeof fetch;
+    allowPrivateIp?: boolean;
+  }
+): Promise<unknown> {
+  return withMCPConnectionPolicy(options, () =>
+    callMCPToolWithTasksInContext(agentUrl, toolName, args, authToken, debugLogs, customHeaders, options)
+  );
+}
+
+/** @internal Dispatch within an SDK-owned connection-policy boundary. */
+export async function callMCPToolWithTasksInContext(
+  agentUrl: string,
+  toolName: string,
+  args: Record<string, unknown>,
+  authToken?: string,
+  debugLogs: DebugLogEntry[] = [],
+  customHeaders?: Record<string, string>,
+  options?: MCPConnectionPolicy & {
+    workingTimeout?: number;
+    signingContext?: AgentSigningContext;
+    signal?: AbortSignal;
+    requestTimeoutMs?: number;
+    fetchFn?: typeof fetch;
+    allowPrivateIp?: boolean;
+  }
+): Promise<unknown> {
+  // Keep the public debug-log contract identical across modern and legacy
+  // protocol eras. Era negotiation happens after these common entries; the
+  // selected transport appends its own connection diagnostics.
+  debugLogs.push({
+    type: 'info',
+    message: `MCP: Auth configuration`,
+    timestamp: new Date().toISOString(),
+    hasAuth: !!authToken,
+    headers: authToken ? { 'x-adcp-auth': '***' } : {},
+    customHeaderKeys: customHeaders ? Object.keys(customHeaders) : [],
+  });
+
+  debugLogs.push({
+    type: 'info',
+    message: `MCP: Calling tool ${toolName} with args: ${JSON.stringify(redactArgsForLog(args))}`,
+    timestamp: new Date().toISOString(),
+  });
+
+  if (authToken) {
+    debugLogs.push({
+      type: 'info',
+      message: `MCP: Transport configured with x-adcp-auth header for ${toolName}`,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  const modernAttempt = await tryCallModernMCPTool(agentUrl, toolName, args, authToken, debugLogs, customHeaders, {
+    ...(options?.signingContext && { signingContext: options.signingContext }),
+    ...(options?.signal && { signal: options.signal }),
+    ...(options?.requestTimeoutMs !== undefined && { requestTimeoutMs: options.requestTimeoutMs }),
+    ...(options?.fetchFn && { fetchFn: options.fetchFn }),
+    ...(options?.allowPrivateIp !== undefined && { allowPrivateIp: options.allowPrivateIp }),
+  });
+  if (modernAttempt.handled) {
+    debugLogs.push({
+      type: modernAttempt.response?.isError ? 'error' : 'success',
+      message: `MCP: Tool ${toolName} response received (${modernAttempt.response?.isError ? 'error' : 'success'})`,
+      timestamp: new Date().toISOString(),
+      response: modernAttempt.response,
+    });
+    return modernAttempt.response;
+  }
+
+  return withSpan(
+    'adcp.mcp.call_tool',
+    {
+      'adcp.tool': toolName,
+      'http.url': agentUrl,
+    },
+    async () =>
+      signingContextStorage.run(options?.signingContext, async () => {
+        const authHeaders = buildAuthHeaders(authToken, customHeaders);
+        const workingTimeout = options?.workingTimeout ?? 120_000;
+
+        return withCachedConnection(
+          agentUrl,
+          authToken,
+          authHeaders,
+          debugLogs,
+          toolName,
+          client =>
+            callToolOnClient(
+              client,
+              toolName,
+              args,
+              debugLogs,
+              workingTimeout,
+              options?.signal,
+              options?.requestTimeoutMs
+            ),
+          options?.fetchFn,
+          {
+            signal: options?.signal,
+            requestTimeoutMs: options?.requestTimeoutMs,
+            allowPrivateIp: options?.allowPrivateIp,
+          }
+        );
+      })
+  );
+}
+
+/**
+ * Call a tool on a pre-connected MCP `Client` without HTTP transport or connection caching.
+ *
+ * This is the in-process companion to `callMCPToolWithTasks`. It skips URL validation,
+ * connection setup, OAuth refresh, and the reconnect-retry path — the caller owns the
+ * client lifecycle. All other semantics (tasks protocol detection, stream handling,
+ * timeout surfacing) are identical to the URL-based path.
+ *
+ * Use via `AgentClient.fromMCPClient()`. Not intended for direct import outside the
+ * protocols directory.
+ */
+export async function callMCPToolWithClient(
+  mcpClient: MCPClient,
+  toolName: string,
+  args: Record<string, unknown>,
+  debugLogs: DebugLogEntry[] = [],
+  options?: { workingTimeout?: number; signal?: AbortSignal; requestTimeoutMs?: number }
+): Promise<unknown> {
+  debugLogs.push({
+    type: 'info',
+    message: `MCP: Calling tool ${toolName} (in-process) with args: ${JSON.stringify(redactArgsForLog(args))}`,
+    timestamp: new Date().toISOString(),
+  });
+  return callToolOnClient(
+    mcpClient,
+    toolName,
+    args,
+    debugLogs,
+    options?.workingTimeout ?? 120_000,
+    options?.signal,
+    options?.requestTimeoutMs
+  );
+}
+
+/**
+ * Inner dispatch logic shared by `callMCPToolWithTasks` (URL path) and
+ * `callMCPToolWithClient` (in-process path). Both paths converge here once
+ * a connected `MCPClient` is in hand.
+ */
+async function callToolOnClient(
+  client: MCPClient,
+  toolName: string,
+  args: Record<string, unknown>,
+  debugLogs: DebugLogEntry[],
+  workingTimeout: number,
+  signal?: AbortSignal,
+  requestTimeoutMs?: number
+): Promise<unknown> {
+  const resolvedRequestTimeoutMs = resolveClientRequestTimeoutMs(requestTimeoutMs);
+  const requestOptions = {
+    ...(signal && { signal }),
+    ...(resolvedRequestTimeoutMs !== undefined && { timeout: resolvedRequestTimeoutMs }),
+  };
+  if (!serverSupportsTasks(client)) {
+    debugLogs.push({
+      type: 'info',
+      message: `MCP Tasks: Server does not support tasks, using standard callTool for ${toolName}`,
+      timestamp: new Date().toISOString(),
+    });
+    const response = (await client.callTool(
+      { name: toolName, arguments: args },
+      undefined,
+      requestOptions
+    )) as CallToolResponse;
+
+    debugLogs.push({
+      type: response?.isError ? 'error' : 'success',
+      message: `MCP: Tool ${toolName} response received (${response?.isError ? 'error' : 'success'})`,
+      timestamp: new Date().toISOString(),
+      response: response,
+    });
+
+    return response;
+  }
+
+  // Ensure tool metadata is cached so the SDK's isToolTask() works correctly.
+  // Without this, callToolStream silently skips task creation for tools that
+  // declare taskSupport: 'optional' | 'required'.
+  await ensureToolsListed(client, signal, resolvedRequestTimeoutMs);
+
+  debugLogs.push({
+    type: 'info',
+    message: `MCP Tasks: Server supports tasks, using callToolStream for ${toolName}`,
+    timestamp: new Date().toISOString(),
+  });
+
+  // Use callToolStream which handles the full task lifecycle
+  const stream = client.experimental.tasks.callToolStream({ name: toolName, arguments: args }, undefined, {
+    timeout: resolvedRequestTimeoutMs ?? workingTimeout,
+    resetTimeoutOnProgress: true,
+    ...(signal && { signal }),
+  });
+
+  let capturedTaskId: string | undefined;
+  let capturedTask: { taskId: string; status: string; pollInterval?: number } | undefined;
+
+  try {
+    for await (const message of stream) {
+      switch (message.type) {
+        case 'taskCreated':
+          capturedTaskId = message.task.taskId;
+          capturedTask = message.task;
+          debugLogs.push({
+            type: 'info',
+            message: `MCP Tasks: Task created ${capturedTaskId} for ${toolName}`,
+            timestamp: new Date().toISOString(),
+          });
+          break;
+
+        case 'taskStatus':
+          capturedTask = message.task;
+          debugLogs.push({
+            type: 'info',
+            message: `MCP Tasks: Status update for ${capturedTaskId}: ${message.task.status}`,
+            timestamp: new Date().toISOString(),
+          });
+          break;
+
+        case 'result': {
+          debugLogs.push({
+            type: 'success',
+            message: `MCP: Tool ${toolName} response received (success)`,
+            timestamp: new Date().toISOString(),
+            response: message.result,
+          });
+          return message.result as CallToolResponse;
+        }
+
+        case 'error': {
+          debugLogs.push({
+            type: 'error',
+            message: `MCP Tasks: Error for ${toolName}: ${message.error.message}`,
+            timestamp: new Date().toISOString(),
+          });
+          // The MCP Tasks SDK error event may strip structured content.
+          // If we have a taskId, fetch the full result to recover adcp_error data
+          // and return it as a proper isError response for downstream unwrapping.
+          if (capturedTaskId) {
+            try {
+              const taskResult = await client.experimental.tasks.getTaskResult(
+                capturedTaskId,
+                CallToolResultSchema,
+                requestOptions
+              );
+              const content = taskResult?.content as Array<{ type: string; text?: string }> | undefined;
+              if (content) {
+                return {
+                  isError: true,
+                  content,
+                  structuredContent: taskResult?.structuredContent,
+                } as unknown as CallToolResponse;
+              }
+            } catch {
+              // Failed to fetch task result — fall through to throw
+            }
+          }
+          throw message.error;
+        }
+      }
+    }
+  } catch (error) {
+    if (signal?.aborted && isAbortOrTimeoutError(error)) {
+      throw error;
+    }
+    // If we timed out but have a taskId, return a working status
+    // so the caller can poll via getMCPTaskStatus/getMCPTaskResult
+    if (capturedTaskId && error instanceof Error && /timeout|timed out/i.test(error.message)) {
+      debugLogs.push({
+        type: 'info',
+        message: `MCP Tasks: Timeout for ${toolName}, returning working status with taskId ${capturedTaskId}`,
+        timestamp: new Date().toISOString(),
+      });
+
+      return {
+        structuredContent: {
+          status: 'working',
+          task_id: capturedTaskId,
+          poll_interval: capturedTask?.pollInterval,
+        },
+      };
+    }
+    if (isAbortOrTimeoutError(error)) {
+      throw error;
+    }
+    // Servers may return a synchronous tool error (e.g. VERSION_UNSUPPORTED)
+    // rather than creating a task. The Tasks SDK rejects these with a Zod
+    // validation error about a missing `task` field. When no task was
+    // captured, fall back to standard callTool so the error response
+    // reaches the caller intact.
+    const msg = error instanceof Error ? error.message : String(error);
+    if (!capturedTaskId && /Invalid task creation result/i.test(msg)) {
+      debugLogs.push({
+        type: 'info',
+        message: `MCP Tasks: Server returned synchronous response for ${toolName}, falling back to callTool`,
+        timestamp: new Date().toISOString(),
+      });
+      return (await client.callTool(
+        { name: toolName, arguments: args },
+        undefined,
+        requestOptions
+      )) as CallToolResponse;
+    }
+    throw error;
+  }
+
+  // Stream ended without result — shouldn't happen with well-behaved servers
+  if (capturedTaskId) {
+    return {
+      structuredContent: {
+        status: 'working',
+        task_id: capturedTaskId,
+        poll_interval: capturedTask?.pollInterval,
+      },
+    };
+  }
+
+  throw new Error(`MCP Tasks: callToolStream for ${toolName} ended without result or task`);
+}
+
+/**
+ * Get task status via MCP Tasks protocol method (not tool call).
+ *
+ * Task lifecycle methods (`tasks/get`, `tasks/result`, `tasks/list`,
+ * `tasks/cancel`) are MCP protocol methods, not AdCP operations.
+ * The transport signing fetch evaluates them against the seller's separate
+ * `protocol_methods_*` lists (or the buyer's `always_sign_protocol_methods`),
+ * using exact JSON-RPC wire names rather than AdCP operation names.
+ *
+ * Re-throws auth errors (401) — only catches protocol capability errors.
+ */
+export async function getMCPTaskStatus(
+  agentUrl: string,
+  taskId: string,
+  authToken?: string,
+  debugLogs: DebugLogEntry[] = [],
+  toolName?: string,
+  options: MCPTaskConnectionOptions = {}
+): Promise<TaskInfo> {
+  return withMCPConnectionPolicy(options, () =>
+    signingContextStorage.run(options.signingContext, () =>
+      getMCPTaskStatusInContext(agentUrl, taskId, authToken, debugLogs, toolName, options)
+    )
+  );
+}
+
+/** @internal Dispatch within an SDK-owned connection-policy boundary. */
+export async function getMCPTaskStatusInContext(
+  agentUrl: string,
+  taskId: string,
+  authToken?: string,
+  debugLogs: DebugLogEntry[] = [],
+  toolName?: string,
+  options: MCPTaskConnectionOptions = {}
+): Promise<TaskInfo> {
+  validateTaskId(taskId);
+  const authHeaders = buildAuthHeaders(authToken, options.headers);
+
+  return withCachedConnection(agentUrl, authToken, authHeaders, debugLogs, `tasks/get:${taskId}`, async client => {
+    const result = await client.experimental.tasks.getTask(taskId);
+    debugLogs.push({
+      type: 'info',
+      message: `MCP Tasks: getTask ${taskId} → ${result.status}`,
+      timestamp: new Date().toISOString(),
+    });
+    return mapMCPTaskToTaskInfo(
+      result as {
+        taskId: string;
+        status: string;
+        createdAt: string;
+        lastUpdatedAt: string;
+        statusMessage?: string;
+        pollInterval?: number;
+      },
+      toolName
+    );
+  });
+}
+
+/**
+ * Get task result via MCP Tasks protocol method (blocks until terminal).
+ */
+export async function getMCPTaskResult(
+  agentUrl: string,
+  taskId: string,
+  authToken?: string,
+  debugLogs: DebugLogEntry[] = [],
+  options: MCPTaskConnectionOptions = {}
+): Promise<unknown> {
+  return withMCPConnectionPolicy(options, () =>
+    signingContextStorage.run(options.signingContext, () =>
+      getMCPTaskResultInContext(agentUrl, taskId, authToken, debugLogs, options)
+    )
+  );
+}
+
+/** @internal Dispatch within an SDK-owned connection-policy boundary. */
+export async function getMCPTaskResultInContext(
+  agentUrl: string,
+  taskId: string,
+  authToken?: string,
+  debugLogs: DebugLogEntry[] = [],
+  options: MCPTaskConnectionOptions = {}
+): Promise<unknown> {
+  validateTaskId(taskId);
+  const authHeaders = buildAuthHeaders(authToken, options.headers);
+
+  return withCachedConnection(agentUrl, authToken, authHeaders, debugLogs, `tasks/result:${taskId}`, async client => {
+    const result = await client.experimental.tasks.getTaskResult(taskId, CallToolResultSchema);
+    debugLogs.push({
+      type: 'success',
+      message: `MCP Tasks: getTaskResult ${taskId} received`,
+      timestamp: new Date().toISOString(),
+    });
+    return result;
+  });
+}
+
+/**
+ * List tasks via MCP Tasks protocol method.
+ */
+export async function listMCPTasks(
+  agentUrl: string,
+  authToken?: string,
+  debugLogs: DebugLogEntry[] = [],
+  options: MCPTaskProtocolOptions = {}
+): Promise<TaskInfo[]> {
+  const authHeaders = buildAuthHeaders(authToken, options.headers);
+
+  return withMCPConnectionPolicy(options.transport, () =>
+    signingContextStorage.run(options.signingContext, () =>
+      withResponseSizeLimit(options.transport?.maxResponseBytes, () =>
+        withTransportDiagnostics(
+          {
+            agentId: options.transportActivityContext?.agentId ?? 'unknown-agent',
+            protocol: 'mcp',
+            tool: 'tasks/list',
+            taskType: 'tasks/list',
+            ...options.transportActivityContext,
+            onTransportActivity: options.onTransportActivity,
+          },
+          () =>
+            withCachedConnection(
+              agentUrl,
+              authToken,
+              authHeaders,
+              debugLogs,
+              'tasks/list',
+              async client => {
+                const result = await client.experimental.tasks.listTasks();
+                debugLogs.push({
+                  type: 'info',
+                  message: `MCP Tasks: listTasks returned ${result.tasks.length} tasks`,
+                  timestamp: new Date().toISOString(),
+                });
+                return result.tasks.map((task: any) => mapMCPTaskToTaskInfo(task));
+              },
+              options.transport?.trustedFetchFn,
+              {
+                requestTimeoutMs: options.transport?.requestTimeoutMs,
+                allowPrivateIp: options.transport?.allowPrivateIp,
+              }
+            )
+        )
+      )
+    )
+  );
+}
+
+/**
+ * Cancel a task via MCP Tasks protocol method.
+ */
+export async function cancelMCPTask(
+  agentUrl: string,
+  taskId: string,
+  authToken?: string,
+  debugLogs: DebugLogEntry[] = [],
+  options: MCPTaskConnectionOptions = {}
+): Promise<void> {
+  return withMCPConnectionPolicy(options, () =>
+    signingContextStorage.run(options.signingContext, () =>
+      cancelMCPTaskInContext(agentUrl, taskId, authToken, debugLogs, options)
+    )
+  );
+}
+
+/** @internal Dispatch within an SDK-owned connection-policy boundary. */
+export async function cancelMCPTaskInContext(
+  agentUrl: string,
+  taskId: string,
+  authToken?: string,
+  debugLogs: DebugLogEntry[] = [],
+  options: MCPTaskConnectionOptions = {}
+): Promise<void> {
+  validateTaskId(taskId);
+  const authHeaders = buildAuthHeaders(authToken, options.headers);
+
+  await withCachedConnection(agentUrl, authToken, authHeaders, debugLogs, `tasks/cancel:${taskId}`, async client => {
+    await client.experimental.tasks.cancelTask(taskId);
+    debugLogs.push({
+      type: 'info',
+      message: `MCP Tasks: cancelTask ${taskId} succeeded`,
+      timestamp: new Date().toISOString(),
+    });
+  });
+}
