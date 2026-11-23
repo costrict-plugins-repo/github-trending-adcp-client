@@ -1,0 +1,380 @@
+/**
+ * CI gates for `examples/hello_signals_adapter_marketplace.ts`.
+ *
+ * Three independent assertions:
+ *   1. The example typechecks under the strictest realistic adopter config
+ *      (--strict + 4 extra strictness flags).
+ *   2. With the published mock-server as upstream, the storyboard runner
+ *      reports zero failed steps (skipped steps for tools the specialism
+ *      doesn't claim are allowed).
+ *   3. After the storyboard run, every expected upstream endpoint shows ≥1
+ *      hit at /_debug/traffic — the façade-resistance gate.
+ *
+ * Together these make the example self-policing: a contributor (or LLM) who
+ * modifies the example or the SDK in a way that breaks any of the three
+ * gates fails CI, not "looks fine" review. This is the pattern the
+ * validate-with-mock-fixtures spec guide describes — applied here to our
+ * own reference adapter so what we tell adopters to do is what we
+ * ourselves do.
+ */
+
+const { describe, it, before, after } = require('node:test');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const { spawn, spawnSync } = require('node:child_process');
+// Public sub-export (per #1287/#1294) — adopters use this exact import path
+// in their own integration tests.
+const { bootMockServer } = require('@adcp/sdk/mock-server');
+const { createMCPClient } = require('../../dist/lib/protocols');
+const { spawnAgent, stopAgent, waitForPort, pickFreePort } = require('./_helpers/runHelloAdapterGates');
+
+const REPO_ROOT = path.resolve(__dirname, '..', '..');
+const EXAMPLE_FILE = path.join(REPO_ROOT, 'examples', 'hello_signals_adapter_marketplace.ts');
+const CLI = path.join(REPO_ROOT, 'bin', 'adcp.js');
+
+// Ports are picked per-run (see `before` below). A hardcoded 35001 sat inside
+// the kernel's ephemeral range, so a sibling suite's `pickFreePort` could hand
+// out the same number and a not-yet-dead agent from that suite would answer
+// this suite's `waitForPort`.
+let AGENT_PORT;
+const ADCP_AUTH_TOKEN = 'sk_harness_do_not_use_in_prod';
+const UPSTREAM_API_KEY = 'mock_signal_market_key_do_not_use_in_prod';
+
+const EXPECTED_ROUTES = ['GET /_lookup/operator', 'GET /v2/cohorts', 'POST /v2/activations'];
+
+describe('examples/hello_signals_adapter_marketplace', () => {
+  // -------------------------------------------------------------------------
+  // Gate 1 — strictest realistic typecheck
+  // -------------------------------------------------------------------------
+  it('passes tsc with --strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes + noPropertyAccessFromIndexSignature', () => {
+    const res = spawnSync(
+      'npx',
+      [
+        'tsc',
+        '--noEmit',
+        EXAMPLE_FILE,
+        '--target',
+        'ES2022',
+        '--module',
+        'commonjs',
+        '--moduleResolution',
+        'node',
+        '--esModuleInterop',
+        '--skipLibCheck',
+        '--strict',
+        '--noUncheckedIndexedAccess',
+        '--exactOptionalPropertyTypes',
+        '--noImplicitOverride',
+        '--noFallthroughCasesInSwitch',
+        '--noPropertyAccessFromIndexSignature',
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000 }
+    );
+    assert.equal(res.status, 0, `tsc reported errors:\n${(res.stdout || '') + (res.stderr || '')}`);
+  });
+
+  // -------------------------------------------------------------------------
+  // Gates 2 + 3 — runtime: storyboard pass + traffic verification
+  // Shared boot so the cost (~5s) is paid once.
+  // -------------------------------------------------------------------------
+  let mockHandle;
+  let agent;
+
+  before(async () => {
+    AGENT_PORT = await pickFreePort();
+    mockHandle = await bootMockServer({
+      specialism: 'signal-marketplace',
+      port: 0,
+      apiKey: UPSTREAM_API_KEY,
+    });
+    // Boot the example as a child process — it calls `serve()` at module
+    // load and runs forever. Async spawn keeps the test's event loop alive
+    // (same lesson as #1250's runGrader fix: spawnSync would deadlock).
+    agent = spawnAgent(EXAMPLE_FILE, {
+      PORT: String(AGENT_PORT),
+      UPSTREAM_URL: mockHandle.url,
+      UPSTREAM_API_KEY,
+      ADCP_AUTH_TOKEN,
+      NODE_ENV: 'development',
+    });
+    await waitForPort('127.0.0.1', AGENT_PORT, 30_000);
+    // Confirm the process answering on AGENT_PORT is the adapter this suite
+    // booted, not a stale agent from another suite. Without this, a wrong
+    // process makes Gate 2 pass vacuously (every step skipped) and Gates 3+
+    // fail with misleading façade / missing-tool errors.
+    const caps = await callMcpTool('get_adcp_capabilities', {});
+    const specialisms = caps?.structuredContent?.specialisms ?? [];
+    assert.ok(
+      specialisms.includes('signal-marketplace'),
+      `agent on port ${AGENT_PORT} does not claim signal-marketplace: ${JSON.stringify(caps?.structuredContent ?? caps)}`
+    );
+  });
+
+  after(async () => {
+    await stopAgent(agent);
+    if (mockHandle) await mockHandle.close();
+  });
+
+  it('passes the signal_marketplace storyboard with zero failed steps', async () => {
+    const grader = await runGrader(`http://127.0.0.1:${AGENT_PORT}/mcp`, 'signal_marketplace');
+    assert.equal(
+      grader.summary.steps_failed,
+      0,
+      `storyboard reported ${grader.summary.steps_failed} failed steps:\n` + formatFailures(grader)
+    );
+    assert.ok(
+      grader.summary.steps_passed > 0,
+      `storyboard ran zero passing steps (${grader.summary.steps_skipped} skipped) — wrong agent on port ${AGENT_PORT}?\n` +
+        JSON.stringify(grader.summary, null, 2)
+    );
+    // Allow `partial` overall_status when no steps failed — that's the
+    // runner's "silent track" classification (issue #1209). What we
+    // strictly disallow is any explicitly-failed step.
+    assert.notEqual(grader.overall_status, 'failing');
+  });
+
+  it('hits every expected upstream route at least once (façade gate)', async () => {
+    const res = await fetch(`${mockHandle.url}/_debug/traffic`);
+    const body = await res.json();
+    const traffic = body.traffic || {};
+    const missing = EXPECTED_ROUTES.filter(r => (traffic[r] || 0) < 1);
+    assert.deepEqual(
+      missing,
+      [],
+      `These upstream routes had zero hits — the adapter is a façade for them:\n  ${missing.join('\n  ')}\n\nFull traffic:\n${JSON.stringify(traffic, null, 2)}`
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // Gate 4 — BuyerAgentRegistry wiring works end-to-end
+  //
+  // The example wires a `BuyerAgentRegistry` (Phase 1 of #1269) keyed off
+  // the api-key principal. Verifies that:
+  //   - Authenticated requests with a known onboarding-ledger entry
+  //     succeed (registry resolved, status active).
+  //   - Unknown api-keys are rejected upstream by `verifyApiKey` (auth
+  //     failure happens before the registry runs).
+  //
+  // The registry is exercised implicitly by Gate 2's storyboard (every
+  // run goes through `agentRegistry.resolve`), but a dedicated assertion
+  // here makes the registry's behavior visible and prevents future
+  // refactors from silently dropping the wiring.
+  // -------------------------------------------------------------------------
+  it('rejects unknown api-key tokens before reaching the registry (auth gate fires first)', async () => {
+    const res = await fetch(`http://127.0.0.1:${AGENT_PORT}/mcp`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        authorization: 'Bearer sk_unknown_token_not_in_keys_map',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'get_signals', arguments: { signal_spec: 'test' } },
+      }),
+    });
+    // verifyApiKey rejects unknown tokens with 401 before the registry
+    // runs. This locks in the auth-before-registry order and confirms
+    // the registry isn't running on un-authenticated traffic.
+    assert.equal(res.status, 401, 'unknown api-key MUST be rejected at the auth layer');
+  });
+
+  it('lets controller seeding change the resolved buyer-agent commercial state', async () => {
+    const seed = await callMcpTool('comply_test_controller', {
+      scenario: 'seed_buyer_agent',
+      account: {
+        brand: { domain: 'novamotors.example' },
+        operator: 'pinnacle-agency.example',
+        sandbox: true,
+      },
+      params: {
+        agent_url: 'https://addie.example.com',
+        status: 'suspended',
+        billing_capabilities: ['operator'],
+        sandbox_only: true,
+      },
+    });
+    assert.equal(seed?.structuredContent?.success, true, JSON.stringify(seed));
+
+    const blocked = await callMcpTool('get_signals', {
+      account: {
+        brand: { domain: 'novamotors.example' },
+        operator: 'pinnacle-agency.example',
+        sandbox: true,
+      },
+      signal_spec: 'In-market EV buyers',
+    });
+    assert.equal(blocked?.isError, true, JSON.stringify(blocked));
+    assert.equal(blocked?.structuredContent?.adcp_error?.code, 'AGENT_SUSPENDED', JSON.stringify(blocked));
+
+    const isolated = await callMcpTool('get_signals', {
+      account: {
+        brand: { domain: 'acmeoutdoor.example' },
+        operator: 'pinnacle-agency.example',
+        sandbox: true,
+      },
+      signal_spec: 'In-market EV buyers',
+    });
+    assert.notEqual(isolated?.isError, true, JSON.stringify(isolated));
+  });
+
+  it('threads seeded buyer-agent status into the framework registry gate', async () => {
+    const sessionId = 'hello-signals-framework-status-gate';
+    const scopedAccount = {
+      brand: { domain: 'novamotors.example' },
+      operator: 'pinnacle-agency.example',
+      sandbox: true,
+    };
+    const seed = await callMcpTool('comply_test_controller', {
+      scenario: 'seed_buyer_agent',
+      account: scopedAccount,
+      context: { session_id: sessionId },
+      params: {
+        agent_url: 'https://addie.example.com',
+        status: 'suspended',
+        billing_capabilities: ['operator'],
+        sandbox_only: true,
+      },
+    });
+    assert.equal(seed?.structuredContent?.success, true, JSON.stringify(seed));
+
+    const blocked = await callMcpTool('get_adcp_capabilities', {
+      context: { session_id: sessionId, account: scopedAccount },
+    });
+    assert.equal(blocked?.isError, true, JSON.stringify(blocked));
+    assert.equal(blocked?.structuredContent?.adcp_error?.code, 'AGENT_SUSPENDED', JSON.stringify(blocked));
+  });
+
+  it('keeps mixed session plus account buyer-agent seeds isolated', async () => {
+    const sessionId = 'hello-signals-mixed-scope';
+    const suspendedAccount = {
+      brand: { domain: 'novamotors.example' },
+      operator: 'pinnacle-agency.example',
+      sandbox: true,
+    };
+    const activeAccount = {
+      brand: { domain: 'acmeoutdoor.example' },
+      operator: 'pinnacle-agency.example',
+      sandbox: true,
+    };
+
+    const suspendedSeed = await callMcpTool('comply_test_controller', {
+      scenario: 'seed_buyer_agent',
+      account: suspendedAccount,
+      context: { session_id: sessionId },
+      params: {
+        agent_url: 'https://addie.example.com',
+        status: 'suspended',
+        billing_capabilities: ['operator'],
+        sandbox_only: true,
+      },
+    });
+    const activeSeed = await callMcpTool('comply_test_controller', {
+      scenario: 'seed_buyer_agent',
+      account: activeAccount,
+      context: { session_id: sessionId },
+      params: {
+        agent_url: 'https://addie.example.com',
+        status: 'active',
+        billing_capabilities: ['operator'],
+        sandbox_only: true,
+      },
+    });
+    assert.equal(suspendedSeed?.structuredContent?.success, true, JSON.stringify(suspendedSeed));
+    assert.equal(activeSeed?.structuredContent?.success, true, JSON.stringify(activeSeed));
+
+    const suspended = await callMcpTool('get_signals', {
+      account: suspendedAccount,
+      context: { session_id: sessionId },
+      signal_spec: 'In-market EV buyers',
+    });
+    assert.equal(suspended?.isError, true, JSON.stringify(suspended));
+    assert.equal(suspended?.structuredContent?.adcp_error?.code, 'AGENT_SUSPENDED', JSON.stringify(suspended));
+
+    const active = await callMcpTool('get_signals', {
+      account: activeAccount,
+      context: { session_id: sessionId },
+      signal_spec: 'In-market EV buyers',
+    });
+    assert.notEqual(active?.isError, true, JSON.stringify(active));
+  });
+
+  // Note: the sandbox_only ↔ accounts.sandbox load-bearing pair is
+  // covered behaviorally by Gate 2 (storyboard) — if either side of the
+  // pair regresses, every storyboard step 403s and Gate 2 fails. The
+  // framework's gate behavior itself is unit-tested in
+  // `test/server-buyer-agent-sandbox-only.test.js`.
+});
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+async function callMcpTool(name, args) {
+  return createMCPClient(`http://127.0.0.1:${AGENT_PORT}/mcp`, ADCP_AUTH_TOKEN).callTool(name, args);
+}
+
+function runGrader(agentUrl, storyboardId) {
+  return new Promise((resolveFn, reject) => {
+    const child = spawn(
+      'node',
+      [
+        CLI,
+        'storyboard',
+        'run',
+        agentUrl,
+        storyboardId,
+        '--json',
+        '--allow-http',
+        '--auth',
+        ADCP_AUTH_TOKEN,
+        '--webhook-receiver',
+      ],
+      {
+        cwd: REPO_ROOT,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }
+    );
+    const out = [];
+    const err = [];
+    child.stdout.on('data', c => out.push(c));
+    child.stderr.on('data', c => err.push(c));
+    const timer = setTimeout(() => child.kill('SIGTERM'), 60_000);
+    child.on('close', () => {
+      clearTimeout(timer);
+      const stdout = Buffer.concat(out).toString('utf8');
+      try {
+        resolveFn(JSON.parse(stdout));
+      } catch (e) {
+        reject(
+          new Error(
+            `grader stdout was not parseable JSON (storyboard=${storyboardId}):\n${stdout.slice(0, 500)}\n\nstderr: ${Buffer.concat(err).toString('utf8').slice(0, 500)}`
+          )
+        );
+      }
+    });
+    child.on('error', reject);
+  });
+}
+
+function formatFailures(grader) {
+  const failed = [];
+  function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    if (node.passed === false && !node.skipped) {
+      const detail = node.details || node.error || '';
+      failed.push(
+        `  ✗ ${node.task || '?'} — ${node.step || node.step_id || '?'}\n      ${String(detail).slice(0, 200)}`
+      );
+    }
+    for (const k of Object.keys(node)) {
+      const v = node[k];
+      if (Array.isArray(v)) v.forEach(walk);
+      else if (typeof v === 'object') walk(v);
+    }
+  }
+  walk(grader);
+  return failed.join('\n') || '(no per-step detail captured)';
+}

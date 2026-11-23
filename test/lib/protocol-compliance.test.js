@@ -1,0 +1,551 @@
+// Protocol Compliance Tests - Tests message format validation for A2A and MCP protocols
+const { test, describe } = require('node:test');
+const assert = require('node:assert');
+const { Role } = require('@a2a-js/sdk');
+
+const ADCP_A2A_EXTENSION = 'https://adcontextprotocol.org/extensions/adcp/v3';
+
+function dataPartValue(message) {
+  const part = message.parts[0];
+  assert.strictEqual(part.content?.$case, 'data', 'Part must contain A2A 1.0 data content');
+  return part.content.value;
+}
+
+// Import protocol functions
+const { callA2ATool, closeA2AConnections } = require('../../dist/lib/protocols/a2a.js');
+
+/**
+ * Protocol Compliance Testing Strategy
+ *
+ * Purpose: Validate that our protocol implementations generate correctly formatted messages
+ * that conform to A2A and MCP specifications, without requiring external servers.
+ *
+ * Approach:
+ * 1. Mock at the SDK transport level (not HTTP level)
+ * 2. Capture actual messages being sent to SDK clients
+ * 3. Validate message structure against protocol schemas
+ * 4. Test edge cases and error conditions
+ */
+
+describe('A2A Protocol Compliance', { skip: process.env.CI ? 'Slow tests - skipped in CI' : false }, () => {
+  // Mock the A2A SDK to capture and validate actual messages being sent
+  let capturedMessages = [];
+  let mockA2AClient;
+
+  // Reset mocks before each test
+  function setupA2AMocks() {
+    capturedMessages = [];
+    closeA2AConnections();
+
+    // Create a mock A2A client that captures sendMessage calls
+    mockA2AClient = {
+      sendMessage: async payload => {
+        capturedMessages.push(payload);
+
+        // Return a valid success response to simulate server acceptance
+        return {
+          jsonrpc: '2.0',
+          id: 'test-id',
+          result: {
+            kind: 'task',
+            id: 'task-123',
+            contextId: 'ctx-123',
+            status: {
+              state: 'completed',
+              timestamp: new Date().toISOString(),
+            },
+          },
+        };
+      },
+    };
+
+    // Replace the local factory seam with a deterministic SDK client.
+    const originalA2AClient = require('../../dist/lib/protocols/a2a').legacyA2AClientTestShim;
+    originalA2AClient.fromCardUrl = async () => mockA2AClient;
+  }
+
+  describe('Message Structure Validation', () => {
+    test('should generate correctly formatted A2A message with required fields', async () => {
+      setupA2AMocks();
+
+      const agentUrl = 'https://test-agent.example.com';
+      const toolName = 'get_products';
+      const parameters = { category: 'electronics', limit: 10 };
+
+      await callA2ATool(agentUrl, toolName, parameters);
+
+      // Verify exactly one message was sent
+      assert.strictEqual(capturedMessages.length, 1);
+
+      const sentMessage = capturedMessages[0];
+
+      // Test required top-level structure
+      assert.ok(sentMessage.message, 'Message should have a message property');
+
+      const message = sentMessage.message;
+
+      // Validate the A2A 1.0 protobuf-shaped request handed to the official client.
+      assert.ok(message.messageId, 'Message must have messageId');
+      assert.strictEqual(message.role, Role.ROLE_USER, 'Message must have the user role');
+      assert.ok(Array.isArray(message.parts), 'Message must have parts array');
+      assert.deepStrictEqual(message.extensions, [ADCP_A2A_EXTENSION]);
+
+      // Validate parts structure
+      assert.strictEqual(message.parts.length, 1, 'Should have exactly one part');
+      const data = dataPartValue(message);
+      assert.strictEqual(data.skill, toolName, 'Part data must have correct skill');
+      assert.deepStrictEqual(data.input, parameters, 'AdCP 3.2 profile data must use the input field');
+    });
+
+    test('should use the AdCP 3.2 input field rather than the legacy parameters field', async () => {
+      setupA2AMocks();
+
+      const agentUrl = 'https://test-agent.example.com';
+      const toolName = 'get_products';
+      const parameters = { category: 'electronics' };
+
+      await callA2ATool(agentUrl, toolName, parameters);
+
+      const sentMessage = capturedMessages[0];
+      const data = dataPartValue(sentMessage.message);
+
+      assert.deepStrictEqual(data.input, parameters, 'Input should contain the AdCP invocation data');
+      assert.strictEqual(data.parameters, undefined, 'A2A 1.0 must not emit the legacy parameters alias');
+    });
+
+    test('should validate messageId format and uniqueness', async () => {
+      setupA2AMocks();
+
+      const agentUrl = 'https://test-agent.example.com';
+      const toolName = 'test_skill';
+
+      // Send two messages
+      await callA2ATool(agentUrl, toolName, {});
+      await callA2ATool(agentUrl, toolName, {});
+
+      assert.strictEqual(capturedMessages.length, 2);
+
+      const message1Id = capturedMessages[0].message.messageId;
+      const message2Id = capturedMessages[1].message.messageId;
+
+      // Verify messageId format (should start with 'msg_')
+      assert.ok(message1Id.startsWith('msg_'), 'MessageId should start with "msg_"');
+      assert.ok(message2Id.startsWith('msg_'), 'MessageId should start with "msg_"');
+
+      // Verify uniqueness
+      assert.notStrictEqual(message1Id, message2Id, 'MessageIds should be unique');
+
+      // Verify length is reasonable (timestamp + random string)
+      assert.ok(message1Id.length > 15, 'MessageId should be sufficiently long');
+    });
+
+    test('should handle empty parameters correctly', async () => {
+      setupA2AMocks();
+
+      await callA2ATool('https://test.com', 'skill_without_params', {});
+
+      const sentMessage = capturedMessages[0];
+      const data = dataPartValue(sentMessage.message);
+
+      assert.deepStrictEqual(data.input, {}, 'Empty input should result in an empty object');
+      assert.strictEqual(data.skill, 'skill_without_params', 'Skill name should be preserved');
+    });
+
+    test('should handle complex nested parameters', async () => {
+      setupA2AMocks();
+
+      const complexParams = {
+        criteria: {
+          category: 'electronics',
+          price: { min: 100, max: 500 },
+          tags: ['mobile', 'smartphone'],
+        },
+        options: {
+          includeImages: true,
+          sortBy: 'price',
+          limit: 25,
+        },
+      };
+
+      await callA2ATool('https://test.com', 'complex_search', complexParams);
+
+      const sentMessage = capturedMessages[0];
+      const data = dataPartValue(sentMessage.message);
+
+      assert.deepStrictEqual(data.input, complexParams, 'Complex nested input should be preserved exactly');
+    });
+  });
+
+  describe('Authentication Integration', () => {
+    test('should pass authentication token to SDK client correctly', async () => {
+      // This test verifies auth token integration without testing HTTP details
+      const authToken = 'TEST_BEARER_TOKEN_PLACEHOLDER';
+      let capturedFetchImpl;
+
+      // Set up shared mocks first so mockA2AClient is available
+      setupA2AMocks();
+
+      // Then re-override fromCardUrl to capture the fetchImpl option
+      const originalA2AClient = require('../../dist/lib/protocols/a2a').legacyA2AClientTestShim;
+      originalA2AClient.fromCardUrl = async (cardUrl, options) => {
+        capturedFetchImpl = options?.fetchImpl;
+        return mockA2AClient;
+      };
+
+      await callA2ATool('https://test.com', 'test_skill', {}, authToken);
+
+      // Verify fetchImpl was provided when auth token exists
+      assert.ok(capturedFetchImpl, 'Should provide fetchImpl when auth token provided');
+      assert.strictEqual(typeof capturedFetchImpl, 'function', 'fetchImpl should be a function');
+    });
+
+    test('should not provide fetchImpl when no auth token', async () => {
+      let capturedOptions;
+
+      const originalA2AClient = require('../../dist/lib/protocols/a2a').legacyA2AClientTestShim;
+      originalA2AClient.fromCardUrl = async (cardUrl, options) => {
+        capturedOptions = options;
+        return mockA2AClient;
+      };
+
+      setupA2AMocks();
+
+      await callA2ATool('https://test.com', 'test_skill', {}); // No auth token
+
+      // Verify no fetchImpl provided when no auth token
+      assert.ok(!capturedOptions?.fetchImpl, 'Should not provide fetchImpl when no auth token');
+    });
+  });
+
+  describe('Error Response Handling', () => {
+    test('should properly detect JSON-RPC errors in response', async () => {
+      closeA2AConnections();
+      const errorClient = {
+        sendMessage: async () => ({
+          jsonrpc: '2.0',
+          id: 'test-id',
+          error: {
+            code: -32602,
+            message: "Invalid params: missing required field 'kind' in message",
+            data: { field: 'kind', expected: 'message' },
+          },
+        }),
+      };
+
+      const originalA2AClient = require('../../dist/lib/protocols/a2a').legacyA2AClientTestShim;
+      originalA2AClient.fromCardUrl = async () => errorClient;
+
+      await assert.rejects(
+        async () => {
+          await callA2ATool('https://test.com', 'test_skill', {});
+        },
+        {
+          message: /A2A agent returned error: Invalid params: missing required field 'kind' in message/,
+        },
+        'Should throw error when server returns JSON-RPC error'
+      );
+    });
+
+    test('should handle nested result errors', async () => {
+      closeA2AConnections();
+      const errorClient = {
+        sendMessage: async () => ({
+          jsonrpc: '2.0',
+          id: 'test-id',
+          result: {
+            error: {
+              code: -32600,
+              message: "Malformed request: 'input' field not supported, use 'parameters' instead",
+            },
+          },
+        }),
+      };
+
+      const originalA2AClient = require('../../dist/lib/protocols/a2a').legacyA2AClientTestShim;
+      originalA2AClient.fromCardUrl = async () => errorClient;
+
+      await assert.rejects(
+        async () => {
+          await callA2ATool('https://test.com', 'test_skill', {});
+        },
+        {
+          message: /A2A agent returned error: Malformed request: 'input' field not supported, use 'parameters' instead/,
+        },
+        'Should throw error when server returns nested error in result'
+      );
+    });
+
+    // Regression: adcp-client#1575
+    // When the seller emits a spec-compliant terminal-state Task carrying an
+    // `adcp_error` DataPart per AdCP transport-errors §A2A Binding, the
+    // protocol layer must let the response through to the upstream unwrapper
+    // — even if the seller also embedded a transport-level `result.error`
+    // hint. Otherwise the structured `adcp_error.code` is lost behind a
+    // generic "A2A agent returned error" throw and storyboard validators
+    // read transport-state instead of the AdCP error envelope.
+    test('should pass through failed Task carrying adcp_error DataPart', async () => {
+      closeA2AConnections();
+      const failedTaskClient = {
+        sendMessage: async () => ({
+          jsonrpc: '2.0',
+          id: 'test-id',
+          result: {
+            kind: 'task',
+            id: 'task-9a364eb3',
+            contextId: 'ctx-abc',
+            status: { state: 'failed', timestamp: new Date().toISOString() },
+            // Some sellers also surface a transport-level error string alongside
+            // the structured artifact. The artifact is canonical per spec; the
+            // protocol layer must prefer it.
+            error: { message: 'Task 9a364eb3 is in terminal state: 3' },
+            artifacts: [
+              {
+                artifactId: 'art-1',
+                parts: [
+                  {
+                    kind: 'data',
+                    data: {
+                      adcp_error: {
+                        code: 'TERMS_REJECTED',
+                        message: 'Brief rejected by policy',
+                        recovery: 'correctable',
+                        field: 'brief',
+                      },
+                      context: { correlation_id: 'corr-123' },
+                    },
+                  },
+                  { kind: 'text', text: 'Rejected.' },
+                ],
+              },
+            ],
+          },
+        }),
+      };
+
+      const originalA2AClient = require('../../dist/lib/protocols/a2a').legacyA2AClientTestShim;
+      originalA2AClient.fromCardUrl = async () => failedTaskClient;
+
+      const response = await callA2ATool('https://test.com', 'get_products', { brief: 'x' });
+
+      // Spec-compliant terminal-state Task — must flow through unmodified so
+      // the unwrapper can extract `adcp_error` from the DataPart.
+      assert.strictEqual(response.result.kind, 'task');
+      assert.strictEqual(response.result.status.state, 'failed');
+      assert.strictEqual(response.result.artifacts[0].parts[0].data.adcp_error.code, 'TERMS_REJECTED');
+    });
+
+    // Negative: terminal-state Task without a DataPart (only TextParts) must
+    // still throw — there's no canonical envelope to defer to.
+    test('should still throw when terminal Task has only TextParts (no DataPart)', async () => {
+      closeA2AConnections();
+      const textOnlyClient = {
+        sendMessage: async () => ({
+          jsonrpc: '2.0',
+          id: 'test-id',
+          result: {
+            kind: 'task',
+            id: 'task-x',
+            status: { state: 'failed' },
+            error: { message: 'transport hint' },
+            artifacts: [{ parts: [{ kind: 'text', text: 'sorry' }] }],
+          },
+        }),
+      };
+
+      const originalA2AClient = require('../../dist/lib/protocols/a2a').legacyA2AClientTestShim;
+      originalA2AClient.fromCardUrl = async () => textOnlyClient;
+
+      await assert.rejects(
+        async () => callA2ATool('https://test.com', 'test_skill', {}),
+        { message: /A2A agent returned error: transport hint/ },
+        'TextPart-only artifact has no canonical envelope — must throw'
+      );
+    });
+
+    // Negative: terminal-state Task with empty artifacts array must still
+    // throw — no envelope present.
+    test('should still throw when terminal Task has empty artifacts array', async () => {
+      closeA2AConnections();
+      const emptyArtifactsClient = {
+        sendMessage: async () => ({
+          jsonrpc: '2.0',
+          id: 'test-id',
+          result: {
+            kind: 'task',
+            id: 'task-y',
+            status: { state: 'failed' },
+            error: { message: 'no artifact' },
+            artifacts: [],
+          },
+        }),
+      };
+
+      const originalA2AClient = require('../../dist/lib/protocols/a2a').legacyA2AClientTestShim;
+      originalA2AClient.fromCardUrl = async () => emptyArtifactsClient;
+
+      await assert.rejects(
+        async () => callA2ATool('https://test.com', 'test_skill', {}),
+        { message: /A2A agent returned error: no artifact/ },
+        'Empty artifacts array — must throw'
+      );
+    });
+
+    test('should pass through rejected Task carrying adcp_error DataPart', async () => {
+      closeA2AConnections();
+      const rejectedTaskClient = {
+        sendMessage: async () => ({
+          jsonrpc: '2.0',
+          id: 'test-id',
+          result: {
+            kind: 'task',
+            id: 'task-rej',
+            status: { state: 'rejected' },
+            artifacts: [
+              {
+                parts: [
+                  {
+                    kind: 'data',
+                    data: {
+                      adcp_error: { code: 'POLICY_VIOLATION', message: 'no' },
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        }),
+      };
+
+      const originalA2AClient = require('../../dist/lib/protocols/a2a').legacyA2AClientTestShim;
+      originalA2AClient.fromCardUrl = async () => rejectedTaskClient;
+
+      const response = await callA2ATool('https://test.com', 'get_products', {});
+      assert.strictEqual(response.result.status.state, 'rejected');
+      assert.strictEqual(response.result.artifacts[0].parts[0].data.adcp_error.code, 'POLICY_VIOLATION');
+    });
+  });
+
+  describe('Debug Logging Integration', () => {
+    test('should capture debug logs with actual payload information', async () => {
+      setupA2AMocks();
+
+      const debugLogs = [];
+      const testParams = { test: 'data' };
+
+      await callA2ATool('https://test.com', 'debug_test', testParams, null, debugLogs);
+
+      // Should have request and response debug logs
+      assert.ok(debugLogs.length >= 2, 'Should have debug logs for request and response');
+
+      // Find request log
+      const requestLog = debugLogs.find(log => log.type === 'info' && log.message.includes('Calling skill'));
+      assert.ok(requestLog, 'Should have request debug log');
+      assert.ok(requestLog.actualPayload, 'Should include actual payload in debug log');
+      const data = dataPartValue(requestLog.actualPayload.message);
+      assert.strictEqual(data.skill, 'debug_test');
+      assert.deepStrictEqual(data.input, testParams);
+
+      // Find response log
+      const responseLog = debugLogs.find(log => log.type === 'success' && log.message.includes('Response received'));
+      assert.ok(responseLog, 'Should have response debug log');
+      assert.ok(responseLog.response, 'Should include response data in debug log');
+    });
+  });
+});
+
+describe('Schema Validation Utilities', () => {
+  /**
+   * These tests would validate helper functions for protocol schema compliance.
+   * In a full implementation, you would create utilities to validate messages
+   * against JSON schemas derived from the A2A and MCP specifications.
+   */
+
+  test('should validate A2A message schema compliance', () => {
+    const validMessage = {
+      message: {
+        messageId: 'msg_123_abc',
+        role: Role.ROLE_USER,
+        extensions: [ADCP_A2A_EXTENSION],
+        parts: [
+          {
+            content: {
+              $case: 'data',
+              value: {
+                skill: 'test_skill',
+                input: { param: 'value' },
+              },
+            },
+          },
+        ],
+      },
+    };
+
+    assert.strictEqual(validMessage.message.role, Role.ROLE_USER);
+    assert.ok(validMessage.message.extensions.includes(ADCP_A2A_EXTENSION));
+    assert.deepStrictEqual(dataPartValue(validMessage.message).input, { param: 'value' });
+  });
+
+  test('should identify common A2A message format errors', () => {
+    const invalidMessages = [
+      // Missing required AdCP profile activation.
+      {
+        message: {
+          messageId: 'msg_123',
+          role: Role.ROLE_USER,
+          extensions: [],
+          parts: [{ content: { $case: 'data', value: { skill: 'test', input: {} } } }],
+        },
+      },
+      // Using the legacy parameters alias instead of input.
+      {
+        message: {
+          messageId: 'msg_123',
+          role: Role.ROLE_USER,
+          extensions: [ADCP_A2A_EXTENSION],
+          parts: [{ content: { $case: 'data', value: { skill: 'test', parameters: {} } } }],
+        },
+      },
+      // Invalid protobuf oneof case.
+      {
+        message: {
+          messageId: 'msg_123',
+          role: Role.ROLE_USER,
+          extensions: [ADCP_A2A_EXTENSION],
+          parts: [{ content: { $case: 'invalid', value: { skill: 'test', input: {} } } }],
+        },
+      },
+    ];
+
+    invalidMessages.forEach((msg, index) => {
+      if (index === 0) assert.ok(!msg.message.extensions.includes(ADCP_A2A_EXTENSION));
+      if (index === 1) assert.strictEqual(msg.message.parts[0].content.value.input, undefined);
+      if (index === 2) assert.strictEqual(msg.message.parts[0].content.$case, 'invalid');
+    });
+  });
+});
+
+/**
+ * Additional Test Categories to Implement:
+ *
+ * 1. MCP Protocol Compliance Tests:
+ *    - Similar structure for MCP message validation
+ *    - Test MCP initialize, tool calls, notifications
+ *    - Validate against MCP JSON-RPC schemas
+ *
+ * 2. Cross-Protocol Consistency Tests:
+ *    - Ensure similar operations produce expected results across A2A and MCP
+ *    - Test error handling consistency
+ *
+ * 3. Integration Contract Tests:
+ *    - Test against protocol test servers/mocks
+ *    - Validate end-to-end message round trips
+ *
+ * 4. Performance and Load Tests:
+ *    - Test message generation performance
+ *    - Test concurrent protocol operations
+ *
+ * 5. Security Tests:
+ *    - Test authentication integration
+ *    - Test parameter sanitization
+ *    - Test against injection attacks
+ */

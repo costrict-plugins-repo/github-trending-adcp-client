@@ -1,0 +1,144 @@
+import { signRequest, type SignerKey, type SignRequestOptions } from './signer';
+import type { SfBinaryEncoding } from './content-digest';
+
+/** Callback form for `coverContentDigest` — lets the wrapper decide per call. */
+export type CoverContentDigestPredicate = (url: string, init: RequestInit | undefined) => boolean;
+export type BinaryEncodingPredicate = (url: string, init: RequestInit | undefined) => SfBinaryEncoding;
+
+export interface SigningFetchOptions extends Omit<SignRequestOptions, 'coverContentDigest' | 'binaryEncoding'> {
+  shouldSign?: (url: string, init: RequestInit | undefined) => boolean;
+  /**
+   * Whether to cover `content-digest`. May be a boolean (static) or a
+   * predicate resolved at signing time against the current request — used by
+   * the AdCP agent wrapper to honor the seller's `covers_content_digest`
+   * policy (`required` / `forbidden` / `either`) per operation.
+   */
+  coverContentDigest?: boolean | CoverContentDigestPredicate;
+  binaryEncoding?: SfBinaryEncoding | BinaryEncodingPredicate;
+}
+
+/**
+ * Minimal fetch shape that the signing wrappers compose around. Exported
+ * so external call sites (`src/lib/protocols/a2a.ts:cancelA2ATask`) can
+ * type their upstream wrapper without resorting to casts.
+ */
+export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+/**
+ * Header names whose wire values are produced by the signer itself. Any
+ * caller-supplied value gets stripped before signing so a misconfigured
+ * custom-headers bag can't silently overwrite (or bypass) the RFC 9421
+ * signature output.
+ *
+ * `authorization` is intentionally NOT in this set. AdCP's RFC 9421 profile
+ * does not cover `Authorization` (see `MANDATORY_COMPONENTS` in
+ * `src/lib/signing/types.ts`), so a caller-supplied bearer or RFC 7617 Basic
+ * header passes through unmodified. If a future profile adds `authorization`
+ * to `covered_components`, the canonicalizer must read the FINAL outgoing
+ * value (post-`mergeHeaders` injection in `bin/adcp.js` for the CLI Basic
+ * path) — `createSigningFetch` already does because it reads `init.headers`
+ * at fetch time. Note RFC 9421 §7.5.7 warns about signing over long-lived
+ * credentials (Basic doesn't rotate) — re-attacking the signed credential is
+ * a real risk; a `covers_authorization` policy needs that in scope.
+ */
+const SIGNING_RESERVED_HEADERS = new Set(['signature', 'signature-input', 'content-digest']);
+
+export function createSigningFetch(upstream: FetchLike, key: SignerKey, options: SigningFetchOptions = {}): FetchLike {
+  return async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+    const shouldSign = options.shouldSign ?? (() => method !== 'GET');
+    if (!shouldSign(url, init)) return upstream(input, init);
+
+    if (input instanceof Request) {
+      throw new TypeError(
+        'createSigningFetch does not accept Request objects (the body would be consumed out from under the signer). Pass a URL string and a separate init.'
+      );
+    }
+    assertFetchTargetCanBeSigned(url, 'createSigningFetch');
+
+    const headers = headersToRecord(init?.headers);
+    for (const name of Object.keys(headers)) {
+      if (SIGNING_RESERVED_HEADERS.has(name.toLowerCase())) {
+        delete headers[name];
+      }
+    }
+    const hasContentType = Object.keys(headers).some(k => k.toLowerCase() === 'content-type');
+    if (!hasContentType && (init?.body !== undefined || method !== 'GET')) {
+      headers['content-type'] = 'application/json';
+    }
+    const body = bodyToString(init?.body);
+
+    const coverContentDigest =
+      typeof options.coverContentDigest === 'function'
+        ? options.coverContentDigest(url, init)
+        : options.coverContentDigest;
+    const binaryEncoding =
+      typeof options.binaryEncoding === 'function' ? options.binaryEncoding(url, init) : options.binaryEncoding;
+    const { coverContentDigest: _omitDigest, binaryEncoding: _omitEncoding, ...signerOptionsBase } = options;
+    const signerOptions: SignRequestOptions = { ...signerOptionsBase, coverContentDigest, binaryEncoding };
+
+    const signed = signRequest({ method, url, headers, body }, key, signerOptions);
+
+    const mergedInit: RequestInit = { ...init, method, headers: signed.headers };
+    if (body !== undefined && mergedInit.body === undefined) mergedInit.body = body;
+    return upstream(url, mergedInit);
+  };
+}
+
+/** Fetch transports can omit a terminal empty query marker from the wire target. */
+export function assertFetchTargetCanBeSigned(url: string, apiName: string): void {
+  const parsed = new URL(url);
+  const fragmentlessHref = parsed.href.split('#', 1)[0] ?? parsed.href;
+  if (parsed.search === '' && fragmentlessHref.endsWith('?')) {
+    throw new TypeError(
+      `${apiName} cannot safely sign a URL with a trailing empty query marker ("?"): Fetch can omit it from the wire target. ` +
+        'Use a URL without the empty delimiter.'
+    );
+  }
+}
+
+function headersToRecord(headers: HeadersInit | Headers | undefined): Record<string, string> {
+  if (!headers) return {};
+  if (headers instanceof Headers) {
+    const out: Record<string, string> = {};
+    headers.forEach((v, k) => {
+      out[k] = v;
+    });
+    return out;
+  }
+  if (Array.isArray(headers)) {
+    return Object.fromEntries(headers);
+  }
+  return { ...(headers as Record<string, string>) };
+}
+
+function bodyToString(body: RequestInit['body']): string | undefined {
+  if (body === undefined || body === null) return undefined;
+  if (typeof body === 'string') return body;
+  if (body instanceof Uint8Array) return decodeUtf8Strict(body);
+  if (body instanceof ArrayBuffer) return decodeUtf8Strict(new Uint8Array(body));
+  throw new TypeError(
+    'createSigningFetch requires a string, Uint8Array, or ArrayBuffer body. FormData / Blob / ReadableStream are not supported because the signature must cover the exact wire bytes.'
+  );
+}
+
+/**
+ * Decode bytes to UTF-8, throwing on invalid sequences. Permissive decode
+ * (the `Buffer.toString('utf8')` default) replaces invalid bytes with
+ * `U+FFFD`, which would silently corrupt binary or non-UTF-8 payloads — the
+ * signer would commit to the lossy string and the wire would carry the same
+ * lossy bytes, so verification still passes but the seller receives
+ * mangled content. Throwing forces the caller to send a string body or
+ * ensure their Uint8Array is valid UTF-8.
+ */
+function decodeUtf8Strict(bytes: Uint8Array): string {
+  try {
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    throw new TypeError(
+      'createSigningFetch received a Uint8Array/ArrayBuffer body that is not valid UTF-8. ' +
+        'Pass a string body, ensure the bytes are UTF-8, or sign the request manually with `signRequest` against the exact wire bytes you intend to send.'
+    );
+  }
+}

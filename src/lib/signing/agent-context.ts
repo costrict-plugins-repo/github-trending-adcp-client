@@ -1,0 +1,280 @@
+import { mcpConnectionPartitionKey } from '../protocols/mcp-connection-policy';
+import { createHash, hkdfSync, randomBytes } from 'node:crypto';
+import { globalAsyncLocalStorage } from '../utils/global-async-local-storage';
+import type { AgentConfig, AgentRequestSigningConfig } from '../types/adcp';
+import {
+  buildCapabilityCacheKey,
+  CapabilityCache,
+  defaultCapabilityCache,
+  type CachedCapability,
+} from './capability-cache';
+import { freezeSigningProvider, type SigningProvider } from './provider';
+import type { AdcpSignAlg } from './types';
+import { ADCP_VERSION } from '../version';
+import { assertSigningPolicy, hasUnsignedCapabilityBootstrap } from './protocol-methods';
+
+const CAPABILITY_SCOPE_SALT = randomBytes(32);
+
+/**
+ * Snapshot of the signing identity captured at context-build time. The
+ * transport layer reads from this snapshot rather than from `provider.*`
+ * directly so a provider object whose fields drift between context build
+ * and outbound request can't desynchronize the on-wire `keyid` from the
+ * cache key the connection was bound to. TypeScript's `readonly` modifier
+ * is compile-time only; the snapshot is the runtime defense.
+ */
+export interface AgentSigningIdentitySnapshot {
+  keyid: string;
+  algorithm: AdcpSignAlg;
+  adcpUse?: string;
+  /** Defensively hashed disambiguator — see {@link buildAgentSigningContext}. */
+  fingerprint: string;
+}
+
+/**
+ * Per-call signing context passed down to the MCP/A2A transport layer. Built
+ * at `ProtocolClient.callTool` and consumed by the signing fetch wrapper
+ * attached to the transport. Opaque to the transport helpers — they only
+ * use `cacheKey` (to disambiguate connection-cache entries per signing
+ * identity), `getCapability` (to read the cached seller advertisement on
+ * each outbound request), and `signing` (to produce the signer key or
+ * provider).
+ */
+export interface AgentSigningContext {
+  /** Signing config copied from AgentConfig.request_signing. */
+  signing: AgentRequestSigningConfig;
+  /** Provider when `signing.kind === 'provider'`; undefined for inline keys. */
+  provider?: SigningProvider;
+  /** Snapshot of identity fields read from the provider at build time. */
+  identity: AgentSigningIdentitySnapshot;
+  /** Suffix to append to transport connection-cache keys so agents with different signing identities don't share a connection. */
+  cacheKey: string;
+  /** Lazy accessor for the currently cached capability for this agent. */
+  getCapability: () => CachedCapability | undefined;
+  /** Capability cache backing this context (for external invalidation). */
+  cache: CapabilityCache;
+  /** Stable cache key used against the capability cache itself. */
+  capabilityCacheKey: string;
+  /** Trusted SDK/endpoint pin used to select the request-signing wire profile. */
+  adcpVersion: string;
+  /**
+   * Evict this context's capability entry so the next outbound call
+   * re-primes `get_adcp_capabilities`. Use after a seller-side rotation
+   * signal — or on a 401 / protocol-signature error — without having to
+   * rebuild the cache key from the agent's identifying fields.
+   */
+  invalidate(): void;
+}
+
+/**
+ * AsyncLocalStorage carrying the signing context across the transport layer.
+ * Top-level protocol entries (`callMCPTool`, `callA2ATool`, etc.) push a
+ * context onto this storage for the duration of the call; internal helpers
+ * (`withCachedConnection`, `connectMCPWithFallback`, `buildFetchImpl`) read
+ * it when building cache keys and signing-fetch wrappers, avoiding the need
+ * to thread `signingContext` through every intermediate signature.
+ *
+ * The top-level entries always call `run()` — including with `undefined` —
+ * so a non-signing call cannot inherit a stale context from an enclosing
+ * scope.
+ */
+export const signingContextStorage = globalAsyncLocalStorage<AgentSigningContext | undefined>('signingContext');
+
+/**
+ * Build an `AgentSigningContext` from an `AgentConfig` when signing is
+ * configured. Returns `undefined` when the agent has no `request_signing`
+ * block — callers use this to branch into the no-op fast path.
+ */
+let rfcIdentityWarningEmitted = false;
+export function buildAgentSigningContext(
+  agent: AgentConfig,
+  options: { cache?: CapabilityCache; adcpVersion?: string; connectionPartition?: string } = {}
+): AgentSigningContext | undefined {
+  const configuredSigning = agent.request_signing;
+  if (!configuredSigning) return undefined;
+  assertSigningPolicy(configuredSigning);
+  const policySnapshot = {
+    ...(Array.isArray(configuredSigning.always_sign) && { always_sign: [...configuredSigning.always_sign] }),
+    ...(configuredSigning.always_sign_protocol_methods && {
+      always_sign_protocol_methods: [...configuredSigning.always_sign_protocol_methods],
+    }),
+  };
+  const signing: AgentRequestSigningConfig =
+    configuredSigning.kind === 'provider'
+      ? {
+          ...configuredSigning,
+          ...policySnapshot,
+          provider: freezeSigningProvider(configuredSigning.provider),
+          ...(configuredSigning.public_key && { public_key: snapshotJwk(configuredSigning.public_key) }),
+        }
+      : { ...configuredSigning, ...policySnapshot, private_key: snapshotJwk(configuredSigning.private_key) };
+  if (signing.profile !== 'web-bot-auth' && !rfcIdentityWarningEmitted) {
+    rfcIdentityWarningEmitted = true;
+    process.emitWarning(
+      'RFC 9421 agent identity discovery is deprecated in AdCP 3.3; opt into Web Bot Auth after counterparties advertise support. RFC configuration remains supported through 3.x.',
+      { code: 'ADCP_RFC9421_IDENTITY_DEPRECATED', type: 'Warning' }
+    );
+  }
+
+  const cache = options.cache ?? defaultCapabilityCache;
+  const identity = snapshotIdentity(signing);
+  const cacheFingerprint =
+    signing.profile === 'web-bot-auth'
+      ? createHash('sha256')
+          .update(deriveCacheFingerprint(identity))
+          .update('\0web-bot-auth\0')
+          .update(signing.agent_url)
+          .digest('hex')
+          .slice(0, 32)
+      : deriveCacheFingerprint(identity);
+  const adcpVersion = options.adcpVersion ?? ADCP_VERSION;
+  const connectionPartitionKey =
+    'connectionPartition' in options
+      ? mcpConnectionPartitionKey(options.connectionPartition)
+      : mcpConnectionPartitionKey();
+  const capabilityCacheKey = buildCapabilityCacheKey(
+    agent.agent_uri,
+    capabilityPrincipalScope(agent, connectionPartitionKey),
+    cacheFingerprint,
+    adcpVersion
+  );
+  // Transport-connection cache-key suffix binds to the defensively hashed
+  // identity, not just the advertised `kid`. Two tenants that misconfigure
+  // the same `kid` string but hold distinct keys must not collide on a
+  // shared cached transport — that would sign one tenant's outbound
+  // requests with the other tenant's key (same `kid`, different material),
+  // an impersonation. The hash includes `algorithm` so an Ed25519/P-256
+  // swap on the same `kid+fingerprint` doesn't alias either.
+  // Cached transports capture a signing policy. Equal keys with different
+  // caller overrides must not reuse a fetch wrapper holding the older policy.
+  const policyFingerprint = createHash('sha256')
+    .update(
+      JSON.stringify({
+        alwaysSign: signing.always_sign ?? [],
+        alwaysSignProtocolMethods: signing.always_sign_protocol_methods ?? [],
+        signSupported: signing.sign_supported === true,
+        unsignedCapabilityBootstrap: hasUnsignedCapabilityBootstrap(signing),
+      })
+    )
+    .digest('hex')
+    .slice(0, 16);
+  const cacheKey = `sig=${cacheFingerprint};adcp=${adcpVersion};policy=${policyFingerprint}${connectionPartitionKey ? `;principal=${connectionPartitionKey}` : ''}`;
+  const provider = signing.kind === 'provider' ? signing.provider : undefined;
+
+  return {
+    signing,
+    provider,
+    identity,
+    cacheKey,
+    cache,
+    capabilityCacheKey,
+    adcpVersion,
+    getCapability: () => cache.get(capabilityCacheKey),
+    invalidate: () => cache.invalidate(capabilityCacheKey),
+  };
+}
+
+/**
+ * Bind capability advertisements to the effective authenticated/routed
+ * principal. Basic and routing credentials live in headers, while OAuth
+ * credentials live outside `auth_token`; hashing the complete scope prevents
+ * one principal from reusing another principal's signing policy.
+ */
+function capabilityPrincipalScope(agent: AgentConfig, connectionPartitionKey?: string): string | undefined {
+  const credentials = agent.oauth_client_credentials;
+  const headers = agent.headers
+    ? Object.fromEntries(
+        Object.entries(agent.headers)
+          .map(([name, value]) => [name.toLowerCase(), value] as const)
+          .sort(([a], [b]) => a.localeCompare(b))
+      )
+    : undefined;
+  const scope = {
+    protocol: agent.protocol,
+    ...(connectionPartitionKey && { connectionPartition: connectionPartitionKey }),
+    authToken: agent.auth_token,
+    oauthAccessToken: agent.oauth_tokens?.access_token,
+    oauthClientId: agent.oauth_client?.client_id,
+    oauthResource: agent.oauth_resource,
+    oauthClientCredentials: credentials
+      ? {
+          tokenEndpoint: credentials.token_endpoint,
+          clientId: credentials.client_id,
+          scope: credentials.scope,
+          resource: credentials.resource,
+          audience: credentials.audience,
+        }
+      : undefined,
+    headers,
+  };
+  return capabilityScopeDisambiguator(JSON.stringify(scope));
+}
+
+function capabilityScopeDisambiguator(value: string): string {
+  return Buffer.from(hkdfSync('sha256', value, CAPABILITY_SCOPE_SALT, 'adcp-signing-capability-cache', 32)).toString(
+    'hex'
+  );
+}
+
+/**
+ * Snapshot the signing identity at context-build time. For provider configs,
+ * reads `keyid` / `algorithm` / `fingerprint` once and freezes them. For
+ * inline configs, derives a fingerprint from the private scalar — same
+ * 64-bit cache disambiguator the SDK has always used.
+ */
+function snapshotIdentity(signing: AgentRequestSigningConfig): AgentSigningIdentitySnapshot {
+  if (signing.kind === 'provider') {
+    const provider = signing.provider;
+    return {
+      keyid: provider.keyid,
+      algorithm: provider.algorithm,
+      ...(provider.adcpUse !== undefined && { adcpUse: provider.adcpUse }),
+      fingerprint: provider.fingerprint,
+    };
+  }
+  return {
+    keyid: signing.kid,
+    algorithm: signing.alg,
+    ...(typeof signing.private_key.adcp_use === 'string' && { adcpUse: signing.private_key.adcp_use }),
+    fingerprint: inlineFingerprint(signing.kid, signing.private_key.d),
+  };
+}
+
+/**
+ * Defensively hash the snapshot before composing cache keys. A
+ * provider-supplied `fingerprint` is treated as untrusted input — a
+ * confused integrator could return a constant, an empty string, or a
+ * tenant-controlled value, any of which would re-enable cross-tenant
+ * collisions on the same `kid`. Including `algorithm` in the digest
+ * prevents an Ed25519/P-256 swap on identical `kid+fingerprint` from
+ * aliasing.
+ *
+ * Truncated to 16 hex chars — a 64-bit collision-resistance budget against
+ * random keys is plenty for a cache disambiguator, and we never rely on
+ * this value as a security boundary.
+ */
+function deriveCacheFingerprint(identity: AgentSigningIdentitySnapshot): string {
+  return createHash('sha256')
+    .update(identity.algorithm)
+    .update('\0')
+    .update(identity.keyid)
+    .update('\0')
+    .update(identity.adcpUse ?? '')
+    .update('\0')
+    .update(identity.fingerprint)
+    .digest('hex')
+    .slice(0, 16);
+}
+
+function inlineFingerprint(kid: string, d: string | undefined): string {
+  if (!d) {
+    throw new TypeError(
+      `AgentRequestSigningConfig (kind: 'inline', kid='${kid}') is missing 'private_key.d' — JWK must include the private scalar.`
+    );
+  }
+  return createHash('sha256').update(kid).update('\0').update(d).digest('hex').slice(0, 16);
+}
+
+function snapshotJwk<T extends { key_ops?: unknown }>(jwk: T): T {
+  return { ...jwk, ...(Array.isArray(jwk.key_ops) && { key_ops: [...jwk.key_ops] }) };
+}

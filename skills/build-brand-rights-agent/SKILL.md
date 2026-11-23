@@ -1,0 +1,104 @@
+---
+name: build-brand-rights-agent
+description: Use when building an AdCP brand rights agent — a platform that represents brand identity, licenses rights (image usage, logo placement, AI generation), and approves creatives.
+---
+
+# Build a Brand Rights Agent
+
+A brand rights agent represents a brand's identity and licensing. Buyers discover the brand, browse available rights (image usage, logo placement, AI generation), acquire licenses, and submit generated creatives for approval. The agent enforces brand guidelines.
+
+## Pick your fork target
+
+| Specialism | Status | Fork this | Storyboard |
+| --- | --- | --- | --- |
+| `brand-rights` | stable | [`hello_seller_adapter_multi_tenant.ts`](../../examples/hello_seller_adapter_multi_tenant.ts) — `brandRights` block | `brand_rights` |
+
+The multi-tenant adapter is the canonical fork target. Its `brandRights` block implements all five operations (`getBrandIdentity`, `getRights`, `acquireRights`, `updateRights`, `reviewCreativeApproval`) plus the cross-specialism governance check (`enforceGovernance`) called from `acquireRights`.
+
+### What to delete if you're single-specialism brand-rights
+
+**Forking the multi-tenant adapter for a single specialism? Delete these blocks first** — leaning on stable symbol names rather than line numbers (the adapter evolves; greppable identifiers don't):
+
+- The `campaignGovernance = defineCampaignGovernancePlatform({ ... })` block (the entire `sync_plans` / `check_governance` / `report_plan_outcome` / `get_plan_audit_logs` surface)
+- The `propertyLists = definePropertyListsPlatform({ ... })` block (property-lists CRUD)
+- The `private async enforceGovernance(...)` helper method and its **call site inside `acquireRights`** — the two lines `const denial = await this.enforceGovernance(tenant, ctx, offering, req); if (denial) return denial;`. Without `campaignGovernance` co-resident, the in-process dispatch has nothing to call. Single-specialism adopters who need governance dial out to a registered governance agent's URL via the `@adcp/sdk` client.
+- The `governanceBindings: Map<string, GovernanceBinding>` field on `TenantState`, the `interface GovernanceBinding`, and the `syncGovernanceRow` callback on `createTenantStore` (governance bindings have nothing to register against).
+- The validation seam block in `acquireRights` that requires `campaign.estimated_impressions` when a governance binding exists — without bindings this constraint never fires.
+
+**Keep**: the `accounts` / `createTenantStore` block (translates to single-tenant by passing one tenant entry — needed for tenant isolation), `agentRegistry`, the `brandRights` block, `getTenant(ctx)` resolution.
+
+The storyboard tests identity discovery → rights search → acquisition → enforcement (including expired-campaign denial).
+
+For exact response shapes, error codes, and optional fields, `docs/llms.txt` is the canonical reference.
+
+## When to use this skill
+
+- User wants to build an agent that manages brand identity and licensing
+- User mentions brand rights, brand guidelines, creative approval, or licensing (Warner Bros Discovery, Disney rights pipelines)
+- User references `get_brand_identity`, `get_rights`, `acquire_rights`, `update_rights`, or `creative_approval`
+
+**Not this skill:**
+
+- Selling ad inventory → `skills/build-seller-agent/`
+- Managing creative formats/library → `skills/build-creative-agent/`
+- Evaluating media buys → `skills/build-governance-agent/`
+
+## Cross-cutting rules
+
+Every brand-rights agent hits the cross-cutting rules in [`../cross-cutting.md`](../cross-cutting.md). The high-traffic ones for brand-rights (deep-linked to the rule):
+
+- [`idempotency_key`](../cross-cutting.md#idempotency_key-is-required-on-every-mutating-call) on `acquire_rights` and `update_rights`
+- [Authentication](../cross-cutting.md#authentication-is-mandatory) — `serve({ authenticate })` baseline
+- [Webhooks](../cross-cutting.md#webhooks-stable-operation_id-across-retries) — `creative_approval.${creative_id}` operation_id must be stable across retries; the `creative_approval` webhook receiver itself validates idempotency manually (the framework's auto-idempotency middleware applies to MCP/A2A tools, not arbitrary HTTP receivers)
+
+One brand-rights-specific note:
+
+### `creative_approval` is webhook-only
+
+The spec models creative approval as an HTTP POST from the buyer to the `approval_webhook` URL the seller returned in `acquire_rights`. There is no inbound MCP/A2A tool for `creative_approval` — wire an HTTP receiver and dispatch to `brandRights.reviewCreativeApproval`.
+
+The receiver must validate `idempotency_key` itself (the framework's auto-idempotency middleware applies to MCP/A2A tools, not arbitrary HTTP receivers) and replay the cached verdict on resubmission.
+
+## Tool surface
+
+| Operation | How to implement |
+| --- | --- |
+| `get_brand_identity` | `brandRights.getBrandIdentity` handler — locale-keyed brand name, domain, logos, house identity |
+| `get_rights` | `brandRights.getRights` handler — list licensable rights with pricing + use cases |
+| `acquire_rights` | `brandRights.acquireRights` handler (mutating) — returns `approval_webhook` URL |
+| `update_rights` | `brandRights.updateRights` handler (mutating) — for campaign-end revocation, scope changes |
+| `creative_approval` | HTTP receiver at the `approval_webhook` URL; dispatch to `brandRights.reviewCreativeApproval` |
+
+## Specialism deltas
+
+**`brand-rights`** —
+
+- **Brand definition**: name (locale-keyed for i18n), domain, logos, house identity, languages/markets
+- **Rights catalog**: image usage, AI generation, logo placement, talent likeness; each with pricing (flat_rate, cpm) and uses (likeness, voice, commercial, ai_generated_image)
+- **Approval criteria**: auto-approve (basic checks), guidelines check (brand standards), human review (queue for manual)
+- **Revocation webhook**: emit when a campaign ends or rights are revoked mid-campaign — same `operation_id` stability rules as other webhooks (see `../cross-cutting.md`)
+- **Governance denial**: the storyboard exercises `GOVERNANCE_DENIED` on `acquire_rights` when the requested use exceeds the licensed scope; map this error code, don't substitute a generic `INVALID_REQUEST`
+
+## Validate locally
+
+```bash
+# Run the fork-matrix gate (tsc strict)
+npm run compliance:fork-matrix -- --test-name-pattern="hello-seller-adapter-multi-tenant"
+
+# Run your forked agent against the brand_rights storyboard
+adcp storyboard run http://127.0.0.1:3003/mcp brand_rights \
+  --bearer "$ADCP_AUTH_TOKEN" --include-bundles --json
+```
+
+The fork-matrix gate is the three-gate contract from [`docs/guides/EXAMPLE-TEST-CONTRACT.md`](../../docs/guides/EXAMPLE-TEST-CONTRACT.md). The multi-tenant adapter currently runs the strict-tsc gate only (no brand-rights mock-server today); storyboard-grader gates land alongside the next mock-server family.
+
+For deeper validation: [`docs/guides/VALIDATE-YOUR-AGENT.md`](../../docs/guides/VALIDATE-YOUR-AGENT.md).
+
+## Common shape gotchas
+
+`acquire_rights` response includes `approval_webhook` URL — buyer POSTs to this to submit creatives, you don't pull. `sync_accounts` rows require `action: 'created' | 'updated' | 'unchanged' | 'failed'`. Brand name is locale-keyed (`{ "en-US": "...", "es-MX": "..." }`), not a bare string. See [`../SHAPE-GOTCHAS.md`](../SHAPE-GOTCHAS.md).
+
+## Migration notes
+
+- 6.6 → 6.7: `update_rights` wired as a first-class tool + `creative_approval` webhook builders shipped in #1349. See [`docs/migration-6.6-to-6.7.md`](../../docs/migration-6.6-to-6.7.md).
+- 4.x → 5.x: [`docs/migration-4.x-to-5.x.md`](../../docs/migration-4.x-to-5.x.md)

@@ -1,0 +1,337 @@
+/**
+ * Pricing Option Adapter
+ *
+ * Normalizes historical pricing fields for established AdCP 3 catalogs.
+ *
+ * Field mappings:
+ * - v3 fixed_price ↔ v2 rate (for fixed pricing)
+ * - v3 floor_price ↔ v2 price_guidance.floor (for auction pricing)
+ * - v3 presence of fixed_price ↔ v2 is_fixed: true/false
+ */
+
+/**
+ * v3 price guidance (percentiles only, floor moved to top level)
+ */
+export interface PriceGuidanceV3 {
+  p25?: number;
+  p50?: number;
+  p75?: number;
+  p90?: number;
+}
+
+/**
+ * v2 price guidance (includes floor)
+ */
+export interface PriceGuidanceV2 {
+  floor?: number;
+  p25?: number;
+  p50?: number;
+  p75?: number;
+  p90?: number;
+}
+
+/**
+ * v3 pricing option structure
+ */
+export interface PricingOptionV3 {
+  pricing_option_id: string;
+  pricing_model: string;
+  currency: string;
+  /** Fixed price - if present, this is fixed pricing */
+  fixed_price?: number;
+  /** Floor price for auction - mutually exclusive with fixed_price */
+  floor_price?: number;
+  /** Percentile hints for auction bidding */
+  price_guidance?: PriceGuidanceV3;
+  min_spend_per_package?: number;
+  parameters?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+/**
+ * v2 pricing option structure
+ */
+export interface PricingOptionV2 {
+  pricing_option_id: string;
+  pricing_model: string;
+  currency: string;
+  /** Fixed rate (v2 name for fixed_price) */
+  rate?: number;
+  /** Boolean discriminator for fixed vs auction */
+  is_fixed?: boolean;
+  /** Price guidance including floor */
+  price_guidance?: PriceGuidanceV2;
+  min_spend_per_package?: number;
+  parameters?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+/**
+ * Check if a pricing option uses v2 field names
+ */
+export function usesV2PricingFields(option: any): boolean {
+  if (!option || typeof option !== 'object') return false;
+  // v2 uses 'rate' or 'is_fixed' or has floor inside price_guidance
+  return option.rate !== undefined || option.is_fixed !== undefined || option.price_guidance?.floor !== undefined;
+}
+
+/**
+ * Check if a pricing option uses v3 field names
+ */
+export function usesV3PricingFields(option: any): boolean {
+  if (!option || typeof option !== 'object') return false;
+  // v3 uses fixed_price or floor_price at top level
+  return option.fixed_price !== undefined || option.floor_price !== undefined;
+}
+
+/**
+ * Detect if a pricing option is fixed pricing (works with v2 or v3)
+ */
+export function isFixedPricing(option: PricingOptionV2 | PricingOptionV3): boolean {
+  // v3: presence of fixed_price indicates fixed pricing
+  if ((option as PricingOptionV3).fixed_price !== undefined) {
+    return true;
+  }
+  // v2: is_fixed boolean
+  if ((option as PricingOptionV2).is_fixed !== undefined) {
+    return (option as PricingOptionV2).is_fixed!;
+  }
+  // v2: presence of rate without is_fixed defaults to fixed
+  if ((option as PricingOptionV2).rate !== undefined) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Detect if a pricing option is CPA (cost per acquisition) pricing
+ */
+export function isCPAPricing(option: PricingOptionV2 | PricingOptionV3): boolean {
+  return option?.pricing_model === 'cpa';
+}
+
+/**
+ * Get the price value from a pricing option (works with v2 or v3)
+ */
+export function getPrice(option: PricingOptionV2 | PricingOptionV3): number | undefined {
+  // v3 field takes precedence
+  if ((option as PricingOptionV3).fixed_price !== undefined) {
+    return (option as PricingOptionV3).fixed_price;
+  }
+  // Fall back to v2 field
+  return (option as PricingOptionV2).rate;
+}
+
+/**
+ * Get the floor price from a pricing option (works with v2 or v3)
+ */
+export function getFloorPrice(option: PricingOptionV2 | PricingOptionV3): number | undefined {
+  // v3 field takes precedence
+  if ((option as PricingOptionV3).floor_price !== undefined) {
+    return (option as PricingOptionV3).floor_price;
+  }
+  // Fall back to v2 field (inside price_guidance)
+  return (option as PricingOptionV2).price_guidance?.floor;
+}
+
+/**
+ * Normalize a v2-style pricing option to v3.
+ * Converts rate → fixed_price, price_guidance.floor → floor_price
+ */
+export function normalizePricingOption(option: PricingOptionV2 | PricingOptionV3): PricingOptionV3 {
+  // Already v3 format
+  if (usesV3PricingFields(option) && !usesV2PricingFields(option)) {
+    return option as PricingOptionV3;
+  }
+
+  const v2Option = option as PricingOptionV2;
+  const { rate, is_fixed, price_guidance, ...rest } = v2Option;
+
+  const result: PricingOptionV3 = { ...rest } as PricingOptionV3;
+
+  // Convert rate → fixed_price (for fixed pricing)
+  if (rate !== undefined && (is_fixed === true || is_fixed === undefined)) {
+    result.fixed_price = rate;
+  }
+
+  // Convert price_guidance.floor → floor_price (for auction pricing)
+  if (price_guidance) {
+    const { floor, ...percentiles } = price_guidance;
+
+    if (floor !== undefined) {
+      result.floor_price = floor;
+    }
+
+    // Keep percentiles in price_guidance if any exist
+    if (Object.keys(percentiles).length > 0) {
+      result.price_guidance = percentiles;
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Normalize all pricing options in a product to v3
+ */
+export function normalizeProductPricing(product: any): any {
+  if (!product?.pricing_options || !Array.isArray(product.pricing_options)) {
+    return product;
+  }
+
+  return {
+    ...product,
+    pricing_options: product.pricing_options.map(normalizePricingOption),
+  };
+}
+
+/**
+ * Normalize v2 channel names on a product to v3.
+ * v2 used coarser buckets; some map one-to-many (e.g. 'video' → ['olv', 'ctv']).
+ */
+export function normalizeProductChannels(product: any): any {
+  if (!product?.channels || !Array.isArray(product.channels)) {
+    return product;
+  }
+
+  const v3ChannelMap: Record<string, string[]> = {
+    video: ['olv', 'ctv'],
+    audio: ['streaming_audio'],
+    native: ['display'],
+    retail: ['retail_media'],
+  };
+
+  const normalized = product.channels.flatMap((ch: string) => v3ChannelMap[ch] ?? [ch]);
+  return { ...product, channels: [...new Set(normalized)] };
+}
+
+const LEGACY_ZONED_TIMESTAMP =
+  /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(\.\d+)?(?:[Zz]|\s*UTC|([+-])(\d{2})(?::?(\d{2}))?)$/i;
+
+function normalizeLegacyZonedTimestamp(value: unknown): unknown {
+  let candidate = value;
+  if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+    const entries = Object.entries(candidate as Record<string, unknown>);
+    if (entries.length === 0) return undefined;
+    if (entries.length !== 1 || (entries[0]![0] !== '$date' && entries[0]![0] !== 'value')) return value;
+    candidate = entries[0]![1];
+  }
+  if (candidate === null) return undefined;
+  if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+    return Object.keys(candidate as Record<string, unknown>).length === 0 ? undefined : value;
+  }
+  if (typeof candidate !== 'string') return value;
+
+  const match = LEGACY_ZONED_TIMESTAMP.exec(candidate.trim());
+  if (!match) return value;
+  const [
+    ,
+    yearText,
+    monthText,
+    dayText,
+    hourText,
+    minuteText,
+    secondText,
+    fraction = '',
+    sign,
+    offsetHourText,
+    offsetMinuteText,
+  ] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const offsetHours = offsetHourText === undefined ? 0 : Number(offsetHourText);
+  const offsetMinutes = offsetMinuteText === undefined ? 0 : Number(offsetMinuteText);
+  if (sign === '-' && offsetHours === 0 && offsetMinutes === 0) return value;
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59 ||
+    offsetHours > 23 ||
+    offsetMinutes > 59
+  ) {
+    return value;
+  }
+
+  const local = new Date(0);
+  local.setUTCFullYear(year, month - 1, day);
+  local.setUTCHours(hour, minute, second, 0);
+  if (
+    local.getUTCFullYear() !== year ||
+    local.getUTCMonth() !== month - 1 ||
+    local.getUTCDate() !== day ||
+    local.getUTCHours() !== hour ||
+    local.getUTCMinutes() !== minute ||
+    local.getUTCSeconds() !== second
+  ) {
+    return value;
+  }
+
+  const offset = (offsetHours * 60 + offsetMinutes) * 60_000 * (sign === '-' ? -1 : 1);
+  const utc = new Date(local.getTime() - offset);
+  if (utc.getUTCFullYear() < 0 || utc.getUTCFullYear() > 9999) return value;
+  return `${utc.toISOString().slice(0, 19)}${fraction}Z`;
+}
+
+/** Normalize optional forecast timestamps in established product responses. */
+export function normalizeLegacyProductForecast(product: any): any {
+  if (!product?.forecast || typeof product.forecast !== 'object' || Array.isArray(product.forecast)) return product;
+  const forecast = { ...product.forecast };
+  for (const field of ['generated_at', 'valid_until'] as const) {
+    if (!(field in forecast)) continue;
+    const normalized = normalizeLegacyZonedTimestamp(forecast[field]);
+    if (normalized === undefined) delete forecast[field];
+    else forecast[field] = normalized;
+  }
+  return { ...product, forecast };
+}
+
+/**
+ * Normalize all products in a get_products response to v3
+ */
+export function normalizeGetProductsResponse(response: any): any {
+  // If there's no products field at all, this may be an error response — pass through
+  if (!('products' in (response ?? {}))) {
+    return response;
+  }
+
+  // If products exists but isn't an array, the response is malformed
+  if (!Array.isArray(response.products)) {
+    return {
+      errors: [
+        {
+          code: 'invalid_response',
+          message: `Expected products to be an array, got ${typeof response.products}`,
+        },
+      ],
+    };
+  }
+
+  return {
+    ...response,
+    products: response.products.map((p: any) =>
+      normalizeLegacyProductForecast(normalizeProductChannels(normalizeProductPricing(p)))
+    ),
+  };
+}
+
+/**
+ * Normalize a media buy response's package pricing to v3
+ */
+export function normalizeMediaBuyPricingResponse(response: any): any {
+  // Media buy responses may include products with pricing_options
+  if (response?.products && Array.isArray(response.products)) {
+    return {
+      ...response,
+      products: response.products.map(normalizeProductPricing),
+    };
+  }
+  return response;
+}

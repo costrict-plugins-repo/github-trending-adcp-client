@@ -1,0 +1,1312 @@
+// Unit tests for request validation in SingleAgentClient
+// Tests critical validation that was previously missing (sync_creatives, create_media_buy, build_creative, get_products)
+
+const { test, describe } = require('node:test');
+const assert = require('node:assert');
+
+// Import from built dist
+const { AdCPClient, ProtocolClient } = require('../../dist/lib/index.js');
+
+describe('SingleAgentClient Request Validation', () => {
+  const mockAgent = {
+    id: 'test-agent',
+    name: 'Test Agent',
+    agent_uri: 'https://test.example',
+    protocol: 'a2a',
+  };
+
+  describe('sync_creatives validation', () => {
+    test('should reject request with assets as array instead of object', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      await assert.rejects(
+        async () => {
+          await agent.syncCreatives({
+            creatives: [
+              {
+                creative_id: 'test',
+                name: 'Test Creative',
+                format_id: { agent_url: 'https://test.example', id: 'format1' },
+                // Invalid: assets should be object, not array
+                assets: [
+                  {
+                    asset_type: 'video',
+                    url: 'https://example.com/video.mp4',
+                  },
+                ],
+              },
+            ],
+          });
+        },
+        err => {
+          return err.message.includes('Request validation failed for sync_creatives');
+        },
+        'Should throw validation error for assets as array'
+      );
+    });
+
+    test('should pass unknown top-level fields through (no strict parse)', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      // Unknown top-level fields (e.g. a caller typo like `mode` instead of
+      // `dry_run`) are NOT rejected client-side. Required-field and
+      // shape violations still reject; unknown keys pass through so the
+      // runner's brand/account injection survives to the adapter, which
+      // strips by schema.
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.syncCreatives({
+            account: { account_id: 'test-account' },
+            creatives: [
+              {
+                creative_id: 'test',
+                name: 'Test Creative',
+                format_id: { agent_url: 'https://test.example', id: 'format1' },
+                assets: {
+                  video: {
+                    asset_type: 'video',
+                    url: 'https://example.com/video.mp4',
+                    width: 1920,
+                    height: 1080,
+                    duration_ms: 30000,
+                  },
+                },
+              },
+            ],
+            mode: 'dry_run', // unknown top-level field — passes through now
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      }, 'Unknown top-level fields should not trigger validation rejection');
+    });
+  });
+
+  describe('create_media_buy validation', () => {
+    test('should reject create_media_buy requests with missing required fields', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      await assert.rejects(
+        async () => {
+          // Missing `end_time` (required) — schema violation that must reject
+          // regardless of strict mode.
+          await agent.createMediaBuy({
+            account: { account_id: 'test-account' },
+            brand: { domain: 'example.com' },
+            start_time: 'immediate',
+          });
+        },
+        err => {
+          return err.message.includes('Request validation failed for create_media_buy');
+        },
+        'Should throw validation error when end_time is missing'
+      );
+    });
+
+    test('should pass unknown top-level fields through create_media_buy', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      // Non-strict parse — unknown top-level fields pass client validation.
+      // The server is the authority on unknown keys.
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.createMediaBuy({
+            account: { account_id: 'test-account' },
+            packages: [],
+            brand: { domain: 'example.com' },
+            start_time: 'immediate',
+            end_time: '2025-12-31T23:59:59Z',
+            invalid_field: 'passes through to server',
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      }, 'Unknown top-level fields should not trigger validation rejection');
+    });
+
+    test('should pass validation with brand_manifest present', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      // brand_manifest is preserved by the normalizer and should not cause validation errors
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.createMediaBuy({
+            account: { account_id: 'test-account' },
+            packages: [],
+            brand_manifest: { name: 'Acme', url: 'https://acme.com/brand.json' },
+            start_time: 'immediate',
+            end_time: '2025-12-31T23:59:59Z',
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      }, 'brand_manifest should not cause a validation error');
+    });
+
+    test('should forward brand_manifest URL to v2 agents from manifest object', async () => {
+      const capturedCalls = [];
+      const A2AClient = require('../../dist/lib/protocols/a2a').legacyA2AClientTestShim;
+      const originalFromCardUrl = A2AClient.fromCardUrl;
+
+      A2AClient.fromCardUrl = async () => ({
+        sendMessage: async payload => {
+          capturedCalls.push(payload.message.parts[0].data);
+          return {
+            jsonrpc: '2.0',
+            id: 'test-id',
+            result: {
+              kind: 'task',
+              id: 'task-123',
+              contextId: 'ctx-123',
+              status: { state: 'completed', timestamp: new Date().toISOString() },
+            },
+          };
+        },
+      });
+
+      try {
+        const client = new AdCPClient([mockAgent]);
+        const agent = client.agent(mockAgent.id);
+
+        await agent.createMediaBuy({
+          account: { account_id: 'test-account' },
+          packages: [],
+          brand_manifest: { name: 'Acme', url: 'https://acme.com/brand.json' },
+          start_time: 'immediate',
+          end_time: '2025-12-31T23:59:59Z',
+        });
+      } catch (err) {
+        assert.ok(
+          !err.message.includes('Request validation failed'),
+          `Validation should not reject brand_manifest: ${err.message}`
+        );
+      } finally {
+        A2AClient.fromCardUrl = originalFromCardUrl;
+      }
+
+      // For v2 agents, the manifest object is converted to a URL string.
+      const mediaBuyCall = capturedCalls.find(d => d.skill === 'create_media_buy');
+      if (mediaBuyCall) {
+        assert.strictEqual(
+          mediaBuyCall.parameters.brand_manifest,
+          'https://acme.com/brand.json',
+          'brand_manifest URL should be extracted from manifest object for v2 agents'
+        );
+      }
+    });
+
+    test('should pass validation with buyer_ref present (backward compat)', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      // Callers may still pass a top-level buyer_ref explicitly for legacy servers
+      // that require it — the v2 adapter treats a caller-supplied top-level value
+      // as the highest-priority derivation source. Non-strict parse accepts it
+      // without special-case handling.
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.createMediaBuy({
+            account: { account_id: 'test-account' },
+            packages: [],
+            brand: { domain: 'example.com' },
+            buyer_ref: 'buyer-123',
+            start_time: 'immediate',
+            end_time: '2025-12-31T23:59:59Z',
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      }, 'buyer_ref should not cause a validation error');
+    });
+
+    test('should pass validation with both buyer_ref and brand_manifest present', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      // Both deprecated top-level fields should be stripped before strict validation
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.createMediaBuy({
+            account: { account_id: 'test-account' },
+            packages: [],
+            brand: { domain: 'example.com' },
+            buyer_ref: 'buyer-456',
+            brand_manifest: { name: 'Acme', url: 'https://acme.com/brand.json' },
+            start_time: 'immediate',
+            end_time: '2025-12-31T23:59:59Z',
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      }, 'buyer_ref + brand_manifest together should not cause a validation error');
+    });
+
+    test('should prefer explicit brand over brand_manifest when both are supplied', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.createMediaBuy({
+            account: { account_id: 'test-account' },
+            packages: [],
+            brand: { domain: 'example.com' },
+            brand_manifest: { name: 'Acme', url: 'https://acme.com/brand.json' },
+            start_time: 'immediate',
+            end_time: '2025-12-31T23:59:59Z',
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      }, 'brand takes precedence; brand_manifest stripped without causing a validation error');
+    });
+
+    test('should accept vendor_metric optimization goals with vendor committed_metrics', async () => {
+      const originalCallTool = ProtocolClient.callTool;
+      const captured = [];
+      ProtocolClient.callTool = async (_agentConfig, toolName, args) => {
+        captured.push({ toolName, args });
+        return {
+          status: 'completed',
+          media_buy_id: 'mb-vendor-metric',
+          packages: [],
+        };
+      };
+
+      const mockMCPAgent = {
+        ...mockAgent,
+        agent_uri: 'https://test.example/mcp',
+        protocol: 'mcp',
+      };
+      const client = new AdCPClient([mockMCPAgent]);
+      const agent = client.agent(mockMCPAgent.id);
+      const inner = agent.client;
+      inner.discoveredEndpoint = mockMCPAgent.agent_uri;
+      inner.cachedCapabilities = {
+        version: 'v3',
+        majorVersions: [3],
+        supportedVersions: ['3.2.1'],
+        protocols: ['media_buy'],
+        features: {
+          inlineCreativeManagement: false,
+          conversionTracking: false,
+          audienceTargeting: false,
+          propertyListFiltering: false,
+          contentStandards: false,
+          canonicalCreatives: true,
+        },
+        extensions: [],
+        _synthetic: false,
+      };
+
+      try {
+        await assert.doesNotReject(async () => {
+          await agent.createMediaBuy({
+            account: { account_id: 'test-account' },
+            brand: { domain: 'example.com' },
+            start_time: 'asap',
+            end_time: '2026-06-01T00:00:00Z',
+            packages: [
+              {
+                product_id: 'prod123',
+                pricing_option_id: 'cpm-fixed',
+                budget: 5000,
+                optimization_goals: [
+                  {
+                    kind: 'vendor_metric',
+                    vendor: { domain: 'attentionvendor.example' },
+                    metric_id: 'attention_score',
+                    target: { kind: 'threshold_rate', value: 70 },
+                    priority: 1,
+                  },
+                ],
+                committed_metrics: [
+                  {
+                    scope: 'vendor',
+                    vendor: { domain: 'attentionvendor.example' },
+                    metric_id: 'attention_score',
+                  },
+                ],
+              },
+            ],
+          });
+        }, 'vendor_metric optimization goal shape should not trigger SDK request validation');
+      } finally {
+        ProtocolClient.callTool = originalCallTool;
+      }
+
+      const call = captured.find(c => c.toolName === 'create_media_buy');
+      assert.ok(call, 'create_media_buy should be dispatched after validation');
+      assert.deepStrictEqual(call.args.packages[0].optimization_goals[0], {
+        kind: 'vendor_metric',
+        vendor: { domain: 'attentionvendor.example' },
+        metric_id: 'attention_score',
+        target: { kind: 'threshold_rate', value: 70 },
+        priority: 1,
+      });
+      assert.deepStrictEqual(call.args.packages[0].committed_metrics[0], {
+        scope: 'vendor',
+        vendor: { domain: 'attentionvendor.example' },
+        metric_id: 'attention_score',
+      });
+    });
+  });
+
+  // AdCP v3 schemas have additionalProperties: true for extensibility.
+  // Client-side validation uses non-strict parse so unknown fields pass
+  // through — this matters for the storyboard runner's scoping injection
+  // (`brand`/`account`) on tools whose schema declares neither, which the
+  // downstream adapter strips before the wire call.
+
+  describe('get_products validation', () => {
+    test('should pass unknown top-level fields through get_products', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      // Non-strict parse — unknown top-level fields don't trigger rejection.
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.getProducts({
+            extra_field: 'passes through',
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      }, 'Unknown top-level fields should not trigger validation rejection');
+    });
+
+    test('should infer buying_mode "brief" when brief is provided but buying_mode is missing', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      // Should NOT throw validation error — buying_mode inferred from brief presence
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.getProducts({
+            brief: 'Looking for premium ad placements',
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      });
+    });
+
+    test('should infer buying_mode "wholesale" when neither brief nor buying_mode is provided', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      // Should NOT throw validation error — buying_mode inferred as 'wholesale'
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.getProducts({});
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      });
+    });
+
+    test('should not override explicit buying_mode', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      // Explicit buying_mode should be preserved even if brief is also provided
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.getProducts({
+            buying_mode: 'brief',
+            brief: 'Test brief',
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      });
+    });
+
+    test('should preserve explicit wholesale buying_mode', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.getProducts({
+            buying_mode: 'wholesale',
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      });
+    });
+  });
+
+  describe('update_media_buy validation', () => {
+    test('should allow extra fields in update_media_buy (v3 extensibility)', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      // AdCP v3 allows extra fields for forward compatibility
+      // Use ext field for extensions, but extra fields won't be rejected
+      try {
+        await agent.updateMediaBuy({
+          media_buy_id: 'mb123',
+          extra_field: 'allowed in v3',
+        });
+      } catch (err) {
+        // Network error is expected (mock agent), but validation error is not
+        assert.ok(!err.message.includes('Request validation failed'), 'Should not reject extra fields in v3 schemas');
+      }
+    });
+  });
+
+  describe('list_creatives validation', () => {
+    test('should pass unknown top-level fields through list_creatives', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      // list_creatives declares neither `brand` nor `account`. Before this
+      // change, strict() rejected the runner's injected scoping fields
+      // client-side before the adapter could strip them. Non-strict parse
+      // lets injection pass through to the adapter.
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.listCreatives({
+            invalid_field: 'passes through',
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      }, 'Unknown top-level fields should not trigger validation rejection');
+    });
+  });
+
+  describe('runner-injected brand/account survive client validation', () => {
+    // Regression guard: the storyboard runner's `applyBrandInvariant` injects
+    // top-level `brand` and `account` onto every outgoing request so a single
+    // run stays scoped to one brand. For tools whose schema declares neither
+    // (list_creative_formats, get_signals, activate_signal, sync_creatives),
+    // a strict client-side parse would reject the injection BEFORE
+    // `adaptRequestForServerVersion` strips it by schema. This test pins the
+    // non-strict parse by asserting the injected request actually reaches
+    // dispatch — not just "didn't throw a validation error."
+    for (const [toolName, invoke] of [
+      ['list_creative_formats', agent => agent.listCreativeFormatsLegacy],
+      ['get_signals', agent => agent.getSignals],
+      ['list_creatives', agent => agent.listCreatives],
+    ]) {
+      test(`${toolName} accepts injected brand/account and dispatches`, async () => {
+        const mockMCPAgent = {
+          id: 'scoped-agent',
+          name: 'Scoped Agent',
+          agent_uri: 'https://agents.example.com/mcp',
+          protocol: 'mcp',
+        };
+        const client = new AdCPClient([mockMCPAgent]);
+        const agent = client.agent(mockMCPAgent.id);
+        const inner = agent.client;
+        inner.discoveredEndpoint = mockMCPAgent.agent_uri;
+        inner.cachedCapabilities = {
+          version: 'v3',
+          majorVersions: [3],
+          protocols: ['media_buy', 'signals'],
+          features: {
+            inlineCreativeManagement: false,
+            conversionTracking: false,
+            audienceTargeting: false,
+            propertyListFiltering: false,
+            contentStandards: false,
+          },
+          extensions: [],
+          _synthetic: false,
+        };
+
+        const originalCallTool = ProtocolClient.callTool;
+        const captured = [];
+        ProtocolClient.callTool = async (_cfg, name, args) => {
+          captured.push({ name, args });
+          return {};
+        };
+
+        try {
+          await invoke(agent).call(agent, {
+            brand: { domain: 'example.com' },
+            account: { brand: { domain: 'example.com' }, operator: 'example.com' },
+          });
+        } catch (err) {
+          if (err.message?.includes('Request validation failed')) {
+            throw err;
+          }
+        } finally {
+          ProtocolClient.callTool = originalCallTool;
+        }
+
+        const call = captured.find(c => c.name === toolName);
+        assert.ok(call, `${toolName} should have been dispatched (validation passed)`);
+      });
+    }
+  });
+
+  describe('PackageRequest format_ids validation', () => {
+    test('should allow format_ids with extra fields (Zod strips unknown fields by default)', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      // NOTE: Zod strips unknown fields in nested objects by default (not strict for nested)
+      // This is intentional - strict() only applies to top-level fields
+      // Extra fields in format_ids will be silently stripped, not rejected
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.createMediaBuy({
+            account: { account_id: 'test-account' },
+            packages: [
+              {
+                buyer_ref: 'pkg123',
+                product_id: 'prod123',
+                format_ids: [
+                  {
+                    agent_url: 'https://test.example',
+                    id: 'display_300x250',
+                    width: 300,
+                    height: 250,
+                    // Extra fields - will be stripped, not rejected
+                    name: 'Banner',
+                    description: 'Standard banner',
+                  },
+                ],
+                budget: 1000,
+                pricing_option_id: 'cpm-fixed',
+              },
+            ],
+            brand: { domain: 'example.com' },
+            start_time: 'asap',
+            end_time: '2025-12-31T23:59:59Z',
+          });
+        } catch (err) {
+          // Network errors are expected since we're not mocking the agent
+          // We only care that validation doesn't reject format_ids with extra fields
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      });
+    });
+
+    test('should accept format_ids with only valid FormatID fields', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      // This should NOT throw validation error (may fail on network, but not validation)
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.createMediaBuy({
+            account: { account_id: 'test-account' },
+            packages: [
+              {
+                buyer_ref: 'pkg123',
+                product_id: 'prod123',
+                format_ids: [
+                  {
+                    agent_url: 'https://test.example',
+                    id: 'display_300x250',
+                    width: 300,
+                    height: 250,
+                  },
+                ],
+                budget: 1000,
+                pricing_option_id: 'cpm-fixed',
+              },
+            ],
+            brand: { domain: 'example.com' },
+            start_time: 'asap',
+            end_time: '2025-12-31T23:59:59Z',
+          });
+        } catch (err) {
+          // Network errors are expected since we're not mocking the agent
+          // We only care that validation doesn't reject valid format_ids
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      });
+    });
+  });
+
+  describe('context field preservation', () => {
+    test('should allow arbitrary properties in context field for get_products', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      // This should NOT throw - context field should accept arbitrary properties
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.getProducts({
+            buying_mode: 'brief',
+            brief: 'Test brief',
+            context: {
+              trace_id: '123',
+              request_id: 'abc',
+              custom_field: 'anything',
+              nested: { deeply: { nested: 'value' } },
+            },
+          });
+        } catch (err) {
+          // Network errors are expected since we're not mocking the agent
+          // We only care that validation doesn't reject the context field
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      });
+    });
+
+    test('should allow arbitrary properties in context field for sync_creatives', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.syncCreatives({
+            account: { account_id: 'test-account' },
+            creatives: [
+              {
+                creative_id: 'test',
+                name: 'Test Creative',
+                format_id: { agent_url: 'https://test.example', id: 'format1' },
+                assets: {
+                  video: {
+                    asset_type: 'video',
+                    url: 'https://example.com/video.mp4',
+                    width: 1920,
+                    height: 1080,
+                    duration_ms: 30000,
+                  },
+                },
+              },
+            ],
+            context: {
+              correlation_id: 'xyz-789',
+              tenant_id: 'tenant-123',
+              any_property: 'should be preserved',
+            },
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      });
+    });
+
+    test('should allow arbitrary properties in context field for create_media_buy', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.createMediaBuy({
+            account: { account_id: 'test-account' },
+            packages: [],
+            brand: { domain: 'example.com' },
+            start_time: 'immediate',
+            end_time: '2025-12-31T23:59:59Z',
+            context: {
+              session_id: 'sess-456',
+              user_agent: 'test-client/1.0',
+              custom_metadata: { foo: 'bar', baz: 123 },
+            },
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      });
+    });
+
+    test('should allow arbitrary properties in context field for build_creative', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.buildCreativeLegacy({
+            target_format_id: { agent_url: 'https://test.example', id: 'format1' },
+            context: {
+              build_id: 'build-789',
+              environment: 'test',
+              arbitrary_data: { nested: { structure: true } },
+            },
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      });
+    });
+  });
+
+  describe('get_media_buys validation', () => {
+    test('should accept valid get_media_buys request with media_buy_ids', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.getMediaBuys({
+            account: { account_id: 'test-account' },
+            media_buy_ids: ['mb_123', 'mb_456'],
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      });
+    });
+
+    test('should accept get_media_buys request with status_filter array', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.getMediaBuys({
+            account: { account_id: 'test-account' },
+            status_filter: ['active', 'paused'],
+            include_snapshot: true,
+          });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      });
+    });
+
+    test('should accept empty get_media_buys request', async () => {
+      const client = new AdCPClient([mockAgent]);
+      const agent = client.agent(mockAgent.id);
+
+      await assert.doesNotReject(async () => {
+        try {
+          await agent.getMediaBuys({ account: { account_id: 'test-account' } });
+        } catch (err) {
+          if (err.message.includes('Request validation failed')) {
+            throw err;
+          }
+        }
+      });
+    });
+  });
+});
+
+describe('v3 partial-schema field stripping', () => {
+  // For v3 agents with a cached inputSchema, the client filters request params to
+  // only the fields declared in the schema OR canonical for the task in the
+  // resolved AdCP version. This handles partial v3 implementations that declare
+  // get_adcp_capabilities but omit some canonical v3 fields from their tool
+  // schema — canonical fields are preserved (they're valid AdCP), only fields
+  // unknown to BOTH the agent schema AND the canonical request schema (genuine
+  // junk / vendor extensions) are dropped.
+  test('should strip only non-canonical undeclared fields from get_products for a partial v3 agent', async () => {
+    const mockMCPAgent = {
+      id: 'partial-v3-agent',
+      name: 'Partial V3 Agent',
+      agent_uri: 'https://agents.example.com/mcp',
+      protocol: 'mcp',
+    };
+
+    const client = new AdCPClient([mockMCPAgent]);
+    const agent = client.agent(mockMCPAgent.id);
+    // AgentClient wraps SingleAgentClient in .client; set state there to bypass network calls
+    const inner = agent.client;
+
+    // Simulate: agent is detected as v3 but get_products schema omits 'brand'
+    // (a canonical AdCP field). It also receives a genuinely-unknown vendor
+    // field that is canonical to neither the agent nor the spec.
+    inner.discoveredEndpoint = mockMCPAgent.agent_uri;
+    inner.cachedCapabilities = {
+      version: 'v3',
+      majorVersions: [3],
+      protocols: ['media_buy'],
+      features: {
+        inlineCreativeManagement: false,
+        conversionTracking: false,
+        audienceTargeting: false,
+        propertyListFiltering: false,
+        contentStandards: false,
+      },
+      extensions: [],
+      _synthetic: false,
+    };
+    inner.cachedToolSchemas = new Map([
+      ['get_products', { brief: {}, filters: {}, buying_mode: {} }], // no 'brand'
+    ]);
+
+    const capturedCalls = [];
+    let result;
+    const originalCallTool = ProtocolClient.callTool;
+    ProtocolClient.callTool = async (_agentConfig, toolName, args) => {
+      capturedCalls.push({ toolName, args });
+      return { products: [], formats: [] };
+    };
+
+    try {
+      result = await agent.getProducts({
+        brand: { domain: 'fanta.com' },
+        brief: 'love chocolate and have 20k to spend',
+        totally_made_up_field: 'junk',
+      });
+    } catch (err) {
+      if (err.message?.includes('Request validation failed')) {
+        throw err;
+      }
+      // Network/protocol errors are expected since there's no real server
+    } finally {
+      ProtocolClient.callTool = originalCallTool;
+    }
+
+    const getProductsCall = capturedCalls.find(c => c.toolName === 'get_products');
+    assert.ok(getProductsCall, 'get_products should have been called');
+    // `brand` is a canonical top-level field for get_products in the resolved
+    // AdCP version — it must be preserved even though the partial agent omits
+    // it from its self-declared schema. (Pre-fix this was wrongly stripped.)
+    assert.deepStrictEqual(
+      getProductsCall.args.brand,
+      { domain: 'fanta.com' },
+      'canonical brand should be preserved even when the agent under-declares it'
+    );
+    assert.ok(getProductsCall.args.brief, 'brief should be preserved');
+    assert.strictEqual(
+      getProductsCall.args.totally_made_up_field,
+      undefined,
+      'a field unknown to both the agent schema and the canonical schema should be stripped'
+    );
+    const stripLog = result.debug_logs.find(log => log.details?.code === 'input_schema_field_stripped');
+    assert.ok(stripLog, 'stripped fields should be surfaced in structured debug_logs');
+    assert.match(stripLog.message, /not declared by either the agent tool input schema or canonical AdCP schema/);
+    assert.doesNotMatch(stripLog.message, /not declared in agent tool input schema/);
+    assert.strictEqual(stripLog.details.task, 'get_products');
+    assert.deepStrictEqual(
+      stripLog.details.fields,
+      ['totally_made_up_field'],
+      'only the genuinely-unknown field should be reported as stripped'
+    );
+  });
+
+  test('should pass through all fields when v3 agent schema declares them', async () => {
+    const mockMCPAgent = {
+      id: 'full-v3-agent',
+      name: 'Full V3 Agent',
+      agent_uri: 'https://agents.example.com/mcp',
+      protocol: 'mcp',
+    };
+
+    const client = new AdCPClient([mockMCPAgent]);
+    const agent = client.agent(mockMCPAgent.id);
+    const inner = agent.client;
+
+    // Simulate: agent is detected as v3 and does declare 'brand' in its schema
+    inner.discoveredEndpoint = mockMCPAgent.agent_uri;
+    inner.cachedCapabilities = {
+      version: 'v3',
+      majorVersions: [3],
+      protocols: ['media_buy'],
+      features: {
+        inlineCreativeManagement: false,
+        conversionTracking: false,
+        audienceTargeting: false,
+        propertyListFiltering: false,
+        contentStandards: false,
+      },
+      extensions: [],
+      _synthetic: false,
+    };
+    inner.cachedToolSchemas = new Map([
+      ['get_products', { brief: {}, filters: {}, buying_mode: {}, brand: {} }], // has 'brand'
+    ]);
+
+    const capturedCalls = [];
+    const originalCallTool = ProtocolClient.callTool;
+    ProtocolClient.callTool = async (_agentConfig, toolName, args) => {
+      capturedCalls.push({ toolName, args });
+      return { products: [], formats: [] };
+    };
+
+    try {
+      await agent.getProducts({
+        brand: { domain: 'example.com' },
+        brief: 'test campaign',
+      });
+    } catch (err) {
+      if (err.message?.includes('Request validation failed')) {
+        throw err;
+      }
+    } finally {
+      ProtocolClient.callTool = originalCallTool;
+    }
+
+    const getProductsCall = capturedCalls.find(c => c.toolName === 'get_products');
+    assert.ok(getProductsCall, 'get_products should have been called');
+    assert.deepStrictEqual(
+      getProductsCall.args.brand,
+      { domain: 'example.com' },
+      'brand should be passed through when declared in agent schema'
+    );
+  });
+
+  // Regression: "Open Ads" (https://api.openads.ai/mcp) production incident.
+  // A 3rd-party AdCP sales agent advertised a PARTIAL tool inputSchema via
+  // tools/list. The old strip path intersected outgoing fields with ONLY the
+  // agent's self-declared schema, so canonical — sometimes REQUIRED — AdCP
+  // request fields were dropped before the request left the client:
+  //   update_media_buy: media_buy_id (REQUIRED) was at risk
+  //   get_media_buy_delivery: media_buy_id / media_buy_ids stripped
+  //   sync_creatives: media_buy_id / creative_ids stripped
+  // This broke media-buy updates and delivery polling against partial-schema
+  // sellers. The fix unions the agent schema with the canonical request schema
+  // (schemaAllowsTopLevelField): canonical fields are preserved, genuine junk
+  // is still stripped.
+  const partialSchemaCases = [
+    {
+      name: 'update_media_buy',
+      toolName: 'update_media_buy',
+      invoke: agent => agent.updateMediaBuy.bind(agent),
+      // Partial schema declares only `revision`, omitting canonical media_buy_id.
+      partialToolSchema: { revision: {} },
+      request: {
+        media_buy_id: 'mb_123',
+        totally_made_up_field: 'junk',
+      },
+      preservedField: 'media_buy_id',
+      preservedValue: 'mb_123',
+      mockResponse: { media_buy_id: 'mb_123', status: 'completed' },
+    },
+    {
+      name: 'get_media_buy_delivery',
+      toolName: 'get_media_buy_delivery',
+      invoke: agent => agent.getMediaBuyDelivery.bind(agent),
+      // Partial schema declares only `status_filter`, omitting media_buy_ids.
+      partialToolSchema: { status_filter: {} },
+      request: {
+        media_buy_ids: ['mb_123', 'mb_456'],
+        totally_made_up_field: 'junk',
+      },
+      preservedField: 'media_buy_ids',
+      preservedValue: ['mb_123', 'mb_456'],
+      mockResponse: { deliveries: [] },
+    },
+    {
+      name: 'get_media_buy_delivery requested_metrics',
+      toolName: 'get_media_buy_delivery',
+      invoke: agent => agent.getMediaBuyDelivery.bind(agent),
+      partialToolSchema: { status_filter: {} },
+      request: {
+        requested_metrics: ['viewable_rate', 'quartile_100', 'time_based_views'],
+        reporting_dimensions: { format: { sort_by: 'viewable_rate', sort_direction: 'asc' } },
+        totally_made_up_field: 'junk',
+      },
+      preservedField: 'requested_metrics',
+      preservedValue: ['viewable_rate', 'quartile_100', 'time_based_views'],
+      additionalPreserved: {
+        reporting_dimensions: { format: { sort_by: 'viewable_rate', sort_direction: 'asc' } },
+      },
+      mockResponse: { deliveries: [] },
+    },
+    {
+      name: 'sync_creatives',
+      toolName: 'sync_creatives',
+      invoke: agent => agent.syncCreatives.bind(agent),
+      // Partial schema declares only `creatives`, omitting creative_ids.
+      partialToolSchema: { creatives: {} },
+      // sync_creatives has a strict pre-send Zod gate (required account +
+      // creatives), so supply a valid body — the point of the test is the
+      // downstream strip path, not the required-field gate.
+      request: {
+        account: { account_id: 'test-account' },
+        creatives: [
+          {
+            creative_id: 'cr_1',
+            name: 'Test Creative',
+            format_kind: 'video_hosted',
+            assets: {
+              video: {
+                asset_type: 'video',
+                url: 'https://example.com/video.mp4',
+                width: 1920,
+                height: 1080,
+                duration_ms: 30000,
+              },
+            },
+          },
+        ],
+        creative_ids: ['cr_1', 'cr_2'],
+        totally_made_up_field: 'junk',
+      },
+      preservedField: 'creative_ids',
+      preservedValue: ['cr_1', 'cr_2'],
+      mockResponse: { creatives: [] },
+    },
+  ];
+
+  for (const tc of partialSchemaCases) {
+    test(`Open Ads regression: preserves canonical ${tc.preservedField} but strips junk for partial-schema ${tc.name}`, async () => {
+      const mockMCPAgent = {
+        id: 'open-ads',
+        name: 'Open Ads',
+        agent_uri: 'https://api.openads.ai/mcp',
+        protocol: 'mcp',
+      };
+
+      const client = new AdCPClient([mockMCPAgent]);
+      const agent = client.agent(mockMCPAgent.id);
+      const inner = agent.client;
+
+      inner.discoveredEndpoint = mockMCPAgent.agent_uri;
+      inner.cachedCapabilities = {
+        version: 'v3',
+        majorVersions: [3],
+        supportedVersions: ['3.2.1'],
+        protocols: ['media_buy'],
+        features: {
+          inlineCreativeManagement: false,
+          conversionTracking: false,
+          audienceTargeting: false,
+          propertyListFiltering: false,
+          contentStandards: false,
+          canonicalCreatives: true,
+        },
+        extensions: [],
+        _synthetic: false,
+      };
+      // Partial inputSchema: agent under-declares its tool fields.
+      inner.cachedToolSchemas = new Map([[tc.toolName, tc.partialToolSchema]]);
+
+      const capturedCalls = [];
+      const originalCallTool = ProtocolClient.callTool;
+      ProtocolClient.callTool = async (_agentConfig, toolName, args) => {
+        capturedCalls.push({ toolName, args });
+        return tc.mockResponse;
+      };
+
+      try {
+        await tc.invoke(agent)(tc.request);
+      } catch (err) {
+        if (err.message?.includes('Request validation failed')) {
+          throw err;
+        }
+        // Network/protocol errors are expected — there's no real server.
+      } finally {
+        ProtocolClient.callTool = originalCallTool;
+      }
+
+      const call = capturedCalls.find(c => c.toolName === tc.toolName);
+      assert.ok(call, `${tc.toolName} should have been called`);
+      assert.deepStrictEqual(
+        call.args[tc.preservedField],
+        tc.preservedValue,
+        `canonical ${tc.preservedField} must be preserved even though the agent under-declares it`
+      );
+      for (const [field, value] of Object.entries(tc.additionalPreserved ?? {})) {
+        assert.deepStrictEqual(
+          call.args[field],
+          value,
+          `canonical ${field} must be preserved even though the agent under-declares it`
+        );
+      }
+      assert.strictEqual(
+        call.args.totally_made_up_field,
+        undefined,
+        'a field unknown to both the agent schema and the canonical schema should still be stripped'
+      );
+    });
+  }
+});
+
+describe('strict request validation against v2 servers', () => {
+  test('strict mode still rejects malformed v3 input from the migrated SingleAgentClient seam', async () => {
+    // Regression guard for the call-site move: the inline AJV pass inside
+    // TaskExecutor.executeTask is gone, replaced by SingleAgentClient.executeTask
+    // calling executor.validateRequest before the v2 adapter runs. Confirm a
+    // malformed v3 request (create_media_buy missing required end_time) still
+    // throws — not just "didn't accept it cleanly", we want the
+    // `Request validation failed` channel to fire.
+    const mockMCPAgent = {
+      id: 'v3-agent-negative',
+      name: 'V3 Agent',
+      agent_uri: 'https://agents.example.com/mcp',
+      protocol: 'mcp',
+    };
+
+    const client = new AdCPClient([mockMCPAgent], {
+      validation: { requests: 'strict' },
+    });
+    const agent = client.agent(mockMCPAgent.id);
+    const inner = agent.client;
+    inner.discoveredEndpoint = mockMCPAgent.agent_uri;
+    inner.cachedCapabilities = {
+      version: 'v3',
+      majorVersions: [3],
+      protocols: ['media_buy'],
+      features: {
+        inlineCreativeManagement: false,
+        conversionTracking: false,
+        audienceTargeting: false,
+        propertyListFiltering: false,
+        contentStandards: false,
+      },
+      extensions: [],
+      _synthetic: false,
+    };
+
+    await assert.rejects(
+      agent.createMediaBuy({
+        account: { account_id: 'acct-1' },
+        brand: { domain: 'example.com' },
+        start_time: 'asap',
+        // Missing `end_time` — required by the v3 schema. Must reject.
+      }),
+      err => /Request validation failed|Validation failed for field/.test(err.message ?? ''),
+      'malformed v3 input must still throw from the migrated validate seam'
+    );
+  });
+
+  test('strict mode preserves v3 fields and reaches the protocol layer for a v3 agent', async () => {
+    const mockMCPAgent = {
+      id: 'v3-agent',
+      name: 'V3 Agent',
+      agent_uri: 'https://agents.example.com/mcp',
+      protocol: 'mcp',
+    };
+
+    const client = new AdCPClient([mockMCPAgent], {
+      validation: { requests: 'strict' },
+    });
+    const agent = client.agent(mockMCPAgent.id);
+    const inner = agent.client;
+
+    inner.discoveredEndpoint = mockMCPAgent.agent_uri;
+    inner.cachedCapabilities = {
+      version: 'v3',
+      majorVersions: [3],
+      protocols: ['media_buy'],
+      features: {
+        inlineCreativeManagement: false,
+        conversionTracking: false,
+        audienceTargeting: false,
+        propertyListFiltering: false,
+        contentStandards: false,
+      },
+      extensions: [],
+      _synthetic: false,
+      idempotency: { replayTtlSeconds: 3600 },
+    };
+
+    const capturedCalls = [];
+    const originalCallTool = ProtocolClient.callTool;
+    ProtocolClient.callTool = async (_agentConfig, toolName, args) => {
+      capturedCalls.push({ toolName, args });
+      return { products: [] };
+    };
+
+    try {
+      await agent.getProducts({
+        buying_mode: 'brief',
+        brief: 'Premium ad placements',
+        brand: { domain: 'example.com' },
+      });
+    } finally {
+      ProtocolClient.callTool = originalCallTool;
+    }
+
+    const call = capturedCalls.find(c => c.toolName === 'get_products');
+    assert.ok(call, 'get_products should have reached the protocol layer');
+    assert.strictEqual(call.args.buying_mode, 'brief', 'buying_mode is preserved for v3');
+    assert.deepStrictEqual(call.args.brand, { domain: 'example.com' }, 'brand is preserved for v3');
+  });
+
+  test('request-scoped capabilities override a stale cache during version adaptation', async () => {
+    const mockMCPAgent = {
+      id: 'scoped-v31-agent',
+      name: 'Scoped AdCP 3.1 Agent',
+      agent_uri: 'https://agents.example.com/mcp',
+      protocol: 'mcp',
+    };
+    const client = new AdCPClient([mockMCPAgent]);
+    const agent = client.agent(mockMCPAgent.id);
+    const inner = agent.client;
+
+    inner.discoveredEndpoint = mockMCPAgent.agent_uri;
+    inner.cachedCapabilities = {
+      version: 'v3',
+      majorVersions: [3],
+      supportedVersions: ['3.0'],
+      protocols: ['media_buy'],
+      features: {},
+      extensions: [],
+      _synthetic: false,
+    };
+    inner.getCapabilities = async () => ({
+      version: 'v3',
+      majorVersions: [3],
+      supportedVersions: ['3.1'],
+      protocols: ['media_buy'],
+      features: {},
+      extensions: [],
+      _synthetic: false,
+    });
+
+    const capturedCalls = [];
+    const originalCallTool = ProtocolClient.callTool;
+    ProtocolClient.callTool = async (_agentConfig, toolName, args) => {
+      capturedCalls.push({ toolName, args });
+      return { status: 'completed', products: [] };
+    };
+
+    try {
+      await agent.getProductsLegacy({
+        buying_mode: 'brief',
+        brief: 'Premium ad placements',
+        filters: { pricing_currencies: ['USD'] },
+      });
+    } finally {
+      ProtocolClient.callTool = originalCallTool;
+    }
+
+    const call = capturedCalls.find(c => c.toolName === 'get_products');
+    assert.ok(call, 'get_products should have reached the protocol layer');
+    assert.deepStrictEqual(
+      call.args.filters?.pricing_currencies,
+      ['USD'],
+      'the stale 3.0 cache must not strip fields supported by the request-scoped 3.1 seller'
+    );
+  });
+});

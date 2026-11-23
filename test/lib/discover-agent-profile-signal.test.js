@@ -1,0 +1,254 @@
+/**
+ * Regression test for adcp-client#1612 (third-bug fix).
+ *
+ * Before this fix, `discoverAgentProfile` had no AbortSignal awareness, so
+ * an unhealthy agent's `getAgentInfo()` could spin past comply()'s timeout
+ * (we observed 425s of MCP retries against a non-MCP root). The fix wraps
+ * the underlying calls with an internal `raceWithSignal` so the comply
+ * pipeline's combined timeout/external signal bounds discovery latency.
+ * The orphaned in-flight transport call still resolves in the background;
+ * the fix is about unblocking the caller, not cancelling the transport.
+ *
+ * `discoverAgentProfile` runs the call through `runStep`, which catches
+ * the AbortError and returns `{ step: { passed: false, error } }` rather
+ * than re-throwing — so the assertions check that shape.
+ */
+
+const { describe, test } = require('node:test');
+const assert = require('node:assert');
+
+const { discoverAgentProfile } = require('../../dist/lib/testing/client.js');
+
+function slowClient(delayMs) {
+  let calls = 0;
+  let pendingTimers = [];
+  return {
+    callCount: () => calls,
+    cleanup: () => {
+      pendingTimers.forEach(t => clearTimeout(t));
+      pendingTimers = [];
+    },
+    getAgentInfo: () => {
+      calls += 1;
+      return new Promise(resolve => {
+        const t = setTimeout(() => resolve({ name: 'Slow', tools: [] }), delayMs);
+        pendingTimers.push(t);
+      });
+    },
+    getAdcpCapabilities: async () => ({ success: true, data: {} }),
+  };
+}
+
+describe('discoverAgentProfile: AbortSignal honored (#1612)', () => {
+  test('reports failure on pre-aborted signal without blocking on slow transport', async () => {
+    const controller = new AbortController();
+    controller.abort(new Error('pre-aborted'));
+    const client = slowClient(60000);
+
+    const t0 = Date.now();
+    const { step } = await discoverAgentProfile(client, controller.signal);
+    const elapsed = Date.now() - t0;
+
+    client.cleanup();
+
+    assert.strictEqual(step.passed, false, 'step should fail when signal is pre-aborted');
+    assert.ok(step.error?.includes('pre-aborted'), `expected pre-aborted in error, got: ${step.error}`);
+    assert.ok(elapsed < 100, `should exit fast on pre-aborted signal, took ${elapsed}ms`);
+  });
+
+  test('aborts mid-call without waiting for slow getAgentInfo to resolve', async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error('mid-call')), 30);
+    const client = slowClient(5000);
+
+    const t0 = Date.now();
+    const { step } = await discoverAgentProfile(client, controller.signal);
+    const elapsed = Date.now() - t0;
+
+    client.cleanup();
+
+    assert.strictEqual(step.passed, false, 'step should fail when signal aborts mid-call');
+    assert.ok(step.error?.includes('mid-call'), `expected mid-call in error, got: ${step.error}`);
+    // Race wrapper resolves on abort. Bound is "well below" the 5s mock delay;
+    // loose to avoid CI flakes on slow runners.
+    assert.ok(elapsed < 1000, `expected fast abort exit, took ${elapsed}ms`);
+  });
+
+  test('runs to completion when signal is never aborted', async () => {
+    const client = slowClient(5);
+    const { profile, step } = await discoverAgentProfile(client);
+    assert.strictEqual(step.passed, true);
+    assert.strictEqual(profile.name, 'Slow');
+    client.cleanup();
+  });
+
+  test('passing no signal is a no-op (backward compat)', async () => {
+    const client = slowClient(5);
+    const { profile } = await discoverAgentProfile(client);
+    assert.strictEqual(profile.name, 'Slow');
+    client.cleanup();
+  });
+
+  test('captures schema-invalid capabilities pointers without suppressing best-effort profile parsing', async () => {
+    const client = {
+      getAgentInfo: async () => ({
+        name: 'Invalid capabilities seller',
+        tools: [{ name: 'get_adcp_capabilities' }],
+      }),
+      getAdcpVersion: () => '3.1.11',
+      getAdcpCapabilities: async () => ({
+        success: true,
+        data: {
+          adcp: { major_versions: [3], idempotency: { supported: true, replay_ttl_seconds: 86400 } },
+          supported_protocols: ['media_buy'],
+          account: { supported_billing: 'operator', sandbox: { supported: true } },
+        },
+      }),
+    };
+
+    const { profile } = await discoverAgentProfile(client);
+    assert.deepStrictEqual(profile.supported_protocols, ['media_buy']);
+    assert.ok(profile.raw_capabilities, 'invalid response remains available for downstream selection');
+    assert.ok(profile.capabilities_schema_issues?.length >= 1);
+    assert.ok(
+      profile.capabilities_schema_issues.some(issue => issue.pointer === '/account/supported_billing'),
+      JSON.stringify(profile.capabilities_schema_issues)
+    );
+  });
+
+  test('records a probe diagnostic when capabilities succeeds without data', async () => {
+    const client = {
+      getAgentInfo: async () => ({
+        name: 'Empty capabilities seller',
+        tools: [{ name: 'get_adcp_capabilities' }],
+      }),
+      getAdcpCapabilities: async () => ({ success: true }),
+    };
+
+    const { profile } = await discoverAgentProfile(client);
+    assert.strictEqual(profile.raw_capabilities, undefined);
+    assert.strictEqual(profile.capabilities_probe_error, 'get_adcp_capabilities returned no data');
+  });
+
+  test('marks VERSION_UNSUPPORTED capability discovery as a hard failure with the version delta', async () => {
+    const client = {
+      getAgentInfo: async () => ({
+        name: 'Older prerelease seller',
+        tools: [{ name: 'get_adcp_capabilities' }, { name: 'get_products' }],
+      }),
+      getAdcpVersion: () => '3.2-beta.5',
+      getAdcpCapabilities: async () => ({
+        success: false,
+        error: 'AdCP version 3.2-beta.5 is not supported',
+        adcpError: {
+          code: 'VERSION_UNSUPPORTED',
+          message: 'AdCP version 3.2-beta.5 is not supported',
+          details: {
+            adcp_version: '3.2-beta.5',
+            supported_versions: ['3.1-rc.15', '3.2-beta.2'],
+          },
+        },
+      }),
+    };
+
+    const { profile, step } = await discoverAgentProfile(client);
+    assert.strictEqual(step.passed, false);
+    assert.match(step.error, /^VERSION_UNSUPPORTED:/);
+    assert.match(step.error, /3\.2-beta\.5/);
+    assert.match(step.error, /3\.2-beta\.2/);
+    assert.strictEqual(profile.capabilities_probe_error, step.error);
+    assert.strictEqual(profile.adcp_version, undefined, 'must not synthesize a v2 capability profile');
+  });
+
+  test('detects VERSION_UNSUPPORTED returned as successful tool data', async () => {
+    const client = {
+      getAgentInfo: async () => ({
+        name: 'Public test seller',
+        tools: [{ name: 'get_adcp_capabilities' }, { name: 'list_products' }],
+      }),
+      getAdcpVersion: () => '3.2-beta.5',
+      getAdcpCapabilities: async () => ({
+        success: true,
+        data: {
+          adcp_error: {
+            code: 'VERSION_UNSUPPORTED',
+            message: 'AdCP version 3.2-beta.5 is not supported',
+            details: {
+              adcp_version: '3.2-beta.5',
+              supported_versions: ['3.2-beta.2'],
+            },
+          },
+        },
+      }),
+    };
+
+    const { profile, step } = await discoverAgentProfile(client);
+    assert.strictEqual(step.passed, false);
+    assert.match(step.error, /^VERSION_UNSUPPORTED:/);
+    assert.match(step.error, /3\.2-beta\.2/);
+    assert.strictEqual(profile.capabilities_probe_error, step.error);
+    assert.strictEqual(profile.adcp_version, undefined, 'must not parse an error envelope as v2 capabilities');
+    assert.strictEqual(profile.raw_capabilities, undefined, 'must not publish an error envelope as capabilities');
+    assert.strictEqual(profile.capabilities_schema_issues, undefined, 'must not validate an error as success data');
+  });
+
+  // code-reviewer follow-up on #1612: the wrapper covers the second
+  // `getAdcpCapabilities()` call, not just the first `getAgentInfo()`.
+  // Cover that path explicitly so a future refactor that bypasses
+  // `raceWithSignal` on the second call gets caught.
+  test('aborts the getAdcpCapabilities call too, not just getAgentInfo', async () => {
+    let capabilitiesCalls = 0;
+    let pendingTimers = [];
+    const cleanup = () => {
+      pendingTimers.forEach(t => clearTimeout(t));
+      pendingTimers = [];
+    };
+    const client = {
+      // Fast getAgentInfo so the second call (capabilities) is the one
+      // racing the abort.
+      getAgentInfo: async () => ({
+        name: 'Fast',
+        tools: [{ name: 'get_adcp_capabilities' }],
+      }),
+      getAdcpCapabilities: () => {
+        capabilitiesCalls += 1;
+        return new Promise(resolve => {
+          const t = setTimeout(() => resolve({ success: true, data: {} }), 5000);
+          pendingTimers.push(t);
+        });
+      },
+    };
+
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error('mid-capabilities')), 30);
+
+    const t0 = Date.now();
+    const { profile } = await discoverAgentProfile(client, controller.signal);
+    const elapsed = Date.now() - t0;
+    cleanup();
+
+    assert.strictEqual(capabilitiesCalls, 1, 'capabilities should have been invoked once');
+    assert.ok(elapsed < 1000, `expected fast abort exit, took ${elapsed}ms`);
+    // capabilities never resolved, so capabilities-derived fields stay unset.
+    assert.strictEqual(profile.adcp_version, undefined);
+    assert.strictEqual(profile.specialisms, undefined);
+    // The capabilities_probe_error is set in the catch path — it should
+    // mention the abort, not silently succeed.
+    assert.ok(
+      profile.capabilities_probe_error?.includes('mid-capabilities'),
+      `expected capabilities_probe_error to mention abort, got: ${profile.capabilities_probe_error}`
+    );
+  });
+});
+
+test('a failed tools probe remains identifiable when its empty profile is reused', async () => {
+  const { profile, step } = await discoverAgentProfile({
+    getAgentInfo: async () => {
+      throw new Error('tools discovery unavailable');
+    },
+  });
+  assert.equal(step.passed, false);
+  assert.equal(profile.capabilities_failure.passed, false);
+  assert.equal(profile.capabilities_failure.task, 'getAgentInfo');
+  assert.equal(profile.capabilities_failure.error, 'tools discovery unavailable');
+});

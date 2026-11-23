@@ -1,0 +1,507 @@
+import { randomBytes } from 'crypto';
+import { signWithPrivateJwk } from './crypto';
+import {
+  buildResponseSignatureBase,
+  buildSignatureBase,
+  formatSignatureParams,
+  type RequestLike,
+  type ResponseLike,
+  type SignatureParams,
+} from './canonicalize';
+import { computeContentDigest, serializeByteSequenceMember, type SfBinaryEncoding } from './content-digest';
+import { RequestSignatureError, ResponseSignatureError, WebhookSignatureError } from './errors';
+import type { AdcpUse } from './jwks-helpers';
+import {
+  MANDATORY_COMPONENTS,
+  MAX_SIGNATURE_WINDOW_SECONDS,
+  REQUEST_SIGNING_TAG,
+  RESPONSE_MANDATORY_COMPONENTS,
+  RESPONSE_SIGNING_TAG,
+  type AdcpJsonWebKey,
+  type AdcpSignAlg,
+} from './types';
+import { WEBHOOK_MANDATORY_COMPONENTS, WEBHOOK_SIGNING_TAG } from './webhook-verifier';
+
+export interface SignerKey {
+  keyid: string;
+  alg: 'ed25519' | 'ecdsa-p256-sha256';
+  /**
+   * Private JWK. MUST carry `adcp_use` matching the helper being called:
+   * - `signRequest` requires `adcp_use: 'request-signing'`
+   * - `signWebhook` requires `adcp_use: 'request-signing'` (the deprecated
+   *   `'webhook-signing'` is still accepted — adcontextprotocol/adcp#5555)
+   * - `signResponse` requires `adcp_use: 'response-signing'`
+   *
+   * Mismatched or missing `adcp_use` throws at the signer with the same
+   * error code the verifier raises at step 8 — failure surfaces at
+   * configuration time rather than at the receiver, where the message is
+   * far from its cause. Mint keys with `pemToAdcpJwk({ adcp_use: ... })`
+   * to get the binding right by construction.
+   */
+  privateKey: AdcpJsonWebKey;
+}
+
+/**
+ * Step-8-equivalent purpose-binding gate on the signer side. The verifier
+ * already enforces `jwk.adcp_use === expected` at step 8 (see verifier.ts
+ * for request signing; webhook-verifier.ts for webhooks). Replicating the
+ * check on the signer side prevents the more common operator footgun:
+ * passing a wrong-purpose key into the helper, producing a wire-conformant
+ * signature that the downstream verifier then rejects, surfacing the
+ * misconfiguration at the wrong end of the connection.
+ *
+ * Errors emit the same code the verifier uses for that direction so log
+ * scrapers across signer / verifier see consistent vocabulary.
+ */
+/**
+ * Subset of {@link AdcpUse} that the RFC 9421 helpers in this module emit
+ * as `expected`. Governance signing is JWS-based and lives on a different
+ * code path; narrowing the parameter here lets the exhaustiveness branch
+ * stay tight without a `case 'governance-signing':` arm that throws an
+ * untyped error. A future JWS helper would mint its own typed error class
+ * rather than route through `throwIfPurposeMismatch`.
+ */
+type Rfc9421AdcpUse = Exclude<AdcpUse, 'governance-signing'>;
+
+function assertKeyPurpose(key: SignerKey, expected: Rfc9421AdcpUse): void {
+  throwIfPurposeMismatch(key.keyid, key.privateKey.adcp_use, expected);
+}
+
+/**
+ * Async-path equivalent. Mirrors {@link assertKeyPurpose} but reads
+ * `adcpUse` from a {@link SigningProvider} rather than a `SignerKey`.
+ *
+ * **Optional binding.** When `provider.adcpUse` is `undefined`, the gate
+ * is skipped — preserves backward compat with adapters that pre-date the
+ * `SigningProvider.adcpUse` field. Adapter authors who want signer-side
+ * defense-in-depth set `adcpUse` on their provider; the async helpers
+ * (`signRequestAsync` / `signWebhookAsync`) then enforce the binding
+ * parallel to the sync path.
+ */
+function assertProviderPurpose(
+  provider: { readonly keyid: string; readonly adcpUse?: string },
+  expected: Rfc9421AdcpUse,
+  options: { requirePurpose?: boolean } = {}
+): void {
+  if (provider.adcpUse === undefined && !options.requirePurpose) return;
+  throwIfPurposeMismatch(provider.keyid, provider.adcpUse, expected);
+}
+
+function throwIfPurposeMismatch(keyid: string, actual: string | undefined, expected: Rfc9421AdcpUse): void {
+  if (actual === expected) return;
+  const message =
+    `Signing key '${keyid}' has adcp_use=${actual === undefined ? '<missing>' : `'${actual}'`} ` +
+    `but the helper requires '${expected}'. Mint a key scoped for '${expected}' via ` +
+    `pemToAdcpJwk({ adcp_use: '${expected}' }) — sharing keys across purposes is intentionally refused.`;
+  switch (expected) {
+    case 'request-signing':
+      throw new RequestSignatureError('request_signature_key_purpose_invalid', 8, message);
+    case 'webhook-signing':
+      throw new WebhookSignatureError('webhook_signature_key_purpose_invalid', 8, message);
+    case 'response-signing':
+      throw new ResponseSignatureError('response_signature_key_purpose_invalid', 8, message);
+    default: {
+      // Compile-time exhaustiveness: a future widening of `Rfc9421AdcpUse`
+      // (typically because `AdcpUse` grew an RFC-9421 member) must add a
+      // case arm here. Trips `tsc --noEmit` if the union grows without an
+      // explicit gate decision for the new member.
+      const _exhaustive: never = expected;
+      throw new Error(`unreachable: unhandled Rfc9421AdcpUse '${_exhaustive}'`);
+    }
+  }
+}
+
+/**
+ * Purpose gate for the webhook signing helpers. Webhooks are signed with a
+ * `adcp_use: "request-signing"` key — there is no dedicated webhook key
+ * purpose. See webhook-verifier.ts step 8 for the rationale: the signature
+ * `tag` (`adcp/webhook-signing/v1`) plus mandatory `content-digest` coverage
+ * carry domain separation, so the key purpose need not be webhook-specific.
+ * The deprecated `adcp_use: "webhook-signing"` value is still accepted for
+ * backward compatibility (pending removal — adcontextprotocol/adcp#5555). Any other purpose
+ * (`response-signing`, `governance-signing`, unknown) is refused with the same
+ * `webhook_signature_key_purpose_invalid` code the verifier emits.
+ */
+const WEBHOOK_SIGNING_PURPOSES: readonly string[] = ['request-signing', 'webhook-signing'];
+
+function throwIfWebhookPurposeMismatch(keyid: string, actual: string | undefined): void {
+  if (actual !== undefined && WEBHOOK_SIGNING_PURPOSES.includes(actual)) return;
+  throw new WebhookSignatureError(
+    'webhook_signature_key_purpose_invalid',
+    8,
+    `Signing key '${keyid}' has adcp_use=${actual === undefined ? '<missing>' : `'${actual}'`} ` +
+      `but webhook signing requires 'request-signing' (the deprecated 'webhook-signing' is also accepted).`
+  );
+}
+
+function assertWebhookKeyPurpose(key: SignerKey): void {
+  throwIfWebhookPurposeMismatch(key.keyid, key.privateKey.adcp_use);
+}
+
+function assertWebhookProviderPurpose(
+  provider: { readonly keyid: string; readonly adcpUse?: string },
+  options: { requirePurpose?: boolean } = {}
+): void {
+  if (provider.adcpUse === undefined && !options.requirePurpose) return;
+  throwIfWebhookPurposeMismatch(provider.keyid, provider.adcpUse);
+}
+
+export { assertProviderPurpose, assertWebhookProviderPurpose };
+
+export interface SignRequestOptions {
+  coverContentDigest?: boolean;
+  label?: string;
+  windowSeconds?: number;
+  now?: () => number;
+  nonce?: string;
+  /**
+   * Binary serialization selected from the trusted negotiated endpoint.
+   * 3.2 uses RFC 8941 padded Base64; 3.0/3.1 use unpadded Base64URL.
+   */
+  binaryEncoding?: SfBinaryEncoding;
+}
+
+export interface SignedRequest {
+  headers: Record<string, string>;
+  signatureBase: string;
+  params: SignatureParams;
+}
+
+/**
+ * Identity fields needed to populate `Signature-Input` parameters. The sync
+ * `signRequest` path takes these from a {@link SignerKey}; the async path
+ * takes them from a `SigningProvider`. Centralizing the shape keeps both
+ * canonicalizations identical.
+ */
+export interface SignatureIdentity {
+  keyid: string;
+  alg: AdcpSignAlg;
+}
+
+/**
+ * Result of canonicalizing a request for signing — everything `signRequest`
+ * and `signRequestAsync` produce up to (but not including) the call into
+ * the signer/provider.
+ */
+export interface PreparedRequestSignature {
+  components: string[];
+  params: SignatureParams;
+  /**
+   * Outbound headers including `Content-Digest` when covered, but not yet
+   * including `Signature-Input` / `Signature` — those are appended by
+   * {@link finalizeRequestSignature}.
+   */
+  headers: Record<string, string>;
+  /** Canonical signature base bytes (UTF-8). Pass to the signer/provider. */
+  base: string;
+  label: string;
+  binaryEncoding: SfBinaryEncoding;
+}
+
+/**
+ * Canonicalize a request for RFC 9421 request-signing. Pure (no I/O); the
+ * sync and async paths share this so canonicalization can't drift between
+ * them.
+ *
+ * **No purpose-binding gate.** This function takes a `SignatureIdentity`
+ * (just `keyid` + `alg`), not a full `SignerKey`, so it deliberately
+ * cannot enforce `adcp_use`. Callers composing `prepare* + own-signer`
+ * are responsible for purpose binding themselves — the convenience
+ * helper `signRequest` runs `assertKeyPurpose` before calling this and
+ * is what most adopters want. Test-vector authors who need to sign with
+ * wrong-purpose keys (e.g. AdCP negative-vector 009 cross-purpose
+ * rejection) use this prepare/finalize composition deliberately.
+ */
+export function prepareRequestSignature(
+  request: RequestLike,
+  identity: SignatureIdentity,
+  options: SignRequestOptions = {}
+): PreparedRequestSignature {
+  const now = options.now ? options.now() : Math.floor(Date.now() / 1000);
+  const windowSeconds = Math.min(options.windowSeconds ?? 300, MAX_SIGNATURE_WINDOW_SECONDS);
+  const nonce = options.nonce ?? base64UrlRandom(16);
+  const label = options.label ?? 'sig1';
+  assertLabelAndClock(label, now);
+  const hasBody = (request.body ?? '').length > 0;
+
+  // Keep the low-level helper backward compatible for callers that do not
+  // select a profile. SDK transport wrappers always pass the trusted pin.
+  const binaryEncoding = options.binaryEncoding ?? 'legacy-base64url';
+  // 3.2 defaults to covering the digest, but an explicitly negotiated
+  // `covers_content_digest: forbidden` policy must still win. Encoding and
+  // digest coverage are independent parts of the signing profile.
+  const coverDigest = options.coverContentDigest ?? binaryEncoding === 'rfc8941-base64';
+  const headers: Record<string, string> = { ...flattenHeaders(request.headers) };
+  if (coverDigest) {
+    // Content-Digest is an RFC 9530 Structured Field and uses RFC 8941
+    // standard Base64 independently of the request Signature's versioned
+    // serialization. Frozen AdCP 3.0/3.1 vectors already use this form.
+    headers['Content-Digest'] = computeContentDigest(request.body ?? '', 'rfc8941-base64');
+  }
+
+  const components = [...MANDATORY_COMPONENTS];
+  if (hasBody) components.push('content-type');
+  if (coverDigest) components.push('content-digest');
+
+  const params: SignatureParams = {
+    created: now,
+    expires: now + windowSeconds,
+    nonce,
+    keyid: identity.keyid,
+    alg: identity.alg,
+    tag: REQUEST_SIGNING_TAG,
+  };
+
+  const normalizedRequest: RequestLike = { ...request, headers };
+  const base = buildSignatureBase(
+    components,
+    normalizedRequest,
+    params,
+    undefined,
+    binaryEncoding === 'rfc8941-base64' ? '3.2' : 'legacy'
+  );
+
+  return { components, params, headers, base, label, binaryEncoding };
+}
+
+/**
+ * Attach `Signature` / `Signature-Input` headers given the bytes returned
+ * by the signer/provider. Shared between the sync and async paths so the
+ * binary emission stays canonical for the selected AdCP request profile.
+ */
+export function finalizeRequestSignature(prepared: PreparedRequestSignature, signature: Uint8Array): SignedRequest {
+  const headers = { ...prepared.headers };
+  headers['Signature-Input'] = `${prepared.label}=${formatSignatureParams(prepared.components, prepared.params)}`;
+  headers['Signature'] = serializeByteSequenceMember(prepared.label, signature, prepared.binaryEncoding);
+  return { headers, signatureBase: prepared.base, params: prepared.params };
+}
+
+export function signRequest(request: RequestLike, key: SignerKey, options: SignRequestOptions = {}): SignedRequest {
+  assertKeyPurpose(key, 'request-signing');
+  assertSafeHighLevelRequestProfile(options);
+  const prepared = prepareRequestSignature(request, { keyid: key.keyid, alg: key.alg }, options);
+  const signature = produceSignature(key, Buffer.from(prepared.base, 'utf8'));
+  return finalizeRequestSignature(prepared, signature);
+}
+
+/** @internal Guard the convenience signer while leaving low-level vector authoring available. */
+export function assertSafeHighLevelRequestProfile(options: SignRequestOptions): void {
+  if (options.binaryEncoding === 'rfc8941-base64' && options.coverContentDigest === false) {
+    throw new TypeError(
+      'AdCP 3.2 request signing requires Content-Digest coverage. ' +
+        'Use prepareRequestSignature()/finalizeRequestSignature() only when authoring an intentional negative test vector.'
+    );
+  }
+}
+
+export interface SignWebhookOptions {
+  label?: string;
+  windowSeconds?: number;
+  now?: () => number;
+  nonce?: string;
+  /**
+   * Override the signature tag. Defaults to `adcp/webhook-signing/v1`.
+   * Exposed so test suites can pin a wrong tag to exercise receiver
+   * rejection paths without mutating the signed headers post-hoc.
+   */
+  tag?: string;
+}
+
+/**
+ * Canonicalize an outbound webhook request under the RFC 9421 webhook
+ * profile. Pure (no I/O); shared between sync `signWebhook` and async
+ * `signWebhookAsync` paths. Covers the five mandatory components —
+ * `@method`, `@target-uri`, `@authority`, `content-type`, `content-digest` —
+ * and sets `Content-Digest` on the outgoing headers.
+ *
+ * **No purpose-binding gate** — same caveat as
+ * {@link prepareRequestSignature}. The convenience helper `signWebhook`
+ * runs `assertKeyPurpose` before calling this.
+ */
+export function prepareWebhookSignature(
+  request: RequestLike,
+  identity: SignatureIdentity,
+  options: SignWebhookOptions = {}
+): PreparedRequestSignature {
+  const now = options.now ? options.now() : Math.floor(Date.now() / 1000);
+  const windowSeconds = Math.min(options.windowSeconds ?? 300, MAX_SIGNATURE_WINDOW_SECONDS);
+  const nonce = options.nonce ?? base64UrlRandom(16);
+  const label = options.label ?? 'sig1';
+  assertLabelAndClock(label, now);
+
+  const headers: Record<string, string> = { ...flattenHeaders(request.headers) };
+  headers['Content-Digest'] = computeContentDigest(request.body ?? '', 'legacy-base64url');
+
+  const components = [...WEBHOOK_MANDATORY_COMPONENTS];
+  const params: SignatureParams = {
+    created: now,
+    expires: now + windowSeconds,
+    nonce,
+    keyid: identity.keyid,
+    alg: identity.alg,
+    tag: options.tag ?? WEBHOOK_SIGNING_TAG,
+  };
+
+  const normalizedRequest: RequestLike = { ...request, headers };
+  // AdCP 3.2 keeps the webhook profile's legacy Base64URL binary encoding,
+  // but aligns its derived-component canonicalization with request signing.
+  const base = buildSignatureBase(components, normalizedRequest, params, undefined, '3.2');
+
+  return { components, params, headers, base, label, binaryEncoding: 'legacy-base64url' };
+}
+
+/**
+ * Sign an outbound webhook request under the RFC 9421 webhook profile
+ * (`tag=adcp/webhook-signing/v1`). Covers the five mandatory components —
+ * `@method`, `@target-uri`, `@authority`, `content-type`, `content-digest` —
+ * and sets `Content-Digest` on the outgoing headers. Publishers emitting
+ * conformant webhooks should use this instead of hand-rolling signatures.
+ */
+export function signWebhook(request: RequestLike, key: SignerKey, options: SignWebhookOptions = {}): SignedRequest {
+  assertWebhookKeyPurpose(key);
+  const prepared = prepareWebhookSignature(request, { keyid: key.keyid, alg: key.alg }, options);
+  const signature = produceSignature(key, Buffer.from(prepared.base, 'utf8'));
+  return finalizeRequestSignature(prepared, signature);
+}
+
+export interface SignResponseOptions {
+  /**
+   * Cover a `Content-Digest` of the response body. Defaults to `true` when
+   * the response has a body.
+   */
+  coverContentDigest?: boolean;
+  /**
+   * Additional derived/header components to cover beyond
+   * {@link RESPONSE_MANDATORY_COMPONENTS}. The defaults include `@status`,
+   * `@method;req`, `@authority;req`, and `@target-uri;req`. Only the
+   * RFC 9421 `;req` component parameter is supported; other component
+   * parameters are rejected rather than silently round-tripped.
+   */
+  additionalComponents?: ReadonlyArray<string>;
+  label?: string;
+  windowSeconds?: number;
+  now?: () => number;
+  nonce?: string;
+  /**
+   * Override the signature tag. Defaults to `adcp/response-signing/v1`.
+   */
+  tag?: string;
+}
+
+export interface SignedResponse {
+  status: number;
+  headers: Record<string, string>;
+  signatureBase: string;
+  params: SignatureParams;
+}
+
+export interface PreparedResponseSignature {
+  status: number;
+  components: string[];
+  params: SignatureParams;
+  /**
+   * Outbound response headers including `Content-Digest` when covered, but
+   * not yet including `Signature-Input` / `Signature`.
+   */
+  headers: Record<string, string>;
+  /** Canonical signature base bytes (UTF-8). Pass to the signer/provider. */
+  base: string;
+  label: string;
+}
+
+/**
+ * Canonicalize a response for RFC 9421 response signing. This compatibility
+ * helper is signing-only; it does not imply a generic AdCP response-verifier
+ * protocol surface.
+ */
+export function prepareResponseSignature(
+  response: ResponseLike,
+  identity: SignatureIdentity,
+  options: SignResponseOptions = {}
+): PreparedResponseSignature {
+  const now = options.now ? options.now() : Math.floor(Date.now() / 1000);
+  const windowSeconds = Math.min(options.windowSeconds ?? 300, MAX_SIGNATURE_WINDOW_SECONDS);
+  const nonce = options.nonce ?? base64UrlRandom(16);
+  const label = options.label ?? 'sig1';
+  assertLabelAndClock(label, now);
+  const hasBody = (response.body ?? '').length > 0;
+  const coverDigest = (options.coverContentDigest ?? true) && hasBody;
+
+  const headers: Record<string, string> = { ...flattenHeaders(response.headers) };
+  if (coverDigest) {
+    headers['Content-Digest'] = computeContentDigest(response.body ?? '');
+  }
+
+  const components = [...RESPONSE_MANDATORY_COMPONENTS];
+  if (hasBody) components.push('content-type');
+  if (coverDigest) components.push('content-digest');
+  if (options.additionalComponents) {
+    for (const component of options.additionalComponents) {
+      if (!components.includes(component)) components.push(component);
+    }
+  }
+
+  const params: SignatureParams = {
+    created: now,
+    expires: now + windowSeconds,
+    nonce,
+    keyid: identity.keyid,
+    alg: identity.alg,
+    tag: options.tag ?? RESPONSE_SIGNING_TAG,
+  };
+
+  const normalizedResponse: ResponseLike = { ...response, headers };
+  const base = buildResponseSignatureBase(components, normalizedResponse, params);
+
+  return { status: response.status, components, params, headers, base, label };
+}
+
+export function finalizeResponseSignature(prepared: PreparedResponseSignature, signature: Uint8Array): SignedResponse {
+  const headers = { ...prepared.headers };
+  headers['Signature-Input'] = `${prepared.label}=${formatSignatureParams(prepared.components, prepared.params)}`;
+  // Response signatures keep the AdCP 3.0/3.1 Base64URL byte-sequence form.
+  headers['Signature'] = serializeByteSequenceMember(prepared.label, signature, 'legacy-base64url');
+  return { status: prepared.status, headers, signatureBase: prepared.base, params: prepared.params };
+}
+
+export function signResponse(
+  response: ResponseLike,
+  key: SignerKey,
+  options: SignResponseOptions = {}
+): SignedResponse {
+  assertKeyPurpose(key, 'response-signing');
+  const prepared = prepareResponseSignature(response, { keyid: key.keyid, alg: key.alg }, options);
+  const signature = produceSignature(key, Buffer.from(prepared.base, 'utf8'));
+  return finalizeResponseSignature(prepared, signature);
+}
+
+function produceSignature(key: SignerKey, data: Buffer): Uint8Array {
+  // Synchronous API: node:crypto with the key passed as a JWK, a shape both
+  // Node and workerd accept (#3243). The async signers prefer WebCrypto.
+  return signWithPrivateJwk(key.alg, key.privateKey as AdcpJsonWebKey, data);
+}
+
+function flattenHeaders(headers: Record<string, string | string[] | undefined>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    if (v === undefined) continue;
+    // Trim each entry and use ", " as the joiner so the signer and verifier
+    // produce the same canonical value when a header was originally multi-line.
+    out[k] = Array.isArray(v) ? v.map(entry => entry.trim()).join(', ') : v.trim();
+  }
+  return out;
+}
+
+/**
+ * Both fields are serialized as RFC 8941 Dictionaries, so the label must be a
+ * Dictionary key and `created`/`expires` integers. Checked before signing so a
+ * KMS call is never spent on a header that cannot be emitted.
+ */
+function assertLabelAndClock(label: string, now: number): void {
+  if (!/^[a-z*][a-z0-9_.*-]*$/.test(label)) throw new TypeError(`Signature label "${label}" is not an RFC 8941 key`);
+  if (!Number.isSafeInteger(now)) throw new TypeError('Signature clock must return integer epoch seconds');
+}
+
+function base64UrlRandom(byteLength: number): string {
+  return randomBytes(byteLength).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}

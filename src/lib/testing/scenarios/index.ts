@@ -1,0 +1,89 @@
+/**
+ * Test Scenarios Index
+ *
+ * Re-exports all test scenarios for easy importing.
+ */
+
+// Health check
+export { testHealthCheck } from './health';
+
+// Discovery
+export { testDiscovery } from './discovery';
+
+// Media buy / sales flow
+export {
+  testCreateMediaBuy,
+  testFullSalesFlow,
+  testReportingFlow,
+  testCreativeSync,
+  testCreativeInline,
+  testCreativeReference,
+  testSyncAudiences,
+  resolveAccountForMediaBuy,
+  resolveAccountForAudiences,
+  selectProduct,
+  selectPricingOption,
+  buildCreateMediaBuyRequest,
+  testMediaBuyLifecycle,
+  testTerminalStateEnforcement,
+  testPackageLifecycle,
+} from './media-buy';
+
+// Creative agent testing
+export { testCreativeFlow, testCreativeLifecycle } from './creative';
+
+// Signals agent testing
+export { testSignalsFlow } from './signals';
+
+// Edge case testing
+export {
+  testErrorHandling,
+  testValidation,
+  testPricingEdgeCases,
+  testTemporalValidation,
+  testBehaviorAnalysis,
+  testResponseConsistency,
+} from './edge-cases';
+
+// v3 Governance protocol testing
+export {
+  testGovernancePropertyLists,
+  testGovernanceContentStandards,
+  testPropertyListFilters,
+  testCampaignGovernance,
+  testCampaignGovernanceDenied,
+  testCampaignGovernanceConditions,
+  testCampaignGovernanceDelivery,
+  testSellerGovernanceContext,
+  hasGovernanceTools,
+  hasCampaignGovernanceTools,
+} from './governance';
+
+// v3 SI (Sponsored Intelligence) protocol testing
+export { testSISessionLifecycle, testSIAvailability, testSIHandoff, hasSITools } from './sponsored-intelligence';
+
+// v3 Trusted Match Protocol testing
+export { testTrustedMatchFlow, hasTrustedMatchTools } from './trusted-match';
+
+// v3 Brand Rights Protocol testing
+export { testBrandIdentity, testBrandRightsFlow, testCreativeApproval, hasBrandRightsTools } from './brand-rights';
+
+// v3 Capability discovery testing
+export { testCapabilityDiscovery, likelySupportsV3 } from './capabilities';
+
+// Schema compliance testing
+export { testSchemaCompliance } from './schema-compliance';
+
+// Error compliance testing (transport error mapping spec)
+export { testErrorCodes, testErrorStructure, testErrorTransport } from './error-compliance';
+
+// Deterministic state machine testing (requires comply_test_controller)
+export {
+  testCreativeStateMachine,
+  testMediaBuyStateMachine,
+  testAccountStateMachine,
+  testSessionStateMachine,
+  testDeliverySimulation,
+  testBudgetSimulation,
+  testControllerValidation,
+} from './deterministic';

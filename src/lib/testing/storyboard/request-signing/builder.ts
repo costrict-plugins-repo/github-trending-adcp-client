@@ -1,0 +1,960 @@
+import { createHash, randomBytes, randomUUID } from 'crypto';
+import { serializeInnerList } from 'structured-headers';
+import { signWithPrivateJwk } from '../../../signing/crypto';
+import {
+  buildSignatureBase,
+  computeContentDigest,
+  finalizeRequestSignature,
+  formatSignatureParams,
+  prepareRequestSignature,
+  requestSigningEncodingForVersion,
+  REQUEST_SIGNING_TAG,
+  type AdcpJsonWebKey,
+  type RequestLike,
+  type SignatureParams,
+  type SignerKey,
+} from '../../../signing';
+import { findKey } from './vector-loader';
+import type { NegativeVector, PositiveVector, TestKeyset, TestKeypair } from './types';
+import type { CapturedA2aRequest } from './a2a-dispatch';
+
+export interface BuildOptions {
+  /** Override the signer clock (unix seconds). Defaults to `Date.now()/1000`. */
+  now?: number;
+  /** Override the nonce. Defaults to freshly-generated. */
+  nonce?: string;
+  /** Override the `expires - created` window (seconds). Defaults to 300. */
+  windowSeconds?: number;
+  /**
+   * Agent base URL. When set, the vector's request URL has its origin replaced
+   * with this base before signing — the vectors point at `seller.example.com`
+   * but real agents live elsewhere. The path and query are preserved so the
+   * operation intent (e.g., `/adcp/create_media_buy`) is unchanged.
+   *
+   * Canonicalization-edge vectors (005 default-port, 006 dot-segment path,
+   * 007 query preservation, 008 percent-encoded path) bake their edge case
+   * into the vector URL; replacing the origin keeps that edge intact in the
+   * path/query, but vectors sensitive to the port or scheme will no longer
+   * exercise the edge against a mismatched agent base.
+   */
+  baseUrl?: string;
+  /**
+   * Transport-layer framing. `'raw'` sends the vector body to the retargeted
+   * vector URL verbatim — matches the conformance vectors' intent of testing
+   * a per-operation HTTP endpoint. `'mcp'` wraps the vector body in a
+   * JSON-RPC `tools/call` envelope and posts to `baseUrl` as-is (no path
+   * join); operation name comes from the vector URL's last segment.
+   *
+   * MCP mode trades the canonicalization-edge coverage for reach: vectors
+   * 005–008 fold into plain POSTs against the MCP endpoint, but the grader
+   * works against any MCP agent that wires a verifier at the HTTP layer.
+   *
+   * **Defaults differ by layer, deliberately.** Omitting the field here
+   * builds a raw request: this is the low-level primitive, and a caller
+   * holding a vector and a REST target shouldn't have its body silently
+   * re-framed. Every grader entry point above it (`gradeRequestSigning`,
+   * `gradeOneVector`, the storyboard `request_signing_probe` dispatch)
+   * resolves the default to `'mcp'` instead, because the runner reaches
+   * agents through `tools/call` and raw replay 404s on an MCP mount before
+   * the verifier runs (adcontextprotocol/adcp#6548). REST-binding agents
+   * pass `'raw'` explicitly — `adcp storyboard run --signing-transport raw`
+   * or `adcp grade request-signing --transport raw`.
+   *
+   * `'a2a'` takes the request the OFFICIAL `@a2a-js/sdk` client emitted and
+   * signs those bytes. Nothing about the A2A wire is framed here: the endpoint,
+   * the JSON-RPC method name, the `a2a-version` header and the proto-JSON
+   * encoding are all the SDK's, captured at its own `fetchImpl` seam
+   * (`a2a-dispatch.ts`) and handed in via {@link BuildOptions.a2aRequest}. It
+   * trades the same canonicalization-edge coverage as MCP mode and for the same
+   * reason: both route every vector to the one endpoint the agent declares.
+   */
+  transport?: 'raw' | 'mcp' | 'a2a';
+  /**
+   * The request the official A2A client produced for this vector. REQUIRED
+   * when `transport` is `'a2a'` and meaningless otherwise.
+   *
+   * Passed in rather than produced here because capturing it is asynchronous
+   * (the SDK resolves the agent card first) while this builder is synchronous
+   * — and because a builder that could reach the network would make signing
+   * depend on a fetch, which is the kind of coupling that turns a signature
+   * mismatch into an unreadable failure.
+   */
+  a2aRequest?: CapturedA2aRequest;
+  /**
+   * JSON-RPC `id` for the MCP envelope. Defaults to `crypto.randomUUID()`
+   * so concurrent runs never collide. Override for tests that need a stable
+   * id — JSON-RPC 2.0 permits number, string, or null.
+   */
+  mcpJsonRpcId?: number | string;
+}
+
+export interface SignedHttpRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body?: string;
+}
+
+export function buildPositiveRequest(
+  vector: PositiveVector,
+  keys: TestKeyset,
+  options: BuildOptions = {}
+): SignedHttpRequest {
+  const key = signerKeyFor(vector, keys);
+  // A fixture's Host header is its authority on the wire. Once the request is
+  // retargeted the signer signs the retargeted URL's authority, so a stale
+  // fixture Host would contradict the signature; the HTTP client derives the
+  // real one from the URL.
+  const retargeted = options.baseUrl !== undefined || (options.transport ?? 'raw') !== 'raw';
+  const fixture = retargeted ? withoutFixtureHost(vector) : vector;
+  const shape = POSITIVE_SHAPES[positiveShapeKey(vector.id)];
+  if (shape) return shape(key, fixture, options);
+  return sign(key, fixture, {
+    coverContentDigest: vector.verifier_capability.covers_content_digest === 'required',
+    ...options,
+  });
+}
+
+function withoutFixtureHost<V extends PositiveVector | NegativeVector>(vector: V): V {
+  const headers = Object.fromEntries(
+    Object.entries(vector.request.headers).filter(([name]) => name.toLowerCase() !== 'host')
+  );
+  return { ...vector, request: { ...vector.request, headers } };
+}
+
+/**
+ * Positive vectors whose wire shape is the thing under test. The generic
+ * signer re-emits one `sig1` and one `sha-256` member, which would let these
+ * pass without ever presenting the shape they exist to grade.
+ */
+const POSITIVE_SHAPES: Record<
+  string,
+  (key: SignerKey, vector: PositiveVector, options: BuildOptions) => SignedHttpRequest
+> = {
+  // Two distinct labels on both headers. `sig1` is a real signature; `sig2`
+  // keeps the fixture's well-formed, correctly sized, non-verifying value and
+  // a different covered-component set and nonce. A verifier must process
+  // exactly one label and ignore the rest.
+  '013-two-signature-labels-distinct': (key, vector, options) => {
+    const signed = sign(key, vector, options);
+    const fixtureSig2 = /(?:^|,\s*)(sig2=:[^:,\s]+:)/.exec(vector.request.headers['Signature'] ?? '')?.[1];
+    if (!fixtureSig2) throw new Error(`${vector.id}: fixture Signature carries no sig2 member`);
+    const sig1Input = signed.headers['Signature-Input'] ?? '';
+    const sig2Input = sig1Input
+      .replace(/^sig1=\([^)]*\)/, 'sig2=("@method" "@target-uri" "@authority")')
+      .replace(/nonce="[^"]*"/, `nonce="${randomNonce()}"`);
+    if (sig2Input === sig1Input) throw new Error(`${vector.id}: could not derive the sig2 member`);
+    return {
+      ...signed,
+      headers: {
+        ...signed.headers,
+        'Signature-Input': `${sig1Input}, ${sig2Input}`,
+        Signature: `${signed.headers['Signature']}, ${fixtureSig2}`,
+      },
+    };
+  },
+
+  // Content-Digest lists sha-256 and sha-512, each correct for the body that
+  // is actually sent, and the signature covers that exact header value.
+  '014-content-digest-two-algorithms': (key, vector, options) =>
+    signWithComponents(
+      key,
+      vector,
+      options,
+      ['@method', '@target-uri', '@authority', 'content-type', 'content-digest'],
+      (body, encoding) =>
+        `${computeContentDigest(body, encoding)}, sha-512=:${createHash('sha512')
+          .update(body)
+          .digest(encoding === 'legacy-base64url' ? 'base64url' : 'base64')}:`
+    ),
+};
+
+function positiveShapeKey(id: string): string {
+  return id.replace(/^profile-3\.2\/positive\//, '');
+}
+
+/**
+ * Apply the adversarial mutation documented for a negative vector.
+ *
+ * Black-box grader: the positive/001 signature bytes sitting in most negative
+ * fixtures are placeholders; we re-sign dynamically, then mutate. Covers all
+ * 20 current negative vectors. Stateful contract vectors (016 replay, 017
+ * revoked, 020 rate abuse) produce a single well-formed request; the
+ * storyboard runner orchestrates the repeat/flood/revoked-keyid behavior
+ * around that request per the signed-requests-runner test-kit.
+ */
+export function buildNegativeRequest(
+  vector: NegativeVector,
+  keys: TestKeyset,
+  options: BuildOptions = {}
+): SignedHttpRequest {
+  const mutation = MUTATIONS[vector.id];
+  if (!mutation) {
+    throw new Error(`No adversarial builder registered for negative vector "${vector.id}"`);
+  }
+  return mutation(vector, keys, options);
+}
+
+export function listSupportedNegativeVectors(): string[] {
+  return Object.keys(MUTATIONS);
+}
+
+type Mutator = (vector: NegativeVector, keys: TestKeyset, options: BuildOptions) => SignedHttpRequest;
+
+const MUTATIONS: Record<string, Mutator> = {
+  '001-no-signature-header': (vector, _keys, options) => {
+    const shaped = applyTransport(vector, options);
+    return {
+      method: shaped.method,
+      url: shaped.url,
+      headers: stripSignatureHeaders(shaped.headers),
+      body: shaped.body,
+    };
+  },
+
+  '002-wrong-tag': (vector, keys, options) => {
+    const key = signerKeyFor(vector, keys);
+    return signWithParamOverride(key, vector, options, { tag: 'example-org/signing/v1' });
+  },
+
+  '003-expired-signature': (vector, keys, options) => {
+    const key = signerKeyFor(vector, keys);
+    const now = nowSeconds(options);
+    return sign(key, vector, { ...options, now: now - 600, windowSeconds: 300 });
+  },
+
+  '004-window-too-long': (vector, keys, options) => {
+    const key = signerKeyFor(vector, keys);
+    return signWithParamOverride(key, vector, options, {
+      expiresDelta: 301,
+    });
+  },
+
+  '005-alg-not-allowed': (vector, keys, options) => {
+    const key = signerKeyFor(vector, keys);
+    return signWithParamOverride(key, vector, options, { alg: 'rsa-pss-sha512' });
+  },
+
+  '006-missing-covered-component': (vector, keys, options) => {
+    const key = signerKeyFor(vector, keys);
+    return signWithComponents(key, vector, options, ['@method', '@target-uri', 'content-type']);
+  },
+
+  '007-missing-content-digest': (vector, keys, options) => {
+    const key = signerKeyFor(vector, keys);
+    return sign(key, vector, { ...options, coverContentDigest: false });
+  },
+
+  '008-unknown-keyid': (vector, keys, options) => {
+    const key = signerKeyFor(vector, keys);
+    return signWithParamOverride(key, vector, options, { keyid: 'unknown-key-9999' });
+  },
+
+  '009-key-ops-missing-verify': (vector, keys, options) => {
+    // Vector 009 pins `jwks_ref: ["test-gov-2026"]` (adcp_use:
+    // governance-signing, not request-signing) — use it directly instead of
+    // inferring. Honors the vector's intent if future keysets add a second
+    // non-request-signing keypair.
+    const key = signerKeyFor(vector, keys);
+    return sign(key, vector, options);
+  },
+
+  '010-content-digest-mismatch': (vector, keys, options) => {
+    // Vector 010 tests "signer committed a wrong Content-Digest value" — the
+    // signature IS valid over the base that includes that wrong value, so the
+    // verifier passes the signature check (step 10) and then fails the
+    // digest-vs-body recompute (step 11). Do NOT mutate the body post-sign —
+    // that tests a different bug (body-tampered-in-transit) and a verifier
+    // that recomputes digest from sent body would not catch the "lying
+    // signer" path this vector exercises.
+    const key = signerKeyFor(vector, keys);
+    // Zero-byte digest: guaranteed not to match the actual body.
+    const zeroDigest = 'sha-256=:' + Buffer.alloc(32).toString('base64') + ':';
+    const headersWithBadDigest = { ...vector.request.headers, 'Content-Digest': zeroDigest };
+    const vectorWithBadDigest = {
+      ...vector,
+      request: { ...vector.request, headers: headersWithBadDigest },
+    };
+    // Sign the request WITH content-digest in covered components, without
+    // letting `signRequest` recompute the digest over the real body.
+    return signWithComponents(key, vectorWithBadDigest, options, [
+      '@method',
+      '@target-uri',
+      '@authority',
+      'content-type',
+      'content-digest',
+    ]);
+  },
+
+  '011-malformed-header': (vector, keys, options) => {
+    const key = signerKeyFor(vector, keys);
+    const signed = sign(key, vector, options);
+    return {
+      ...signed,
+      headers: {
+        ...signed.headers,
+        'Signature-Input': 'sig1=not a valid structured-field value!!!',
+      },
+    };
+  },
+
+  '012-missing-expires-param': (vector, keys, options) => {
+    const key = signerKeyFor(vector, keys);
+    return signWithParamOverride(key, vector, options, { omitExpires: true });
+  },
+
+  '013-expires-le-created': (vector, keys, options) => {
+    const key = signerKeyFor(vector, keys);
+    return signWithParamOverride(key, vector, options, { expiresDelta: 0 });
+  },
+
+  '014-missing-nonce-param': (vector, keys, options) => {
+    const key = signerKeyFor(vector, keys);
+    return signWithParamOverride(key, vector, options, { omitNonce: true });
+  },
+
+  '015-signature-invalid': (vector, keys, options) => {
+    const key = signerKeyFor(vector, keys);
+    const signed = sign(key, vector, options);
+    const zeroSig = Buffer.alloc(64).toString('base64url');
+    return {
+      ...signed,
+      headers: {
+        ...signed.headers,
+        Signature: `sig1=:${zeroSig}:`,
+      },
+    };
+  },
+
+  '016-replayed-nonce': (vector, keys, options) => {
+    // Black-box runner sends the request twice; first accepted, second rejected.
+    // Builder produces the single well-formed request used for both submissions.
+    const key = signerKeyFor(vector, keys);
+    return sign(key, vector, options);
+  },
+
+  '017-key-revoked': (vector, keys, options) => {
+    // Use the dedicated revoked key (`test-revoked-2026`) declared by the
+    // signed-requests-runner test-kit. For current pre-#2353 caches, vector 017
+    // still references test-ed25519-2026; fall back to whatever the vector says.
+    const kid = vector.jwks_ref?.[0];
+    if (!kid) throw new Error(`${vector.id}: jwks_ref missing`);
+    const key = keyFor(keys, kid);
+    return sign(key, vector, options);
+  },
+
+  '018-digest-covered-when-forbidden': (vector, keys, options) => {
+    const key = signerKeyFor(vector, keys);
+    return sign(key, vector, { ...options, coverContentDigest: true });
+  },
+
+  '019-signature-without-signature-input': (vector, keys, options) => {
+    const key = signerKeyFor(vector, keys);
+    const signed = sign(key, vector, options);
+    const { 'Signature-Input': _drop, ...rest } = signed.headers;
+    return { ...signed, headers: rest };
+  },
+
+  '020-rate-abuse': (vector, keys, options) => {
+    // Runner floods the agent with distinct-nonce requests from the same keyid.
+    // Builder produces a single well-formed request; the runner generates N
+    // distinct nonces by calling this builder repeatedly with `options.nonce`.
+    const key = signerKeyFor(vector, keys);
+    return sign(key, vector, options);
+  },
+
+  // The Signature header repeats label `sig1`. Both members carry the same real
+  // signature over a well-formed Signature-Input, so a verifier that keeps
+  // either the first or the last member finds no second fault and must refuse
+  // the duplicate itself.
+  '029-duplicate-signature-label': (vector, keys, options) => {
+    const signed = sign(signerKeyFor(vector, keys), vector, options);
+    const member = /^sig1=:[^:,\s]+:$/.exec(signed.headers['Signature'] ?? '')?.[0];
+    if (!member) throw new Error(`${vector.id}: signer did not emit a single sig1 member`);
+    return { ...signed, headers: { ...signed.headers, Signature: `${member}, ${member}` } };
+  },
+
+  // Content-Digest carries `SHA-256` and `sha-256`, both correct for the body
+  // that is sent, covered by a real signature. The uppercase dictionary key is
+  // the only fault.
+  '030-content-digest-key-case': (vector, keys, options) =>
+    signWithComponents(
+      signerKeyFor(vector, keys),
+      vector,
+      options,
+      ['@method', '@target-uri', '@authority', 'content-type', 'content-digest'],
+      (body, encoding) => {
+        const digest = computeContentDigest(body, encoding);
+        return `SHA-256${digest.slice('sha-256'.length)}, ${digest}`;
+      }
+    ),
+
+  // The signature is real over the base for the URL authority; the fixture's
+  // `Host` header (an unbracketed IPv6 literal) is the only fault, so it must
+  // reach the output unchanged.
+  '031-malformed-host-authority': (vector, keys, options) => {
+    const signed = sign(signerKeyFor(vector, keys), vector, options);
+    const fixtureHost = Object.entries(vector.request.headers).find(([name]) => name.toLowerCase() === 'host');
+    if (!fixtureHost) throw new Error(`${vector.id}: fixture carries no Host header`);
+    const emitted = Object.entries(signed.headers).find(([name]) => name.toLowerCase() === 'host');
+    if (emitted?.[1] !== fixtureHost[1]) throw new Error(`${vector.id}: the fixture Host header was not preserved`);
+    return signed;
+  },
+
+  // Vectors 021-026 ship their exact malformed headers in the fixture — the
+  // adversarial shape (duplicate sig-input label, multi-valued content-type
+  // / content-digest, unquoted string param, malformed JWK, non-ASCII host)
+  // lives in the vector itself, not in a programmatic mutation. Builder just
+  // preserves the fixture's headers verbatim after applying transport.
+  '021-duplicate-signature-input-label': (vector, _keys, options) => passthrough(vector, options),
+  '022-multi-valued-content-type': (vector, _keys, options) => passthrough(vector, options),
+  '023-multi-valued-content-digest': (vector, _keys, options) => passthrough(vector, options),
+  '024-unquoted-string-param': (vector, _keys, options) => passthrough(vector, options),
+  '025-jwk-alg-crv-mismatch': (vector, _keys, options) => passthrough(vector, options),
+  '026-non-ascii-host': (vector, _keys, options) => passthrough(vector, options),
+
+  // Vector 027 tests the "webhook authentication MUST trigger signing" rule:
+  // the fixture is a plain bearer-auth request with zero signature headers,
+  // and the adversarial shape is precisely that absence. Passthrough preserves
+  // the fixture bytes; retargeting still works via applyTransport.
+  '027-webhook-registration-authentication-unsigned': (vector, _keys, options) => passthrough(vector, options),
+
+  // Vector 028 grades the `protocol_methods_required_for` namespace
+  // (adcp#4326). The fixture body is already a JSON-RPC envelope with
+  // `method: "tasks/cancel"` — NOT a `tools/call` envelope — so the standard
+  // MCP-mode `applyTransport` (which would wrap the body in `tools/call`)
+  // is wrong here. Use `protocolMethodPassthrough` which keeps the body
+  // verbatim and targets `baseUrl` directly when set, matching how an
+  // agent's MCP endpoint routes JSON-RPC `tasks/*` methods.
+  '028-unsigned-protocol-method-required': (vector, _keys, options) => protocolMethodPassthrough(vector, options),
+
+  // 3.2 profile negatives ship their exact hostile sf-binary / authority
+  // bytes. Preserve them; the malformed-authority vector is marked
+  // transport-ungradable by the live probe because no HTTP client can route
+  // to that intentionally invalid host spelling.
+  'profile-3.2/negative/001-base64url-sf-binary': (vector, _keys, options) => passthrough(vector, options),
+  // The unsigned 3.2 mirrors ship a correct Content-Digest alongside the missing
+  // signature, so the step-0 refusal is their only fault. Keep the digest,
+  // recomputed for the body actually sent after any transport reshaping.
+  'profile-3.2/negative/001-no-signature-header': (vector, _keys, options) => {
+    const shaped = applyTransport(vector, options);
+    const headers = Object.fromEntries(
+      Object.entries(shaped.headers).filter(([name]) => !/^signature(-input)?$/i.test(name))
+    );
+    return withRefreshedDigest(vector, { method: shaped.method, url: shaped.url, headers, body: shaped.body });
+  },
+  'profile-3.2/negative/002-multiple-trailing-dots': (vector, _keys, options) => passthrough(vector, options),
+  'profile-3.2/negative/002-wrong-tag': delegateToRoot('002-wrong-tag'),
+  'profile-3.2/negative/003-expired-signature': delegateToRoot('003-expired-signature'),
+  'profile-3.2/negative/004-window-too-long': delegateToRoot('004-window-too-long'),
+  'profile-3.2/negative/005-alg-not-allowed': delegateToRoot('005-alg-not-allowed'),
+  'profile-3.2/negative/006-missing-covered-component': (vector, keys, options) =>
+    signWithComponents(
+      signerKeyFor(vector, keys),
+      vector,
+      options,
+      ['@method', '@target-uri', 'content-type', 'content-digest'],
+      true
+    ),
+  'profile-3.2/negative/007-missing-content-digest': delegateToRoot('007-missing-content-digest'),
+  'profile-3.2/negative/008-unknown-keyid': delegateToRoot('008-unknown-keyid'),
+  'profile-3.2/negative/009-key-ops-missing-verify': delegateToRoot('009-key-ops-missing-verify'),
+  'profile-3.2/negative/010-content-digest-mismatch': delegateToRoot('010-content-digest-mismatch'),
+  'profile-3.2/negative/011-malformed-header': delegateToRoot('011-malformed-header'),
+  'profile-3.2/negative/012-missing-expires-param': delegateToRoot('012-missing-expires-param'),
+  'profile-3.2/negative/013-expires-le-created': delegateToRoot('013-expires-le-created'),
+  'profile-3.2/negative/014-missing-nonce-param': delegateToRoot('014-missing-nonce-param'),
+  'profile-3.2/negative/015-signature-invalid': (vector, keys, options) => {
+    const signed = sign(signerKeyFor(vector, keys), vector, options);
+    return {
+      ...signed,
+      headers: { ...signed.headers, Signature: `sig1=:${Buffer.alloc(64).toString('base64')}:` },
+    };
+  },
+  'profile-3.2/negative/016-replayed-nonce': delegateToRoot('016-replayed-nonce'),
+  'profile-3.2/negative/017-key-revoked': delegateToRoot('017-key-revoked'),
+  'profile-3.2/negative/019-signature-without-signature-input': delegateToRoot('019-signature-without-signature-input'),
+  'profile-3.2/negative/020-rate-abuse': delegateToRoot('020-rate-abuse'),
+  'profile-3.2/negative/021-duplicate-signature-input-label': delegateToRoot('021-duplicate-signature-input-label'),
+  'profile-3.2/negative/022-multi-valued-content-type': delegateToRoot('022-multi-valued-content-type'),
+  'profile-3.2/negative/023-multi-valued-content-digest': delegateToRoot('023-multi-valued-content-digest'),
+  'profile-3.2/negative/024-unquoted-string-param': delegateToRoot('024-unquoted-string-param'),
+  'profile-3.2/negative/025-jwk-alg-crv-mismatch': delegateToRoot('025-jwk-alg-crv-mismatch'),
+  'profile-3.2/negative/026-non-ascii-host': delegateToRoot('026-non-ascii-host'),
+  'profile-3.2/negative/027-webhook-registration-authentication-unsigned': (vector, _keys, options) =>
+    withRefreshedDigest(vector, passthrough(vector, options)),
+  'profile-3.2/negative/028-unsigned-protocol-method-required': (vector, _keys, options) =>
+    withRefreshedDigest(vector, protocolMethodPassthrough(vector, options)),
+  'profile-3.2/negative/029-duplicate-signature-label': delegateToRoot('029-duplicate-signature-label'),
+  'profile-3.2/negative/030-content-digest-key-case': delegateToRoot('030-content-digest-key-case'),
+  'profile-3.2/negative/031-malformed-host-authority': delegateToRoot('031-malformed-host-authority'),
+};
+
+function delegateToRoot(rootId: string): Mutator {
+  return (vector, keys, options) => {
+    const mutation = MUTATIONS[rootId];
+    if (!mutation) throw new Error(`Missing root request-signing mutation "${rootId}"`);
+    return mutation(vector, keys, options);
+  };
+}
+
+function withRefreshedDigest(vector: NegativeVector, request: SignedHttpRequest): SignedHttpRequest {
+  if (!Object.keys(vector.request.headers).some(name => name.toLowerCase() === 'content-digest')) return request;
+  return {
+    ...request,
+    headers: mergeHeadersCaseInsensitively(request.headers, {
+      'Content-Digest': computeContentDigest(
+        request.body ?? '',
+        requestSigningEncodingForVersion(vector.signing_profile_version)
+      ),
+    }),
+  };
+}
+
+function passthrough(vector: NegativeVector, options: BuildOptions): SignedHttpRequest {
+  const shaped = applyTransport(vector, options);
+  return {
+    method: shaped.method,
+    url: shaped.url,
+    headers: shaped.headers,
+    body: shaped.body,
+  };
+}
+
+/**
+ * Passthrough for vectors whose body is already a JSON-RPC envelope with a
+ * non-`tools/call` `method` (e.g., `tasks/cancel`). MCP-mode `applyTransport`
+ * would wrap the body in `tools/call`, which is wrong: the protocol_methods
+ * namespace matches against the JSON-RPC envelope's `method` field, so
+ * wrapping in `tools/call` would route the request to MCP tool dispatch
+ * (looking up a tool literally named "tasks/cancel"; 404) instead of the
+ * SDK's auto-registered `tasks/cancel` JSON-RPC handler.
+ *
+ * Targets `options.baseUrl` directly when set (the MCP endpoint URL), or
+ * the vector's URL verbatim otherwise.
+ */
+function protocolMethodPassthrough(vector: NegativeVector, options: BuildOptions): SignedHttpRequest {
+  if (options.transport === 'a2a') return passthrough(vector, options);
+  const url = options.baseUrl ?? vector.request.url;
+  const headers = { ...vector.request.headers };
+  // MCP Streamable HTTP requires this Accept negotiation header on JSON-RPC
+  // probes — match the wrapping path's behavior.
+  if (options.transport === 'mcp') {
+    headers['Accept'] = 'application/json, text/event-stream';
+  }
+  return {
+    method: vector.request.method,
+    url,
+    headers,
+    body: vector.request.body,
+  };
+}
+
+// ── Primitives ────────────────────────────────────────────────
+
+interface SignArgs extends BuildOptions {
+  coverContentDigest?: boolean;
+}
+
+function binaryEncoding(vector: PositiveVector | NegativeVector): 'base64' | 'base64url' {
+  return requestSigningEncodingForVersion(vector.signing_profile_version) === 'rfc8941-base64' ? 'base64' : 'base64url';
+}
+
+function canonicalizationProfile(vector: PositiveVector | NegativeVector): '3.2' | 'legacy' {
+  return binaryEncoding(vector) === 'base64' ? '3.2' : 'legacy';
+}
+
+function sign(key: SignerKey, vector: PositiveVector | NegativeVector, args: SignArgs): SignedHttpRequest {
+  const shaped = applyTransport(vector, args);
+  const request: RequestLike = {
+    method: shaped.method,
+    url: shaped.url,
+    headers: shaped.headers,
+    body: shaped.body,
+  };
+  // Negative-vector 009 deliberately signs with a wrong-purpose key
+  // (`adcp_use: 'governance-signing'`) to exercise the verifier's step-8
+  // purpose check. The signer-side `signRequest` gate refuses wrong-purpose
+  // keys to prevent the more common operator footgun; bypass it here by
+  // composing `prepareRequestSignature` (which takes `SignatureIdentity`
+  // and runs no gate) with this file's local `produceSignature` helper.
+  // The bypass is intentional and confined to test-vector authoring.
+  const prepared = prepareRequestSignature(
+    request,
+    { keyid: key.keyid, alg: key.alg },
+    {
+      coverContentDigest: args.coverContentDigest ?? vector.verifier_capability.covers_content_digest === 'required',
+      now: args.now !== undefined ? () => args.now! : undefined,
+      nonce: args.nonce,
+      windowSeconds: args.windowSeconds,
+      binaryEncoding: requestSigningEncodingForVersion(vector.signing_profile_version),
+    }
+  );
+  const signature = produceSignature(key, Buffer.from(prepared.base, 'utf8'));
+  const signed = finalizeRequestSignature(prepared, signature);
+  return {
+    method: shaped.method,
+    url: shaped.url,
+    headers: mergeHeaders(shaped.headers, signed.headers),
+    body: shaped.body,
+  };
+}
+
+function retargetUrl(vectorUrl: string, baseUrl: string | undefined): string {
+  if (!baseUrl) return vectorUrl;
+  const v = new URL(vectorUrl);
+  const b = new URL(baseUrl);
+  v.protocol = b.protocol;
+  v.host = b.host;
+  // Prefix the agent's mount path (from baseUrl) ahead of the vector's path
+  // so agents mounted at e.g. `/v1/adcp/*` receive requests at
+  // `/v1/adcp/create_media_buy` rather than the bare `/adcp/create_media_buy`
+  // the vector carries. When baseUrl has no path (or just `/`), this is a
+  // no-op. Canonicalization-edge vectors (005–008) bake their edge into the
+  // vector's path/query; we preserve those bytes by joining, not replacing.
+  if (b.pathname && b.pathname !== '/') {
+    const mount = b.pathname.replace(/\/+$/, '');
+    const vectorPath = v.pathname.startsWith('/') ? v.pathname : `/${v.pathname}`;
+    v.pathname = `${mount}${vectorPath}`;
+  }
+  return v.toString();
+}
+
+interface TransportShapedRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body?: string;
+}
+
+/**
+ * Apply the transport transform to a vector's request shape. In `'raw'` mode
+ * (default) this is just origin-swap path-merge. In `'mcp'` mode:
+ *   - URL becomes `baseUrl` exactly (no path join — MCP agents expose a single
+ *     JSON-RPC endpoint; the operation is named in the body).
+ *   - Body is wrapped in a JSON-RPC `tools/call` envelope; the operation name
+ *     comes from the vector's last URL segment.
+ *   - `Accept: application/json, text/event-stream` added so MCP Streamable
+ *     HTTP servers don't 406 on the probe.
+ *
+ * Shared call site for `sign`, `signWithParamOverride`, `signWithComponents`
+ * so every mutation path produces MCP-shaped requests when requested.
+ */
+
+/**
+ * Merge *overrides* onto *base*, treating header names case-insensitively.
+ *
+ * An override replaces any base entry matching case-insensitively and keeps the
+ * OVERRIDE's spelling, so a header the two sides spell differently
+ * (`Content-Type` vs `content-type`) goes on the wire exactly ONCE. A plain
+ * object spread is case-sensitive and sends it twice, which a conformant
+ * verifier refuses at checklist step 1 before grading anything.
+ */
+function mergeHeadersCaseInsensitively(
+  base: Record<string, string>,
+  overrides: Record<string, string>
+): Record<string, string> {
+  const overridden = new Set(Object.keys(overrides).map(name => name.toLowerCase()));
+  const merged: Record<string, string> = {};
+  for (const [name, value] of Object.entries(base)) {
+    if (!overridden.has(name.toLowerCase())) merged[name] = value;
+  }
+  return { ...merged, ...overrides };
+}
+
+function applyTransport(vector: PositiveVector | NegativeVector, options: BuildOptions): TransportShapedRequest {
+  const headers = { ...vector.request.headers };
+  if (options.transport === 'a2a') {
+    if (!options.a2aRequest) {
+      throw new Error(
+        `transport: 'a2a' requires a2aRequest — the request captured from the official ` +
+          `@a2a-js/sdk client (see a2a-dispatch.ts). Framing one here would be this repo ` +
+          `inventing an A2A binding, which is the thing that transport exists not to do.`
+      );
+    }
+    // THE FIXTURE WINS; the transport only fills gaps. The client's headers
+    // supply what the wire needs and the fixture does not set (`a2a-version`,
+    // `accept`), but where a vector names a header it is naming it ON PURPOSE —
+    // vector 022 presents a deliberately multi-valued `Content-Type`, and that
+    // header IS the fault under test. Letting the transport's clean
+    // `content-type` overwrite it destroys the vector: the agent then answers
+    // about some other defect, and the run grades a request nobody meant to
+    // send.
+    //
+    // CASE-INSENSITIVELY, because HTTP header names are. A plain object spread
+    // is case-SENSITIVE, so a fixture's `Content-Type` and the client's
+    // `content-type` both survive it and the request goes out carrying the
+    // header twice — which a conformant verifier refuses at checklist step 1 as
+    // `request_signature_header_malformed`, before it evaluates anything the
+    // vector actually grades. Measured against a live agent: 16 of 27 A2A
+    // vector failures were this and nothing else.
+    return {
+      method: options.a2aRequest.method,
+      url: options.a2aRequest.url,
+      headers: mergeHeadersCaseInsensitively(options.a2aRequest.headers, headers),
+      body: options.a2aRequest.body,
+    };
+  }
+  if (options.transport === 'mcp') {
+    if (!options.baseUrl) {
+      throw new Error(`transport: 'mcp' requires a baseUrl (the MCP endpoint, e.g. http://agent/mcp)`);
+    }
+    const operation = extractOperationFromVectorUrl(vector.request.url);
+    const envelope = wrapMcpEnvelope(operation, vector.request.body, options.mcpJsonRpcId);
+    // Accept header added for MCP Streamable HTTP negotiation. Not in the
+    // signed components list (MANDATORY_COMPONENTS doesn't include `accept`),
+    // so adding it after the vector's headers doesn't affect the signature.
+    headers['Accept'] = 'application/json, text/event-stream';
+    return {
+      method: vector.request.method,
+      url: options.baseUrl,
+      headers,
+      body: envelope,
+    };
+  }
+  return {
+    method: vector.request.method,
+    url: retargetUrl(vector.request.url, options.baseUrl),
+    headers,
+    body: vector.request.body,
+  };
+}
+
+// AdCP operation names are spec-defined identifiers (lowercase alnum +
+// underscore — `create_media_buy`, `sync_creatives`, `si_send_message`,
+// etc.; verified against every `task:` value shipped in
+// `compliance/cache/{version}/protocols/**/*.yaml`). Constrain the extractor
+// output to that shape so a compromised compliance cache can't smuggle
+// arbitrary bytes into `params.name` via a weird vector URL.
+const OPERATION_NAME_SAFE = /^[a-z][a-z0-9_]*$/;
+
+function extractOperationFromVectorUrl(vectorUrl: string): string {
+  const parsed = new URL(vectorUrl);
+  const segments = parsed.pathname.split('/').filter(Boolean);
+  const last = segments[segments.length - 1];
+  if (!last) throw new Error(`Cannot extract operation from vector URL: ${vectorUrl}`);
+  if (!OPERATION_NAME_SAFE.test(last)) {
+    throw new Error(
+      `Operation name "${last}" extracted from ${vectorUrl} fails identifier check. ` +
+        `AdCP operations are lowercase_snake_case; this is likely a corrupted compliance cache.`
+    );
+  }
+  return last;
+}
+
+function wrapMcpEnvelope(
+  operation: string,
+  rawBody: string | undefined,
+  idOverride: number | string | undefined
+): string {
+  const id = idOverride ?? randomUUID();
+  // Conformance vectors' bodies are spec-typed as JSON. A parse failure is
+  // a vector drift, not a runtime input-validation case — let it surface.
+  const args = rawBody && rawBody.length > 0 ? JSON.parse(rawBody) : {};
+  return JSON.stringify({
+    jsonrpc: '2.0',
+    id,
+    method: 'tools/call',
+    params: { name: operation, arguments: args },
+  });
+}
+
+interface ParamOverride {
+  tag?: string;
+  alg?: string;
+  keyid?: string;
+  expiresDelta?: number;
+  omitExpires?: boolean;
+  omitNonce?: boolean;
+}
+
+/**
+ * Build a signature base with overridden params, sign it directly, and emit
+ * the headers. Needed when the mutation lives in `@signature-params` itself
+ * (tag, alg, keyid, expires, nonce) — signRequest won't emit those exact
+ * malformations.
+ */
+function signWithParamOverride(
+  key: SignerKey,
+  vector: PositiveVector | NegativeVector,
+  options: BuildOptions,
+  override: ParamOverride
+): SignedHttpRequest {
+  const shaped = applyTransport(vector, options);
+  if (vector.verifier_capability.covers_content_digest === 'required') refreshContentDigest(shaped, vector);
+  const url = shaped.url;
+  const request: RequestLike = {
+    method: shaped.method,
+    url,
+    headers: shaped.headers,
+    body: shaped.body,
+  };
+  const hasBody = (request.body ?? '').length > 0;
+  const components = hasBody
+    ? ['@method', '@target-uri', '@authority', 'content-type']
+    : ['@method', '@target-uri', '@authority'];
+  if (hasBody && vector.verifier_capability.covers_content_digest === 'required') {
+    components.push('content-digest');
+  }
+
+  const now = nowSeconds(options);
+  const windowSeconds = options.windowSeconds ?? 300;
+  const params: SignatureParams = {
+    created: now,
+    expires: now + (override.expiresDelta ?? windowSeconds),
+    nonce: options.nonce ?? randomNonce(),
+    keyid: override.keyid ?? key.keyid,
+    alg: override.alg ?? key.alg,
+    tag: override.tag ?? REQUEST_SIGNING_TAG,
+  };
+
+  const paramsString = formatParamsWithOmissions(components, params, override);
+  const base = buildSignatureBase(components, request, params, paramsString, canonicalizationProfile(vector));
+  const signature = produceSignature(key, Buffer.from(base, 'utf8'));
+
+  return {
+    method: shaped.method,
+    url,
+    headers: {
+      ...shaped.headers,
+      'Signature-Input': `sig1=${paramsString}`,
+      Signature: `sig1=:${Buffer.from(signature).toString(binaryEncoding(vector))}:`,
+    },
+    body: shaped.body,
+  };
+}
+
+function signWithComponents(
+  key: SignerKey,
+  vector: PositiveVector | NegativeVector,
+  options: BuildOptions,
+  components: string[],
+  refreshDigest: boolean | DigestShaper = false
+): SignedHttpRequest {
+  const shaped = applyTransport(vector, options);
+  if (refreshDigest) refreshContentDigest(shaped, vector, refreshDigest === true ? undefined : refreshDigest);
+  const url = shaped.url;
+  const request: RequestLike = {
+    method: shaped.method,
+    url,
+    headers: shaped.headers,
+    body: shaped.body,
+  };
+  const now = nowSeconds(options);
+  const windowSeconds = options.windowSeconds ?? 300;
+  const params: SignatureParams = {
+    created: now,
+    expires: now + windowSeconds,
+    nonce: options.nonce ?? randomNonce(),
+    keyid: key.keyid,
+    alg: key.alg,
+    tag: REQUEST_SIGNING_TAG,
+  };
+  const paramsString = formatSignatureParams(components, params);
+  const base = buildSignatureBase(components, request, params, paramsString, canonicalizationProfile(vector));
+  const signature = produceSignature(key, Buffer.from(base, 'utf8'));
+  return {
+    method: shaped.method,
+    url,
+    headers: {
+      ...shaped.headers,
+      'Signature-Input': `sig1=${paramsString}`,
+      Signature: `sig1=:${Buffer.from(signature).toString(binaryEncoding(vector))}:`,
+    },
+    body: shaped.body,
+  };
+}
+
+/** Builds the Content-Digest header value for the body that will be sent. */
+type DigestShaper = (body: string, encoding: ReturnType<typeof requestSigningEncodingForVersion>) => string;
+
+function refreshContentDigest(
+  shaped: TransportShapedRequest,
+  vector: PositiveVector | NegativeVector,
+  shape?: DigestShaper
+): void {
+  const encoding = requestSigningEncodingForVersion(vector.signing_profile_version);
+  const body = shaped.body ?? '';
+  shaped.headers = mergeHeadersCaseInsensitively(shaped.headers, {
+    'Content-Digest': shape ? shape(body, encoding) : computeContentDigest(body, encoding),
+  });
+}
+
+function formatParamsWithOmissions(
+  components: ReadonlyArray<string>,
+  params: SignatureParams,
+  override: ParamOverride
+): string {
+  const omitted = new Set<string>([
+    ...(override.omitExpires ? ['expires'] : []),
+    ...(override.omitNonce ? ['nonce'] : []),
+  ]);
+  const pairs = new Map<string, string | number>();
+  for (const key of ['created', 'expires', 'nonce', 'keyid', 'alg', 'tag'] as const) {
+    if (!omitted.has(key) && params[key] !== undefined) pairs.set(key, params[key]);
+  }
+  return serializeInnerList([components.map(c => [c, new Map()] as const), pairs]);
+}
+
+function produceSignature(key: SignerKey, data: Buffer): Uint8Array {
+  return signWithPrivateJwk(key.alg, key.privateKey as AdcpJsonWebKey, data);
+}
+
+// ── Helpers ───────────────────────────────────────────────────
+
+function signerKeyFor(vector: PositiveVector | NegativeVector, keys: TestKeyset): SignerKey {
+  const kid = vector.jwks_ref?.[0];
+  if (!kid) {
+    throw new Error(
+      `${vector.id}: jwks_ref missing — vectors signed dynamically by the builder must declare a keys.json kid. ` +
+        `Vectors shipping an inline jwks_override must use a passthrough mutator (no re-signing).`
+    );
+  }
+  return keyFor(keys, kid);
+}
+
+function keyFor(keys: TestKeyset, kid: string): SignerKey {
+  const keypair = findKey(keys, kid);
+  return toSignerKey(keypair);
+}
+
+function toSignerKey(keypair: TestKeypair): SignerKey {
+  const alg: SignerKey['alg'] = keypair.crv === 'Ed25519' ? 'ed25519' : 'ecdsa-p256-sha256';
+  const privateKey: AdcpJsonWebKey = {
+    kid: keypair.kid,
+    kty: keypair.kty,
+    crv: keypair.crv,
+    alg: keypair.alg,
+    use: keypair.use,
+    key_ops: ['sign'],
+    adcp_use: keypair.adcp_use,
+    x: keypair.x,
+    y: keypair.y,
+    d: keypair.private_d,
+  };
+  return { keyid: keypair.kid, alg, privateKey };
+}
+
+function stripSignatureHeaders(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    const lower = k.toLowerCase();
+    if (lower === 'signature' || lower === 'signature-input' || lower === 'content-digest') continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+function mergeHeaders(from: Record<string, string>, signed: Record<string, string>): Record<string, string> {
+  // Drop original Signature/Signature-Input/Content-Digest before overlaying fresh ones.
+  const base = stripSignatureHeaders(from);
+  return { ...base, ...signed };
+}
+
+function nowSeconds(options: BuildOptions): number {
+  return options.now ?? Math.floor(Date.now() / 1000);
+}
+
+function randomNonce(): string {
+  return randomBytes(16).toString('base64url');
+}

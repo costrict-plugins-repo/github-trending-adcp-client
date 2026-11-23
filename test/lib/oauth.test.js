@@ -1,0 +1,1028 @@
+/**
+ * Tests for OAuth module
+ */
+
+const { test, describe, beforeEach, mock } = require('node:test');
+const assert = require('node:assert');
+
+// Import from built library
+const {
+  MCPOAuthProvider,
+  CLIFlowHandler,
+  createCLIOAuthProvider,
+  hasValidOAuthTokens,
+  clearOAuthTokens,
+  getEffectiveAuthToken,
+  toMCPTokens,
+  fromMCPTokens,
+  toMCPClientInfo,
+  fromMCPClientInfo,
+  DEFAULT_CLIENT_METADATA,
+  discoverOAuthMetadata,
+} = require('../../dist/lib/auth/oauth');
+
+describe('OAuth Types', () => {
+  describe('toMCPTokens', () => {
+    test('converts AgentOAuthTokens to MCP format', () => {
+      const agentTokens = {
+        access_token: 'test-access-token',
+        refresh_token: 'test-refresh-token',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        scope: 'read write',
+      };
+
+      const mcpTokens = toMCPTokens(agentTokens);
+
+      assert.strictEqual(mcpTokens.access_token, 'test-access-token');
+      assert.strictEqual(mcpTokens.refresh_token, 'test-refresh-token');
+      assert.strictEqual(mcpTokens.token_type, 'Bearer');
+      assert.strictEqual(mcpTokens.expires_in, 3600);
+      assert.strictEqual(mcpTokens.scope, 'read write');
+    });
+
+    test('defaults token_type to Bearer', () => {
+      const agentTokens = {
+        access_token: 'test-access-token',
+      };
+
+      const mcpTokens = toMCPTokens(agentTokens);
+      assert.strictEqual(mcpTokens.token_type, 'Bearer');
+    });
+  });
+
+  describe('fromMCPTokens', () => {
+    test('converts MCP tokens to AgentOAuthTokens format', () => {
+      const mcpTokens = {
+        access_token: 'test-access-token',
+        refresh_token: 'test-refresh-token',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        scope: 'read write',
+      };
+
+      const agentTokens = fromMCPTokens(mcpTokens);
+
+      assert.strictEqual(agentTokens.access_token, 'test-access-token');
+      assert.strictEqual(agentTokens.refresh_token, 'test-refresh-token');
+      assert.strictEqual(agentTokens.token_type, 'Bearer');
+      assert.strictEqual(agentTokens.expires_in, 3600);
+      assert.strictEqual(agentTokens.scope, 'read write');
+      assert.ok(agentTokens.expires_at);
+    });
+
+    test('calculates expires_at from expires_in', () => {
+      const now = Date.now();
+      const mcpTokens = {
+        access_token: 'test',
+        expires_in: 3600,
+      };
+
+      const agentTokens = fromMCPTokens(mcpTokens);
+      const expiresAt = new Date(agentTokens.expires_at).getTime();
+
+      // Should be approximately 1 hour from now
+      assert.ok(expiresAt > now + 3500000);
+      assert.ok(expiresAt < now + 3700000);
+    });
+
+    test('omits refresh_token if not present', () => {
+      const mcpTokens = {
+        access_token: 'test',
+      };
+
+      const agentTokens = fromMCPTokens(mcpTokens);
+      assert.strictEqual(agentTokens.refresh_token, undefined);
+    });
+  });
+
+  describe('toMCPClientInfo', () => {
+    test('converts AgentOAuthClient to MCP format', () => {
+      const agentClient = {
+        client_id: 'test-client-id',
+        client_secret: 'test-secret',
+        client_secret_expires_at: 1234567890,
+      };
+
+      const mcpClient = toMCPClientInfo(agentClient);
+
+      assert.strictEqual(mcpClient.client_id, 'test-client-id');
+      assert.strictEqual(mcpClient.client_secret, 'test-secret');
+      assert.strictEqual(mcpClient.client_secret_expires_at, 1234567890);
+    });
+  });
+
+  describe('fromMCPClientInfo', () => {
+    test('converts MCP client info to AgentOAuthClient format', () => {
+      const mcpClient = {
+        client_id: 'test-client-id',
+        client_secret: 'test-secret',
+        client_secret_expires_at: 1234567890,
+      };
+
+      const agentClient = fromMCPClientInfo(mcpClient);
+
+      assert.strictEqual(agentClient.client_id, 'test-client-id');
+      assert.strictEqual(agentClient.client_secret, 'test-secret');
+      assert.strictEqual(agentClient.client_secret_expires_at, 1234567890);
+    });
+  });
+});
+
+describe('OAuth Helper Functions', () => {
+  describe('hasValidOAuthTokens', () => {
+    test('returns false for agent without oauth_tokens', () => {
+      const agent = {
+        id: 'test',
+        name: 'Test',
+        agent_uri: 'https://example.com',
+        protocol: 'mcp',
+      };
+
+      assert.strictEqual(hasValidOAuthTokens(agent), false);
+    });
+
+    test('returns false for agent with empty oauth_tokens', () => {
+      const agent = {
+        id: 'test',
+        name: 'Test',
+        agent_uri: 'https://example.com',
+        protocol: 'mcp',
+        oauth_tokens: {},
+      };
+
+      assert.strictEqual(hasValidOAuthTokens(agent), false);
+    });
+
+    test('returns true for agent with valid access_token', () => {
+      const agent = {
+        id: 'test',
+        name: 'Test',
+        agent_uri: 'https://example.com',
+        protocol: 'mcp',
+        oauth_tokens: {
+          access_token: 'valid-token',
+        },
+      };
+
+      assert.strictEqual(hasValidOAuthTokens(agent), true);
+    });
+
+    test('returns false for expired token', () => {
+      const agent = {
+        id: 'test',
+        name: 'Test',
+        agent_uri: 'https://example.com',
+        protocol: 'mcp',
+        oauth_tokens: {
+          access_token: 'valid-token',
+          expires_at: new Date(Date.now() - 1000).toISOString(),
+        },
+      };
+
+      assert.strictEqual(hasValidOAuthTokens(agent), false);
+    });
+
+    test('returns false for token expiring within 5 minutes', () => {
+      const agent = {
+        id: 'test',
+        name: 'Test',
+        agent_uri: 'https://example.com',
+        protocol: 'mcp',
+        oauth_tokens: {
+          access_token: 'valid-token',
+          expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString(),
+        },
+      };
+
+      assert.strictEqual(hasValidOAuthTokens(agent), false);
+    });
+
+    test('returns true for token expiring after 5 minutes', () => {
+      const agent = {
+        id: 'test',
+        name: 'Test',
+        agent_uri: 'https://example.com',
+        protocol: 'mcp',
+        oauth_tokens: {
+          access_token: 'valid-token',
+          expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+        },
+      };
+
+      assert.strictEqual(hasValidOAuthTokens(agent), true);
+    });
+  });
+
+  describe('clearOAuthTokens', () => {
+    test('removes all OAuth data from agent', () => {
+      const agent = {
+        id: 'test',
+        name: 'Test',
+        agent_uri: 'https://example.com',
+        protocol: 'mcp',
+        oauth_tokens: { access_token: 'token' },
+        oauth_client: { client_id: 'client' },
+        oauth_code_verifier: 'verifier',
+      };
+
+      clearOAuthTokens(agent);
+
+      assert.strictEqual(agent.oauth_tokens, undefined);
+      assert.strictEqual(agent.oauth_client, undefined);
+      assert.strictEqual(agent.oauth_code_verifier, undefined);
+    });
+
+    test('preserves other agent properties', () => {
+      const agent = {
+        id: 'test',
+        name: 'Test',
+        agent_uri: 'https://example.com',
+        protocol: 'mcp',
+        auth_token: 'static-token',
+        oauth_tokens: { access_token: 'token' },
+      };
+
+      clearOAuthTokens(agent);
+
+      assert.strictEqual(agent.id, 'test');
+      assert.strictEqual(agent.name, 'Test');
+      assert.strictEqual(agent.auth_token, 'static-token');
+    });
+  });
+
+  describe('getEffectiveAuthToken', () => {
+    test('returns OAuth access_token when valid', () => {
+      const agent = {
+        id: 'test',
+        name: 'Test',
+        agent_uri: 'https://example.com',
+        protocol: 'mcp',
+        auth_token: 'static-token',
+        oauth_tokens: {
+          access_token: 'oauth-token',
+          expires_at: new Date(Date.now() + 3600000).toISOString(),
+        },
+      };
+
+      assert.strictEqual(getEffectiveAuthToken(agent), 'oauth-token');
+    });
+
+    test('falls back to static token when OAuth expired', () => {
+      const agent = {
+        id: 'test',
+        name: 'Test',
+        agent_uri: 'https://example.com',
+        protocol: 'mcp',
+        auth_token: 'static-token',
+        oauth_tokens: {
+          access_token: 'oauth-token',
+          expires_at: new Date(Date.now() - 1000).toISOString(),
+        },
+      };
+
+      assert.strictEqual(getEffectiveAuthToken(agent), 'static-token');
+    });
+
+    test('returns static token when no OAuth tokens', () => {
+      const agent = {
+        id: 'test',
+        name: 'Test',
+        agent_uri: 'https://example.com',
+        protocol: 'mcp',
+        auth_token: 'static-token',
+      };
+
+      assert.strictEqual(getEffectiveAuthToken(agent), 'static-token');
+    });
+
+    test('returns undefined when no auth configured', () => {
+      const agent = {
+        id: 'test',
+        name: 'Test',
+        agent_uri: 'https://example.com',
+        protocol: 'mcp',
+      };
+
+      assert.strictEqual(getEffectiveAuthToken(agent), undefined);
+    });
+  });
+});
+
+describe('MCPOAuthProvider', () => {
+  let agent;
+  let mockFlowHandler;
+
+  beforeEach(() => {
+    agent = {
+      id: 'test-agent',
+      name: 'Test Agent',
+      agent_uri: 'https://example.com/mcp',
+      protocol: 'mcp',
+    };
+
+    mockFlowHandler = {
+      getRedirectUrl: () => 'http://localhost:8766/callback',
+      redirectToAuthorization: async () => {},
+      waitForCallback: async () => 'auth-code',
+      cleanup: async () => {},
+    };
+  });
+
+  test('creates provider with correct metadata', () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+        client_name: 'Test Client',
+      },
+    });
+
+    assert.strictEqual(provider.clientMetadata.client_name, 'Test Client');
+    assert.strictEqual(provider.redirectUrl, 'http://localhost:8766/callback');
+  });
+
+  test('returns undefined for clientInformation when not registered', async () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    const info = await provider.clientInformation();
+    assert.strictEqual(info, undefined);
+  });
+
+  test('saves and retrieves client information', async () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    await provider.saveClientInformation({
+      client_id: 'test-client-id',
+      client_secret: 'test-secret',
+      issuer: 'https://auth.example.com',
+    });
+
+    const info = await provider.clientInformation();
+    assert.strictEqual(info.client_id, 'test-client-id');
+    assert.strictEqual(agent.oauth_client.client_id, 'test-client-id');
+    assert.strictEqual(info.issuer, 'https://auth.example.com');
+  });
+
+  test('returns undefined for tokens when not authenticated', async () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    const tokens = await provider.tokens();
+    assert.strictEqual(tokens, undefined);
+  });
+
+  test('saves tokens and clears code verifier', async () => {
+    agent.oauth_code_verifier = 'test-verifier';
+
+    const provider = new MCPOAuthProvider({
+      allowInteractiveAuthorization: true,
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    await provider.saveTokens({
+      access_token: 'test-access-token',
+      refresh_token: 'test-refresh-token',
+      issuer: 'https://auth.example.com',
+      token_type: 'Bearer',
+      expires_in: 3600,
+    });
+
+    const tokens = await provider.tokens();
+    assert.strictEqual(tokens.access_token, 'test-access-token');
+    assert.strictEqual(tokens.issuer, 'https://auth.example.com');
+    assert.strictEqual(agent.oauth_tokens.access_token, 'test-access-token');
+    assert.strictEqual(agent.oauth_code_verifier, undefined); // Cleaned up
+  });
+
+  test('saves and retrieves code verifier', async () => {
+    const provider = new MCPOAuthProvider({
+      allowInteractiveAuthorization: true,
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    await provider.saveCodeVerifier('test-verifier');
+    const verifier = await provider.codeVerifier();
+
+    assert.strictEqual(verifier, 'test-verifier');
+    assert.strictEqual(agent.oauth_code_verifier, 'test-verifier');
+  });
+
+  test('throws when code verifier not saved', async () => {
+    const provider = new MCPOAuthProvider({
+      allowInteractiveAuthorization: true,
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    await assert.rejects(() => provider.codeVerifier(), /No PKCE code verifier found/);
+  });
+
+  test('invalidates all credentials', async () => {
+    agent.oauth_tokens = { access_token: 'token' };
+    agent.oauth_client = { client_id: 'client' };
+    agent.oauth_code_verifier = 'verifier';
+
+    const provider = new MCPOAuthProvider({
+      allowInteractiveAuthorization: true,
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    await provider.invalidateCredentials('all');
+
+    assert.strictEqual(agent.oauth_tokens, undefined);
+    assert.strictEqual(agent.oauth_client, undefined);
+    assert.strictEqual(agent.oauth_code_verifier, undefined);
+  });
+
+  test('invalidates only tokens', async () => {
+    agent.oauth_tokens = { access_token: 'token' };
+    agent.oauth_client = { client_id: 'client' };
+
+    const provider = new MCPOAuthProvider({
+      allowInteractiveAuthorization: true,
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    await provider.invalidateCredentials('tokens');
+
+    assert.strictEqual(agent.oauth_tokens, undefined);
+    assert.strictEqual(agent.oauth_client.client_id, 'client');
+  });
+
+  test('checks hasValidTokens correctly', () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    assert.strictEqual(provider.hasValidTokens(), false);
+
+    agent.oauth_tokens = {
+      access_token: 'token',
+      expires_at: new Date(Date.now() + 3600000).toISOString(),
+    };
+
+    assert.strictEqual(provider.hasValidTokens(), true);
+  });
+
+  test('checks hasRefreshToken correctly', () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    assert.strictEqual(provider.hasRefreshToken(), false);
+
+    agent.oauth_tokens = { access_token: 'token', refresh_token: 'refresh' };
+    assert.strictEqual(provider.hasRefreshToken(), true);
+  });
+
+  test('validateResourceURL returns server resource when present', async () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    // Server advertises a different domain (e.g., canonical domain behind proxy)
+    const result = await provider.validateResourceURL(
+      'https://test-agent.example.org/mcp',
+      'https://canonical.example.com/mcp'
+    );
+    assert.ok(result instanceof URL);
+    assert.strictEqual(result.toString(), 'https://canonical.example.com/mcp');
+  });
+
+  test('validateResourceURL prefers the operator resource override for refresh', async () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      resourceOverride: 'https://operator.example.com',
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    const result = await provider.validateResourceURL(
+      'https://test-agent.example.org/mcp',
+      'https://metadata.example.com/mcp'
+    );
+    assert.strictEqual(result.toString(), 'https://operator.example.com/');
+  });
+
+  test('validateResourceURL uses an override persisted on AgentConfig', async () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+    agent.oauth_resource = 'https://persisted.example.com';
+
+    const result = await provider.validateResourceURL('https://test-agent.example.org/mcp');
+    assert.strictEqual(result.toString(), 'https://persisted.example.com/');
+  });
+
+  test('validateResourceURL honors explicit null by falling back to protected-resource metadata', async () => {
+    agent.oauth_resource = 'https://persisted.example.com';
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      resourceOverride: null,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    const result = await provider.validateResourceURL('https://example.com/mcp', 'https://metadata.example.com/mcp');
+    assert.strictEqual(result.toString(), 'https://metadata.example.com/mcp');
+  });
+
+  test('validateResourceURL returns undefined when no resource', async () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    const result = await provider.validateResourceURL('https://example.com/mcp');
+    assert.strictEqual(result, undefined);
+  });
+
+  test('validateResourceURL rejects non-HTTPS resource URLs', async () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    await assert.rejects(
+      () => provider.validateResourceURL('https://example.com/mcp', 'http://insecure.example.com/mcp'),
+      { message: /must use HTTPS/ }
+    );
+  });
+
+  test('validateResourceURL accepts non-HTTPS resource URLs when allowHttp is set', async () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+      allowHttp: true,
+    });
+
+    const result = await provider.validateResourceURL('http://localhost:3000/figma/mcp', 'http://localhost:3000/figma');
+    assert.ok(result instanceof URL);
+    assert.strictEqual(result.toString(), 'http://localhost:3000/figma');
+  });
+
+  test('validateResourceURL rejects invalid URL strings', async () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    await assert.rejects(() => provider.validateResourceURL('https://example.com/mcp', 'not-a-url'));
+  });
+
+  test('calls storage when provided', async () => {
+    let savedAgent = null;
+    const mockStorage = {
+      loadAgent: async () => agent,
+      saveAgent: async a => {
+        savedAgent = a;
+      },
+    };
+
+    const provider = new MCPOAuthProvider({
+      allowInteractiveAuthorization: true,
+      agent,
+      flowHandler: mockFlowHandler,
+      storage: mockStorage,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    await provider.saveTokens({ access_token: 'token' });
+
+    assert.strictEqual(savedAgent, agent);
+  });
+});
+
+describe('CLIFlowHandler', () => {
+  test('returns correct redirect URL', () => {
+    const handler = new CLIFlowHandler({ callbackPort: 9999 });
+    assert.strictEqual(handler.getRedirectUrl(), 'http://localhost:9999/callback');
+  });
+
+  test('uses default port 8766', () => {
+    const handler = new CLIFlowHandler();
+    assert.strictEqual(handler.getRedirectUrl(), 'http://localhost:8766/callback');
+  });
+
+  test('cleans up without error when no server running', async () => {
+    const handler = new CLIFlowHandler();
+    await handler.cleanup();
+    // Should complete without throwing
+    assert.ok(true);
+  });
+
+  /**
+   * The callback server listens on loopback, so any local process or page can
+   * reach it. Binding the callback to the state that went out with the
+   * authorization request is what stops one of them from injecting a code.
+   *
+   * These cases all resolve before `openBrowser`, so no browser is launched.
+   */
+  describe('callback binding', () => {
+    test('refuses to start a flow whose authorization URL carries no state', async () => {
+      const handler = new CLIFlowHandler({ quiet: true });
+      await assert.rejects(
+        () => handler.redirectToAuthorization(new URL('https://auth.example.com/authorize?client_id=abc')),
+        /missing the "state" parameter/
+      );
+    });
+
+    test('refuses a non-http authorization scheme', async () => {
+      const handler = new CLIFlowHandler({ quiet: true });
+      await assert.rejects(
+        () => handler.redirectToAuthorization(new URL('file:///etc/passwd?state=s1')),
+        /Refusing to open authorization URL/
+      );
+    });
+
+    test('rejects a callback that arrives with no authorization request pending', async () => {
+      // expectedState is null here, so there is nothing to bind to and the
+      // callback must be refused rather than resolved with the supplied code.
+      const handler = new CLIFlowHandler({ callbackPort: 8791, timeout: 5000, quiet: true });
+      // Attach the rejection assertion before triggering the callback, so the
+      // rejection is never momentarily unhandled.
+      const rejection = assert.rejects(() => handler.waitForCallback(), /state mismatch/);
+
+      // Give the server a moment to bind before probing it.
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const res = await fetch('http://127.0.0.1:8791/callback?code=injected_code');
+      assert.strictEqual(res.status, 400, 'the injecting caller gets an error page, not a success page');
+
+      await rejection;
+      await handler.cleanup();
+    });
+
+    /** Drive the real authorization path without launching a browser. */
+    async function startFlow(handler, state) {
+      handler.openBrowser = async () => {};
+      await handler.redirectToAuthorization(new URL(`https://auth.example.com/authorize?client_id=abc&state=${state}`));
+    }
+
+    test('rejects a callback whose state does not match the request', async () => {
+      const handler = new CLIFlowHandler({ callbackPort: 8792, timeout: 5000, quiet: true });
+      await startFlow(handler, 'the_real_state');
+      const rejection = assert.rejects(() => handler.waitForCallback(), /state mismatch/);
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+      await fetch('http://127.0.0.1:8792/callback?code=injected_code&state=attacker_state');
+
+      await rejection;
+      await handler.cleanup();
+    });
+
+    test('rejects a callback that omits state entirely', async () => {
+      const handler = new CLIFlowHandler({ callbackPort: 8794, timeout: 5000, quiet: true });
+      await startFlow(handler, 'the_real_state');
+      const rejection = assert.rejects(() => handler.waitForCallback(), /state mismatch/);
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+      await fetch('http://127.0.0.1:8794/callback?code=injected_code');
+
+      await rejection;
+      await handler.cleanup();
+    });
+
+    test('accepts a callback whose state matches the request', async () => {
+      const handler = new CLIFlowHandler({ callbackPort: 8793, timeout: 5000, quiet: true });
+      await startFlow(handler, 'the_real_state');
+      const pending = handler.waitForCallback();
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+      await fetch('http://127.0.0.1:8793/callback?code=good_code&state=the_real_state');
+
+      assert.strictEqual(await pending, 'good_code');
+      await handler.cleanup();
+    });
+  });
+});
+
+describe('createCLIOAuthProvider', () => {
+  test('creates provider with default options', () => {
+    const agent = {
+      id: 'test',
+      name: 'Test',
+      agent_uri: 'https://example.com',
+      protocol: 'mcp',
+    };
+
+    const provider = createCLIOAuthProvider(agent);
+
+    assert.strictEqual(provider.getAgentId(), 'test');
+    assert.strictEqual(provider.redirectUrl, 'http://localhost:8766/callback');
+  });
+
+  test('creates provider with custom port', () => {
+    const agent = {
+      id: 'test',
+      name: 'Test',
+      agent_uri: 'https://example.com',
+      protocol: 'mcp',
+    };
+
+    const provider = createCLIOAuthProvider(agent, { callbackPort: 9999 });
+
+    assert.strictEqual(provider.redirectUrl, 'http://localhost:9999/callback');
+  });
+
+  test('creates provider with custom client metadata', () => {
+    const agent = {
+      id: 'test',
+      name: 'Test',
+      agent_uri: 'https://example.com',
+      protocol: 'mcp',
+    };
+
+    const provider = createCLIOAuthProvider(agent, {
+      clientMetadata: { client_name: 'Custom Client' },
+    });
+
+    assert.strictEqual(provider.clientMetadata.client_name, 'Custom Client');
+  });
+});
+
+describe('discoverOAuthMetadata', () => {
+  const validMetadata = {
+    authorization_endpoint: 'https://auth.example.com/authorize',
+    token_endpoint: 'https://auth.example.com/token',
+  };
+
+  function mockFetch(urlToResponse) {
+    return async url => {
+      const entry = urlToResponse[url];
+      if (!entry) return new Response('{}', { status: 404 });
+      return new Response(JSON.stringify(entry), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+  }
+
+  test('root URL discovers at /.well-known/oauth-authorization-server', async () => {
+    let fetchedUrl;
+    const metadata = await discoverOAuthMetadata('https://example.com', {
+      trustedFetchFn: async url => {
+        fetchedUrl = url;
+        return new Response(JSON.stringify(validMetadata), { status: 200 });
+      },
+    });
+    assert.strictEqual(fetchedUrl, 'https://example.com/.well-known/oauth-authorization-server');
+    assert.deepStrictEqual(metadata, validMetadata);
+  });
+
+  test('explicit private-network opt-in supports loopback OAuth discovery', async () => {
+    const metadata = await discoverOAuthMetadata('http://127.0.0.1:3000/mcp', {
+      allowPrivateIp: true,
+      trustedFetchFn: async url => {
+        assert.strictEqual(url.toString(), 'http://127.0.0.1:3000/.well-known/oauth-authorization-server/mcp');
+        return new Response(JSON.stringify(validMetadata), { status: 200 });
+      },
+    });
+
+    assert.deepStrictEqual(metadata, validMetadata);
+  });
+
+  test('path URL tries path-aware discovery first', async () => {
+    const fetched = [];
+    const metadata = await discoverOAuthMetadata('https://example.com/mcp', {
+      trustedFetchFn: async url => {
+        fetched.push(url);
+        if (url === 'https://example.com/.well-known/oauth-authorization-server/mcp') {
+          return new Response(JSON.stringify(validMetadata), { status: 200 });
+        }
+        return new Response('{}', { status: 404 });
+      },
+    });
+    assert.deepStrictEqual(metadata, validMetadata);
+    assert.strictEqual(fetched.length, 1);
+    assert.strictEqual(fetched[0], 'https://example.com/.well-known/oauth-authorization-server/mcp');
+  });
+
+  test('path URL falls back to root when path-aware returns 404', async () => {
+    const metadata = await discoverOAuthMetadata('https://example.com/mcp', {
+      trustedFetchFn: mockFetch({
+        'https://example.com/.well-known/oauth-authorization-server': validMetadata,
+      }),
+    });
+    assert.deepStrictEqual(metadata, validMetadata);
+  });
+
+  test('trailing slash is stripped from path', async () => {
+    const metadata = await discoverOAuthMetadata('https://example.com/mcp/', {
+      trustedFetchFn: mockFetch({
+        'https://example.com/.well-known/oauth-authorization-server/mcp': validMetadata,
+      }),
+    });
+    assert.deepStrictEqual(metadata, validMetadata);
+  });
+
+  test('returns null when no endpoint responds', async () => {
+    const metadata = await discoverOAuthMetadata('https://example.com/mcp', {
+      trustedFetchFn: mockFetch({}),
+    });
+    assert.strictEqual(metadata, null);
+  });
+
+  test('returns null when metadata lacks required fields', async () => {
+    const metadata = await discoverOAuthMetadata('https://example.com', {
+      trustedFetchFn: async () => new Response(JSON.stringify({ issuer: 'https://example.com' }), { status: 200 }),
+    });
+    assert.strictEqual(metadata, null);
+  });
+
+  test('falls back to root when path-aware URL returns malformed JSON', async () => {
+    const metadata = await discoverOAuthMetadata('https://example.com/mcp', {
+      trustedFetchFn: async url => {
+        if (url === 'https://example.com/.well-known/oauth-authorization-server/mcp') {
+          return new Response('{not-json', { status: 200 });
+        }
+        return new Response(JSON.stringify(validMetadata), { status: 200 });
+      },
+    });
+    assert.deepStrictEqual(metadata, validMetadata);
+  });
+
+  test('returns null for network errors', async () => {
+    const metadata = await discoverOAuthMetadata('https://example.com', {
+      trustedFetchFn: async () => {
+        throw new Error('network error');
+      },
+    });
+    assert.strictEqual(metadata, null);
+  });
+
+  test('does not follow metadata redirects to an unvalidated destination', async () => {
+    const fetched = [];
+    const metadata = await discoverOAuthMetadata('https://example.com/mcp', {
+      trustedFetchFn: async url => {
+        fetched.push(url.toString());
+        return new Response('', { status: 302, headers: { location: 'http://127.0.0.1/latest/meta-data' } });
+      },
+    });
+    assert.strictEqual(metadata, null);
+    assert.ok(fetched.length > 0);
+    assert.ok(fetched.every(url => new URL(url).hostname === 'example.com'));
+  });
+});
+
+describe('OAuth issuer bindings', () => {
+  test('round-trips token and client issuer through configuration conversions', () => {
+    const tokens = {
+      access_token: 'at',
+      refresh_token: 'rt',
+      token_type: 'Bearer',
+      issuer: 'https://as.example/tenant',
+    };
+    assert.strictEqual(toMCPTokens(fromMCPTokens(tokens)).issuer, tokens.issuer);
+    const client = { client_id: 'cid', client_secret: 'secret', issuer: tokens.issuer };
+    assert.strictEqual(toMCPClientInfo(fromMCPClientInfo(client)).issuer, client.issuer);
+  });
+
+  test('treats null as an absent issuer for non-secret credentials only', async () => {
+    const agent = {
+      id: 'nullable',
+      name: 'Nullable',
+      agent_uri: 'https://agent.example/mcp',
+      protocol: 'mcp',
+      oauth_tokens: { access_token: 'at', token_type: 'Bearer', issuer: null },
+      oauth_client: { client_id: 'cid', issuer: null },
+    };
+    const provider = new MCPOAuthProvider({ agent, flowHandler: {}, clientMetadata: DEFAULT_CLIENT_METADATA });
+    assert.strictEqual((await provider.tokens()).issuer, undefined);
+    assert.strictEqual((await provider.clientInformation()).issuer, undefined);
+    assert.strictEqual(fromMCPTokens(agent.oauth_tokens).issuer, undefined);
+    assert.strictEqual(fromMCPClientInfo(agent.oauth_client).issuer, undefined);
+    agent.oauth_tokens.refresh_token = 'rt';
+    agent.oauth_client.client_secret = 'secret';
+    await assert.rejects(
+      () => provider.tokens(),
+      error => error.code === 'oauth_issuer_required'
+    );
+    await assert.rejects(
+      () => provider.clientInformation(),
+      error => error.code === 'oauth_issuer_required'
+    );
+  });
+
+  test('refuses legacy unbound refresh tokens and confidential clients', async () => {
+    const provider = new MCPOAuthProvider({
+      agent: {
+        id: 'legacy',
+        name: 'Legacy',
+        agent_uri: 'https://agent.example/mcp',
+        protocol: 'mcp',
+        oauth_tokens: { access_token: 'at', refresh_token: 'rt' },
+        oauth_client: { client_id: 'cid', client_secret: 'secret' },
+      },
+      flowHandler: {},
+      clientMetadata: DEFAULT_CLIENT_METADATA,
+    });
+    await assert.rejects(
+      () => provider.tokens(),
+      error => error.code === 'oauth_issuer_required'
+    );
+    await assert.rejects(
+      () => provider.clientInformation(),
+      error => error.code === 'oauth_issuer_required'
+    );
+  });
+});
+
+describe('DEFAULT_CLIENT_METADATA', () => {
+  test('has required fields', () => {
+    assert.strictEqual(DEFAULT_CLIENT_METADATA.client_name, 'ADCP Client');
+    assert.ok(DEFAULT_CLIENT_METADATA.redirect_uris.includes('http://localhost:8766/callback'));
+    assert.ok(DEFAULT_CLIENT_METADATA.grant_types.includes('authorization_code'));
+    assert.ok(DEFAULT_CLIENT_METADATA.grant_types.includes('refresh_token'));
+    assert.ok(DEFAULT_CLIENT_METADATA.response_types.includes('code'));
+    assert.strictEqual(DEFAULT_CLIENT_METADATA.token_endpoint_auth_method, 'none');
+  });
+});
